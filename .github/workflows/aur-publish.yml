@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ inputs.version || !fromJson(inputs.plan).announcement_is_prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Extract version
         id: version
