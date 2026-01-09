@@ -38,7 +38,7 @@ function download(url, dest) {
 async function install() {
   const info = getBinaryInfo();
   const archiveName = `fresh-editor-${info.target}.${info.ext}`;
-  const url = `https://github.com/${REPO}/releases/download/latest/${archiveName}`;
+  const url = `https://github.com/${REPO}/releases/latest/download/${archiveName}`;
   const archivePath = path.join(__dirname, archiveName);
   const binDir = path.join(__dirname, 'bin');
   const binaryPath = path.join(binDir, info.binaryName);

@@ -1,6 +1,6 @@
 {
   "name": "@involvex/fresh-editor",
-  "version": "0.1.78",
+  "version": "0.1.79",
   "description": "A modern terminal-based text editor with plugin support",
   "repository": {
     "type": "git",
