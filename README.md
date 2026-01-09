@@ -48,7 +48,7 @@ Fresh is engineered for speed. It delivers a low-latency experience, with text a
 
 Quick install (autodetect best method):
 
-`curl https://raw.githubusercontent.com/sinelaw/fresh/refs/heads/master/scripts/install.sh | sh`
+`curl https://raw.githubusercontent.com/involvex/fresh/refs/heads/master/scripts/install.sh | sh`
 
 Or, pick your preferred method:
 
@@ -72,7 +72,7 @@ Or, pick your preferred method:
 On macOS and some linux distros (Bazzite/Bluefin/Aurora):
 
 ```bash
-brew tap sinelaw/fresh
+brew tap involvex/fresh
 brew install fresh-editor
 ```
 
@@ -109,24 +109,24 @@ yay -S fresh-editor
 Download and install the latest release:
 
 ```bash
-curl -sL $(curl -s https://api.github.com/repos/sinelaw/fresh/releases/latest | grep "browser_download_url.*_$(dpkg --print-architecture)\.deb" | cut -d '"' -f 4) -o fresh-editor.deb && sudo dpkg -i fresh-editor.deb
+curl -sL $(curl -s https://api.github.com/repos/involvex/fresh/releases/latest | grep "browser_download_url.*_$(dpkg --print-architecture)\.deb" | cut -d '"' -f 4) -o fresh-editor.deb && sudo dpkg -i fresh-editor.deb
 ```
 
-Or download the `.deb` file manually from the [releases page](https://github.com/sinelaw/fresh/releases).
+Or download the `.deb` file manually from the [releases page](https://github.com/involvex/fresh/releases).
 
 ### Fedora/RHEL/openSUSE (.rpm)
 
 Download and install the latest release:
 
 ```bash
-curl -sL $(curl -s https://api.github.com/repos/sinelaw/fresh/releases/latest | grep "browser_download_url.*\.$(uname -m)\.rpm" | cut -d '"' -f 4) -o fresh-editor.rpm && sudo rpm -U fresh-editor.rpm
+curl -sL $(curl -s https://api.github.com/repos/involvex/fresh/releases/latest | grep "browser_download_url.*\.$(uname -m)\.rpm" | cut -d '"' -f 4) -o fresh-editor.rpm && sudo rpm -U fresh-editor.rpm
 ```
 
-Or download the `.rpm` file manually from the [releases page](https://github.com/sinelaw/fresh/releases).
+Or download the `.rpm` file manually from the [releases page](https://github.com/involvex/fresh/releases).
 
 ### AppImage
 
-Download the `.AppImage` file from the [releases page](https://github.com/sinelaw/fresh/releases) and run:
+Download the `.AppImage` file from the [releases page](https://github.com/involvex/fresh/releases) and run:
 
 ```bash
 chmod +x fresh-editor-VERSION-x86_64.AppImage
@@ -146,7 +146,7 @@ Ensure `~/.local/bin` is in your PATH. Available for x86_64 and aarch64 architec
 
 ### Flatpak
 
-Download the `.flatpak` bundle from the [releases page](https://github.com/sinelaw/fresh/releases) and install:
+Download the `.flatpak` bundle from the [releases page](https://github.com/involvex/fresh/releases) and install:
 
 ```bash
 flatpak install --user fresh-editor-VERSION-x86_64.flatpak
@@ -157,7 +157,7 @@ See [flatpak/README.md](flatpak/README.md) for building from source.
 
 ### Pre-built binaries
 
-Download the latest release for your platform from the [releases page](https://github.com/sinelaw/fresh/releases).
+Download the latest release for your platform from the [releases page](https://github.com/involvex/fresh/releases).
 
 ### npm
 
@@ -191,12 +191,12 @@ cargo binstall fresh-editor
 
 Run without installing:
 ```bash
-nix run github:sinelaw/fresh
+nix run github:involvex/fresh
 ```
 
 Or install to your profile:
 ```bash
-nix profile add github:sinelaw/fresh
+nix profile add github:involvex/fresh
 ```
 
 ### From crates.io
@@ -208,7 +208,7 @@ cargo install fresh-editor
 ### From source
 
 ```bash
-git clone https://github.com/sinelaw/fresh.git
+git clone https://github.com/involvex/fresh.git
 cd fresh
 cargo build --release
 ./target/release/fresh [file]

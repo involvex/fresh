@@ -7,9 +7,7 @@ permissions:
   id-token: write
 
 on:
-  push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -230,7 +228,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: '24.x'
+          node-version: "24.x"
 
       - name: Download all build artifacts
         uses: actions/download-artifact@v7
@@ -346,7 +344,18 @@ jobs:
   # Only runs if ALL needed jobs succeed - uses !cancelled() to run after all jobs complete,
   # then !failure() ensures none failed
   release:
-    needs: [plan, build, build-musl, build-linux-packages, build-flatpak, build-appimage, build-npm-package, build-homebrew-formula, test-nix-build]
+    needs:
+      [
+        plan,
+        build,
+        build-musl,
+        build-linux-packages,
+        build-flatpak,
+        build-appimage,
+        build-npm-package,
+        build-homebrew-formula,
+        test-nix-build,
+      ]
     if: ${{ !cancelled() && !failure() && needs.plan.outputs.publishing == 'true' }}
     runs-on: ubuntu-22.04
     env:
@@ -489,7 +498,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: '24'
+          node-version: "24"
 
       - name: Update npm
         run: npm install -g npm@latest

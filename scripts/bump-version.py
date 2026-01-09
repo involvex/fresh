@@ -273,10 +273,10 @@ def main() -> None:
         print(f"  - Create GitHub Release")
         print(f"  - Publish to crates.io")
         print(f"  - Publish to npm (@fresh-editor/fresh-editor)")
-        print(f"  - Update Homebrew tap (sinelaw/fresh)")
+        print(f"  - Update Homebrew tap (involvex/fresh)")
         print(f"  - Update AUR package (fresh-editor)")
         print("")
-        print(f"Monitor progress at: {BLUE}https://github.com/sinelaw/fresh/actions{NC}")
+        print(f"Monitor progress at: {BLUE}https://github.com/involvex/fresh/actions{NC}")
 
     except subprocess.CalledProcessError as e:
         print(f"{RED}An error occurred during git operations: {e}{NC}")
