@@ -1,6 +1,6 @@
 {
   "name": "@involvex/fresh-editor",
-  "version": "0.1.76",
+  "version": "0.1.78",
   "description": "A modern terminal-based text editor with plugin support",
   "repository": {
     "type": "git",
@@ -13,7 +13,8 @@
   "scripts": {
     "postinstall": "node install.js",
     "start": "node run-fresh.js",
-    "dev": "node run-fresh.js -- --dev"
+    "dev": "node run-fresh.js -- --dev",
+    "build": "bun build bin/fresh.exe   --root . --preload  run-fresh.js binary.js binary-install.js install.js  --target bun --outdir dist "
   },
   "files": [
     "binary.js",
@@ -23,9 +24,13 @@
     "plugins/**/*",
     "themes/**/*",
     "README.md",
+    "bin/fresh.exe",
+    "bin/**/*",
+    "dist/**/*",
     "LICENSE",
     "CHANGELOG.md"
   ],
+  "main": "run-fresh.js",
   "os": ["darwin", "linux", "win32"],
   "cpu": ["x64", "arm64"],
   "keywords": ["editor", "terminal", "cli", "text-editor", "vim"],
