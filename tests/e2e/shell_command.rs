@@ -98,7 +98,7 @@ fn test_shell_command_replace_buffer() {
 /// Note: This test is complex due to selection mode behavior - skipping for now
 #[test]
 #[ignore = "Selection-based shell commands require more complex test setup"]
-#[cfg_attr(not(unix), ignore = "Shell commands require Unix-like environment")]
+#[cfg_attr(not(unix))]
 fn test_shell_command_on_selection() {
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("mixed.txt");
@@ -407,7 +407,7 @@ fn test_shell_command_replace_preserves_cursor_position() {
 /// Test that cursor position is clamped when buffer gets shorter
 #[test]
 #[ignore = "Flaky test - timing issues with shell command execution"]
-#[cfg_attr(not(unix), ignore = "Shell commands require Unix-like environment")]
+#[cfg_attr(not(unix))]
 fn test_shell_command_replace_clamps_cursor_when_buffer_shrinks() {
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("long.txt");

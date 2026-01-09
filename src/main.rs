@@ -670,7 +670,7 @@ fn main() -> AnyhowResult<()> {
         #[cfg(target_os = "linux")]
         gpm_client,
         #[cfg(not(target_os = "linux"))]
-        gpm_client,
+            gpm_client: _,
     } = initialize_app(&args).context("Failed to initialize application")?;
 
     let mut current_working_dir = initial_working_dir;

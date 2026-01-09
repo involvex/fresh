@@ -14,7 +14,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 /// may not be working correctly in the test environment.
 #[test]
 #[ignore = "Needs investigation: fake LSP and plugin loading issues"]
-#[cfg_attr(windows, ignore)] // Uses bash script for fake LSP server
+#[cfg_attr(windows)] // Uses bash script for fake LSP server
 fn test_lsp_find_references() -> anyhow::Result<()> {
     // Create a temporary project directory
     let temp_dir = tempfile::TempDir::new()?;

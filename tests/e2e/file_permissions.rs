@@ -1,10 +1,5 @@
 // End-to-end tests for file permission preservation during save
 
-use crate::common::harness::EditorTestHarness;
-use crossterm::event::{KeyCode, KeyModifiers};
-use std::fs::Permissions;
-use tempfile::TempDir;
-
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
