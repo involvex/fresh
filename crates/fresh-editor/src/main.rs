@@ -5519,7 +5519,7 @@ fn real_main() -> AnyhowResult<()> {
         #[cfg(target_os = "linux")]
         gpm_client,
         #[cfg(not(target_os = "linux"))]
-        gpm_client,
+        gpm_client: _,
         mut terminal_modes,
         authority: startup_authority,
         _remote_session: remote_session,

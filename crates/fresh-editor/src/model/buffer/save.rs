@@ -359,7 +359,7 @@ pub(super) fn write_inplace_recovery_meta(
     meta_path: &Path,
     dest_path: &Path,
     temp_path: &Path,
-    original_metadata: &Option<FileMetadata>,
+    _original_metadata: &Option<FileMetadata>,
 ) -> io::Result<()> {
     #[cfg(unix)]
     let (uid, gid, mode) = original_metadata
