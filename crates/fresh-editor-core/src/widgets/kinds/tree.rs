@@ -1,0 +1,796 @@
+//! `Tree` — disclosure tree with optional checkboxes and card density.
+
+use std::collections::{HashMap, HashSet};
+
+use fresh_core::api::WidgetSpec;
+use serde_json::json;
+
+use super::WidgetImpl;
+use crate::widgets::registry::WidgetInstanceState;
+
+pub struct Tree;
+
+use crate::widgets::render::PAN_COLUMNS;
+
+impl WidgetImpl for Tree {
+    fn picker_nav(&self) -> super::PickerNav {
+        // A Tree is a real (tabbable) focus target. Peek-forwarding
+        // would move the tree's selection while the previously focused
+        // button/field keeps its focus ring — two focused elements at
+        // once, and Enter would still act on the button, not the
+        // highlighted row. Focus moves INTO the tree instead.
+        super::PickerNav::TakeFocus
+    }
+
+    fn activates_on_picker_enter(&self) -> bool {
+        true
+    }
+
+    fn picker_activate_event(
+        &self,
+        spec: &WidgetSpec,
+        key: &str,
+        panel: &crate::widgets::WidgetPanelState,
+    ) -> Option<(String, serde_json::Value)> {
+        activate_event(spec, key, panel)
+    }
+
+    fn box_meta(&self, spec: &WidgetSpec) -> super::BoxMeta {
+        let mut m = super::BoxMeta::plain("tree");
+        if let WidgetSpec::Tree { key: Some(k), .. } = spec {
+            if !k.is_empty() {
+                m.key = Some(k.clone());
+                m.focusable = true;
+                m.scrollable = true;
+                m.picker_scroll_target = true;
+            }
+        }
+        m
+    }
+
+    /// Keep the single-focus invariant when panel focus crosses a
+    /// Tree boundary. A Tree renders a highlight on its selected row
+    /// independent of panel focus — deliberate, so editor-driven
+    /// match navigation can highlight a row while the panel is
+    /// unfocused. The cost is that focus moving within the panel
+    /// could leave a toolbar button's focus ring next to a
+    /// highlighted tree row (two focused elements), or Tab onto the
+    /// tree with no visible selection (invisible focus). So: clear a
+    /// blurred tree's selection, and seed a newly focused tree's to
+    /// its first visible row when it has none. Kind-owned (moved from
+    /// the central focus-move path).
+    fn on_focus_change(
+        &self,
+        panel: &mut crate::widgets::WidgetPanelState,
+        key: &str,
+        gained: bool,
+    ) {
+        if !gained {
+            panel.set_selected_index(key, -1);
+            return;
+        }
+        // Through the one resolver: an untouched tree records no state
+        // at all now, and the spec's `selected_index` is its seed — so
+        // reading the map raw would land focus on the first row of a
+        // tree whose plugin had already said which row was selected.
+        let cur_sel = match crate::widgets::find_widget_by_key(&panel.spec, key) {
+            Some(spec) => resolve(spec, key, &panel.instance_states).selected,
+            None => -1,
+        };
+        if cur_sel >= 0 {
+            return;
+        }
+        // First visible (un-collapsed) node, honoring the host's
+        // expansion set through the same resolver — which falls back to
+        // the spec's `expanded_keys` seed, so this is one statement of
+        // that rule rather than a second. Computed in a scope so the
+        // spec borrow ends before the selection write.
+        let first = {
+            let Some(node_spec) = crate::widgets::find_widget_by_key(&panel.spec, key) else {
+                return;
+            };
+            let WidgetSpec::Tree {
+                nodes, item_keys, ..
+            } = node_spec
+            else {
+                return;
+            };
+            let expanded = resolve(node_spec, key, &panel.instance_states).expanded;
+            collect_visible_tree_indices(nodes, item_keys, &expanded)
+                .first()
+                .map(|&i| i as i32)
+        };
+        if let Some(first) = first {
+            panel.set_selected_index(key, first);
+        }
+    }
+
+    /// Keyboard model: arrows walk the visible-flat order (skipping
+    /// descendants of collapsed nodes), Page keys jump by a viewport
+    /// page in *nodes*, Right expands / Left collapses-or-parents,
+    /// Enter activates, Space toggles a checkable row's checkbox
+    /// (falling back to activate). Self-contained state + events, so
+    /// it lives with the kind.
+    fn on_key(
+        &self,
+        spec: &WidgetSpec,
+        widget_key: &str,
+        panel: &mut crate::widgets::WidgetPanelState,
+        viewport: super::Viewport,
+        key: &crate::keys::KeySeq,
+        fx: &mut super::KeyFx,
+    ) -> super::KeyDisposition {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        const SHIFT: KeyModifiers = KeyModifiers::SHIFT;
+        let Some(key) = key.single() else {
+            return super::KeyDisposition::Pass;
+        };
+        match (key.code(), key.mods()) {
+            (KeyCode::Up, m) | (KeyCode::Down, m) if m.is_empty() => {
+                let delta = if key.code() == KeyCode::Up { -1 } else { 1 };
+                select_move(spec, widget_key, panel, delta, fx);
+            }
+            (KeyCode::PageUp, m) | (KeyCode::PageDown, m) if m.is_empty() => {
+                // A Tree paces in *nodes*, and the window arrives in
+                // them: `viewport.items` is the row budget already
+                // divided by the rows one node occupies (bordered cards
+                // take two extra each, so that division is a
+                // conservative page estimate and never overshoots). The
+                // division is the resolver's — this seam only pages.
+                // One node of overlap so the user keeps a visual anchor.
+                let page = viewport.items.saturating_sub(1).max(1) as i32;
+                let delta = if key.code() == KeyCode::PageUp {
+                    -page
+                } else {
+                    page
+                };
+                select_move(spec, widget_key, panel, delta, fx);
+            }
+            // An arrow that expands, collapses or climbs to a parent is the
+            // tree's; one with nothing to do here — a leaf with no parent,
+            // or nothing selected — is not, and passes, so the panel moves
+            // focus to the control beside the tree (R4). A board of trees
+            // side by side is walked with ←/→ that way.
+            (KeyCode::Left, m) | (KeyCode::Right, m) if m.is_empty() => {
+                if !lateral(spec, widget_key, panel, key.code() == KeyCode::Right, fx) {
+                    return super::KeyDisposition::Pass;
+                }
+            }
+            // Panning. `Left`/`Right` are collapse/expand — the tree meaning
+            // every OS tree widget and the ARIA tree pattern give them — so
+            // sideways takes the one arrow chord whose conventional meaning a
+            // read-only, single-select tree does not have: extend selection.
+            // (`Alt`+arrows are back/forward, `Ctrl`+arrows word-wise; both
+            // are bound.) Issue #1580.
+            (KeyCode::Left, SHIFT)
+            | (KeyCode::Right, SHIFT)
+            | (KeyCode::Home, SHIFT)
+            | (KeyCode::End, SHIFT) => {
+                let bounds = crate::widgets::render::pan_bounds(spec, viewport.cols, None);
+                // `S-End` is "the end of the row I am on", not "the end of
+                // the longest row": the pan is shared, rows of unequal length
+                // cannot all sit at their tail at once, and answering with
+                // the longest one leaves the selected row clamped with
+                // keystrokes still to spend before it moves.
+                let selected = resolve(spec, widget_key, &panel.instance_states).selected;
+                let end = usize::try_from(selected)
+                    .ok()
+                    .map(|r| crate::widgets::render::pan_bounds(spec, viewport.cols, Some(r)).1)
+                    // A row with nowhere to go — a file header among match
+                    // rows — would make the key a no-op while the rows around
+                    // it still had a tail to show. Fall back to the longest.
+                    .filter(|&r| r > 0)
+                    .unwrap_or(bounds.1);
+                let delta = match key.code() {
+                    KeyCode::Left => Some(-PAN_COLUMNS),
+                    KeyCode::Right => Some(PAN_COLUMNS),
+                    // Home is where each row's content says it should rest —
+                    // its own match — not the head of the line. The head is a
+                    // few more `S-Left`s away, and a reader who wants the
+                    // match back should not have to pan to find it.
+                    KeyCode::Home => None,
+                    // Far enough that the per-row clamp lands every row on
+                    // its own tail — and no further, so `S-Left` walks back
+                    // from the end of the longest row rather than from a
+                    // number no content justifies.
+                    _ => Some(end),
+                };
+                if !panel.pan_h(widget_key, delta, bounds) {
+                    // Already home, or already at the value asked for: say so,
+                    // so the key can mean something else further out rather
+                    // than being swallowed by a tree that did nothing.
+                    return super::KeyDisposition::Pass;
+                }
+            }
+            (KeyCode::Enter, m) if m.is_empty() => {
+                if let Some(ev) = activate_event(spec, widget_key, panel) {
+                    fx.events.push(ev);
+                }
+            }
+            (KeyCode::Char(' '), m) if m.is_empty() => {
+                // On a checkable Tree, Space is the conventional
+                // checkbox key — toggle the focused row (matching what
+                // a click on its `[v]`/`[ ]` glyph would do). Falls
+                // back to `activate` for trees that aren't checkable,
+                // or rows without a checkbox glyph (`checked: None`).
+                //
+                // The fallback says it came from Space (`via: "space"`): a
+                // plugin whose Enter "opens" a row can tell the two apart and
+                // leave Space inert, now that the focused tree answers Space
+                // before the plugin's own bindings do.
+                if let Some(ev) = toggle_if_checkable_event(spec, widget_key, panel) {
+                    fx.events.push(ev);
+                } else if let Some((name, mut payload)) = activate_event(spec, widget_key, panel) {
+                    payload["via"] = json!("space");
+                    fx.events.push((name, payload));
+                }
+            }
+            _ => return super::KeyDisposition::Pass,
+        }
+        super::KeyDisposition::Consumed
+    }
+
+    /// Pointer model: a disclosure-column click toggles the row's
+    /// expansion (the host owns the expanded-keys set) and fires its
+    /// own `expand` event with the post-toggle state — the recorded
+    /// hit event is suppressed. A row-body click syncs the host-owned
+    /// selection to the clicked index and then lets the recorded
+    /// `select` fire, mirroring the List path — without the sync a
+    /// click would leave the highlight where it was; a click on the
+    /// row's action button syncs it the same way and fires `action`.
+    /// Checkbox `toggle` and right-click `context` hits pass through.
+    fn on_pointer(
+        &self,
+        spec: &WidgetSpec,
+        widget_key: &str,
+        panel: &mut crate::widgets::WidgetPanelState,
+        event_type: &str,
+        payload: &serde_json::Value,
+        fx: &mut super::PointerFx,
+    ) -> super::PointerDisposition {
+        match event_type {
+            "expand" => {
+                let Some(item_key) = payload.get("key").and_then(|v| v.as_str()) else {
+                    // Keyless row: nothing to toggle, and the recorded
+                    // event would name no row — swallow, as the old
+                    // central handler did.
+                    return super::PointerDisposition::Consumed;
+                };
+                let Resolved {
+                    selected: cur_sel,
+                    mut expanded,
+                } = resolve(spec, widget_key, &panel.instance_states);
+                let now_expanded = if expanded.contains(item_key) {
+                    expanded.remove(item_key);
+                    false
+                } else {
+                    expanded.insert(item_key.to_string());
+                    true
+                };
+                panel.instance_states.insert(
+                    widget_key.to_string(),
+                    WidgetInstanceState::Tree {
+                        selected_index: cur_sel,
+                        expanded_keys: expanded,
+                    },
+                );
+                fx.key.events.push((
+                    "expand".to_string(),
+                    serde_json::json!({ "key": item_key, "expanded": now_expanded }),
+                ));
+                super::PointerDisposition::Consumed
+            }
+            // A press on a row's action button is also a press on the row:
+            // the selection follows it, so what the plugin then does happens
+            // to the row the reader is looking at.
+            // With `toggle_on_click`, a press on a heading's body is a press
+            // on its disclosure glyph too: it selects the row and flips it.
+            "select" if toggles_on_click(spec, payload) => {
+                let (Some(idx), Some(item_key)) = (
+                    payload.get("index").and_then(|v| v.as_i64()),
+                    payload.get("key").and_then(|v| v.as_str()),
+                ) else {
+                    return super::PointerDisposition::Default;
+                };
+                let Resolved { mut expanded, .. } =
+                    resolve(spec, widget_key, &panel.instance_states);
+                let now_expanded = if expanded.remove(item_key) {
+                    false
+                } else {
+                    expanded.insert(item_key.to_string());
+                    true
+                };
+                panel.instance_states.insert(
+                    widget_key.to_string(),
+                    WidgetInstanceState::Tree {
+                        selected_index: idx as i32,
+                        expanded_keys: expanded,
+                    },
+                );
+                fx.key.events.push((
+                    "expand".to_string(),
+                    serde_json::json!({
+                        "index": idx,
+                        "key": item_key,
+                        "expanded": now_expanded,
+                    }),
+                ));
+                super::PointerDisposition::Consumed
+            }
+            "select" | "action" => {
+                if let Some(idx) = payload.get("index").and_then(|v| v.as_i64()) {
+                    panel.set_selected_index(widget_key, idx as i32);
+                }
+                super::PointerDisposition::Default
+            }
+            _ => super::PointerDisposition::Default,
+        }
+    }
+}
+
+/// Whether a row-body click described by `payload` should toggle the
+/// row's expansion: the tree opted in with `toggle_on_click` and the
+/// row is a keyed node with children.
+fn toggles_on_click(spec: &WidgetSpec, payload: &serde_json::Value) -> bool {
+    let WidgetSpec::Tree {
+        nodes,
+        toggle_on_click: true,
+        ..
+    } = spec
+    else {
+        return false;
+    };
+    let keyed = payload
+        .get("key")
+        .and_then(|v| v.as_str())
+        .is_some_and(|k| !k.is_empty());
+    keyed
+        && payload
+            .get("index")
+            .and_then(|v| v.as_u64())
+            .and_then(|i| nodes.get(i as usize))
+            .is_some_and(|n| n.has_children)
+}
+
+/// A `Tree`'s state, once the spec and the instance map have been
+/// reconciled. As with [`crate::widgets::kinds::list::Resolved`], the
+/// window is absent: that is the viewport's, and the tree's viewport
+/// element holds it.
+pub struct Resolved {
+    /// The selected node's ABSOLUTE index into `nodes`, or `-1`.
+    ///
+    /// **Not clamped to what is visible** — that clamp needs the
+    /// visible-flat walk and belongs with the one that does it
+    /// (`render_widget_tree`'s `clamp_to_visible`, which then also has
+    /// to find the selection's position for scroll math). Every handler
+    /// read this value raw before, and still does; what changed is only
+    /// where the seed comes from.
+    pub selected: i32,
+    /// The expanded-key set: the stored one once anything has expanded
+    /// or collapsed a node, the spec's seed until then.
+    pub expanded: HashSet<String>,
+}
+
+/// **Where a `Tree`'s selection and expansion actually come from.**
+///
+/// Instance state is authoritative once a handler has decided; the spec's
+/// `selected_index` / `expanded_keys` are seeds until then. That used to be
+/// true only of the first frame, because the render walk wrote a resolved
+/// entry back on every one — so every handler could read the map raw and
+/// get a seeded answer. The walk no longer decides, so an untouched tree has
+/// no entry at all and the seeding has to happen where every reader is: at
+/// the read. Without this, a wheel notch or a focus arrival on a tree whose
+/// plugin had already named a selected row would silently discard it.
+pub fn resolve(
+    spec: &WidgetSpec,
+    widget_key: &str,
+    prev: &HashMap<String, WidgetInstanceState>,
+) -> Resolved {
+    let (spec_selected, spec_expanded) = match spec {
+        WidgetSpec::Tree {
+            selected_index,
+            expanded_keys,
+            ..
+        } => (*selected_index, expanded_keys.as_slice()),
+        _ => (-1, &[] as &[String]),
+    };
+    resolve_seeded(spec_selected, spec_expanded, widget_key, prev)
+}
+
+/// [`resolve`] against the seeds directly, for a reader handed a `Tree`'s
+/// fields unpacked rather than the spec node itself — the shell's described
+/// `Tree` arms, which draw from what this returns.
+pub fn resolve_seeded(
+    spec_selected: i32,
+    spec_expanded: &[String],
+    widget_key: &str,
+    prev: &HashMap<String, WidgetInstanceState>,
+) -> Resolved {
+    match prev.get(widget_key).filter(|_| !widget_key.is_empty()) {
+        Some(WidgetInstanceState::Tree {
+            selected_index,
+            expanded_keys,
+        }) => Resolved {
+            selected: *selected_index,
+            expanded: expanded_keys.clone(),
+        },
+        _ => Resolved {
+            selected: spec_selected,
+            expanded: spec_expanded.iter().cloned().collect(),
+        },
+    }
+}
+
+/// Move the host-owned selection by `delta` along the visible-flat
+/// order (descendants of collapsed nodes are skipped — selection is
+/// the *absolute* `nodes` index, so we walk the visible order to
+/// find the neighbour), and queue `select`. Also requests the host's scrollbar flash so
+/// keyboard nav in an overflowing dock list stays oriented.
+pub fn select_move(
+    spec: &WidgetSpec,
+    widget_key: &str,
+    panel: &mut crate::widgets::WidgetPanelState,
+    delta: i32,
+    fx: &mut super::KeyFx,
+) {
+    let WidgetSpec::Tree {
+        nodes, item_keys, ..
+    } = spec
+    else {
+        return;
+    };
+    if nodes.is_empty() {
+        return;
+    }
+    let Resolved {
+        selected: cur_sel,
+        expanded,
+        ..
+    } = resolve(spec, widget_key, &panel.instance_states);
+    let visible_indices = collect_visible_tree_indices(nodes, item_keys, &expanded);
+    if visible_indices.is_empty() {
+        return;
+    }
+    let cur_pos = if cur_sel < 0 {
+        if delta > 0 {
+            -1
+        } else {
+            visible_indices.len() as i32
+        }
+    } else {
+        visible_indices
+            .iter()
+            .position(|&v| v as i32 == cur_sel)
+            .map(|p| p as i32)
+            .unwrap_or(-1)
+    };
+    let new_pos = (cur_pos + delta).clamp(0, (visible_indices.len() as i32) - 1);
+    let new_abs = visible_indices[new_pos as usize];
+    let new_key = item_keys[new_abs].clone();
+    panel.instance_states.insert(
+        widget_key.to_string(),
+        WidgetInstanceState::Tree {
+            selected_index: new_abs as i32,
+            expanded_keys: expanded,
+        },
+    );
+    fx.flash_scrollbar = true;
+    fx.events.push((
+        "select".into(),
+        json!({ "index": new_abs as i64, "key": new_key }),
+    ));
+}
+
+/// Right/Left arrow.
+///
+/// * Right: if the selected node has children and is collapsed,
+///   expand it. Else no-op.
+/// * Left: if the selected node has children and is expanded,
+///   collapse it. Else move selection up to the parent.
+///
+/// Updates host instance state and (when a change happened) queues
+/// `expand` or `select`. Returns whether anything changed — `false` is an
+/// arrow the tree had no use for.
+pub fn lateral(
+    spec: &WidgetSpec,
+    widget_key: &str,
+    panel: &mut crate::widgets::WidgetPanelState,
+    is_right: bool,
+    fx: &mut super::KeyFx,
+) -> bool {
+    let WidgetSpec::Tree {
+        nodes, item_keys, ..
+    } = spec
+    else {
+        return false;
+    };
+    if nodes.is_empty() {
+        return false;
+    }
+    let Resolved {
+        selected: cur_sel,
+        mut expanded,
+    } = resolve(spec, widget_key, &panel.instance_states);
+    if cur_sel < 0 {
+        return false;
+    }
+    let sel_idx = cur_sel as usize;
+    let Some(node) = nodes.get(sel_idx) else {
+        return false;
+    };
+    let key = item_keys[sel_idx].clone();
+    let was_expanded = expanded.contains(&key);
+
+    let mut new_sel = cur_sel;
+    let mut expansion_changed: Option<bool> = None; // Some(new_state)
+    if is_right {
+        if node.has_children && !was_expanded && !key.is_empty() {
+            expanded.insert(key.clone());
+            expansion_changed = Some(true);
+        }
+    } else if node.has_children && was_expanded && !key.is_empty() {
+        expanded.remove(&key);
+        expansion_changed = Some(false);
+    } else if let Some(parent_idx) = crate::widgets::tree_parent_index(nodes, sel_idx) {
+        new_sel = parent_idx as i32;
+    }
+    // No change → bail (don't fire spurious select/expand).
+    if expansion_changed.is_none() && new_sel == cur_sel {
+        return false;
+    }
+    let final_key = item_keys[new_sel as usize].clone();
+    panel.instance_states.insert(
+        widget_key.to_string(),
+        WidgetInstanceState::Tree {
+            selected_index: new_sel,
+            expanded_keys: expanded,
+        },
+    );
+    if let Some(now_expanded) = expansion_changed {
+        fx.events.push((
+            "expand".into(),
+            json!({
+                "index": cur_sel as i64,
+                "key": key,
+                "expanded": now_expanded,
+            }),
+        ));
+    } else if new_sel != cur_sel {
+        fx.events.push((
+            "select".into(),
+            json!({
+                "index": new_sel as i64,
+                "key": final_key,
+            }),
+        ));
+    }
+    true
+}
+
+/// The `activate` event for the currently-selected node, if any.
+/// Shared by Enter in [`Tree::on_key`] and the panel-level picker
+/// forwarding — the plugin's handler decides what "activate" means
+/// (open the file, run an action, etc.).
+pub fn activate_event(
+    spec: &WidgetSpec,
+    widget_key: &str,
+    panel: &crate::widgets::WidgetPanelState,
+) -> Option<(String, serde_json::Value)> {
+    let WidgetSpec::Tree { item_keys, .. } = spec else {
+        return None;
+    };
+    let sel = resolve(spec, widget_key, &panel.instance_states).selected;
+    if sel < 0 {
+        return None;
+    }
+    // An index past the nodes selects nothing, so there is nothing to
+    // activate.
+    let item_key = item_keys.get(sel as usize)?.clone();
+    Some(("activate".into(), json!({ "index": sel, "key": item_key, })))
+}
+
+/// If the focused row is checkable (parent tree has `checkable:
+/// true` *and* the row's `checked` is `Some(_)`), the `toggle` event
+/// with the inverted value — mirroring what a click on the row's
+/// `[v]`/`[ ]` glyph would do. `None` lets the caller fall back to
+/// `activate`.
+fn toggle_if_checkable_event(
+    spec: &WidgetSpec,
+    widget_key: &str,
+    panel: &crate::widgets::WidgetPanelState,
+) -> Option<(String, serde_json::Value)> {
+    let WidgetSpec::Tree {
+        nodes,
+        item_keys,
+        checkable,
+        ..
+    } = spec
+    else {
+        return None;
+    };
+    if !checkable {
+        return None;
+    }
+    let sel = resolve(spec, widget_key, &panel.instance_states).selected;
+    if sel < 0 {
+        return None;
+    }
+    // No checkbox glyph on this row — let activate fire.
+    let cur_checked = nodes.get(sel as usize).and_then(|n| n.checked)?;
+    let new_checked = !cur_checked;
+    let item_key = item_keys[sel as usize].clone();
+    Some((
+        "toggle".into(),
+        json!({ "index": sel, "key": item_key, "checked": new_checked, }),
+    ))
+}
+
+/// Indices of the tree nodes visible under the current expansion set:
+/// a node shows iff every ancestor on its depth path is expanded.
+/// Shared by the renderer-side wheel bound and the app-side selection
+/// movement / paging (`app/widget_runtime.rs`).
+pub fn collect_visible_tree_indices(
+    nodes: &[fresh_core::api::TreeNode],
+    item_keys: &[String],
+    expanded: &std::collections::HashSet<String>,
+) -> Vec<usize> {
+    let mut ancestor_open: Vec<bool> = Vec::new();
+    let mut visible: Vec<usize> = Vec::with_capacity(nodes.len());
+    for (i, node) in nodes.iter().enumerate() {
+        let depth = node.depth as usize;
+        ancestor_open.truncate(depth);
+        if ancestor_open.iter().all(|open| *open) {
+            visible.push(i);
+        }
+        let is_open = if node.has_children {
+            expanded.contains(&item_keys[i])
+        } else {
+            true
+        };
+        ancestor_open.push(is_open);
+    }
+    visible
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::widgets::kinds::WidgetImpl;
+    use fresh_core::api::TreeNode;
+    use fresh_core::text_property::TextPropertyEntry;
+
+    fn node(text: &str, depth: u32, has_children: bool) -> TreeNode {
+        TreeNode {
+            text: TextPropertyEntry::text(text),
+            depth,
+            has_children,
+            flush: false,
+            draggable: false,
+            checked: None,
+            extra_lines: Vec::new(),
+            window_anchor: None,
+            cells: Vec::new(),
+            action: None,
+        }
+    }
+
+    fn tree(toggle_on_click: bool) -> WidgetSpec {
+        WidgetSpec::Tree {
+            nodes: vec![node("group", 0, true), node("leaf", 1, false)].into(),
+            item_keys: vec!["g".into(), "l".into()].into(),
+            selected_index: -1,
+            visible_rows: Some(5),
+            expanded_keys: vec![],
+            checkable: false,
+            item_height: 1,
+            card_borders: false,
+            toggle_on_click,
+            indent_cols: 2,
+            columns: Vec::new(),
+            key: Some("t".into()),
+        }
+    }
+
+    fn panel_of(spec: &WidgetSpec) -> crate::widgets::WidgetPanelState {
+        crate::widgets::WidgetPanelState {
+            buffer_id: None,
+            spec: std::rc::Rc::new(spec.clone()),
+            instance_states: HashMap::new(),
+            focus_key: String::new(),
+            auto_focus_first: true,
+            page: false,
+            focus_follows_cursor: false,
+            hovered_widget_key: String::new(),
+            hovered_item_key: String::new(),
+            h_pan: Default::default(),
+        }
+    }
+
+    fn click(
+        spec: &WidgetSpec,
+        panel: &mut crate::widgets::WidgetPanelState,
+        index: i64,
+        key: &str,
+    ) -> (super::super::PointerDisposition, super::super::PointerFx) {
+        let mut fx = super::super::PointerFx::default();
+        let d = Tree.on_pointer(
+            spec,
+            "t",
+            panel,
+            "select",
+            &json!({ "index": index, "key": key }),
+            &mut fx,
+        );
+        (d, fx)
+    }
+
+    /// ←/→ belong to the tree only while they do something — expand, fold,
+    /// or climb to a parent. One with nothing to do here reports so, and the
+    /// key passes on (R4: an unused arrow moves focus by screen position),
+    /// which is how a row of trees is walked with ←/→.
+    #[test]
+    fn a_lateral_arrow_with_nothing_to_do_is_not_the_trees() {
+        let spec = tree(false);
+        let mut panel = panel_of(&spec);
+        click(&spec, &mut panel, 0, "g");
+        let mut fx = super::super::KeyFx::default();
+        assert!(
+            lateral(&spec, "t", &mut panel, true, &mut fx),
+            "→ opens the heading"
+        );
+        assert!(
+            !lateral(&spec, "t", &mut panel, true, &mut fx),
+            "→ on an open heading does nothing"
+        );
+        assert!(
+            lateral(&spec, "t", &mut panel, false, &mut fx),
+            "← folds it"
+        );
+        assert!(
+            !lateral(&spec, "t", &mut panel, false, &mut fx),
+            "← on a folded top-level heading has no parent to climb to"
+        );
+    }
+
+    #[test]
+    fn a_row_click_on_a_heading_toggles_it_when_opted_in() {
+        let spec = tree(true);
+        let mut panel = panel_of(&spec);
+        let (d, fx) = click(&spec, &mut panel, 0, "g");
+        assert!(matches!(d, super::super::PointerDisposition::Consumed));
+        assert_eq!(fx.key.events.len(), 1);
+        assert_eq!(fx.key.events[0].0, "expand");
+        assert_eq!(fx.key.events[0].1["expanded"], true);
+        assert_eq!(fx.key.events[0].1["index"], 0);
+        let r = resolve(&spec, "t", &panel.instance_states);
+        assert_eq!(r.selected, 0, "the click selects the heading");
+        assert!(r.expanded.contains("g"));
+
+        let (_, fx) = click(&spec, &mut panel, 0, "g");
+        assert_eq!(
+            fx.key.events[0].1["expanded"], false,
+            "a second click folds it"
+        );
+        assert!(!resolve(&spec, "t", &panel.instance_states)
+            .expanded
+            .contains("g"));
+    }
+
+    #[test]
+    fn a_row_click_on_a_leaf_or_without_the_flag_only_selects() {
+        let spec = tree(true);
+        let mut panel = panel_of(&spec);
+        let (d, fx) = click(&spec, &mut panel, 1, "l");
+        assert!(matches!(d, super::super::PointerDisposition::Default));
+        assert!(fx.key.events.is_empty());
+        assert_eq!(resolve(&spec, "t", &panel.instance_states).selected, 1);
+
+        let spec = tree(false);
+        let mut panel = panel_of(&spec);
+        let (d, _) = click(&spec, &mut panel, 0, "g");
+        assert!(matches!(d, super::super::PointerDisposition::Default));
+        assert!(resolve(&spec, "t", &panel.instance_states)
+            .expanded
+            .is_empty());
+    }
+}

@@ -171,8 +171,11 @@ fn shift_without_control_still_folds_the_character_in() {
     );
 }
 
+/// A raw-mode terminal sends CR for Enter and LF only for Ctrl+J, and
+/// programs in the integrated terminal tell the two apart (sinelaw/fresh#3169:
+/// Ctrl+J inserts a newline where Enter submits). LF used to parse as Enter.
 #[test]
-fn enter_key_cr_and_lf() {
+fn enter_is_cr_and_lf_is_ctrl_j() {
     let mut p = InputParser::new();
     assert_eq!(
         keys(&p.parse(&[0x0D])),
@@ -180,7 +183,14 @@ fn enter_key_cr_and_lf() {
     );
     assert_eq!(
         keys(&p.parse(&[0x0A])),
-        vec![(KeyCode::Enter, KeyModifiers::empty())]
+        vec![(KeyCode::Char('j'), KeyModifiers::CONTROL)]
+    );
+    assert_eq!(
+        keys(&p.parse(&[0x1b, 0x0A])),
+        vec![(
+            KeyCode::Char('j'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        )]
     );
 }
 
@@ -356,6 +366,28 @@ fn shift_tab_csi_z() {
         keys(&p.parse(b"\x1b[Z")),
         vec![(KeyCode::BackTab, KeyModifiers::SHIFT)]
     );
+}
+
+#[test]
+fn shift_tab_csi_z_keeps_the_other_modifiers() {
+    // `CSI 1 ; <mods> Z`: WezTerm's legacy encoding of Ctrl+Shift+Tab is
+    // `CSI 1 ; 5 Z`, and a terminal may also report the Shift it implies
+    // (`CSI 1 ; 6 Z`). Either way the key is the shifted Tab; Ctrl and Alt
+    // must survive.
+    let cases: &[(&[u8], KeyModifiers)] = &[
+        (b"\x1b[1;2Z", KeyModifiers::SHIFT),
+        (b"\x1b[1;5Z", KeyModifiers::SHIFT | KeyModifiers::CONTROL),
+        (b"\x1b[1;6Z", KeyModifiers::SHIFT | KeyModifiers::CONTROL),
+        (b"\x1b[1;3Z", KeyModifiers::SHIFT | KeyModifiers::ALT),
+    ];
+    for (bytes, mods) in cases {
+        let mut p = InputParser::new();
+        assert_eq!(
+            keys(&p.parse(bytes)),
+            vec![(KeyCode::BackTab, *mods)],
+            "{bytes:?}"
+        );
+    }
 }
 
 #[test]
@@ -1666,6 +1698,63 @@ fn ss3_application_keypad_forms() {
     ); // keypad .
 }
 
+/// Every application-keypad byte, not just the six above.
+///
+/// `feed_ss3` names its keys by keysym and takes the code from
+/// `keypad::KEYPAD_KEYS`; a name that stopped resolving would take that byte
+/// silently out of service rather than failing to compile. This is the check
+/// that turns such a typo into a test failure.
+#[test]
+fn ss3_keypad_bytes_all_resolve() {
+    let expected: &[(u8, KeyCode)] = &[
+        (b'M', KeyCode::Enter),
+        (b'E', KeyCode::KeypadBegin),
+        (b'X', KeyCode::Char('=')),
+        (b'j', KeyCode::Char('*')),
+        (b'k', KeyCode::Char('+')),
+        (b'l', KeyCode::Char(',')),
+        (b'm', KeyCode::Char('-')),
+        (b'n', KeyCode::Char('.')),
+        (b'o', KeyCode::Char('/')),
+    ];
+    let mut p = InputParser::new();
+    for (byte, code) in expected {
+        assert_eq!(
+            keys(&p.parse(&[0x1b, b'O', *byte])),
+            vec![(*code, KeyModifiers::empty())],
+            "ESC O {}",
+            *byte as char
+        );
+    }
+    for d in 0..=9u8 {
+        assert_eq!(
+            keys(&p.parse(&[0x1b, b'O', b'p' + d])),
+            vec![(KeyCode::Char((b'0' + d) as char), KeyModifiers::empty())],
+            "keypad digit {d}"
+        );
+    }
+}
+
+/// Every keypad key in the shared table decodes from its kitty codepoint.
+///
+/// `kitty_functional_key` resolves the whole keypad range through
+/// `keypad::KEYPAD_KEYS`; this is the end-to-end check that the delegation
+/// covers the range it claims, including `kp_begin` at its top edge.
+#[test]
+fn kitty_keypad_codepoints_all_decode() {
+    let mut p = InputParser::new();
+    for k in keypad::KEYPAD_KEYS {
+        let seq = format!("\x1b[{};1u", k.kitty_codepoint);
+        assert_eq!(
+            keys(&p.parse(seq.as_bytes())),
+            vec![(k.code, KeyModifiers::empty())],
+            "kitty codepoint {} ({})",
+            k.kitty_codepoint,
+            k.keysym
+        );
+    }
+}
+
 #[test]
 fn csi_e_is_keypad_begin() {
     let mut p = InputParser::new();
@@ -1776,4 +1865,453 @@ fn utf8_lead_bytes_above_rfc3629_are_not_starts() {
     let mut p = InputParser::new();
     let ev = p.parse(&[0xf5, b'a']);
     assert_eq!(keys(&ev), vec![(KeyCode::Char('a'), KeyModifiers::empty())]);
+}
+
+fn mouse(kind: crossterm::event::MouseEventKind, x: u16) -> Event {
+    Event::Mouse(crossterm::event::MouseEvent {
+        kind,
+        column: x,
+        row: 3,
+        modifiers: crossterm::event::KeyModifiers::NONE,
+    })
+}
+
+/// A burst of drag reports collapses to its last one; the press and the
+/// release around it, and a drag of another button, each survive.
+#[test]
+fn coalesce_motion_keeps_only_the_latest_of_each_drag_run() {
+    use crossterm::event::{MouseButton, MouseEventKind as K};
+    let events = vec![
+        mouse(K::Down(MouseButton::Left), 10),
+        mouse(K::Drag(MouseButton::Left), 11),
+        mouse(K::Drag(MouseButton::Left), 12),
+        mouse(K::Drag(MouseButton::Left), 13),
+        mouse(K::Drag(MouseButton::Right), 14),
+        mouse(K::Drag(MouseButton::Left), 15),
+        mouse(K::Up(MouseButton::Left), 15),
+        mouse(K::Moved, 16),
+        mouse(K::Moved, 17),
+    ];
+    let got: Vec<(K, u16)> = coalesce_motion(events)
+        .into_iter()
+        .map(|e| match e {
+            Event::Mouse(m) => (m.kind, m.column),
+            other => panic!("unexpected {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (K::Down(MouseButton::Left), 10),
+            (K::Drag(MouseButton::Left), 13),
+            (K::Drag(MouseButton::Right), 14),
+            (K::Drag(MouseButton::Left), 15),
+            (K::Up(MouseButton::Left), 15),
+            (K::Moved, 17),
+        ]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// MouseReportScanner
+//
+// The teardown drain (sinelaw/fresh#3474) reads raw bytes with no parser around
+// it, so these cover the scanner directly — no tty required.
+// ---------------------------------------------------------------------------
+
+/// Feed a whole byte string, returning the scan result of each byte.
+fn scan_all(bytes: &[u8]) -> (MouseReportScanner, Vec<MouseScan>) {
+    let mut sc = MouseReportScanner::new();
+    let out = bytes.iter().map(|&b| sc.step(b)).collect();
+    (sc, out)
+}
+
+/// The last byte of a report completes it; everything before is partial.
+fn completed(bytes: &[u8]) -> Option<MouseEventKind> {
+    let (_, out) = scan_all(bytes);
+    match out.last() {
+        Some(MouseScan::Complete { kind }) => *kind,
+        other => panic!("expected a completed report, got {other:?}"),
+    }
+}
+
+#[test]
+fn scanner_classifies_sgr_press_and_release() {
+    assert_eq!(
+        completed(b"\x1b[<0;3;17M"),
+        Some(MouseEventKind::Down(MouseButton::Left))
+    );
+    assert_eq!(
+        completed(b"\x1b[<0;3;17m"),
+        Some(MouseEventKind::Up(MouseButton::Left))
+    );
+}
+
+#[test]
+fn scanner_tracks_the_held_button_across_a_click() {
+    let mut sc = MouseReportScanner::new();
+    assert!(!sc.button_down());
+    sc.feed(b"\x1b[<0;3;17M");
+    assert!(sc.button_down(), "a press leaves the button held");
+    sc.feed(b"\x1b[<0;3;17m");
+    assert!(!sc.button_down(), "the release clears it");
+}
+
+#[test]
+fn scanner_does_not_treat_motion_or_wheel_as_a_held_button() {
+    // Bare motion under DECSET 1003 ends in `M`, like a press.
+    let mut sc = MouseReportScanner::new();
+    sc.feed(b"\x1b[<35;5;9M");
+    assert!(!sc.button_down(), "bare motion is not a press");
+
+    // `Cb` 3 is "no button", even with an `M` terminator and no motion bit —
+    // how JediTerm-based emulators report free movement.
+    let mut sc = MouseReportScanner::new();
+    sc.feed(b"\x1b[<3;5;9M");
+    assert!(!sc.button_down(), "Cb 3 is no button, not a press");
+
+    // A wheel notch reports no release at all, so it must not leave a debt.
+    let mut sc = MouseReportScanner::new();
+    sc.feed(b"\x1b[<64;5;9M");
+    assert!(!sc.button_down(), "a wheel notch is not a press");
+}
+
+#[test]
+fn scanner_keeps_the_button_held_through_a_drag() {
+    let mut sc = MouseReportScanner::new();
+    sc.feed(b"\x1b[<0;3;17M");
+    sc.feed(b"\x1b[<32;4;17M\x1b[<32;5;17M");
+    assert!(sc.button_down(), "drags do not end the press");
+    sc.feed(b"\x1b[<0;5;17m");
+    assert!(!sc.button_down());
+}
+
+#[test]
+fn scanner_rejects_a_byte_that_cannot_start_a_report() {
+    let (_, out) = scan_all(b"e");
+    assert_eq!(out, vec![MouseScan::NotAReport]);
+}
+
+#[test]
+fn scanner_resyncs_on_an_esc_arriving_mid_report() {
+    // `ESC[<` then a stray ESC: the second ESC starts a fresh report rather
+    // than being discarded, so the report that follows is still recognised.
+    let (_, out) = scan_all(b"\x1b[<\x1b[<0;3;17m");
+    assert!(
+        !out.contains(&MouseScan::NotAReport),
+        "an ESC should resync, not abort: {out:?}"
+    );
+    assert_eq!(
+        out.last(),
+        Some(&MouseScan::Complete {
+            kind: Some(MouseEventKind::Up(MouseButton::Left))
+        })
+    );
+}
+
+#[test]
+fn scanner_handles_x10_reports() {
+    // `ESC[M` then Cb+32, x+32, y+32. Cb 0 is a left press; Cb 3 a release.
+    assert_eq!(
+        completed(b"\x1b[M\x20\x21\x22"),
+        Some(MouseEventKind::Down(MouseButton::Left))
+    );
+    let mut sc = MouseReportScanner::new();
+    sc.feed(b"\x1b[M\x20\x21\x22");
+    assert!(sc.button_down());
+    sc.feed(b"\x1b[M\x23\x21\x22");
+    assert!(!sc.button_down(), "X10 reports a release as button 3");
+}
+
+#[test]
+fn scanner_consumes_high_button_reports_without_classifying_them() {
+    // Buttons 8-15 have no `MouseEventKind`, but their bytes are still a report
+    // and must not be left for the shell.
+    assert_eq!(completed(b"\x1b[<128;5;9M"), None);
+    // Likewise a `Cb` past one byte, which is malformed rather than a button.
+    assert_eq!(completed(b"\x1b[<300;5;9M"), None);
+}
+
+#[test]
+fn scanner_survives_keystrokes_mixed_into_the_stream() {
+    let mut sc = MouseReportScanner::new();
+    sc.feed(b"hello\x1b[<0;3;17Mworld");
+    assert!(
+        sc.button_down(),
+        "a report between keystrokes still registers"
+    );
+}
+
+// ---- win32-input-mode (Windows, `CSI ? 9001 h`) ----
+//
+// The byte strings below were recorded from Windows Terminal and WezTerm on
+// Windows 10 with win32-input-mode requested, reading the console the way
+// fresh does (VT input mode + ReadConsoleInputW).
+
+fn parse_all(bytes: &[u8]) -> Vec<Event> {
+    let mut p = InputParser::new();
+    let mut ev = p.parse(bytes);
+    ev.extend(p.flush());
+    ev
+}
+
+#[test]
+fn win32_ctrl_tab_keeps_ctrl() {
+    // Over ConPTY's VT encoding this chord arrives as a bare Tab.
+    let ev = parse_all(b"\x1b[9;15;0;1;8;1_");
+    assert_eq!(keys(&ev), vec![(KeyCode::Tab, KeyModifiers::CONTROL)]);
+}
+
+#[test]
+fn win32_ctrl_shift_tab_and_shift_tab() {
+    let ev = parse_all(b"\x1b[9;15;0;1;24;1_");
+    assert_eq!(
+        keys(&ev),
+        vec![(KeyCode::Tab, KeyModifiers::CONTROL | KeyModifiers::SHIFT)]
+    );
+    let ev = parse_all(b"\x1b[9;15;0;1;16;1_");
+    assert_eq!(keys(&ev), vec![(KeyCode::BackTab, KeyModifiers::SHIFT)]);
+}
+
+#[test]
+fn win32_ctrl_shift_letter_keeps_shift() {
+    // Windows Terminal's VT encoding sends this as 0x05, i.e. Ctrl+E.
+    let ev = parse_all(b"\x1b[69;18;5;1;24;1_");
+    assert_eq!(
+        keys(&ev),
+        vec![(
+            KeyCode::Char('e'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )]
+    );
+}
+
+#[test]
+fn win32_reports_match_the_kitty_spelling_of_the_same_chord() {
+    // The layout character is part of the spelling: a chord that keeps its base
+    // key has to report the typed character here exactly as it does over kitty.
+    for (win32, kitty) in [
+        (&b"\x1b[69;18;5;1;24;1_"[..], &b"\x1b[101:69;6u"[..]), // Ctrl+Shift+E
+        (b"\x1b[69;18;5;1;8;1_", b"\x1b[101;5u"),               // Ctrl+E
+        (b"\x1b[9;15;0;1;8;1_", b"\x1b[9;5u"),                  // Ctrl+Tab
+        (b"\x1b[9;15;0;1;24;1_", b"\x1b[9;6u"),                 // Ctrl+Shift+Tab
+        (b"\x1b[67;46;3;1;8;1_", b"\x1b[99;5u"),                // Ctrl+C
+        // Ctrl+Shift+1 types `!` on a US layout: both spellings keep the
+        // digit and carry the `!` alongside.
+        (b"\x1b[49;2;33;1;24;1_", b"\x1b[49:33;6u"),
+        // The same chord on a German layout, where Shift+7 types `/`.
+        (b"\x1b[55;8;47;1;24;1_", b"\x1b[55:47;6u"),
+    ] {
+        assert_eq!(
+            keys_with_layout(&parse_all(win32)),
+            keys_with_layout(&parse_all(kitty)),
+            "{win32:?} vs {kitty:?}"
+        );
+    }
+}
+
+#[test]
+fn win32_ctrl_shift_digit_names_the_key_and_carries_the_typed_character() {
+    // Before the fix this arrived as `ctrl+shift+!`, which a `ctrl+shift+1`
+    // binding never saw, while the kitty spelling of the same chord stayed on
+    // `1`. The digit is the key; `!` is what it types.
+    assert_eq!(
+        keys_with_layout(&parse_all(b"\x1b[49;2;33;1;24;1_")),
+        vec![(
+            KeyCode::Char('1'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            Some('!')
+        )]
+    );
+    // Ctrl+Shift+A stays as before: `A` is just the letter's uppercase, which
+    // the SHIFT bit already says — both when the console reports `A` and when
+    // it reports the C0 code.
+    for bytes in [
+        &b"\x1b[65;30;65;1;24;1_"[..], // Uc is the typed `A`
+        b"\x1b[65;30;1;1;24;1_",       // Uc is Ctrl+A's 0x01
+    ] {
+        assert_eq!(
+            keys_with_layout(&parse_all(bytes)),
+            vec![(
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                None
+            )],
+            "{bytes:?}"
+        );
+    }
+}
+
+#[test]
+fn win32_plain_and_shifted_characters() {
+    assert_eq!(
+        keys(&parse_all(b"\x1b[69;18;101;1;0;1_")),
+        vec![(KeyCode::Char('e'), KeyModifiers::empty())]
+    );
+    // Shift+E types `E`, the same as the legacy byte 0x45.
+    assert_eq!(
+        keys(&parse_all(b"\x1b[69;18;69;1;16;1_")),
+        keys(&parse_all(b"E"))
+    );
+}
+
+#[test]
+fn win32_key_ups_and_keys_that_type_nothing_are_dropped() {
+    let ev = parse_all(
+        b"\x1b[17;29;0;1;8;1_\x1b[16;42;0;1;24;1_\x1b[69;18;5;0;24;1_\
+          \x1b[17;29;0;0;0;1_\x1b[25;41;0;1;2;1_\x1b[13;28;13;0;0;1_",
+    );
+    assert!(ev.is_empty(), "{ev:?}");
+}
+
+#[test]
+fn win32_functional_keys() {
+    assert_eq!(
+        keys(&parse_all(b"\x1b[13;28;13;1;0;1_")),
+        vec![(KeyCode::Enter, KeyModifiers::empty())]
+    );
+    // Arrow keys carry ENHANCED_KEY (0x100).
+    assert_eq!(
+        keys(&parse_all(b"\x1b[38;72;0;1;256;1_\x1b[37;75;0;1;264;1_")),
+        vec![
+            (KeyCode::Up, KeyModifiers::empty()),
+            (KeyCode::Left, KeyModifiers::CONTROL),
+        ]
+    );
+    assert_eq!(
+        keys(&parse_all(
+            b"\x1b[46;83;0;1;256;1_\x1b[8;14;8;1;0;1_\x1b[27;1;27;1;0;1_\x1b[114;61;0;1;16;1_"
+        )),
+        vec![
+            (KeyCode::Delete, KeyModifiers::empty()),
+            (KeyCode::Backspace, KeyModifiers::empty()),
+            (KeyCode::Esc, KeyModifiers::empty()),
+            (KeyCode::F(3), KeyModifiers::SHIFT),
+        ]
+    );
+}
+
+#[test]
+fn win32_ctrl_letters_are_not_their_c0_namesakes() {
+    // Ctrl+H, Ctrl+I and Ctrl+M type 0x08, 0x09 and 0x0D, but they are not
+    // Backspace, Tab and Enter: the virtual key says which key was pressed.
+    assert_eq!(
+        keys(&parse_all(
+            b"\x1b[72;35;8;1;8;1_\x1b[73;23;9;1;8;1_\x1b[77;50;13;1;8;1_"
+        )),
+        vec![
+            (KeyCode::Char('h'), KeyModifiers::CONTROL),
+            (KeyCode::Char('i'), KeyModifiers::CONTROL),
+            (KeyCode::Char('m'), KeyModifiers::CONTROL),
+        ]
+    );
+}
+
+#[test]
+fn win32_alt_and_altgr() {
+    assert_eq!(
+        keys(&parse_all(b"\x1b[70;33;102;1;2;1_")),
+        vec![(KeyCode::Char('f'), KeyModifiers::ALT)]
+    );
+    // AltGr+Q on a German layout types `@` and reports LEFT_CTRL | RIGHT_ALT.
+    assert_eq!(
+        keys(&parse_all(b"\x1b[81;16;64;1;9;1_")),
+        vec![(KeyCode::Char('@'), KeyModifiers::empty())]
+    );
+}
+
+#[test]
+fn win32_ime_text_arrives_one_character_per_report() {
+    // WezTerm reports committed IME text with a zero virtual key.
+    let ev = parse_all(
+        b"\x1b[0;0;12395;1;0;1_\x1b[0;0;12395;0;0;1_\x1b[0;0;12411;1;0;1_\x1b[0;0;12411;0;0;1_",
+    );
+    assert_eq!(
+        keys(&ev),
+        vec![
+            (KeyCode::Char('に'), KeyModifiers::empty()),
+            (KeyCode::Char('ほ'), KeyModifiers::empty()),
+        ]
+    );
+}
+
+#[test]
+fn win32_surrogate_pair_is_reassembled_across_reads() {
+    // 😀 is U+1F600: high surrogate 0xD83D (55357), low 0xDE00 (56832), each
+    // with its own key-down and key-up, split here at an arbitrary read
+    // boundary.
+    let bytes: &[u8] =
+        b"\x1b[0;0;55357;1;0;1_\x1b[0;0;55357;0;0;1_\x1b[0;0;56832;1;0;1_\x1b[0;0;56832;0;0;1_";
+    for split in 0..=bytes.len() {
+        let mut p = InputParser::new();
+        let mut ev = p.parse(&bytes[..split]);
+        ev.extend(p.parse(&bytes[split..]));
+        assert_eq!(
+            keys(&ev),
+            vec![(KeyCode::Char('😀'), KeyModifiers::empty())],
+            "split at {split}"
+        );
+    }
+}
+
+#[test]
+fn win32_lone_low_surrogate_is_dropped() {
+    assert!(keys(&parse_all(b"\x1b[0;0;56832;1;0;1_")).is_empty());
+}
+
+#[test]
+fn win32_repeat_count() {
+    assert_eq!(
+        keys(&parse_all(b"\x1b[65;30;97;1;0;3_")),
+        vec![(KeyCode::Char('a'), KeyModifiers::empty()); 3]
+    );
+}
+
+#[test]
+fn win32_reports_mix_with_plain_vt() {
+    // Mouse reports stay SGR, and a terminal's own send-string bindings (for
+    // instance WezTerm's `SendString`) arrive as plain VT between the reports.
+    let ev = parse_all(b"\x1b[<0;62;14M\x1b[9;15;0;1;8;1_\x1b[9;6u");
+    assert!(matches!(ev[0], Event::Mouse(_)), "{ev:?}");
+    assert_eq!(
+        keys(&ev),
+        vec![
+            (KeyCode::Tab, KeyModifiers::CONTROL),
+            (KeyCode::Tab, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+        ]
+    );
+}
+
+#[test]
+fn win32_line_breaks_inside_a_paste_are_restored() {
+    // Windows Terminal pastes the text itself as plain characters but each
+    // line break as an Enter key report, down and up.
+    let ev = parse_all(
+        "\x1b[200~test\x1b[13;28;13;1;0;1_\x1b[13;28;13;0;0;1_あいう abc\x1b[13;28;13;1;0;1_\x1b[13;28;13;0;0;1_😀\x1b[201~"
+            .as_bytes(),
+    );
+    assert_eq!(ev.len(), 1, "{ev:?}");
+    assert!(
+        matches!(&ev[0], Event::Paste(t) if t == "test\rあいう abc\r😀"),
+        "{ev:?}"
+    );
+}
+
+#[test]
+fn win32_characters_inside_a_paste_are_decoded() {
+    let ev = parse_all(
+        b"\x1b[200~\x1b[0;0;12395;1;0;1_\x1b[0;0;12395;0;0;1_\x1b[0;0;55357;1;0;1_\x1b[0;0;56832;1;0;1_\x1b[201~",
+    );
+    assert!(matches!(&ev[0], Event::Paste(t) if t == "に😀"), "{ev:?}");
+}
+
+#[test]
+fn win32_malformed_reports_are_dropped() {
+    for bytes in [
+        &b"\x1b[1;2;3;4;5;6;7_"[..], // too many fields
+        b"\x1b[99999;0;0;1;0;1_",    // virtual key out of range
+        b"\x1b[65;0;99999;1;0;1_",   // UTF-16 unit out of range
+    ] {
+        assert!(parse_all(bytes).is_empty(), "{bytes:?}");
+    }
 }

@@ -91,6 +91,26 @@ pub struct SpawnResult {
     pub exit_code: i32,
 }
 
+/// Result of [`ProcessSpawner::spawn_raw`]: like [`SpawnResult`], but with
+/// stdout kept as the bytes the process wrote, for callers that decode it
+/// themselves (e.g. `git show` of a file that isn't UTF-8).
+#[derive(Debug, Clone)]
+pub struct RawSpawnResult {
+    pub stdout: Vec<u8>,
+    pub stderr: String,
+    pub exit_code: i32,
+}
+
+impl From<RawSpawnResult> for SpawnResult {
+    fn from(raw: RawSpawnResult) -> Self {
+        Self {
+            stdout: String::from_utf8_lossy(&raw.stdout).into_owned(),
+            stderr: raw.stderr,
+            exit_code: raw.exit_code,
+        }
+    }
+}
+
 /// Error from spawning a process
 #[derive(Debug, thiserror::Error)]
 pub enum SpawnError {
@@ -110,13 +130,27 @@ pub enum SpawnError {
 /// to spawn processes transparently on either local or remote filesystems.
 #[async_trait::async_trait]
 pub trait ProcessSpawner: Send + Sync {
-    /// Spawn a process and wait for completion
+    /// Spawn a process and wait for completion, keeping stdout as the raw
+    /// bytes it wrote. The one method every backend implements: the others
+    /// derive from it, so none of them can hand back stdout that was already
+    /// decoded (lossily) on the way.
+    async fn spawn_raw(
+        &self,
+        command: String,
+        args: Vec<String>,
+        cwd: Option<String>,
+    ) -> Result<RawSpawnResult, SpawnError>;
+
+    /// Spawn a process and wait for completion, with stdout decoded as UTF-8
+    /// (invalid sequences replaced).
     async fn spawn(
         &self,
         command: String,
         args: Vec<String>,
         cwd: Option<String>,
-    ) -> Result<SpawnResult, SpawnError>;
+    ) -> Result<SpawnResult, SpawnError> {
+        self.spawn_raw(command, args, cwd).await.map(Into::into)
+    }
 
     /// Spawn a process, piping stdout directly to a file instead of
     /// buffering it in memory. Default impl buffers and writes; concrete
@@ -133,9 +167,9 @@ pub trait ProcessSpawner: Send + Sync {
     ) -> Result<SpawnResult, SpawnError> {
         // Fallback: collect in memory then write. Concrete impls override
         // to pipe directly.
-        let result = self.spawn(command, args, cwd).await?;
+        let result = self.spawn_raw(command, args, cwd).await?;
         if result.exit_code == 0 || !result.stdout.is_empty() {
-            std::fs::write(&stdout_to, result.stdout.as_bytes())
+            std::fs::write(&stdout_to, &result.stdout)
                 .map_err(|e| SpawnError::Process(format!("write {:?}: {}", stdout_to, e)))?;
         }
         Ok(SpawnResult {
@@ -153,7 +187,8 @@ pub trait ProcessSpawner: Send + Sync {
     /// the result reflects the killed exit status.
     ///
     /// Default impl ignores `kill_rx` (no true cancellation for backends
-    /// that buffer in memory). Local override implements real kill.
+    /// that buffer in memory). The local and remote-agent (SSH, Kubernetes)
+    /// overrides implement real kill; a container's `docker exec` runs on.
     async fn spawn_cancellable(
         &self,
         command: String,
@@ -197,12 +232,12 @@ impl LocalProcessSpawner {
 
 #[async_trait::async_trait]
 impl ProcessSpawner for LocalProcessSpawner {
-    async fn spawn(
+    async fn spawn_raw(
         &self,
         command: String,
         args: Vec<String>,
         cwd: Option<String>,
-    ) -> Result<SpawnResult, SpawnError> {
+    ) -> Result<RawSpawnResult, SpawnError> {
         gate(&self.trust, &command, cwd.as_deref())?;
         let mut cmd = tokio::process::Command::new(resolve_program(&command).as_ref());
         cmd.args(&args);
@@ -218,8 +253,8 @@ impl ProcessSpawner for LocalProcessSpawner {
             .await
             .map_err(|e| SpawnError::Process(e.to_string()))?;
 
-        Ok(SpawnResult {
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        Ok(RawSpawnResult {
+            stdout: output.stdout,
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
             exit_code: output.status.code().unwrap_or(-1),
         })
@@ -244,6 +279,10 @@ impl ProcessSpawner for LocalProcessSpawner {
         cmd.args(&args);
         self.apply_env(&mut cmd).await;
         cmd.hide_window();
+        // Nothing writes to a plugin's child: one that inherited the editor's
+        // stdin could read it, and a program like `rg` given no path searches
+        // a piped stdin instead of its cwd, waiting forever on one held open.
+        cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         if let Some(ref dir) = cwd {
@@ -508,44 +547,92 @@ impl RemoteProcessSpawner {
     }
 }
 
-#[async_trait::async_trait]
-impl ProcessSpawner for RemoteProcessSpawner {
-    async fn spawn(
+impl RemoteProcessSpawner {
+    /// Run `command` on the host. When `kill` fires first, the agent is told
+    /// to cancel the request — which terminates the process — and the run
+    /// ends with exit code -1 and what it had written so far.
+    async fn exec(
         &self,
         command: String,
         args: Vec<String>,
         cwd: Option<String>,
-    ) -> Result<SpawnResult, SpawnError> {
+        mut kill: Option<tokio::sync::oneshot::Receiver<()>>,
+    ) -> Result<RawSpawnResult, SpawnError> {
         gate(&self.trust, &command, cwd.as_deref())?;
         let captured = self.captured_env().await;
         let (eff_cmd, eff_args) = env_wrap(&captured, &command, &args);
         let params = exec_params(&eff_cmd, &eff_args, cwd.as_deref());
 
-        // Use streaming request to get live output
-        let (mut data_rx, result_rx) = self.channel.request_streaming("exec", params).await?;
+        // With the id, so a consumer that gives up can stop the producer.
+        let (request_id, mut data_rx, result_rx) =
+            self.channel.request_streaming_id("exec", params).await?;
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        // Collect streaming output
-        while let Some(data) = data_rx.recv().await {
-            if let Some(out) = data.get("out").and_then(|v| v.as_str()) {
-                if let Ok(decoded) = decode_base64(out) {
-                    stdout.extend_from_slice(&decoded);
+        // Bounded by the agent's silence, not the command's: a quiet command is
+        // fine, a machine that has stopped answering is not. The agent sends an
+        // empty chunk every `EXEC_KEEPALIVE_SECS` while the process is quiet, so
+        // nothing arriving within `STREAM_IDLE_TIMEOUT` means the agent is gone.
+        loop {
+            let next = tokio::time::timeout(
+                crate::services::remote::channel::STREAM_IDLE_TIMEOUT,
+                data_rx.recv(),
+            );
+            let next = match kill.as_mut() {
+                Some(kill_rx) => tokio::select! {
+                    next = next => next,
+                    killed = kill_rx => {
+                        // A dropped sender is no kill: keep reading.
+                        kill = None;
+                        if killed.is_err() {
+                            continue;
+                        }
+                        self.channel.cancel_detached(request_id);
+                        return Ok(RawSpawnResult {
+                            stdout,
+                            stderr: String::from_utf8_lossy(&stderr).to_string(),
+                            exit_code: -1,
+                        });
+                    }
+                },
+                None => next.await,
+            };
+            match next {
+                Ok(Some(data)) => {
+                    if let Some(out) = data.get("out").and_then(|v| v.as_str()) {
+                        if let Ok(decoded) = decode_base64(out) {
+                            stdout.extend_from_slice(&decoded);
+                        }
+                    }
+                    if let Some(err) = data.get("err").and_then(|v| v.as_str()) {
+                        if let Ok(decoded) = decode_base64(err) {
+                            stderr.extend_from_slice(&decoded);
+                        }
+                    }
                 }
-            }
-            if let Some(err) = data.get("err").and_then(|v| v.as_str()) {
-                if let Ok(decoded) = decode_base64(err) {
-                    stderr.extend_from_slice(&decoded);
+                Ok(None) => break,
+                Err(_elapsed) => {
+                    self.channel.cancel_detached(request_id);
+                    return Err(SpawnError::Channel(ChannelError::Timeout));
                 }
             }
         }
 
-        // Get final result
-        let result = result_rx
-            .await
-            .map_err(|_| SpawnError::Channel(ChannelError::ChannelClosed))?
-            .map_err(SpawnError::Process)?;
+        // The result is still a promise the remote has to keep, so it gets the same bound.
+        let result = match tokio::time::timeout(
+            crate::services::remote::channel::STREAM_IDLE_TIMEOUT,
+            result_rx,
+        )
+        .await
+        {
+            Ok(Ok(result)) => result.map_err(SpawnError::Process)?,
+            Ok(Err(_recv)) => return Err(SpawnError::Channel(ChannelError::ChannelClosed)),
+            Err(_elapsed) => {
+                self.channel.cancel_detached(request_id);
+                return Err(SpawnError::Channel(ChannelError::Timeout));
+            }
+        };
 
         let exit_code = result
             .get("code")
@@ -553,11 +640,23 @@ impl ProcessSpawner for RemoteProcessSpawner {
             .map(|c| c as i32)
             .unwrap_or(-1);
 
-        Ok(SpawnResult {
-            stdout: String::from_utf8_lossy(&stdout).to_string(),
+        Ok(RawSpawnResult {
+            stdout,
             stderr: String::from_utf8_lossy(&stderr).to_string(),
             exit_code,
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl ProcessSpawner for RemoteProcessSpawner {
+    async fn spawn_raw(
+        &self,
+        command: String,
+        args: Vec<String>,
+        cwd: Option<String>,
+    ) -> Result<RawSpawnResult, SpawnError> {
+        self.exec(command, args, cwd, None).await
     }
 
     async fn spawn_to_file(
@@ -570,6 +669,25 @@ impl ProcessSpawner for RemoteProcessSpawner {
         Err(SpawnError::Process(
             "stdoutTo is not supported for remote processes".to_string(),
         ))
+    }
+
+    /// Killed through the agent: it terminates the process when the request
+    /// is cancelled.
+    async fn spawn_cancellable(
+        &self,
+        command: String,
+        args: Vec<String>,
+        cwd: Option<String>,
+        stdout_to: Option<std::path::PathBuf>,
+        kill_rx: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<SpawnResult, SpawnError> {
+        match stdout_to {
+            Some(p) => self.spawn_to_file(command, args, cwd, p).await,
+            None => self
+                .exec(command, args, cwd, Some(kill_rx))
+                .await
+                .map(Into::into),
+        }
     }
 }
 
@@ -840,9 +958,7 @@ fn build_remote_exec(
     if !env.is_empty() {
         s.push_str("env ");
         for (k, v) in env {
-            s.push_str(k);
-            s.push('=');
-            s.push_str(&shell_quote(v));
+            s.push_str(&shell_quote(&format!("{k}={v}")));
             s.push(' ');
         }
     }
@@ -859,7 +975,10 @@ fn build_remote_exec(
 /// rather than the `env` binary.
 fn build_remote_command_exists(env: &[(String, String)], command: &str) -> String {
     let mut s = String::new();
-    for (k, v) in env {
+    // `export` takes only shell identifiers; a key such as
+    // `BASH_FUNC_f%%` (an exported Bash function) would abort the probe.
+    // Such keys can't change what `command -v` finds, so they are skipped.
+    for (k, v) in env.iter().filter(|(k, _)| is_shell_identifier(k)) {
         s.push_str("export ");
         s.push_str(k);
         s.push('=');
@@ -870,6 +989,13 @@ fn build_remote_command_exists(env: &[(String, String)], command: &str) -> Strin
     s.push_str(&shell_quote(command));
     s.push_str(" >/dev/null 2>&1");
     s
+}
+
+/// Whether `k` is a POSIX shell variable name: `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_shell_identifier(k: &str) -> bool {
+    let mut chars = k.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Assemble the `ssh` argv: connection options, `user@host`, then the single
@@ -1055,16 +1181,22 @@ pub fn ssh_remote_env_launcher(recipe: &str) -> String {
         r#"import os,subprocess
 _r={recipe_json}
 _S="{sentinel}"
-_script="command env; printf '%s\\n' '"+_S+"'; "+_r+"; command env"
+_D={dump_json}
+_script=_D+"; printf '%s\\n' '"+_S+"'; "+_r+"; "+_D
 try:
     _o=subprocess.run(["bash","-lc",_script],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL).stdout.decode("utf-8","replace")
 except Exception:
     _o=""
+_M="{marker}"
 def _p(t):
     d={{}}
-    for ln in t.splitlines():
-        i=ln.find("=")
-        if i>0: d[ln[:i]]=ln[i+1:]
+    i=t.find(_M)
+    if i>=0:
+        t=t[i+len(_M):]
+        if t.startswith("\n"): t=t[1:]
+    for r in (t.split("\0") if "\0" in t else t.splitlines()):
+        i=r.find("=")
+        if i>0: d[r[:i]]=r[i+1:]
     return d
 if _S in _o:
     _b,_a=_o.split(_S,1)
@@ -1077,6 +1209,9 @@ _sh=os.environ.get("SHELL") or "/bin/sh"
 os.execvp(_sh,[_sh,"-l"])
 "#,
         sentinel = crate::services::env_provider::DELTA_SENTINEL,
+        dump_json = serde_json::to_string(crate::services::env_provider::ENV_DUMP)
+            .unwrap_or_else(|_| "\"\"".to_string()),
+        marker = crate::services::env_provider::ENV_DUMP_MARKER,
     );
 
     let b64 = BASE64.encode(launcher_src.as_bytes());
@@ -1393,6 +1528,50 @@ mod tests {
         assert_ne!(result.exit_code, 0, "killed process shouldn't be exit 0");
     }
 
+    /// A kill reaches the process on the host: the agent terminates it, so
+    /// what it would have done next never happens. The hosts are Unix: the
+    /// agent's `select` on pipes, and `sh`, are not on Windows.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_remote_spawner_cancellable_kill() {
+        let Ok(channel) = crate::services::remote::spawn_local_agent().await else {
+            eprintln!("Skipping test: could not spawn the agent");
+            return;
+        };
+        // Held for the whole test, as the authority holds it: the cancel is
+        // written after the run has returned
+        let spawner = RemoteProcessSpawner::new(
+            channel.clone(),
+            Arc::new(EnvProvider::inactive()),
+            Arc::new(WorkspaceTrust::permissive()),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("not-killed");
+        let script = format!("echo started; sleep 1; touch '{}'", marker.display());
+        let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            spawner
+                .spawn_cancellable(
+                    "sh".to_string(),
+                    vec!["-c".to_string(), script],
+                    None,
+                    None,
+                    kill_rx,
+                )
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        #[allow(clippy::let_underscore_must_use)]
+        let _ = kill_tx.send(());
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result.exit_code, -1, "a killed run ends with -1");
+
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(!marker.exists(), "the process ran on after the kill");
+        drop(channel);
+    }
+
     #[tokio::test]
     async fn local_long_running_spawn_stdio_pipes_output() {
         let spawner = LocalLongRunningSpawner::new(
@@ -1489,7 +1668,33 @@ mod tests {
         let s = build_remote_exec(&env, Some("/proj dir"), "python", &["x.py".to_string()]);
         assert_eq!(
             s,
-            "cd '/proj dir' && exec env VIRTUAL_ENV='/proj/.venv' 'python' 'x.py'"
+            "cd '/proj dir' && exec env 'VIRTUAL_ENV=/proj/.venv' 'python' 'x.py'"
+        );
+    }
+
+    /// Issue #3586: a key that isn't a shell identifier and a value with a
+    /// newline reach the remote `env` as one quoted word each.
+    #[test]
+    fn build_remote_exec_quotes_whole_assignments() {
+        let env = vec![(
+            "BASH_FUNC_f%%".to_string(),
+            "() {  local x=1\n}".to_string(),
+        )];
+        assert_eq!(
+            build_remote_exec(&env, None, "tsc", &[]),
+            "exec env 'BASH_FUNC_f%%=() {  local x=1\n}' 'tsc'"
+        );
+    }
+
+    #[test]
+    fn build_remote_command_exists_skips_non_identifier_keys() {
+        let env = vec![
+            ("BASH_FUNC_f%%".to_string(), "() { :; }".to_string()),
+            ("PATH".to_string(), "/v/bin".to_string()),
+        ];
+        assert_eq!(
+            build_remote_command_exists(&env, "tsc"),
+            "export PATH='/v/bin'; command -v 'tsc' >/dev/null 2>&1"
         );
     }
 
@@ -1633,6 +1838,54 @@ mod tests {
         );
         assert!(src.contains(crate::services::env_provider::DELTA_SENTINEL));
         assert!(src.contains("os.execvp"));
+    }
+
+    /// Issue #3586: run the real launcher on this host. An exported Bash
+    /// function from the recipe reaches the shell it execs whole, and a value
+    /// with a newline is not split into a second variable.
+    #[cfg(unix)]
+    #[test]
+    fn ssh_launcher_carries_multiline_values_to_the_shell() {
+        let have = |p: &str| {
+            std::process::Command::new(p)
+                .arg("--version")
+                .output()
+                .is_ok()
+        };
+        if !have("python3") || !have("bash") {
+            eprintln!("skipping: python3 or bash not installed");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let shell = tmp.path().join("shell.sh");
+        std::fs::write(
+            &shell,
+            // A Bash login shell, as `$SHELL` usually is. (dash would drop
+            // `BASH_FUNC_demo_function%%` itself: it keeps no variable whose
+            // name isn't a shell identifier.)
+            "#!/usr/bin/env bash\ndemo_function; printf \"[%s][%s]\" \"$MULTI\" \"${INJECTED-unset}\"\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let launcher = ssh_remote_env_launcher(
+            "echo 'Using python=3.11'; \
+             demo_function() { if true; then echo hello; fi; }; export -f demo_function; \
+             export MULTI=$'line1\\nINJECTED=evil'",
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&launcher)
+            .env("SHELL", &shell)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "hello\n[line1\nINJECTED=evil][unset]",
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     #[test]

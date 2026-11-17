@@ -1,255 +1,344 @@
 //! The left dock column (orchestrator sessions panel).
+//!
+//! The dock's *content* is a plugin's; the column is the editor's. Whether
+//! the slot is open and how wide is decided here at construction, from the
+//! plugin's manifest, what the user left, and the launch mode; kept in
+//! `Editor::{dock_reserved, dock_width, dock_width_rule}`; and remembered
+//! across launches in `<data>/chrome.json`.
 
-use crate::app::types::HoverTarget;
-use crate::widgets::LayoutBox;
+use fresh_editor_core::model::host_path::AsHostPath;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
-use super::{ChromeComponent, ChromeTreeBuilder, Editor};
+use serde::{Deserialize, Serialize};
 
-pub(crate) struct Dock;
+use super::Editor;
+use crate::model::filesystem::FileSystem;
+use crate::services::plugins::manifest::PluginManifest;
 
-impl ChromeComponent for Dock {
-    fn collect(&self, ed: &Editor, t: &mut ChromeTreeBuilder) {
-        if let Some(dock) = &ed.dock {
-            if let crate::app::PanelPlacement::LeftDock { width_cols } = dock.placement {
-                // The resize border (the column's rightmost cell
-                // column) is pushed FIRST: it sits inside the column
-                // rect, and within a band the earlier-pushed box wins,
-                // so a press there is a resize handle, not a widget
-                // hit.
-                let mut border = LayoutBox::plain(
-                    "chrome:dock_border",
-                    0,
-                    width_cols.saturating_sub(1) as u32,
-                    1,
-                    t.frame_height(),
-                );
-                border.z = 130;
-                t.push(border);
-                let mut column = LayoutBox::plain(
-                    "chrome:dock_column",
-                    0,
-                    0,
-                    width_cols as u32,
-                    t.frame_height(),
-                );
-                column.z = 130;
-                t.push(column);
-                // Blur observer: any left-click OUTSIDE the dock column
-                // while the dock is focused blurs it, then routing
-                // continues (act-then-continue). Ranked above every
-                // consuming surface so the blur precedes whatever the
-                // click lands on — the pre-walk block's exact contract.
-                t.full("chrome:dock_blur", 195);
+/// What `chrome.json` remembers about the dock. Any may be unknown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DockChromeState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) open: Option<bool>,
+    /// The width as a percent of the frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) width_percent: Option<u8>,
+    /// The width in columns, as an older Fresh wrote it. Read once, as a
+    /// share of the terminal it is read on, and dropped at the next write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) width: Option<u16>,
+}
+
+/// The file: editor-global, shared by every editor this data directory serves.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ChromeState {
+    #[serde(default)]
+    dock: DockChromeState,
+}
+
+/// The narrowest a drag (or a plugin's `dock_width`) may make the dock.
+/// Below `DOCK_MIN` on purpose: that floor is where the dock stops being
+/// opened by default, not where the user stops being allowed to squeeze it.
+const DOCK_DRAG_MIN: u16 = crate::view::shell::frame::DOCK_NARROWEST;
+
+fn chrome_state_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("chrome.json")
+}
+
+/// Read the remembered chrome. A missing or unreadable file is a first launch.
+pub(crate) fn read_dock_chrome_state(fs: &dyn FileSystem, data_dir: &Path) -> DockChromeState {
+    let path = chrome_state_path(data_dir);
+    match fs.read_file(path.as_host()) {
+        Ok(bytes) => match serde_json::from_slice::<ChromeState>(&bytes) {
+            Ok(state) => state.dock,
+            Err(e) => {
+                tracing::warn!("chrome state: ignoring unparseable {path:?}: {e}");
+                DockChromeState::default()
             }
-            // (No separate inner-rect box: no handler ever matched
-            // "chrome:dock", and the kind-blind wheel arm is already
-            // reachable through `chrome:dock_column`, which covers the
-            // inner rect at the same z and ranks first in the band.)
-        }
-    }
-
-    fn on_pointer(
-        &self,
-        ed: &mut Editor,
-        bx: &LayoutBox,
-        ev: &super::ChromePointer,
-    ) -> anyhow::Result<super::Disposition> {
-        use super::{Disposition, PointerPress};
-        let width_cols = match ed.dock.as_ref().map(|f| f.placement) {
-            Some(crate::app::PanelPlacement::LeftDock { width_cols }) => width_cols,
-            _ => return Ok(Disposition::Pass),
-        };
-        match (ev.press, bx.kind) {
-            // A press on the dock's right border starts the
-            // width-resize GRAB (routed by the drag/up arms until
-            // release; see `chrome::pointer_grab`).
-            (PointerPress::Left, "chrome:dock_border") => {
-                ed.dock_resizing = true;
-                Ok(Disposition::Consumed)
-            }
-            // Clicks inside the column hit-test the dock's panel,
-            // re-focusing it first if blurred: the un-blur must notify
-            // the plugin via a `focus` widget_event so any mirror of
-            // dock-focus state updates before the click's row-select
-            // event fires its scheduling logic.
-            (PointerPress::Left, "chrome:dock_column") => {
-                if ed.dock.as_ref().is_some_and(|f| !f.focused) {
-                    ed.refocus_floating_panel(crate::app::PanelSlot::Dock);
-                }
-                ed.handle_floating_widget_click(crate::app::PanelSlot::Dock, ev.col, ev.row);
-                Ok(Disposition::Consumed)
-            }
-            (PointerPress::Left, "chrome:dock_blur") => {
-                if ev.col >= width_cols && ed.dock.as_ref().is_some_and(|f| f.focused) {
-                    ed.blur_floating_panel(crate::app::PanelSlot::Dock);
-                    return Ok(Disposition::PassAfter);
-                }
-                Ok(Disposition::Pass)
-            }
-            // Right-click in the column → the plugin raises a
-            // per-session context menu; mirror the left-click path
-            // (re-focus first) and consume so it never falls through
-            // to the editor or the file-explorer menu below.
-            (PointerPress::Right, "chrome:dock_column") => {
-                if ed.dock.as_ref().is_some_and(|f| !f.focused) {
-                    ed.refocus_floating_panel(crate::app::PanelSlot::Dock);
-                }
-                ed.handle_floating_widget_context_click(
-                    crate::app::PanelSlot::Dock,
-                    ev.col,
-                    ev.row,
-                );
-                Ok(Disposition::Consumed)
-            }
-            _ => Ok(Disposition::Pass),
-        }
-    }
-
-    fn on_hover_change(
-        &self,
-        ed: &mut Editor,
-        _old: Option<&HoverTarget>,
-        _new: Option<&HoverTarget>,
-        col: u16,
-        row: u16,
-    ) -> bool {
-        // The dock's overlay scrollbar follows the pointer: reveal it
-        // while the mouse is over the sessions list, hide it otherwise.
-        // Tracked off the actual motion events we receive (not gated on
-        // `mouse_hover_enabled`, which only governs terminal-level mode
-        // 1003 — and is off by default on Windows): if a Moved event
-        // arrives, use it. Keyed on col/row, not the target diff.
-        // Re-render only on the enter/leave transition (not every
-        // motion) so it fades in/out without churn.
-        let now_over = ed
-            .dock
-            .as_ref()
-            .map(|d| {
-                d.scrollbar_hover_zones.iter().any(|z| {
-                    col >= z.x && col < z.x + z.width && row >= z.y && row < z.y + z.height
-                })
-            })
-            .unwrap_or(false);
-        if let Some(d) = ed.dock.as_mut() {
-            if d.scrollbar_zone_hovered != now_over {
-                d.scrollbar_zone_hovered = now_over;
-                return true;
-            }
-        }
-        false
-    }
-
-    fn on_wheel(
-        &self,
-        ed: &mut Editor,
-        _bx: &LayoutBox,
-        col: u16,
-        row: u16,
-        delta: i32,
-    ) -> anyhow::Result<super::Disposition> {
-        if ed.handle_floating_widget_panel_wheel(crate::app::PanelSlot::Dock, col, row, delta) {
-            Ok(super::Disposition::Consumed)
-        } else {
-            Ok(super::Disposition::Pass)
-        }
-    }
-
-    fn on_layer_key(
-        &self,
-        ed: &mut Editor,
-        layer: &crate::app::overlay::Layer,
-        event: &crossterm::event::KeyEvent,
-    ) -> Option<anyhow::Result<crate::input::handler::InputResult>> {
-        // Only while this layer owns the keyboard (a FOCUSED dock). A
-        // blurred dock's layer is still visited by the walk (it
-        // carries the Dock `KeyContext` for `get_key_context`) but
-        // never claims keys. Riding the walk at rank DOCK (810) —
-        // instead of the old pre-band `on_key` grab — means an open
-        // prompt (850), popup (840), menu (860) or modal (900s) now
-        // takes the key FIRST, exactly as `get_key_context` always
-        // resolved it: the grab's rank inversion (Esc aimed at a
-        // prompt blurring the dock instead) is gone.
-        if !layer.owns_keyboard {
-            return None;
-        }
-        // A focused dock swallows keys in the dispatch below, so the
-        // global focus-toggle (default Alt+O) would never be able to
-        // hand focus back to the editor once you've dived in. Resolve
-        // it ahead of the dock's own key handling, so the toggle is
-        // symmetric (same key in and out). Only the blur-out
-        // direction needs this — focusing a blurred dock is ordinary
-        // keybinding resolution (the editor owns the keyboard then).
-        let ctx = ed.get_key_context();
-        let resolved = ed.keybindings.read().ok().map(|kb| kb.resolve(event, ctx));
-        if matches!(
-            resolved,
-            Some(crate::input::keybindings::Action::ToggleDockFocus)
-        ) {
-            return Some(
-                ed.handle_action(crate::input::keybindings::Action::ToggleDockFocus)
-                    .map(|_| crate::input::handler::InputResult::Consumed),
-            );
-        }
-        // The focused dock claims every other key its widget dispatch
-        // consumes; anything it declines falls through the walk to the
-        // editor base.
-        if ed.dispatch_floating_widget_key(crate::app::PanelSlot::Dock, event.code, event.modifiers)
-        {
-            return Some(Ok(crate::input::handler::InputResult::Consumed));
-        }
-        None
-    }
-
-    fn layers(&self, ed: &Editor, out: &mut Vec<(u16, crate::app::overlay::Layer)>) {
-        use crate::app::overlay::{Layer, LayerKind};
-        // Owns the keyboard only while focused; a blurred dock stays
-        // visible but lets the buffer underneath keep the keyboard
-        // AND receive PTY routing (the dock lives beside the chrome,
-        // not over it).
-        if let Some(d) = ed.dock.as_ref() {
-            out.push((
-                super::layer_rank::DOCK,
-                Layer {
-                    kind: LayerKind::Dock,
-                    owns_keyboard: d.focused,
-                    key_context: Some(crate::input::keybindings::KeyContext::Dock),
-                    blocks_terminal_input: d.focused,
-                },
-            ));
-        }
+        },
+        Err(_) => DockChromeState::default(),
     }
 }
 
-/// Behavior owned by this component — the drag half of the
-/// width-resize grab; the press half arms it in `on_pointer`, and the
-/// release finalizer in `handle_mouse`'s Up arm persists the width.
+/// What the plugin's `open_setting` asks for. It replaced a boolean whose
+/// `true` meant "allow", not "open".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DockOpenPolicy {
+    /// Closed, ignoring what was remembered.
+    Never,
+    /// Open, ignoring what was remembered.
+    Always,
+    /// The manifest's `open`, unless the dock was closed at the last quit.
+    /// A dock remembered as *open* does not come back on its own: older
+    /// builds opened it by default and the plugin opens it for its own
+    /// reasons, so only the user's own open (written as `Always`) does.
+    Auto,
+}
+
+impl DockOpenPolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::Always => "always",
+            Self::Auto => "auto",
+        }
+    }
+
+    /// Booleans are the pre-#3442 spelling and are always accepted, so
+    /// nothing depends on the rewrite below having run.
+    ///
+    /// Anything unrecognised is `Auto`, which is also what the Settings UI
+    /// falls back to showing, so the two agree.
+    fn read(value: Option<&serde_json::Value>) -> Self {
+        match value {
+            Some(serde_json::Value::String(s)) => match s.as_str() {
+                "never" => Self::Never,
+                "always" => Self::Always,
+                _ => Self::Auto,
+            },
+            Some(serde_json::Value::Bool(false)) => Self::Never,
+            Some(serde_json::Value::Bool(true)) => Self::Auto,
+            _ => Self::Auto,
+        }
+    }
+
+    fn is_legacy(value: Option<&serde_json::Value>) -> bool {
+        matches!(value, Some(serde_json::Value::Bool(_)))
+    }
+}
+
 impl Editor {
-    /// Dock resize drag (`PointerGrab::DockResize`, armed by the press
-    /// on `chrome:dock_border`): track the pointer column as the new
-    /// dock width (the right border follows the cursor), clamped so it
-    /// can't swallow the chrome.
-    pub(crate) fn handle_dock_resize_drag(&mut self, col: u16) {
-        let max_cols = self.terminal_width.max(20).saturating_sub(20).max(10);
-        let new_w = col.saturating_add(1).clamp(10, max_cols);
-        let mut changed = false;
-        if let Some(fwp) = self.dock.as_mut() {
-            if let crate::app::PanelPlacement::LeftDock { width_cols } = &mut fwp.placement {
-                changed = *width_cols != new_w;
-                *width_cols = new_w;
+    /// Decide the dock's startup chrome, before the first frame. No dock
+    /// declared, no column.
+    ///
+    /// The width rule and a remembered width are adopted even when the slot
+    /// stays closed, so a dock toggled open later comes up the right size.
+    ///
+    /// The launch mode plays no part: a bare `fresh` (Orchestrator mode)
+    /// starts with the dock closed like any other launch until the user opens
+    /// it, and from then on it comes back the way they left it. Under `auto`
+    /// a remembered open is not enough (see [`DockOpenPolicy::Auto`]).
+    ///
+    /// A file launch (`Editor::file_launch`: `fresh FILE`, `--simple`) is not
+    /// a session, so the dock stays closed whatever the setting says or was
+    /// remembered — `always` included. Nothing is written back: the next
+    /// session launch still finds the dock the way the user left it.
+    pub(crate) fn apply_startup_dock_chrome(
+        &mut self,
+        manifests: &HashMap<String, PluginManifest>,
+    ) {
+        let remembered =
+            read_dock_chrome_state(&*self.local_filesystem, &self.dir_context.data_dir);
+        self.dock_width_percent = remembered.width_percent;
+        if let (None, Some(cols)) = (self.dock_width_percent, remembered.width) {
+            self.set_dock_width_cols(cols);
+        }
+
+        // One slot, so one declaration: the lowest name wins, deterministically.
+        let docks = || {
+            manifests
+                .iter()
+                .filter_map(|(name, m)| m.chrome.dock.as_ref().map(|d| (name, d)))
+        };
+        let Some((name, decl)) = docks().min_by_key(|(name, _)| *name) else {
+            return;
+        };
+        let claimants = docks().count();
+        if claimants > 1 {
+            tracing::warn!("plugin manifest: {claimants} plugins declare the dock; {name} wins");
+        }
+        self.dock_width_rule = decl.width;
+
+        let setting = decl.open_setting.clone();
+        let stored = setting.as_deref().and_then(|key| {
+            self.config
+                .plugins
+                .get(name.as_str())
+                .and_then(|c| c.settings.get(key))
+        });
+        let policy = DockOpenPolicy::read(stored);
+        let legacy = DockOpenPolicy::is_legacy(stored);
+        self.dock_reserved = match policy {
+            _ if self.file_launch => false,
+            DockOpenPolicy::Never => false,
+            DockOpenPolicy::Always => true,
+            DockOpenPolicy::Auto => decl.open && remembered.open != Some(false),
+        };
+        tracing::debug!(
+            plugin = %name,
+            reserved = self.dock_reserved,
+            width_percent = ?self.dock_width_percent,
+            ?policy,
+            "startup dock chrome"
+        );
+
+        if legacy {
+            let plugin = name.clone();
+            if let Some(key) = setting {
+                self.rewrite_legacy_dock_open_setting(&plugin, &key, policy);
             }
         }
-        if changed {
-            // Persist the live width *before* relaying out. `relayout`
-            // fires the `resize` hook, and the orchestrator answers it
-            // by re-issuing the dock's responsive `dock_width`, which
-            // `handle_floating_panel_control` clamps against the
-            // persisted `dock_width` override. Updating that override
-            // here (not only on mouse-up) lets the user's dragged width
-            // win the round-trip — otherwise the responsive re-issue
-            // snaps the dock straight back and the drag does nothing.
-            self.dock_width = Some(new_w);
-            // The dock got wider/narrower: reflow the chrome (terminals,
-            // viewports, panels) to the new dock width via the funnel.
+    }
+
+    /// Rewrite a pre-#3442 boolean as the mode it meant, in memory and on
+    /// disk.
+    ///
+    /// Needed because the plugin's field registration only fills in a value
+    /// that is *absent* (`handle_add_plugin_config_field` uses `or_insert`):
+    /// a boolean would survive under the enum's schema, and the Settings UI
+    /// would show the enum default while startup honoured the boolean.
+    ///
+    /// Best-effort — `DockOpenPolicy::read` still accepts booleans, so a
+    /// failed write just retries next launch.
+    fn rewrite_legacy_dock_open_setting(
+        &mut self,
+        plugin: &str,
+        setting: &str,
+        policy: DockOpenPolicy,
+    ) {
+        let value = serde_json::Value::String(policy.as_str().to_string());
+        let cfg = std::sync::Arc::make_mut(&mut self.config);
+        if let Some(entry) = cfg.plugins.get_mut(plugin) {
+            if let serde_json::Value::Object(map) = &mut entry.settings {
+                map.insert(setting.to_string(), value.clone());
+            }
+        }
+        tracing::info!(
+            plugin,
+            setting,
+            mode = policy.as_str(),
+            "migrating a boolean dock open_setting to its mode"
+        );
+        self.persist_config_pointer(&format!("/plugins/{plugin}/settings/{setting}"), value);
+    }
+
+    /// Hand back a column held open at startup that nothing mounted into;
+    /// returns whether there was one. Called when the `ready` hook's
+    /// sentinel lands (every mount it sent is ahead of it in the channel),
+    /// or by a test harness that runs no startup hooks. Reflows the chrome;
+    /// the caller decides whether a full repaint is needed too. Nothing is
+    /// remembered: the column going away is not the user's doing.
+    pub fn release_startup_dock_reservation(&mut self) -> bool {
+        let released = std::mem::take(&mut self.dock_reserved) && self.dock.is_none();
+        if released {
+            self.relayout();
+        }
+        released
+    }
+
+    /// Whether the slot is held open for a panel that has not arrived.
+    pub(crate) fn dock_slot_reserved(&self) -> bool {
+        self.dock_reserved && self.dock.is_none()
+    }
+
+    /// The width the dock asks for on a frame `frame_width` wide: the
+    /// explicit width if there is one, else the rule. The one derivation —
+    /// do not recompute it elsewhere. Whether a column is carved at all is
+    /// `frame::dock_width`'s call.
+    pub(crate) fn requested_dock_width(&self, frame_width: u16) -> u16 {
+        match self.dock_width_percent {
+            Some(pct) => crate::config::ExplorerWidth::Percent(pct).to_cols(frame_width),
+            None => self.dock_width_rule.width(frame_width),
+        }
+    }
+
+    /// Make the dock `cols` wide on the terminal as it is now, kept as the
+    /// share of it that renders nearest — so it narrows and widens with the
+    /// terminal from here on, as the file explorer does.
+    pub(crate) fn set_dock_width_cols(&mut self, cols: u16) {
+        if self.terminal_width == 0 {
+            return; // no terminal yet to take a share of
+        }
+        let crate::config::ExplorerWidth::Percent(pct) =
+            crate::config::ExplorerWidth::Percent(0).with_cols(cols, self.terminal_width)
+        else {
+            unreachable!("with_cols keeps the variant")
+        };
+        self.dock_width_percent = Some(pct);
+    }
+
+    /// Clamp an explicit width so the editor keeps its `EDITOR_MIN` columns.
+    /// Shared by the drag and the `dock_width` op.
+    pub(crate) fn clamp_dock_width(&self, cols: u16) -> u16 {
+        let max = self
+            .terminal_width
+            .saturating_sub(crate::view::shell::frame::EDITOR_MIN)
+            .max(DOCK_DRAG_MIN);
+        cols.clamp(DOCK_DRAG_MIN, max)
+    }
+
+    /// Remember whether the dock is open. Called at quit, not on every mount
+    /// and unmount: the plugin closes and reopens the dock on its own (a
+    /// dive into a worktree), and writing those would remember a transient
+    /// as the user's decision. A column merely held open at quit says
+    /// nothing and leaves the file as it was.
+    pub fn save_dock_chrome(&self) {
+        let open = (!self.dock_slot_reserved()).then_some(self.dock.is_some());
+        self.persist_dock_chrome(open);
+    }
+
+    /// Remember the dock's explicit width now (a drag's end, or a plugin's
+    /// `dock_width` op). A no-op with no dock mounted.
+    pub(crate) fn persist_dock_width(&self) {
+        if self.dock.is_some() {
+            self.persist_dock_chrome(None);
+        }
+    }
+
+    /// Write `chrome.json`: the width as it stands, and `open` when given.
+    /// Read-merge-write, atomic (tmp + rename), best-effort.
+    fn persist_dock_chrome(&self, open: Option<bool>) {
+        let fs = &*self.local_filesystem;
+        let path = chrome_state_path(&self.dir_context.data_dir);
+        let mut dock = read_dock_chrome_state(fs, &self.dir_context.data_dir);
+        dock.width_percent = self.dock_width_percent;
+        dock.width = None;
+        if let Some(open) = open {
+            dock.open = Some(open);
+        }
+        let bytes = match serde_json::to_vec_pretty(&ChromeState { dock }) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("chrome state: failed to serialise: {e}");
+                return;
+            }
+        };
+        if let Some(dir) = path.parent() {
+            if let Err(e) = fs.create_dir_all(dir.as_host()) {
+                tracing::warn!("chrome state: failed to create {dir:?}: {e}");
+                return;
+            }
+        }
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = fs.write_file(tmp.as_host(), &bytes) {
+            tracing::warn!("chrome state: failed to write {tmp:?}: {e}");
+            return;
+        }
+        if let Err(e) = fs.rename(tmp.as_host(), path.as_host()) {
+            tracing::warn!("chrome state: failed to rename {tmp:?} → {path:?}: {e}");
+        }
+    }
+
+    /// The dock column's width as the host would carve it now, mounted or
+    /// not; `0` when the terminal is too narrow for one. What the plugin
+    /// lays its content out to.
+    #[cfg(feature = "plugins")]
+    pub(crate) fn dock_cols_if_open(&self) -> u16 {
+        let requested = self.requested_dock_width(self.terminal_width);
+        crate::view::shell::frame::dock_width(Some(requested), self.terminal_width).unwrap_or(0)
+    }
+
+    /// Dock resize drag (`PointerGrab::DockResize`): the pointer column is
+    /// the new width, clamped. Disk waits for the release
+    /// (`persist_dock_width`).
+    pub(crate) fn handle_dock_resize_drag(&mut self, col: u16) {
+        if self.dock.is_none() {
+            return;
+        }
+        let before = self.dock_width_percent;
+        self.set_dock_width_cols(self.clamp_dock_width(col.saturating_add(1)));
+        if self.dock_width_percent != before {
             self.relayout();
         }
     }

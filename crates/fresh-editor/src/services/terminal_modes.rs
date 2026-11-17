@@ -60,6 +60,15 @@ pub mod sequences {
 
     // Attributes
     pub const RESET_ATTRIBUTES: &[u8] = b"\x1b[0m";
+
+    // Kitty keyboard protocol: pop one entry off the current screen's stack.
+    pub const POP_KEYBOARD_ENHANCEMENT: &[u8] = b"\x1b[<1u";
+
+    /// Kitty keyboard protocol: push `flags` onto the current screen's
+    /// stack — the bytes crossterm's `PushKeyboardEnhancementFlags` writes.
+    pub fn push_keyboard_enhancement(flags: crossterm::event::KeyboardEnhancementFlags) -> Vec<u8> {
+        format!("\x1b[>{}u", flags.bits()).into_bytes()
+    }
 }
 
 /// Configuration for keyboard enhancement flags.
@@ -87,6 +96,16 @@ impl Default for KeyboardConfig {
 }
 
 impl KeyboardConfig {
+    /// The `editor.keyboard_*` settings of `editor`.
+    pub fn from_editor_config(editor: &crate::config::EditorConfig) -> Self {
+        Self {
+            disambiguate_escape_codes: editor.keyboard_disambiguate_escape_codes,
+            report_event_types: editor.keyboard_report_event_types,
+            report_alternate_keys: editor.keyboard_report_alternate_keys,
+            report_all_keys_as_escape_codes: editor.keyboard_report_all_keys_as_escape_codes,
+        }
+    }
+
     /// Build crossterm KeyboardEnhancementFlags from this config.
     pub fn to_flags(&self) -> KeyboardEnhancementFlags {
         let mut flags = KeyboardEnhancementFlags::empty();
@@ -125,6 +144,7 @@ pub struct TerminalModes {
     mouse_capture: bool,
     keyboard_enhancement: bool,
     bracketed_paste: bool,
+    stderr_redirected: bool,
 }
 
 impl TerminalModes {
@@ -236,6 +256,9 @@ impl TerminalModes {
             tracing::debug!("Enabled bracketed paste mode");
         }
 
+        // Keep anything written to fd 2 from painting over the frame (#3662).
+        modes.stderr_redirected = super::stderr_redirect::redirect_to_log();
+
         Ok(modes)
     }
 
@@ -245,6 +268,13 @@ impl TerminalModes {
     /// and only disables those modes.
     #[allow(clippy::let_underscore_must_use)]
     pub fn undo(&mut self) {
+        // Give stderr back first, so whatever is printed after teardown
+        // reaches the user's terminal.
+        if self.stderr_redirected {
+            super::stderr_redirect::restore();
+            self.stderr_redirected = false;
+        }
+
         // Best-effort terminal teardown — if stdout is broken, we can't recover.
         // Disable mouse capture
         // On Windows, skip crossterm's DisableMouseCapture (same reason as enable).
@@ -264,11 +294,10 @@ impl TerminalModes {
             tracing::debug!("Disabled bracketed paste");
         }
 
-        // Reset cursor style to default
+        // Reset cursor style to default. Not the cursor *colour*: the editor
+        // never sets one, so there is nothing of ours to put back and a colour
+        // the user's shell set is theirs to keep.
         let _ = stdout().execute(SetCursorStyle::DefaultUserShape);
-
-        // Reset terminal cursor color
-        crate::view::theme::Theme::reset_terminal_cursor_color();
 
         // Pop keyboard enhancement flags
         if self.keyboard_enhancement {
@@ -295,29 +324,9 @@ impl TerminalModes {
         let _ = stdout().flush();
     }
 
-    /// Returns true if raw mode is enabled.
-    pub fn raw_mode_enabled(&self) -> bool {
-        self.raw_mode
-    }
-
-    /// Returns true if keyboard enhancement is enabled.
-    pub fn keyboard_enhancement_enabled(&self) -> bool {
-        self.keyboard_enhancement
-    }
-
     /// Returns true if mouse capture is enabled.
     pub fn mouse_capture_enabled(&self) -> bool {
         self.mouse_capture
-    }
-
-    /// Returns true if bracketed paste is enabled.
-    pub fn bracketed_paste_enabled(&self) -> bool {
-        self.bracketed_paste
-    }
-
-    /// Returns true if alternate screen is enabled.
-    pub fn alternate_screen_enabled(&self) -> bool {
-        self.alternate_screen
     }
 }
 
@@ -362,6 +371,10 @@ pub fn suspend_and_resume(
 /// regardless of whether they were actually enabled.
 #[allow(clippy::let_underscore_must_use)]
 pub fn emergency_cleanup() {
+    // Give stderr back first: the panic message printed after this hook
+    // must reach the user's terminal, not the log.
+    super::stderr_redirect::restore();
+
     // Best-effort emergency terminal restore — if stdout is broken, we can't recover.
     // Disable mouse capture
     let _ = stdout().execute(DisableMouseCapture);
@@ -369,14 +382,15 @@ pub fn emergency_cleanup() {
     // Disable bracketed paste
     let _ = stdout().execute(DisableBracketedPaste);
 
-    // Reset cursor style to default
+    // Reset cursor style to default (never the colour — see `restore`).
     let _ = stdout().execute(SetCursorStyle::DefaultUserShape);
-
-    // Reset terminal cursor color
-    crate::view::theme::Theme::reset_terminal_cursor_color();
 
     // Pop keyboard enhancement flags
     let _ = stdout().execute(PopKeyboardEnhancementFlags);
+
+    // Stop win32-input-mode key reports, or the shell would receive them raw.
+    #[cfg(windows)]
+    let _ = fresh_winterm::disable_win32_input_mode();
 
     // Disable raw mode
     let _ = disable_raw_mode();

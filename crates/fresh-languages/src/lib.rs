@@ -121,9 +121,12 @@ impl HighlightCategory {
             Self::Comment => "syntax.comment",
             Self::Function => "syntax.function",
             Self::Type => "syntax.type",
-            Self::Variable | Self::Property => "syntax.variable",
+            Self::Variable => "syntax.variable",
+            Self::Property => "syntax.property",
             Self::VariableBuiltin => "syntax.variable_builtin",
-            Self::Constant | Self::Number | Self::Attribute => "syntax.constant",
+            Self::Constant => "syntax.constant",
+            Self::Number => "syntax.number",
+            Self::Attribute => "syntax.attribute",
             Self::Operator => "syntax.operator",
             Self::PunctuationBracket => "syntax.punctuation_bracket",
             Self::PunctuationDelimiter => "syntax.punctuation_delimiter",
@@ -479,6 +482,22 @@ impl Language {
         }
     }
 
+    /// Whether `<` and `>` are structural delimiters in this language rather
+    /// than comparison / shift operators.
+    ///
+    /// Only markup qualifies. In HTML (and templ, which is HTML with Go in
+    /// it) a `<` opens a tag and the matching `>` closes it, so the pair is
+    /// unambiguous and nests exactly as far as the tag does. Everywhere else
+    /// the same two characters are overwhelmingly operators — `if (a < b)` —
+    /// and the cases where they are delimiters (`template <typename T>`,
+    /// `Vec<T>`) cannot be told from a comparison without parsing the
+    /// expression. Counting them as brackets there gave one comparison
+    /// operator the power to recolour every bracket below it: the `<` pushed
+    /// a nesting level nothing popped (issue #3090).
+    pub fn angle_brackets_are_delimiters(&self) -> bool {
+        matches!(self, Self::HTML | Self::Templ)
+    }
+
     /// File extensions associated with this language.
     ///
     /// Keep in sync with `from_path`. Used by the grammar catalog so that
@@ -532,82 +551,6 @@ impl Language {
             Self::Pascal => "Pascal",
             Self::Odin => "Odin",
             Self::Templ => "Templ",
-        }
-    }
-
-    /// Parse a language from its ID or display name
-    pub fn from_id(id: &str) -> Option<Self> {
-        let id_lower = id.to_lowercase();
-        match id_lower.as_str() {
-            "rust" => Some(Self::Rust),
-            "python" => Some(Self::Python),
-            "javascript" => Some(Self::JavaScript),
-            "typescript" => Some(Self::TypeScript),
-            "html" => Some(Self::HTML),
-            "css" => Some(Self::CSS),
-            "c" => Some(Self::C),
-            "cpp" | "c++" => Some(Self::Cpp),
-            "go" => Some(Self::Go),
-            "json" => Some(Self::Json),
-            "jsonc" => Some(Self::Jsonc),
-            "java" => Some(Self::Java),
-            "c_sharp" | "c#" | "csharp" => Some(Self::CSharp),
-            "php" => Some(Self::Php),
-            "ruby" => Some(Self::Ruby),
-            "bash" => Some(Self::Bash),
-            "lua" => Some(Self::Lua),
-            "pascal" => Some(Self::Pascal),
-            "odin" => Some(Self::Odin),
-            "templ" => Some(Self::Templ),
-            _ => None,
-        }
-    }
-
-    /// Try to map a syntect syntax name to a tree-sitter Language.
-    ///
-    /// This is used to get tree-sitter features (indentation, semantic highlighting)
-    /// when using a syntect grammar for syntax highlighting. This is best-effort since
-    /// tree-sitter only supports ~18 languages while syntect supports 100+.
-    ///
-    /// Syntect uses names like "Rust", "Python", "JavaScript", "JSON", "C++", "C#",
-    /// "Bourne Again Shell (bash)", etc.
-    pub fn from_name(name: &str) -> Option<Self> {
-        // First try exact display name match
-        for lang in Self::all() {
-            if lang.display_name() == name {
-                return Some(*lang);
-            }
-        }
-
-        // Then try case-insensitive matching and common aliases
-        let name_lower = name.to_lowercase();
-        match name_lower.as_str() {
-            "rust" => Some(Self::Rust),
-            "python" => Some(Self::Python),
-            "javascript" | "javascript (babel)" => Some(Self::JavaScript),
-            "typescript" | "typescriptreact" => Some(Self::TypeScript),
-            "html" => Some(Self::HTML),
-            "css" => Some(Self::CSS),
-            "c" => Some(Self::C),
-            "c++" => Some(Self::Cpp),
-            "go" | "golang" => Some(Self::Go),
-            "json" => Some(Self::Json),
-            "jsonc" | "json with comments" => Some(Self::Jsonc),
-            "java" => Some(Self::Java),
-            "c#" => Some(Self::CSharp),
-            "php" => Some(Self::Php),
-            "ruby" => Some(Self::Ruby),
-            "lua" => Some(Self::Lua),
-            "pascal" => Some(Self::Pascal),
-            "odin" => Some(Self::Odin),
-            "templ" => Some(Self::Templ),
-            _ => {
-                // Try matching shell variants
-                if name_lower.contains("bash") || name_lower.contains("shell") {
-                    return Some(Self::Bash);
-                }
-                None
-            }
         }
     }
 }

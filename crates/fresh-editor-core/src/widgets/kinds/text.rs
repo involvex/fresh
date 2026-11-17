@@ -1,0 +1,1660 @@
+//! `Text` — unified single-line / multi-line text field, with markdown
+//! document mode, completion popups, and the block caret.
+
+use std::collections::HashMap;
+
+use fresh_core::api::{OverlayColorSpec, OverlayOptions, WidgetSpec};
+use fresh_core::text_property::{InlineOverlay, OffsetUnit, TextPropertyEntry};
+use serde_json::json;
+
+use super::WidgetImpl;
+use crate::widgets::registry::WidgetInstanceState;
+use crate::widgets::render::{
+    completion_scrollbar_glyph, ensure_trailing_newline, fit_label, focus_gutter_prefix,
+    form_label_width, ratatui_style_to_overlay, render_completion_bottom_border,
+    render_completion_dim_separator_overlay, render_completion_item,
+    render_completion_item_overlay, render_text_input,
+};
+
+pub struct Text;
+
+impl WidgetImpl for Text {
+    fn on_key(
+        &self,
+        spec: &WidgetSpec,
+        widget_key: &str,
+        panel: &mut crate::widgets::WidgetPanelState,
+        viewport: super::Viewport,
+        key: &crate::keys::KeySeq,
+        fx: &mut super::KeyFx,
+    ) -> super::KeyDisposition {
+        use super::KeyDisposition::{Consumed, Pass, PassAfter};
+        use crossterm::event::KeyCode;
+        let Some(key) = key.single() else {
+            return Pass;
+        };
+        let bare = key.mods().is_empty();
+        // **The combo box** (`docs/internal/widget-controls-own-interaction.md`
+        // R3): while the suggestion list is up it claims its keys first.
+        // ↓ steps into the list (the first press highlights the top row, and
+        // nothing is highlighted before it); ↑/↓ and PgUp/PgDn then move the
+        // highlight — the shared pop-up list's arithmetic. Enter or Tab on a
+        // highlighted row accepts it: the host puts it in the field, closes
+        // the list, and reports `change` and `completion_accept`. Enter or Tab
+        // with nothing highlighted closes the list and goes on to act on the
+        // dialog. Esc closes the list, and only a second Esc reaches the
+        // dialog.
+        if bare
+            && matches!(
+                key.code(),
+                KeyCode::Tab
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Enter
+                    | KeyCode::Esc
+            )
+            && completions_open(widget_key, panel)
+        {
+            if let Some(nav) = super::popup_list::nav_of(key) {
+                move_completion_index(spec, widget_key, panel, nav);
+                return Consumed;
+            }
+            return match key.code() {
+                KeyCode::Esc => {
+                    dismiss_completions(widget_key, panel, fx);
+                    Consumed
+                }
+                KeyCode::Enter | KeyCode::Tab => {
+                    if completion_navigated(widget_key, panel) {
+                        accept_completion(spec, widget_key, panel, fx);
+                        return Consumed;
+                    }
+                    // Nothing highlighted: the list must not swallow the key.
+                    // Close it, then let Enter act on the dialog and Tab move
+                    // focus on.
+                    dismiss_completions(widget_key, panel, fx);
+                    PassAfter
+                }
+                _ => Pass,
+            };
+        }
+        // **A closed combo box opens on ↓ or Alt+↓** (the ARIA combobox
+        // pattern). The list is the plugin's, so the field asks for it
+        // (`completion_request`); the plugin answers with `setCompletions`.
+        // ↓ also steps onto the first candidate once it arrives, Alt+↓ only
+        // opens — so the field marks the empty list as entered, and
+        // `SetCompletions` keeps that mark for the items it brings (an empty
+        // list is otherwise never entered: accepting and dismissing both
+        // clear the mark). A field that is not a combo keeps ↓ for the form.
+        if is_combo(spec)
+            && key.code() == KeyCode::Down
+            && (bare || key.mods() == crossterm::event::KeyModifiers::ALT)
+            && !completions_open(widget_key, panel)
+        {
+            ensure_text_state(spec, widget_key, panel);
+            if let Some(WidgetInstanceState::Text {
+                completion_selected_index,
+                completion_navigated,
+                ..
+            }) = panel.instance_states.get_mut(widget_key)
+            {
+                *completion_selected_index = 0;
+                *completion_navigated = bare;
+            }
+            request_completions(fx);
+            return Consumed;
+        }
+        // The editing vocabulary. Caret motion, mutation, selection
+        // chords, clipboard, and multi-line paging are the field's
+        // own; what stays panel policy is the single-line field's
+        // Up/Down (picker forwarding to a sibling list) and Enter
+        // (submit / advance) — those Pass.
+        let WidgetSpec::Text { rows, .. } = spec else {
+            return Pass;
+        };
+        // **A field that cannot be edited does not take the keys that edit.**
+        // A read-only box or a markdown document used to swallow Space,
+        // Backspace, Delete and undo as no-ops; now that the focused control
+        // answers a key before the panel's bindings do, a key it only ignores
+        // must go on to them (a tour's Space for "next step" over its prose).
+        let (is_markdown, is_read_only) = mode(spec);
+        let edits = matches!(
+            key.code(),
+            KeyCode::Backspace | KeyCode::Delete | KeyCode::Char(' ')
+        ) || super::ctrl_char(key, 'z')
+            || super::ctrl_char(key, 'y')
+            || (key.code() == KeyCode::Enter && !is_markdown);
+        if is_read_only && edits {
+            return Pass;
+        }
+        match key.code() {
+            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+                if *rows <= 1 && bare =>
+            {
+                Pass
+            }
+            _ if super::text_caret(key) => {
+                text_key(spec, widget_key, panel, key, fx);
+                Consumed
+            }
+            KeyCode::PageUp | KeyCode::PageDown if bare => {
+                // Multi-line: page the caret (the viewport follows
+                // it), one row of overlap like the lists so the user
+                // keeps a visual anchor across pages. A page is the box's
+                // window as layout gave it, which a box that grows with its
+                // text sizes between `min_rows` and `max_rows`.
+                let page = viewport.items.saturating_sub(1).max(1) as i32;
+                let down = key.code() == KeyCode::PageDown;
+                apply_edit(spec, widget_key, panel, fx, |editor| {
+                    for _ in 0..page.unsigned_abs() {
+                        if down {
+                            editor.move_down();
+                        } else {
+                            editor.move_up();
+                        }
+                    }
+                });
+                Consumed
+            }
+            KeyCode::Enter if bare => {
+                if *rows <= 1 {
+                    // Form policy (submit / picker-activate / advance)
+                    // belongs to the panel.
+                    return Pass;
+                }
+                text_key(spec, widget_key, panel, key, fx);
+                Consumed
+            }
+            KeyCode::Char(' ') if bare => {
+                insert_str_edit(spec, widget_key, panel, " ", fx);
+                Consumed
+            }
+            _ if super::ctrl_char(key, 'c') => {
+                // Copy is consumed even with an empty selection so it
+                // doesn't fall through to the buffer's copy path.
+                if let Some(text) = selected_text(widget_key, panel) {
+                    fx.clipboard_copy = Some(text);
+                }
+                Consumed
+            }
+            _ if super::ctrl_char(key, 'x') => {
+                if let Some(text) = selected_text(widget_key, panel) {
+                    fx.clipboard_copy = Some(text);
+                    // On a read-only / markdown document, Cut degrades
+                    // to Copy: the selection reaches the clipboard,
+                    // nothing is deleted.
+                    if !mode(spec).1 {
+                        apply_edit(spec, widget_key, panel, fx, |editor| {
+                            editor.delete_selection();
+                        });
+                    }
+                }
+                Consumed
+            }
+            _ if super::ctrl_char(key, 'a') => {
+                // SelectAll moves the cursor to end-of-value and sets
+                // anchor at start; `apply_edit` skips the change event
+                // when nothing moved.
+                apply_edit(spec, widget_key, panel, fx, |editor| editor.select_all());
+                Consumed
+            }
+            _ if super::ctrl_char(key, 'z') => {
+                // Engine undo (history lives in the TextEdit itself);
+                // routing through apply_edit fires `change` with the
+                // restored value so a plugin mirror stays in sync.
+                apply_edit(spec, widget_key, panel, fx, |editor| {
+                    editor.undo();
+                });
+                Consumed
+            }
+            _ if super::ctrl_char(key, 'y') => {
+                apply_edit(spec, widget_key, panel, fx, |editor| {
+                    editor.redo();
+                });
+                Consumed
+            }
+            _ => Pass,
+        }
+    }
+
+    /// Typed text lands in the field at the caret, replacing any
+    /// selection; a read-only or markdown field takes none and passes.
+    fn on_text(
+        &self,
+        spec: &WidgetSpec,
+        widget_key: &str,
+        panel: &mut crate::widgets::WidgetPanelState,
+        text: &str,
+        fx: &mut super::KeyFx,
+    ) -> super::KeyDisposition {
+        if text.is_empty() || mode(spec).1 {
+            return super::KeyDisposition::Pass;
+        }
+        insert_str_edit(spec, widget_key, panel, text, fx);
+        super::KeyDisposition::Consumed
+    }
+
+    /// Pointer model: a click in the field's editable area moves the
+    /// caret to the clicked byte, matching every GUI text input
+    /// (#2573). The click-cell → value-byte mapping (and the
+    /// markdown-document row variant) is click-path knowledge the
+    /// panel doesn't have, so the kind *requests* the placement and
+    /// the dispatcher runs the host helper. The recorded `focus`
+    /// event still fires — plugins mirror the caret from it.
+    fn on_pointer(
+        &self,
+        spec: &WidgetSpec,
+        widget_key: &str,
+        panel: &mut crate::widgets::WidgetPanelState,
+        event_type: &str,
+        payload: &serde_json::Value,
+        fx: &mut super::PointerFx,
+    ) -> super::PointerDisposition {
+        // **A press on a candidate row accepts it**, as ↓ to it and Enter
+        // would: the value goes in the field, the list closes, and the plugin
+        // hears `change` then `completion_accept`.
+        if event_type == "completion_pick" {
+            if let (
+                Some(index),
+                Some(WidgetInstanceState::Text {
+                    completions,
+                    completion_selected_index,
+                    completion_navigated,
+                    ..
+                }),
+            ) = (
+                payload.get("index").and_then(|v| v.as_u64()),
+                panel.instance_states.get_mut(widget_key),
+            ) {
+                if (index as usize) < completions.len() {
+                    *completion_selected_index = index as usize;
+                    *completion_navigated = true;
+                    accept_completion(spec, widget_key, panel, &mut fx.key);
+                }
+            }
+            return super::PointerDisposition::Consumed;
+        }
+        // **A combo box's arrow toggles its list** — closing an open one the
+        // way Esc does, asking the plugin for a closed one's the way ↓ does.
+        // The press has already given the field focus; the caret stays where
+        // it was, since the arrow is not a place in the value.
+        if event_type == "combo_toggle" {
+            match completions_open(widget_key, panel) {
+                true => dismiss_completions(widget_key, panel, &mut fx.key),
+                false => request_completions(&mut fx.key),
+            }
+            return super::PointerDisposition::Consumed;
+        }
+        if event_type == "focus" {
+            fx.place_caret = true;
+        }
+        super::PointerDisposition::Default
+    }
+
+    fn on_wheel(
+        &self,
+        spec: &WidgetSpec,
+        widget_key: &str,
+        panel: &mut crate::widgets::WidgetPanelState,
+        _viewport: super::Viewport,
+        delta: i32,
+    ) -> bool {
+        let WidgetSpec::Text {
+            completions_visible_rows,
+            ..
+        } = spec
+        else {
+            return false;
+        };
+        // Only an open completion popup scrolls here — the one window in a
+        // described panel the tree does not own, reached through
+        // `UiFact::WidgetWheel` by name. The field's own rows are the
+        // tree's viewport, which takes its own wheel. Scrolling counts as
+        // stepping into the popup: Enter then accepts the highlighted row.
+        if let Some(WidgetInstanceState::Text {
+            completions,
+            completion_scroll_offset,
+            completion_navigated,
+            completion_selected_index,
+            ..
+        }) = panel.instance_states.get_mut(widget_key)
+        {
+            if !completions.is_empty() {
+                let visible = if *completions_visible_rows == 0 {
+                    5u32
+                } else {
+                    *completions_visible_rows
+                };
+                *completion_navigated = true;
+                let total = completions.len() as u32;
+                let max_scroll = total.saturating_sub(visible.min(total));
+                let next = (*completion_scroll_offset as i32 + delta).clamp(0, max_scroll as i32);
+                *completion_scroll_offset = next as u32;
+                // The window follows the highlight on every layout
+                // (`popup_list::window`), so the highlight rides along with
+                // the wheel — kept inside the rows now shown — or the next
+                // layout would pull the window straight back to it.
+                let last = (next as u32 + visible.min(total)).saturating_sub(1) as usize;
+                *completion_selected_index =
+                    (*completion_selected_index).clamp(next as usize, last);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn box_meta(&self, spec: &WidgetSpec) -> super::BoxMeta {
+        let mut m = super::BoxMeta::plain("text");
+        if let WidgetSpec::Text {
+            key: Some(k),
+            rows,
+            markdown,
+            ..
+        } = spec
+        {
+            if !k.is_empty() {
+                m.key = Some(k.clone());
+                m.focusable = true;
+                m.scrollable = *rows > 1;
+                // A markdown document view scrolls like a list; plain
+                // editable textareas stay excluded (they scroll with
+                // their caret and are not picker targets).
+                m.picker_scroll_target = *markdown && *rows > 1;
+            }
+        }
+        m
+    }
+}
+
+/// Resolve the column width a single-line `full_width` text field's
+/// bracketed region should occupy: `panel_width` minus the label prefix,
+/// the two surrounding `[` / `]` brackets plus the trailing cursor-park
+/// column (3), and the focus-marker gutter when the panel opted in.
+/// Reserving these unconditionally keeps the rendered width stable
+/// across the focus transition so the box never reflows or overflows the
+/// enclosing section. Multi-line fields and non-`full_width` fields use
+/// the plugin-supplied `field_width` verbatim (`render_text_area`
+/// already fills the panel width by default).
+#[allow(clippy::too_many_arguments)]
+pub fn effective_text_field_width(
+    full_width: bool,
+    multiline: bool,
+    label: &str,
+    panel_width: u32,
+    field_width: u32,
+    marker_gutter: bool,
+) -> u32 {
+    if !full_width || multiline {
+        return field_width;
+    }
+    let label_overhead = if label.is_empty() {
+        0u32
+    } else {
+        label.chars().count() as u32 + 1
+    };
+    let marker_reserve = if marker_gutter { 2 } else { 0 };
+    panel_width
+        .saturating_sub(label_overhead)
+        .saturating_sub(3)
+        .saturating_sub(marker_reserve)
+        .max(1)
+}
+
+/// The completion pop-over's rows, in paint order: the dim separator that
+/// takes over the enclosing section's bottom border, the windowed candidate
+/// rows, and the popup's own bottom border.
+pub struct CompletionPopup {
+    /// Separator, items, bottom border — one entry per row, each already
+    /// carrying its own `│ … │` chrome.
+    pub rows: Vec<TextPropertyEntry>,
+    /// The scroll offset to persist for the next render.
+    pub scroll: u32,
+    /// How many candidate rows the window shows, which is the height of the
+    /// popup less its two chrome rows.
+    pub visible: u32,
+}
+
+/// **The completion pop-over: how many rows, which ones, and what they say.**
+///
+/// `panel_width` is the inner width the wrapping `LabeledSection` handed us
+/// (already minus its 4 columns of `│ … │` chrome); the popup widens by 4 so
+/// the side borders it paints line up with the section's. That is why the
+/// float it becomes has to start two columns *left* of the child — see
+/// `view::shell::widgets`'s `Site::escape`.
+///
+/// Scroll is *forward-only*: when the selection walks past the bottom of the
+/// window the view pulls forward to keep it visible, but it is never pulled
+/// back if the selection sits above the window — the mouse-wheel handler
+/// deliberately diverges scroll from selection, and a back-pull would undo the
+/// wheel on the next render.
+///
+/// Default popup height is 5 visible rows. Plugins override per-widget by
+/// setting `completions_visible_rows`; 0 falls back to the default so the
+/// orchestrator's existing `text({...})` calls Just Work.
+///
+/// `lead` puts the candidates under the value: see [`completion_lead`].
+///
+/// Pulled out of the collector because the *description* needs the same rows,
+/// and a second copy of the windowing would be a second place for it to drift
+/// from the scroll offset the collector persists. Pure — no `out`, no
+/// `next_state` — which is what lets a description call it.
+#[allow(clippy::too_many_arguments)]
+pub fn completion_popup(
+    completions: &[fresh_core::api::CompletionItem],
+    completions_visible_rows: u32,
+    panel_width: u32,
+    selected_idx: usize,
+    navigated: bool,
+    prev_scroll: u32,
+    lead: usize,
+    frame: CompletionFrame,
+) -> Option<CompletionPopup> {
+    if completions.is_empty() {
+        return None;
+    }
+    let visible_rows = if completions_visible_rows == 0 {
+        5u32
+    } else {
+        completions_visible_rows
+    };
+    let popup_total = match frame {
+        CompletionFrame::Section => (panel_width as usize).saturating_add(4), // re-add section chrome
+        CompletionFrame::Box => panel_width as usize,
+    };
+    let total = completions.len() as u32;
+    // The shared pop-up list's window, from the highlight, every layout —
+    // both ways, so a highlight above the window pulls it back up as surely
+    // as one below pushes it down.
+    let (scroll, visible) = super::popup_list::window(
+        completions.len(),
+        visible_rows as usize,
+        navigated.then_some(selected_idx),
+        prev_scroll as usize,
+    );
+    let (scroll, visible) = (scroll as u32, visible as u32);
+
+    let mut rows = Vec::with_capacity(visible as usize + 2);
+    // A box is framed by its node's border; only the section-joined list
+    // paints its own chrome rows.
+    if frame == CompletionFrame::Section {
+        rows.push(render_completion_dim_separator_overlay(popup_total));
+    }
+    let needs_scrollbar = total > visible;
+    let end = (scroll + visible).min(total) as usize;
+    for (visible_row, i) in (scroll as usize..end).enumerate() {
+        let item = &completions[i];
+        let thumb = if needs_scrollbar {
+            completion_scrollbar_glyph(visible_row as u32, visible, scroll, total)
+        } else {
+            None
+        };
+        rows.push(match frame {
+            CompletionFrame::Section => render_completion_item_overlay(
+                &item.value,
+                item.kind.as_deref(),
+                // Only paint a selected-row highlight once the user
+                // has stepped into the dropdown (↓/↑). A freshly
+                // surfaced popup shows plain suggestions so it's
+                // clear Enter acts on the form, not the list.
+                navigated && i == selected_idx,
+                popup_total,
+                thumb,
+                lead,
+                true,
+            ),
+            // The box's walls are the node's border, as a dropdown's list's
+            // are, so a row is only the inside: no gutter, starting in the
+            // value's own column.
+            CompletionFrame::Box => render_completion_item(
+                &item.value,
+                item.kind.as_deref(),
+                navigated && i == selected_idx,
+                popup_total.saturating_sub(2),
+                thumb,
+                0,
+                false,
+            ),
+        });
+    }
+    if frame == CompletionFrame::Section {
+        rows.push(render_completion_bottom_border(popup_total));
+    }
+    Some(CompletionPopup {
+        rows,
+        scroll,
+        visible,
+    })
+}
+
+/// How a completion list is framed, which depends on where its field stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionFrame {
+    /// Inside a `LabeledSection`: the list is `panel_width + 4` wide and its
+    /// first row is a dashed separator painted over the section's bottom
+    /// border, so section and list read as one frame.
+    Section,
+    /// Anywhere else: a box of its own under the field, drawn the way a
+    /// dropdown's option list is — the rows are only its inside, and the
+    /// caller frames them with the node's border. `panel_width` is the box's
+    /// outer width, the field's `[…]` span, so the left wall sits under the
+    /// `[` and a row, carrying no gutter, starts in the value's own column. A
+    /// list wider than its field ran past the dialog's edge.
+    Box,
+}
+
+/// **Where a candidate row's text starts, so it sits under the value.**
+///
+/// `value_col` is the display column of the value's first char within the
+/// field's own row — after the focus gutter and a form's `label: [` — and
+/// `escape` how many columns left of that row the popup's left border
+/// starts (`2` inside a `LabeledSection`, whose `│ ` chrome the popup
+/// re-adds; `0` at the panel edge). The row lays `│`, `lead` spaces and two
+/// leading chars before the text, so this is the `lead` that lands it on
+/// `value_col`.
+pub fn completion_lead(value_col: u32, escape: u32) -> usize {
+    (value_col + escape).saturating_sub(3) as usize
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Push a one-cell REVERSED overlay at `byte` in `entry` — the block
+/// caret used by modal form surfaces (`block_caret` Text widgets and
+/// the Number edit cell), where a hardware cursor isn't visible.
+/// Clamps to the entry text; a caret at end-of-text reverses the last
+/// cell if there is one (renderers reserve a trailing pad cell).
+pub fn push_block_caret_overlay(entry: &mut TextPropertyEntry, byte: usize) {
+    let text = &entry.text;
+    let b = byte.min(text.len());
+    let (start, end) = if b < text.len() {
+        let ch_len = text[b..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        (b, b + ch_len)
+    } else if !text.is_empty() {
+        // End-of-text: reverse the final cell.
+        let last_start = text
+            .char_indices()
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(text.len().saturating_sub(1));
+        (last_start, text.len())
+    } else {
+        return;
+    };
+    entry.inline_overlays.push(InlineOverlay {
+        start,
+        end,
+        style: OverlayOptions {
+            reversed: true,
+            ..Default::default()
+        },
+        properties: Default::default(),
+        unit: OffsetUnit::Byte,
+    });
+}
+
+/// Markdown-mode multi-line Text: a read-only *document* view.
+///
+/// The value renders through the shared markdown engine (the same one
+/// behind LSP hover docs) and word-wraps to the widget's width; a shadow
+/// [`TextEdit`](crate::primitives::text_edit::TextEdit) holds the
+/// rendered **plain text** so the caret, selection, and Copy operate on
+/// exactly what's on screen — never on markdown markers, and never on
+/// the chrome of sibling widgets sharing a merged row. The shadow (and
+/// with it the caret) resets whenever the rendered text changes (new
+/// value or new width).
+#[allow(clippy::too_many_arguments)]
+/// The whole markdown document as **one** styled entry: the rendered text with
+/// one inline overlay per span, unwrapped.
+///
+/// **Unwrapped is the point.** `render_markdown_text_area` wraps the parse to a
+/// width it is handed and then emits a row per rendered line, which makes a row
+/// a fact of the renderer rather than of the layout — so the caller has to
+/// re-state the width it laid out at, and the caret, the selection and the
+/// scroll all end up in coordinates only a second wrap can produce. Handed over
+/// as one run instead, the wrap is `fresh-ui`'s at the width *it* settled, and
+/// a byte of this string is the one coordinate everyone shares (L5).
+///
+/// **The indent is normalised back to spaces.** `parse_markdown` turns leading
+/// whitespace into NBSP so the markdown parser does not read an indented line
+/// as a code block, and lays list markers behind NBSP for the same reason; a
+/// wrapper that treats NBSP as space-like then puts the hanging indent back.
+/// `fresh-ui` breaks on `' '` only — correctly, since NBSP exists to *prevent*
+/// a break — so a line's own leading run is converted here, where it is known
+/// to be indentation. An NBSP the author wrote *inside* a line keeps its
+/// meaning.
+pub fn markdown_document(
+    value: &str,
+    md: Option<crate::widgets::MarkdownCtx<'_>>,
+) -> TextPropertyEntry {
+    use crate::markdown::parse_markdown;
+    let lines = match md {
+        Some(md) => parse_markdown(value, md.theme, md.grammars),
+        // No theme (unit tests, plugin-less hosts): the source, unstyled.
+        None => value
+            .split('\n')
+            .map(|l| {
+                let mut sl = crate::markdown::StyledLine::new();
+                sl.push(l.to_string(), ratatui::style::Style::default());
+                sl
+            })
+            .collect(),
+    };
+    markdown_entry_from_lines(&lines)
+}
+
+/// [`markdown_document`] with the parse already done: the assembly half, which
+/// is where the normalisation and the overlay offsets have to agree.
+fn markdown_entry_from_lines(lines: &[crate::markdown::StyledLine]) -> TextPropertyEntry {
+    let mut text = String::new();
+    let mut overlays: Vec<InlineOverlay> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            text.push('\n');
+        }
+        // The line's own leading whitespace, across spans: everything up to its
+        // first non-space-like character is indentation.
+        let mut leading = true;
+        for span in &line.spans {
+            let start = text.len();
+            match leading {
+                true => {
+                    let n = span
+                        .text
+                        .chars()
+                        .take_while(|c| crate::markdown::is_space(*c))
+                        .count();
+                    let head: String = span.text.chars().take(n).map(|_| ' ').collect();
+                    text.push_str(&head);
+                    text.push_str(
+                        &span.text[span
+                            .text
+                            .char_indices()
+                            .nth(n)
+                            .map(|(b, _)| b)
+                            .unwrap_or(span.text.len())..],
+                    );
+                    leading = n == span.text.chars().count();
+                }
+                false => text.push_str(&span.text),
+            }
+            if let Some(style) = ratatui_style_to_overlay(span.style) {
+                overlays.push(InlineOverlay {
+                    start,
+                    end: text.len(),
+                    style,
+                    properties: Default::default(),
+                    unit: OffsetUnit::Byte,
+                });
+            }
+        }
+    }
+    TextPropertyEntry {
+        text,
+        properties: Default::default(),
+        style: None,
+        inline_overlays: overlays,
+        segments: Vec::new(),
+        pad_to_chars: None,
+        truncate_to_chars: None,
+    }
+}
+
+/// A `Text`'s state, once the spec and the instance map have been reconciled.
+///
+/// Host-owned value and cursor (plus scroll, and the completion fields the
+/// plugin pushes rather than the spec): instance state if it exists, else
+/// seeded from the spec on first render. See `WidgetInstanceState::Text`.
+pub struct Resolved {
+    /// The editor the row is rendered from — cursor and selection included.
+    pub editor: crate::primitives::text_edit::TextEdit,
+    /// First visible row (multi-line) or first painted value char
+    /// (single-line): the window the previous render left behind.
+    pub scroll: u32,
+    /// The candidate list the plugin pushed through `SetCompletions`.
+    pub completions: Vec<fresh_core::api::CompletionItem>,
+    /// The highlighted candidate, clamped into `completions`.
+    pub completion_index: usize,
+    /// The completion window's first visible candidate.
+    pub completion_scroll: u32,
+    /// Whether the user has stepped into the list (↑/↓/wheel) — which is what
+    /// makes Enter act on the candidate rather than on the form.
+    pub completion_navigated: bool,
+}
+
+/// **Where a `Text`'s value, cursor and completion list actually come from.**
+///
+/// Instance state is authoritative once it exists; the spec's `value` /
+/// `cursor_byte` are a seed for the first render only. Completions never come
+/// from the spec at all — plugins push them through `SetCompletions` — so they
+/// are carried across renders verbatim, and the index is clamped **once per
+/// render** so a list that shrank host-side (or arrived empty) does not keep a
+/// stale out-of-bounds index alive.
+///
+/// Pulled out of the collector because the *description* needs the same
+/// answer, and a second copy of these rules is a second place for them to
+/// drift. Pure — it never writes `next_state` — which is what lets a
+/// description call it. See `view::shell::widgets`'s single-line `Text` arm.
+pub fn resolve(
+    value: &str,
+    cursor_byte: i32,
+    multiline: bool,
+    key: Option<&str>,
+    prev: &HashMap<String, WidgetInstanceState>,
+) -> Resolved {
+    let mut st = match key.filter(|k| !k.is_empty()).and_then(|k| prev.get(k)) {
+        Some(WidgetInstanceState::Text {
+            editor,
+            scroll,
+            completions,
+            completion_selected_index,
+            completion_scroll_offset,
+            completion_navigated,
+            ..
+        }) => Resolved {
+            editor: editor.clone(),
+            scroll: *scroll,
+            completions: completions.clone(),
+            completion_index: *completion_selected_index,
+            completion_scroll: *completion_scroll_offset,
+            completion_navigated: *completion_navigated,
+        },
+        _ => {
+            let mut editor = if multiline {
+                crate::primitives::text_edit::TextEdit::with_text(value)
+            } else {
+                crate::primitives::text_edit::TextEdit::single_line_with_text(value)
+            };
+            let seed = if cursor_byte < 0 {
+                value.len()
+            } else {
+                (cursor_byte as usize).min(value.len())
+            };
+            editor.set_cursor_from_flat(seed);
+            Resolved {
+                editor,
+                scroll: 0,
+                completions: Vec::new(),
+                completion_index: 0,
+                completion_scroll: 0,
+                completion_navigated: false,
+            }
+        }
+    };
+    st.completion_index = match st.completions.len() {
+        0 => 0,
+        n => st.completion_index.min(n - 1),
+    };
+    st
+}
+
+/// **How many editing rows a multi-line field shows.**
+///
+/// `rows` as the plugin said — unless the field grows with its text
+/// (`max_rows > 0`), when it is as many rows as its value wraps to, never
+/// fewer than `min_rows` (or `rows` when that is `0`) and never more than
+/// `max_rows`, past which it scrolls. `wrapped` is the value's row count at
+/// the width layout gave the box, so a plugin never has to guess a width to
+/// size a box by.
+pub fn text_area_height(rows: u32, min_rows: u32, max_rows: u32, wrapped: u32) -> u32 {
+    if max_rows == 0 {
+        return rows.max(1);
+    }
+    let floor = match min_rows {
+        0 => rows,
+        m => m,
+    }
+    .max(1);
+    wrapped.clamp(floor, max_rows.max(floor))
+}
+
+/// The byte range the selection band paints over, or `None`.
+///
+/// Only meaningful for the focused widget — `None` otherwise keeps the
+/// no-selection rendering paths unchanged. The editor's own selection wins; a
+/// spec-seeded render (stateless surfaces like Settings, which re-emit their
+/// model each frame) falls back to the spec's `sel_start`/`sel_end` byte
+/// range, clamped into the value.
+pub fn selection_of(
+    editor: &crate::primitives::text_edit::TextEdit,
+    is_focused: bool,
+    spec_sel: (i32, i32),
+) -> Option<(usize, usize)> {
+    if !is_focused {
+        return None;
+    }
+    editor.selection_flat_range().or({
+        let (a, b) = spec_sel;
+        if a >= 0 && b > a {
+            let len = editor.value().len();
+            Some(((a as usize).min(len), (b as usize).min(len)))
+        } else {
+            None
+        }
+    })
+}
+
+/// A single-line `Text`'s one row: what it says, where the caret is in it, and
+/// what a press on it means.
+pub struct SingleLine {
+    /// The rendered row, gutter prepended and block caret (if any) already on
+    /// it.
+    pub entry: TextPropertyEntry,
+    /// Byte offset of the caret within `entry.text`, gutter included; `None`
+    /// when the field is unfocused.
+    pub caret: Option<usize>,
+    /// What a press on the row means, present only for a keyed field: a
+    /// `focus` whose payload carries the value-layout breadcrumbs the click
+    /// handler needs to reposition the cursor to the clicked column
+    /// (`valueInnerStart` is where the value's `<inner>` region begins in
+    /// this row's text, after the gutter; the truncation fields translate a
+    /// click over a `…`-prefixed tail view back to a value byte). The
+    /// description attaches it to the whole row; an *unkeyed* field has
+    /// none, because with nothing to name it could not say what it focused.
+    pub event: Option<crate::widgets::WidgetEvent>,
+    /// The horizontal window `render_text_input` chose — the first painted
+    /// value char, to hand back on the next render.
+    pub scroll: u32,
+    /// Display column of the value's first char within `entry.text` —
+    /// after the gutter and the `label: [` — where a completion list
+    /// lines its candidates up ([`completion_lead`]).
+    pub value_col: u32,
+}
+
+/// Put `glyph` in the one-char cell at byte `at` of the field's row, moving
+/// the overlays and the caret after it by the difference in width.
+fn replace_cell(line: &mut SingleLine, at: usize, glyph: &str) {
+    let old = line.entry.text[at..]
+        .chars()
+        .next()
+        .map_or(0, char::len_utf8);
+    line.entry.text.replace_range(at..at + old, glyph);
+    let grow = glyph.len() as isize - old as isize;
+    let shift = |b: &mut usize| {
+        if *b > at {
+            *b = (*b as isize + grow) as usize;
+        }
+    };
+    for io in &mut line.entry.inline_overlays {
+        if io.unit == OffsetUnit::Byte {
+            shift(&mut io.start);
+            shift(&mut io.end);
+        }
+    }
+    if let Some(c) = &mut line.caret {
+        shift(c);
+    }
+}
+
+/// **Mark a combo field: `▼` in the last cell inside its `]`.**
+///
+/// A field that offers a list as well as free text says so before it is
+/// focused, the way a dropdown's `[value ▼]` does; `open` (its list is up)
+/// turns the arrow over, as the dropdown's does. The arrow takes the cell only
+/// while it is blank — the trailing pad the value cell always keeps — so a
+/// value long enough to reach it is never covered. The overlays and the caret
+/// after that cell move with the wider glyph. Returns the arrow's byte range,
+/// which the description gives a press of its own (`combo_toggle`).
+pub fn mark_combo(line: &mut SingleLine, open: bool) -> Option<(usize, usize)> {
+    let text = &line.entry.text;
+    let close = text.rfind(']')?;
+    let Some((at, ' ')) = text[..close].char_indices().last() else {
+        return None;
+    };
+    let glyph = if open { "▲" } else { "▼" };
+    replace_cell(line, at, glyph);
+    line.entry.inline_overlays.push(InlineOverlay {
+        start: at,
+        end: at + glyph.len(),
+        style: OverlayOptions {
+            fg: Some(OverlayColorSpec::theme_key(
+                crate::widgets::render::KEY_HELP_KEY_FG,
+            )),
+            ..Default::default()
+        },
+        properties: Default::default(),
+        unit: OffsetUnit::Byte,
+    });
+    Some((at, at + glyph.len()))
+}
+
+/// **The single-line field's row: label column, value cell, focus gutter,
+/// caret and press.**
+///
+/// Pulled out of the collector whole, because every one of the rules below is
+/// a rule about *this row* rather than about the immediate-mode walk that used
+/// to contain it, and the description needs each of them. Pure — no state
+/// written — which is what lets a description call it. See `view::shell::widgets`'s single-line `Text` arm.
+///
+/// `scroll` cannot be written back by a description: it is the horizontal
+/// window the *next* render starts from, and only the runtime's own pass owns
+/// that write. A described field therefore reads the offset the runtime last
+/// persisted, which is the same position the described `Dropdown` is in. 2.1
+/// is where that stops being two parties.
+#[allow(clippy::too_many_arguments)]
+pub fn single_line(
+    editor: &crate::primitives::text_edit::TextEdit,
+    prev_scroll: u32,
+    label: &str,
+    placeholder: Option<&str>,
+    field_width: u32,
+    max_visible_chars: u32,
+    full_width: bool,
+    block_caret: bool,
+    spec_sel: (i32, i32),
+    label_width: u32,
+    label_align: fresh_core::api::LabelAlign,
+    is_focused: bool,
+    key: Option<&str>,
+    marker_gutter: bool,
+    panel_width: u32,
+) -> SingleLine {
+    let value = editor.value();
+    let cursor = if is_focused {
+        editor.flat_cursor_byte() as i32
+    } else {
+        -1
+    };
+    // Form-column alignment: when `label_width > 0`, pad the label to
+    // the column and terminate it with `:` so the value cell's `[` lines
+    // up with the sibling Toggle/Number/Dropdown cells (which render
+    // `{label}: [..]`). `render_text_input` appends the ` ` + `[`, so the
+    // composed label carries only up to the colon. `label_width == 0`
+    // keeps the compact `{label} [..]` plugins get by default. This is
+    // computed before the field width so the value cell is sized against
+    // the *padded* label overhead (else the wider label overflows the
+    // control's right edge).
+    let composed_label;
+    let effective_label: &str = if label_width > 0 && !label.is_empty() {
+        let lw = form_label_width(
+            label_width,
+            focus_gutter_prefix(is_focused, marker_gutter).len(),
+            // Reserve the bracketed cell + a couple cells of value so the
+            // field opening stays on-screen on a narrow surface.
+            "[  ]".len(),
+            panel_width,
+        );
+        composed_label = format!("{}:", fit_label(label, lw, label_align));
+        &composed_label
+    } else {
+        label
+    };
+    let rendered = render_text_input(
+        &value,
+        cursor,
+        selection_of(editor, is_focused, spec_sel),
+        is_focused,
+        effective_label,
+        placeholder,
+        max_visible_chars,
+        effective_text_field_width(
+            full_width,
+            false,
+            effective_label,
+            panel_width,
+            field_width,
+            marker_gutter,
+        ),
+        full_width,
+        prev_scroll,
+    );
+    let mut entry = rendered.entry;
+    // Lead the single-line input with the focus-marker gutter
+    // (`▸ ` when focused, two spaces otherwise) so focus is
+    // legible from a plain capture — the hardware cursor lands
+    // inside the field too, but a cursor doesn't show up in
+    // `tmux capture-pane`. Shift the cursor offset and every
+    // inline overlay right by the gutter's byte length so the
+    // bracket bg / placeholder / selection spans still line up.
+    // The field width was already reduced by the gutter's two
+    // columns above, so the box doesn't overflow, and the gutter
+    // is present whether or not the field is focused so the
+    // layout never shifts.
+    let gutter = focus_gutter_prefix(is_focused, marker_gutter);
+    let marker_bytes = gutter.len();
+    let mut cursor_in_row = rendered.cursor_byte_in_entry;
+    if marker_bytes > 0 {
+        entry.text.insert_str(0, gutter);
+        for ov in entry.inline_overlays.iter_mut() {
+            ov.start += marker_bytes;
+            ov.end += marker_bytes;
+        }
+        cursor_in_row = cursor_in_row.map(|c| c + marker_bytes);
+        crate::widgets::render::hug_focus_marker(&mut entry.text);
+    }
+    if let Some(byte_in_row) = cursor_in_row {
+        // Modal surfaces paint the caret as a REVERSED cell in the
+        // row itself (no hardware cursor over a modal).
+        if block_caret {
+            push_block_caret_overlay(&mut entry, byte_in_row);
+        }
+    }
+    // A click anywhere on the input line focuses the field so a mouse user
+    // can type. Text widgets previously emitted no hit area, so clicks fell
+    // through and the field stayed unfocused (#2234 item 1). What focuses the
+    // field is `deliver_widget_hit`, which every frontend's press goes
+    // through — the described row's node, the web's index, the text
+    // projection's byte scan; the `focus` event keeps the plugin's focus
+    // mirror in step.
+    //
+    let event = key
+        .filter(|k| !k.is_empty())
+        .map(|k| crate::widgets::WidgetEvent {
+            row_target: false,
+            context_click: false,
+            drag_source: false,
+            widget_key: k.to_string(),
+            widget_kind: "text",
+            payload: json!({
+                "valueInnerStart": marker_bytes + rendered.inner_byte_start,
+                "valueDropped": rendered.value_dropped_bytes,
+                "ellipsisBytes": rendered.ellipsis_bytes,
+                "valueLen": rendered.value_len,
+            }),
+            event_type: "focus",
+            owner_key: None,
+        });
+    ensure_trailing_newline(&mut entry);
+    let value_col = crate::primitives::display_width::str_width(
+        &entry.text[..(marker_bytes + rendered.inner_byte_start).min(entry.text.len())],
+    ) as u32;
+    SingleLine {
+        entry,
+        caret: cursor_in_row,
+        event,
+        scroll: rendered.scroll_chars,
+        value_col,
+    }
+}
+
+/// Is this Text widget's completion popup showing?
+/// `(markdown, read_only)` for a Text spec. A `markdown` multi-line
+/// Text is forcibly read-only; a plain Text honours its `read_only`
+/// flag; a non-Text spec is `(false, false)`.
+pub fn mode(spec: &WidgetSpec) -> (bool, bool) {
+    let WidgetSpec::Text {
+        markdown,
+        read_only,
+        rows,
+        ..
+    } = spec
+    else {
+        return (false, false);
+    };
+    let md = *markdown && *rows > 1;
+    (md, md || *read_only)
+}
+
+/// Ensure `panel.instance_states[widget_key]` is a seeded
+/// `Text { editor, .. }`. If instance state already has the entry,
+/// no-op. If not, seeds from the spec's `value` / `cursor_byte` /
+/// `rows`. Returns true when the widget is a Text now present in
+/// instance state.
+///
+/// **The one seed a text field has.** Nothing writes a field's state on a
+/// render — the description resolves the spec against whatever is stored
+/// (`resolve`), and a walk that seeded would be a second authority. The
+/// first *handler* that has to hold state seeds it here: an edit, a caret
+/// move, or a plugin pushing completions onto a field nobody has typed in.
+pub fn ensure_text_state(
+    spec: &WidgetSpec,
+    widget_key: &str,
+    panel: &mut crate::widgets::WidgetPanelState,
+) -> bool {
+    if matches!(
+        panel.instance_states.get(widget_key),
+        Some(WidgetInstanceState::Text { .. })
+    ) {
+        return true;
+    }
+    let WidgetSpec::Text {
+        value,
+        cursor_byte,
+        rows,
+        ..
+    } = spec
+    else {
+        return false;
+    };
+    let mut editor = if *rows > 1 {
+        crate::primitives::text_edit::TextEdit::with_text(value)
+    } else {
+        crate::primitives::text_edit::TextEdit::single_line_with_text(value)
+    };
+    let seed = if *cursor_byte < 0 {
+        value.len()
+    } else {
+        (*cursor_byte as usize).min(value.len())
+    };
+    editor.set_cursor_from_flat(seed);
+    panel.instance_states.insert(
+        widget_key.to_string(),
+        WidgetInstanceState::Text {
+            editor,
+            scroll: 0,
+            completions: Vec::new(),
+            completion_selected_index: 0,
+            completion_scroll_offset: 0,
+            completion_navigated: false,
+        },
+    );
+    true
+}
+
+/// Apply a mutating operation to the widget's `TextEdit`. Handles
+/// seeding the editor from the spec on first touch, no-op detection
+/// (skips the change event), and queueing the `change` event with
+/// the post-state. Returns true when the op ran *and* produced a
+/// visible change. The single mutation path — the host's
+/// `with_focused_text_editor` shell and every key here go through
+/// it.
+pub fn apply_edit(
+    spec: &WidgetSpec,
+    widget_key: &str,
+    panel: &mut crate::widgets::WidgetPanelState,
+    fx: &mut super::KeyFx,
+    op: impl FnOnce(&mut crate::primitives::text_edit::TextEdit),
+) -> bool {
+    if !ensure_text_state(spec, widget_key, panel) {
+        return false;
+    }
+    let Some(WidgetInstanceState::Text { editor, .. }) = panel.instance_states.get_mut(widget_key)
+    else {
+        return false;
+    };
+    let (before_value, before_cursor) = (editor.value(), editor.flat_cursor_byte());
+    op(editor);
+    let (after_value, after_cursor) = (editor.value(), editor.flat_cursor_byte());
+    if after_value == before_value && after_cursor == before_cursor {
+        return false;
+    }
+    fx.events.push((
+        "change".into(),
+        json!({ "value": after_value, "cursorByte": after_cursor as i64, }),
+    ));
+    true
+}
+
+/// The widget's current selection, if its editor holds one.
+pub fn selected_text(widget_key: &str, panel: &crate::widgets::WidgetPanelState) -> Option<String> {
+    match panel.instance_states.get(widget_key) {
+        Some(WidgetInstanceState::Text { editor, .. }) => editor.selected_text(),
+        _ => None,
+    }
+}
+
+/// Insert printable / IME-committed text at the cursor (replacing
+/// any active selection). Read-only and markdown fields accept no
+/// insertion. `TextEdit::insert_str` strips embedded newlines when
+/// the editor is single-line.
+pub fn insert_str_edit(
+    spec: &WidgetSpec,
+    widget_key: &str,
+    panel: &mut crate::widgets::WidgetPanelState,
+    text: &str,
+    fx: &mut super::KeyFx,
+) {
+    if text.is_empty() || mode(spec).1 {
+        return;
+    }
+    apply_edit(spec, widget_key, panel, fx, |editor| {
+        editor.insert_str(text);
+    });
+}
+
+/// Apply a non-printable editing key. Every caret-motion / mutation
+/// key routes through the shared
+/// [`apply_text_key`](crate::primitives::text_key::apply_text_key)
+/// table — the single source of truth the Settings input handler
+/// also uses, so the two surfaces can't drift. `Enter` = newline is
+/// the one widget-multiline affordance the shared table deliberately
+/// leaves as chrome (it means "commit" on other surfaces), so it's
+/// handled here: a markdown document has no newline to insert —
+/// Enter is its activate gesture (the tour jumps to the step's
+/// code).
+pub fn text_key(
+    spec: &WidgetSpec,
+    widget_key: &str,
+    panel: &mut crate::widgets::WidgetPanelState,
+    key: crate::keys::Key,
+    fx: &mut super::KeyFx,
+) {
+    let (is_markdown, is_read_only) = mode(spec);
+    if key.code() == crossterm::event::KeyCode::Enter {
+        if is_markdown {
+            fx.events.push(("activate".into(), json!({})));
+            return;
+        }
+        if is_read_only {
+            return;
+        }
+        apply_edit(spec, widget_key, panel, fx, |editor| {
+            editor.insert_char('\n');
+        });
+        return;
+    }
+    let event = key.to_key_event();
+    if is_read_only && key_mutates(&event) {
+        return;
+    }
+    apply_edit(spec, widget_key, panel, fx, |editor| {
+        crate::primitives::text_key::apply_text_key(
+            editor,
+            &event,
+            crate::primitives::text_key::TextKeyContext::multiline(true),
+        );
+    });
+}
+
+/// Whether routing `event` through `apply_text_key` would mutate the
+/// surface. Everything else in the table is caret motion / selection.
+fn key_mutates(event: &crossterm::event::KeyEvent) -> bool {
+    use crossterm::event::KeyCode;
+    matches!(
+        event.code,
+        KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete
+    )
+}
+
+pub fn completions_open(widget_key: &str, panel: &crate::widgets::WidgetPanelState) -> bool {
+    matches!(
+        panel.instance_states.get(widget_key),
+        Some(WidgetInstanceState::Text { completions, .. }) if !completions.is_empty()
+    )
+}
+
+/// Has the user explicitly stepped into the popup (↑/↓ / wheel)? Only
+/// a *navigated* popup accepts on Enter/Tab — a freshly surfaced one
+/// lets the key act on the form instead.
+fn completion_navigated(widget_key: &str, panel: &crate::widgets::WidgetPanelState) -> bool {
+    matches!(
+        panel.instance_states.get(widget_key),
+        Some(WidgetInstanceState::Text {
+            completions,
+            completion_navigated,
+            ..
+        }) if !completions.is_empty() && *completion_navigated
+    )
+}
+
+/// Move the suggestion list's highlight — the shared pop-up list's
+/// arithmetic ([`super::popup_list::step`]). The first move *enters* the
+/// list: it highlights the current (top) row without moving. The window that
+/// shows the highlight is not kept here: the description computes it from the
+/// highlight on every layout (`completion_popup`, `popup_list::window`).
+fn move_completion_index(
+    spec: &WidgetSpec,
+    widget_key: &str,
+    panel: &mut crate::widgets::WidgetPanelState,
+    nav: super::popup_list::Nav,
+) {
+    let page = match spec {
+        WidgetSpec::Text {
+            completions_visible_rows,
+            ..
+        } if *completions_visible_rows > 0 => *completions_visible_rows as usize,
+        _ => 5,
+    };
+    if let Some(WidgetInstanceState::Text {
+        completions,
+        completion_selected_index,
+        completion_navigated,
+        ..
+    }) = panel.instance_states.get_mut(widget_key)
+    {
+        if completions.is_empty() {
+            return;
+        }
+        if !*completion_navigated {
+            *completion_navigated = true;
+            return;
+        }
+        *completion_selected_index =
+            super::popup_list::step(completions.len(), *completion_selected_index, nav, page);
+    }
+}
+
+/// Accept the highlighted suggestion: it becomes the field's value with the
+/// caret at its end, the list closes, and the plugin hears `change` (the new
+/// value — what every other edit reports) and then `completion_accept`. A
+/// plugin that wants the list back — a path that descends into a folder —
+/// pushes new suggestions from the `change`; there is nothing to copy back.
+fn accept_completion(
+    spec: &WidgetSpec,
+    widget_key: &str,
+    panel: &mut crate::widgets::WidgetPanelState,
+    fx: &mut super::KeyFx,
+) {
+    let Some(value) = selected_completion_value(widget_key, panel) else {
+        return;
+    };
+    apply_edit(spec, widget_key, panel, fx, |editor| {
+        editor.set_value(&value);
+        editor.move_end();
+    });
+    if let Some(WidgetInstanceState::Text {
+        completions,
+        completion_selected_index,
+        completion_navigated,
+        ..
+    }) = panel.instance_states.get_mut(widget_key)
+    {
+        completions.clear();
+        *completion_selected_index = 0;
+        *completion_navigated = false;
+    }
+    fx.events.push((
+        "completion_accept".into(),
+        serde_json::json!({ "value": value }),
+    ));
+}
+
+/// Close the suggestion list from outside the kind — a press that landed
+/// elsewhere (the pop-up's dismissal rule, the same as a dropdown's). Queues
+/// `completion_dismiss` like Esc does. Returns whether a list was up.
+pub fn dismiss_completion_list(
+    widget_key: &str,
+    panel: &mut crate::widgets::WidgetPanelState,
+    fx: &mut super::KeyFx,
+) -> bool {
+    let open = completions_open(widget_key, panel);
+    dismiss_completions(widget_key, panel, fx);
+    open
+}
+
+/// Whether `spec` is a combo box: a single-line field that offers a list.
+fn is_combo(spec: &WidgetSpec) -> bool {
+    matches!(spec, WidgetSpec::Text { combo: true, rows, .. } if *rows <= 1)
+}
+
+/// Ask the plugin for a combo box's list: `completion_request`, answered with
+/// `setCompletions`. The host has no candidates of its own to show.
+fn request_completions(fx: &mut super::KeyFx) {
+    fx.events
+        .push(("completion_request".into(), serde_json::json!({})));
+}
+
+/// Close the popup and queue `completion_dismiss` so the plugin can
+/// sync its own state (e.g. invalidate an in-flight fetch token, so a
+/// late-arriving result doesn't re-open the popup the user closed).
+fn dismiss_completions(
+    widget_key: &str,
+    panel: &mut crate::widgets::WidgetPanelState,
+    fx: &mut super::KeyFx,
+) {
+    if let Some(WidgetInstanceState::Text {
+        completions,
+        completion_selected_index,
+        ..
+    }) = panel.instance_states.get_mut(widget_key)
+    {
+        if completions.is_empty() {
+            return;
+        }
+        completions.clear();
+        *completion_selected_index = 0;
+        fx.events
+            .push(("completion_dismiss".into(), serde_json::json!({})));
+    }
+}
+
+/// The currently-highlighted candidate's value, if any.
+fn selected_completion_value(
+    widget_key: &str,
+    panel: &crate::widgets::WidgetPanelState,
+) -> Option<String> {
+    match panel.instance_states.get(widget_key) {
+        Some(WidgetInstanceState::Text {
+            completions,
+            completion_selected_index,
+            ..
+        }) if !completions.is_empty() => {
+            let idx = (*completion_selected_index).min(completions.len() - 1);
+            Some(completions[idx].value.clone())
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod markdown_document_tests {
+    use super::*;
+
+    /// **The indent comes back as spaces.** `parse_markdown` writes NBSP so the
+    /// markdown parser does not read an indented line as a code block; a run
+    /// handed to `fresh-ui` must break and indent on `' '`, which is the one
+    /// thing NBSP exists to prevent.
+    #[test]
+    fn a_lines_leading_nbsp_is_normalised_and_one_inside_it_is_not() {
+        let mut line = crate::markdown::StyledLine::new();
+        line.push(
+            "\u{00A0}\u{00A0}• ".into(),
+            ratatui::style::Style::default(),
+        );
+        line.push(
+            "an item\u{00A0}kept whole".into(),
+            ratatui::style::Style::default(),
+        );
+        let text = document_text_of(&[line]);
+        assert_eq!(
+            text, "  • an item\u{00A0}kept whole",
+            "leading NBSP is indentation; one inside the line is the author's"
+        );
+    }
+
+    /// The overlays index the text they were built beside — the property
+    /// `entry_runs` slices on, and the one the normalisation above could break
+    /// by changing byte lengths as it goes.
+    #[test]
+    fn every_overlay_indexes_the_text_it_was_built_with() {
+        let mut line = crate::markdown::StyledLine::new();
+        line.push("\u{00A0}\u{00A0}".into(), ratatui::style::Style::default());
+        line.push(
+            "bold".into(),
+            ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::BOLD),
+        );
+        let e = entry_of(&[line]);
+        assert_eq!(e.text, "  bold");
+        let o = e
+            .inline_overlays
+            .iter()
+            .find(|o| o.style.bold)
+            .expect("the bold span");
+        assert_eq!(&e.text[o.start..o.end], "bold");
+    }
+
+    /// `markdown_document` with the lines already parsed — the half these tests
+    /// are about, without a theme to build.
+    fn entry_of(lines: &[crate::markdown::StyledLine]) -> TextPropertyEntry {
+        markdown_entry_from_lines(lines)
+    }
+
+    fn document_text_of(lines: &[crate::markdown::StyledLine]) -> String {
+        entry_of(lines).text
+    }
+}
+
+/// **What a focused `Text` does with a key** — the contract the panel's
+/// dispatch relies on now that the control answers before the panel's
+/// bindings: a key the field acts on is `Consumed`, and one it would only
+/// ignore is `Pass`, so it can mean something to the dialog.
+#[cfg(test)]
+mod key_contract_tests {
+    use super::super::{behavior, KeyDisposition, KeyFx};
+    use crate::widgets::WidgetPanelState;
+    use fresh_core::api::WidgetSpec;
+
+    fn field(rows: u32, read_only: bool, markdown: bool) -> WidgetSpec {
+        WidgetSpec::Text {
+            sel_start: -1,
+            sel_end: -1,
+            block_caret: false,
+            label_width: 0,
+            value: "abc".into(),
+            cursor_byte: 3,
+            focused: true,
+            label: String::new(),
+            placeholder: None,
+            rows,
+            field_width: 20,
+            max_visible_chars: 0,
+            full_width: false,
+            completions: Vec::new(),
+            completions_visible_rows: 0,
+            min_rows: 0,
+            max_rows: 0,
+            read_only,
+            markdown,
+            combo: false,
+            key: Some("t".into()),
+        }
+    }
+
+    fn key(spec: &WidgetSpec, panel: &mut WidgetPanelState, k: &str) -> KeyDisposition {
+        let mut fx = KeyFx::default();
+        let seq: crate::keys::KeySeq = k.parse().expect("test key name parses");
+        behavior(spec).on_key(spec, "t", panel, Default::default(), &seq, &mut fx)
+    }
+
+    #[test]
+    fn an_editable_field_takes_its_editing_keys() {
+        let spec = field(1, false, false);
+        let mut panel = WidgetPanelState::surface(spec.clone());
+        for k in ["Space", "Backspace", "Delete", "Left", "Home", "C-z"] {
+            assert_eq!(key(&spec, &mut panel, k), KeyDisposition::Consumed, "{k}");
+        }
+    }
+
+    #[test]
+    fn a_single_line_field_leaves_enter_and_the_vertical_arrows_to_the_dialog() {
+        let spec = field(1, false, false);
+        let mut panel = WidgetPanelState::surface(spec.clone());
+        for k in ["Enter", "Up", "Down", "Esc", "Tab"] {
+            assert_eq!(key(&spec, &mut panel, k), KeyDisposition::Pass, "{k}");
+        }
+    }
+
+    #[test]
+    fn a_growing_text_area_is_as_tall_as_its_text_within_its_bounds() {
+        use super::text_area_height;
+        // Fixed: the plugin's rows, whatever the text.
+        assert_eq!(text_area_height(4, 0, 0, 40), 4);
+        // Growing: between min and max.
+        assert_eq!(text_area_height(3, 0, 10, 1), 3, "never below rows");
+        assert_eq!(text_area_height(3, 0, 10, 6), 6);
+        assert_eq!(text_area_height(3, 0, 10, 40), 10, "scrolls past max");
+        assert_eq!(text_area_height(3, 2, 10, 1), 2, "min_rows wins over rows");
+    }
+
+    #[test]
+    fn a_text_area_takes_enter_and_the_arrows() {
+        let spec = field(4, false, false);
+        let mut panel = WidgetPanelState::surface(spec.clone());
+        for k in ["Enter", "Up", "Down", "PageDown"] {
+            assert_eq!(key(&spec, &mut panel, k), KeyDisposition::Consumed, "{k}");
+        }
+    }
+
+    fn with_suggestions(spec: &WidgetSpec, items: &[&str]) -> WidgetPanelState {
+        let mut panel = WidgetPanelState::surface(spec.clone());
+        panel.focus_key = "t".into();
+        assert!(super::ensure_text_state(spec, "t", &mut panel));
+        if let Some(crate::widgets::WidgetInstanceState::Text { completions, .. }) =
+            panel.instance_states.get_mut("t")
+        {
+            *completions = items
+                .iter()
+                .map(|v| fresh_core::api::CompletionItem {
+                    value: (*v).to_string(),
+                    kind: None,
+                })
+                .collect();
+        }
+        panel
+    }
+
+    fn key_fx(spec: &WidgetSpec, panel: &mut WidgetPanelState, k: &str) -> (KeyDisposition, KeyFx) {
+        let mut fx = KeyFx::default();
+        let seq: crate::keys::KeySeq = k.parse().expect("test key name parses");
+        let d = behavior(spec).on_key(spec, "t", panel, Default::default(), &seq, &mut fx);
+        (d, fx)
+    }
+
+    fn value_of(panel: &WidgetPanelState) -> String {
+        match panel.instance_states.get("t") {
+            Some(crate::widgets::WidgetInstanceState::Text { editor, .. }) => editor.value(),
+            _ => String::new(),
+        }
+    }
+
+    /// The combo box: ↓ steps into the list, and Enter (or Tab) on the
+    /// highlighted row puts it in the field, closes the list and reports
+    /// both `change` and `completion_accept`.
+    #[test]
+    fn enter_on_a_highlighted_suggestion_accepts_it_host_side() {
+        let spec = field(1, false, false);
+        let mut panel = with_suggestions(&spec, &["alpha", "beta"]);
+        assert_eq!(
+            key_fx(&spec, &mut panel, "Down").0,
+            KeyDisposition::Consumed
+        );
+        assert_eq!(
+            key_fx(&spec, &mut panel, "Down").0,
+            KeyDisposition::Consumed
+        );
+        let (d, fx) = key_fx(&spec, &mut panel, "Enter");
+        assert_eq!(d, KeyDisposition::Consumed);
+        assert_eq!(value_of(&panel), "beta");
+        assert!(!super::completions_open("t", &panel), "the list closed");
+        let kinds: Vec<&str> = fx.events.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(kinds, vec!["change", "completion_accept"]);
+    }
+
+    #[test]
+    fn tab_accepts_a_highlighted_suggestion_too() {
+        let spec = field(1, false, false);
+        let mut panel = with_suggestions(&spec, &["alpha", "beta"]);
+        key_fx(&spec, &mut panel, "Down");
+        let (d, _) = key_fx(&spec, &mut panel, "Tab");
+        assert_eq!(d, KeyDisposition::Consumed);
+        assert_eq!(value_of(&panel), "alpha");
+    }
+
+    /// With nothing highlighted the list does not swallow the key: it closes
+    /// and the key goes on to the dialog (Enter) or the ring (Tab).
+    #[test]
+    fn enter_with_nothing_highlighted_closes_the_list_and_passes_on() {
+        let spec = field(1, false, false);
+        let mut panel = with_suggestions(&spec, &["alpha"]);
+        let (d, _) = key_fx(&spec, &mut panel, "Enter");
+        assert_eq!(d, KeyDisposition::PassAfter);
+        assert!(!super::completions_open("t", &panel));
+        assert_eq!(value_of(&panel), "abc", "the typed text stands");
+    }
+
+    #[test]
+    fn escape_closes_the_list_first_and_only_then_passes() {
+        let spec = field(1, false, false);
+        let mut panel = with_suggestions(&spec, &["alpha"]);
+        assert_eq!(key_fx(&spec, &mut panel, "Esc").0, KeyDisposition::Consumed);
+        assert_eq!(key_fx(&spec, &mut panel, "Esc").0, KeyDisposition::Pass);
+    }
+
+    #[test]
+    fn a_read_only_field_passes_the_keys_it_could_only_ignore() {
+        for spec in [field(4, true, false), field(4, false, true)] {
+            let mut panel = WidgetPanelState::surface(spec.clone());
+            for k in ["Space", "Backspace", "Delete", "C-z", "C-y"] {
+                assert_eq!(key(&spec, &mut panel, k), KeyDisposition::Pass, "{k}");
+            }
+            // Reading still moves: the caret keys are the reader's.
+            assert_eq!(key(&spec, &mut panel, "Down"), KeyDisposition::Consumed);
+        }
+        let plain = field(4, true, false);
+        let mut panel = WidgetPanelState::surface(plain.clone());
+        assert_eq!(key(&plain, &mut panel, "Enter"), KeyDisposition::Pass);
+        // A markdown document's Enter follows its link: it acts, so it takes it.
+        let md = field(4, false, true);
+        let mut panel = WidgetPanelState::surface(md.clone());
+        assert_eq!(key(&md, &mut panel, "Enter"), KeyDisposition::Consumed);
+    }
+}

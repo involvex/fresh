@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Context in which a keybinding is active
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, crate::TS)]
 #[ts(export)]
 pub enum KeyContext {
     /// Global bindings that work in all contexts (checked first with highest priority)
@@ -66,7 +66,7 @@ impl KeyContext {
 }
 
 /// High-level actions that can be performed in the editor
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, crate::TS)]
 #[ts(export)]
 pub enum Action {
     // Character input
@@ -171,6 +171,8 @@ pub enum Action {
 
     // Smart editing
     SmartHome,
+    /// `SmartHome` extending the selection instead of moving the cursor.
+    SelectSmartHome,
     DedentSelection,
     ToggleComment,
     /// Cycle through dabbrev completions (Emacs Alt+/ style).

@@ -2,6 +2,7 @@ use crate::common::git_test_helper::GitTestRepo;
 use crate::common::harness::EditorTestHarness;
 use crossterm::event::{KeyCode, KeyModifiers};
 use fresh::config::Config;
+use fresh_editor_core::model::host_path::PathStyle;
 use std::fs;
 
 /// Test file explorer toggle
@@ -819,7 +820,7 @@ fn test_file_explorer_focus_after_delete() {
     harness.wait_for_file_explorer_item("file1.txt").unwrap();
 
     // Verify we're in file explorer context
-    let key_context_before = harness.editor().get_key_context();
+    let key_context_before = harness.editor_mut().get_key_context();
     println!("Key context before deletion: {:?}", key_context_before);
     assert!(
         matches!(
@@ -850,11 +851,8 @@ fn test_file_explorer_focus_after_delete() {
         screen_prompt
     );
 
-    // Confirm deletion with 'y'
-    harness.type_text("y").unwrap();
-    harness
-        .send_key(KeyCode::Enter, KeyModifiers::NONE)
-        .unwrap();
+    // Confirm deletion with the Delete button's letter
+    harness.type_text("d").unwrap();
     harness.sleep(std::time::Duration::from_millis(100));
     harness.render().unwrap();
 
@@ -862,7 +860,7 @@ fn test_file_explorer_focus_after_delete() {
     println!("Screen after deletion:\n{}", screen_after);
 
     // Check that focus is back to file explorer
-    let key_context_after = harness.editor().get_key_context();
+    let key_context_after = harness.editor_mut().get_key_context();
     println!("Key context after deletion: {:?}", key_context_after);
 
     // The critical assertion: focus should be on file explorer after deletion
@@ -1260,6 +1258,13 @@ fn test_scroll_allows_cursor_to_top() {
             .lines()
             .any(|line| line.starts_with('│') && line.contains("project_root")),
         "the project root should remain pinned while its children scroll"
+    );
+    // The pinned root is shaded as the band, but it is not the selection:
+    // the highlight helper must not read it as one.
+    let highlighted = explorer_highlighted_rows(&harness);
+    assert!(
+        !highlighted.iter().any(|row| row.contains("project_root")),
+        "the pinned band is not the selection, got {highlighted:?}\n{screen_at_bottom}"
     );
 
     // Now we're at the bottom and the view has scrolled down.
@@ -1796,7 +1801,7 @@ fn test_click_empty_explorer_area_then_editor_allows_typing() {
     harness.render().unwrap();
 
     // Check key_context after file explorer click
-    let key_context_after_explorer = harness.editor().get_key_context();
+    let key_context_after_explorer = harness.editor_mut().get_key_context();
     println!(
         "Key context after explorer click: {:?}",
         key_context_after_explorer
@@ -1812,7 +1817,7 @@ fn test_click_empty_explorer_area_then_editor_allows_typing() {
     harness.render().unwrap();
 
     // Check key_context after editor click
-    let key_context_after_editor = harness.editor().get_key_context();
+    let key_context_after_editor = harness.editor_mut().get_key_context();
     println!(
         "Key context after editor click: {:?}",
         key_context_after_editor
@@ -2246,7 +2251,7 @@ fn test_file_explorer_new_file_opens_rename_prompt_and_buffer() {
     );
 
     // Verify 2: Focus should be on the editor (Normal key context), not file explorer
-    let key_context = harness.editor().get_key_context();
+    let key_context = harness.editor_mut().get_key_context();
     assert!(
         matches!(key_context, fresh::input::keybindings::KeyContext::Normal),
         "Focus should be on editor (Normal context) after rename. Got: {:?}",
@@ -2281,6 +2286,195 @@ fn test_file_explorer_new_file_opens_rename_prompt_and_buffer() {
         untitled_files.is_empty(),
         "The old generated filename should not exist on disk. Found: {:?}",
         untitled_files
+    );
+}
+
+/// A slash in a newly-created file name is a relative path: Fresh creates
+/// any missing parent directories, moves the temporary file into place, and
+/// keeps the resulting file open in the editor.
+#[test]
+fn test_file_explorer_new_file_creates_missing_parent_directories() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 40).unwrap();
+    // Canonicalize: the editor stores the resolved path, so on platforms that
+    // reach the temp dir through a symlink (macOS) or spell it differently
+    // (Windows verbatim prefixes) the raw handout compares unequal.
+    let project_root = harness.project_dir().unwrap().canonicalize().unwrap();
+
+    harness.editor_mut().focus_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+    harness
+        .send_key(KeyCode::Char('n'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.wait_for_prompt().unwrap();
+
+    harness.type_text("src/components/app.rs").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.wait_for_prompt_closed().unwrap();
+    harness.render().unwrap();
+
+    // Chained join: a single "src/components/app.rs" only compares equal on
+    // Windows because PathBuf::push rewrites separators under a verbatim
+    // prefix, which is exactly the platform assumption to avoid baking in.
+    let created_path = project_root.join("src").join("components").join("app.rs");
+    assert!(created_path.is_file(), "nested file should be created");
+    assert!(
+        project_root.join("src").join("components").is_dir(),
+        "missing parent directories should be created"
+    );
+
+    // Semantic sync: wait for the new name to surface on screen at all.
+    harness.wait_for_screen_contains("app.rs").unwrap();
+
+    // Type, then save. The text can only reach this path through the buffer
+    // the rename left open, and only if focus followed it out of the
+    // explorer -- the two invariants this test used to read out of the
+    // editor's model. Asserting on the screen alone would not do: had focus
+    // stayed behind, the same characters would render in the explorer's
+    // search box.
+    harness.type_text("fn main() {}").unwrap();
+    harness
+        .send_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
+        .unwrap();
+    let saved_path = created_path.clone();
+    harness
+        .wait_until(move |_| {
+            std::fs::read_to_string(&saved_path)
+                .map(|contents| contents.contains("fn main() {}"))
+                .unwrap_or(false)
+        })
+        .unwrap();
+
+    let untitled_files: Vec<_> = std::fs::read_dir(&project_root)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("untitled_"))
+        .collect();
+    assert!(
+        untitled_files.is_empty(),
+        "the temporary file should be moved, not copied"
+    );
+}
+
+#[test]
+fn test_file_explorer_new_file_cannot_escape_project_directory() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 40).unwrap();
+    let project_root = harness.project_dir().unwrap();
+    let escaped_path = project_root.parent().unwrap().join("escaped.rs");
+
+    harness.editor_mut().focus_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+    harness
+        .send_key(KeyCode::Char('n'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.wait_for_prompt().unwrap();
+    harness.type_text("../escaped.rs").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.wait_for_prompt_closed().unwrap();
+    harness.render().unwrap();
+
+    assert!(
+        !escaped_path.exists(),
+        "a relative creation path must not escape the project"
+    );
+}
+
+/// The explorer lists a directory that symlinks out of the project, and
+/// Ctrl+N inside it creates the temporary item there. Naming that item with
+/// a plain name has to work too, otherwise the user is left holding an
+/// `untitled_*` file that the containment check will not let them rename.
+#[cfg(unix)]
+#[test]
+fn test_file_explorer_new_file_flat_name_in_symlinked_directory() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 40).unwrap();
+    let project_root = harness.project_dir().unwrap();
+    let outside = project_root.parent().unwrap().join("outside");
+    fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, project_root.join("linked_out")).unwrap();
+
+    harness.editor_mut().focus_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+    harness.wait_for_screen_contains("linked_out").unwrap();
+
+    // Directories sort first and the root has no other children, so one Down
+    // from the root lands on `linked_out/`.
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness
+        .send_key(KeyCode::Char('n'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.wait_for_prompt().unwrap();
+
+    harness.type_text("notes.md").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.wait_for_prompt_closed().unwrap();
+    harness.render().unwrap();
+
+    assert!(
+        outside.join("notes.md").is_file(),
+        "a plain name must be accepted in a directory the explorer itself lists"
+    );
+    let leftover: Vec<_> = fs::read_dir(&outside)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("untitled_"))
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "the temporary item should have been renamed, not left behind: {:?}",
+        leftover
+    );
+}
+
+/// A new item's name may be a relative path, so it can address a file that
+/// already exists. `rename` would replace it without asking, and the contents
+/// of an unrelated file would be gone with no way back, so the collision is
+/// refused — before anything is written, which leaves nothing behind either.
+#[test]
+fn test_file_explorer_new_file_does_not_overwrite_existing_file() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 40).unwrap();
+    let project_root = harness.project_dir().unwrap();
+
+    let existing = project_root.join("src").join("main.rs");
+    fs::create_dir_all(existing.parent().unwrap()).unwrap();
+    fs::write(&existing, "fn main() { println!(\"keep me\"); }\n").unwrap();
+
+    harness.editor_mut().focus_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+    harness
+        .send_key(KeyCode::Char('n'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.wait_for_prompt().unwrap();
+
+    harness.type_text("src/main.rs").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.wait_for_prompt_closed().unwrap();
+    harness.render().unwrap();
+
+    assert_eq!(
+        fs::read_to_string(&existing).unwrap(),
+        "fn main() { println!(\"keep me\"); }\n",
+        "an existing file must survive a colliding new-item name"
+    );
+
+    // And nothing was created: the refusal happens before anything is written,
+    // so there is no placeholder to clean up or rename again.
+    let created: Vec<_> = fs::read_dir(&project_root)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name != "src")
+        .collect();
+    assert!(
+        created.is_empty(),
+        "a refused name should leave nothing behind: {:?}",
+        created
     );
 }
 
@@ -2319,7 +2513,7 @@ fn test_file_explorer_rename_existing_file_keeps_focus() {
     harness.render().unwrap();
 
     // Verify we're in FileExplorer context
-    let key_context_before = harness.editor().get_key_context();
+    let key_context_before = harness.editor_mut().get_key_context();
     assert!(
         matches!(
             key_context_before,
@@ -2370,7 +2564,7 @@ fn test_file_explorer_rename_existing_file_keeps_focus() {
     );
 
     // Verify 2: Focus should STILL be on file explorer (not switched to editor)
-    let key_context_after = harness.editor().get_key_context();
+    let key_context_after = harness.editor_mut().get_key_context();
     assert!(
         matches!(
             key_context_after,
@@ -2775,7 +2969,7 @@ fn test_file_explorer_escape_clears_search() {
     // Verify we're in file explorer context
     assert!(
         matches!(
-            harness.editor().get_key_context(),
+            harness.editor_mut().get_key_context(),
             fresh::input::keybindings::KeyContext::FileExplorer
         ),
         "Should be in FileExplorer context"
@@ -2808,7 +3002,7 @@ fn test_file_explorer_escape_clears_search() {
     // Should still be in file explorer context
     assert!(
         matches!(
-            harness.editor().get_key_context(),
+            harness.editor_mut().get_key_context(),
             fresh::input::keybindings::KeyContext::FileExplorer
         ),
         "Should still be in FileExplorer context after Escape"
@@ -2823,7 +3017,7 @@ fn test_file_explorer_escape_clears_search() {
 
     assert!(
         matches!(
-            harness.editor().get_key_context(),
+            harness.editor_mut().get_key_context(),
             fresh::input::keybindings::KeyContext::Normal
         ),
         "Should exit FileExplorer context on second Escape (no search to clear)"
@@ -3609,6 +3803,60 @@ fn test_file_explorer_side_right() {
     );
 }
 
+/// With the explorer on the right, the resize grip sits on its LEFT wall —
+/// the one facing the editor — and dragging it left widens the column.
+#[test]
+fn test_file_explorer_side_right_border_drag_resizes() {
+    use fresh::config::{Config, ExplorerWidth, FileExplorerSide};
+
+    let mut config = Config::default();
+    config.file_explorer.side = FileExplorerSide::Right;
+    config.file_explorer.width = ExplorerWidth::Columns(30);
+
+    let mut harness = EditorTestHarness::with_temp_project_and_config(120, 40, config).unwrap();
+    let project_root = harness.project_dir().unwrap();
+    fs::write(project_root.join("test.txt"), "test").unwrap();
+
+    harness.editor_mut().focus_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+    harness.render().unwrap();
+
+    let right_col = find_explorer_border_col(&harness);
+    assert_eq!(
+        right_col, 119,
+        "explorer should be flush with the right edge"
+    );
+    let left_col = right_col - 29;
+    assert_eq!(
+        harness.get_row_text(15).chars().nth(left_col as usize),
+        Some('│'),
+        "expected the explorer's left wall at col {}.\nScreen:\n{}",
+        left_col,
+        harness.screen_to_string()
+    );
+
+    // Dragging the outer (terminal-edge) wall must do nothing.
+    harness
+        .mouse_drag(right_col, 15, right_col - 10, 15)
+        .unwrap();
+    assert_eq!(
+        harness.editor().active_window().file_explorer_width,
+        ExplorerWidth::Columns(30),
+        "the outer wall is not a grip.\nScreen:\n{}",
+        harness.screen_to_string()
+    );
+
+    // Dragging the inner wall toward the editor widens the column.
+    harness.mouse_drag(left_col, 15, left_col - 10, 15).unwrap();
+    assert_eq!(
+        harness.editor().active_window().file_explorer_width,
+        ExplorerWidth::Columns(40),
+        "dragging the inner wall left should widen the explorer.\nScreen:\n{}",
+        harness.screen_to_string()
+    );
+    assert_eq!(find_explorer_border_col(&harness), 119);
+}
+
 /// Test that workspace serialization correctly persists file explorer side
 #[test]
 fn test_file_explorer_side_workspace_serialization() {
@@ -3779,7 +4027,10 @@ fn test_file_explorer_copy_full_path() {
         .map(|e| e.path.clone())
         .expect("explorer must have a selected entry after Down");
     assert_eq!(
-        selected_path.file_name().and_then(|n| n.to_str()),
+        selected_path
+            .under(PathStyle::host())
+            .file_name()
+            .and_then(|n| n.to_str()),
         Some("alpha.txt"),
         "Down from the auto-expanded root should land on alpha.txt; got {:?}",
         selected_path
@@ -3791,10 +4042,18 @@ fn test_file_explorer_copy_full_path() {
     harness.editor_mut().file_explorer_copy_path(false);
 
     let copied = harness.editor().clipboard_content_for_test();
+    // Tree nodes hold canonicalized paths, which on Windows carry the
+    // verbatim `\\?\` prefix; the clipboard gets the plain form (#3296).
+    // Elsewhere stripping is a no-op, so this is an exact comparison.
+    let expected = fresh::primitives::path_utils::strip_verbatim_prefix(selected_path.as_path());
     assert_eq!(
         copied,
-        selected_path.to_string_lossy(),
+        expected.to_string_lossy(),
         "Copy Full Path must put the selected node's absolute path on the clipboard"
+    );
+    assert!(
+        !copied.starts_with(r"\\?\"),
+        "Copy Full Path must not leak the Windows verbatim prefix; got {copied:?}"
     );
 }
 
@@ -3828,7 +4087,10 @@ fn test_file_explorer_copy_relative_path() {
         .map(|e| e.path.clone())
         .expect("explorer must have a selected entry");
     assert_eq!(
-        selected_path.file_name().and_then(|n| n.to_str()),
+        selected_path
+            .under(PathStyle::host())
+            .file_name()
+            .and_then(|n| n.to_str()),
         Some("main.rs"),
         "selection should be on main.rs after Down, Right, Down; got {:?}",
         selected_path
@@ -3842,8 +4104,11 @@ fn test_file_explorer_copy_relative_path() {
     // does — strip the working_dir prefix from the actual selected-node path.
     // `working_dir` and `selected_path` come from the same source (the
     // editor's own state), so the prefix-strip must succeed and the result
-    // is independent of any tempdir-symlink quirks.
-    let working_dir = harness.editor().working_dir().to_path_buf();
+    // is independent of any tempdir-symlink quirks. Both sides drop the
+    // Windows verbatim prefix first, as the copy does (#3296).
+    use fresh::primitives::path_utils::strip_verbatim_prefix;
+    let working_dir = strip_verbatim_prefix(harness.editor().working_dir()).into_owned();
+    let selected_path = strip_verbatim_prefix(selected_path.as_path()).into_owned();
     let expected = selected_path
         .strip_prefix(&working_dir)
         .expect("selected path must live under working_dir");
@@ -3959,88 +4224,6 @@ fn test_file_explorer_duplicate_refreshes_git_decorations() {
         .unwrap();
 }
 
-/// Test that with `file_explorer.follow_active_buffer = true`, switching tabs
-/// re-syncs the file explorer to the newly active buffer's path — moving the
-/// sidebar's *selection highlight* onto that file's row.
-///
-/// The highlight, rather than mere presence in the tree, is what this
-/// asserts, because presence cannot distinguish the two outcomes.
-/// `FileTree::expand_to_path` only ever expands ancestors and nothing on this
-/// path collapses one again, so a directory revealed once stays open for the
-/// rest of the session: "is `file_a.txt` in the tree?" answers yes from the
-/// moment file_a is first opened, whatever the tab bar does afterwards. The
-/// selection is the part that has to keep up with the active buffer.
-#[test]
-fn test_follow_active_buffer_syncs_explorer_on_tab_switch() {
-    let mut config = Config::default();
-    config.file_explorer.follow_active_buffer = true;
-
-    let mut harness = EditorTestHarness::with_temp_project_and_config(120, 40, config).unwrap();
-    let project_root = harness.project_dir().unwrap();
-
-    fs::create_dir_all(project_root.join("dir_a")).unwrap();
-    fs::create_dir_all(project_root.join("dir_b")).unwrap();
-    fs::write(project_root.join("dir_a/file_a.txt"), "content a").unwrap();
-    fs::write(project_root.join("dir_b/file_b.txt"), "content b").unwrap();
-
-    // Open the explorer but keep focus in the editor so the sync hook is
-    // eligible (it is gated on `key_context != FileExplorer`).
-    harness.editor_mut().toggle_file_explorer();
-    harness.editor_mut().active_window_mut().focus_editor();
-    // Wait for the tree itself, not just the panel title: the sidebar draws
-    // its border and title the moment it becomes visible, while the initial
-    // build is still running. Opening a file in that window would queue its
-    // follow request behind the build instead of driving a sync of its own.
-    harness
-        .wait_until(|h| explorer_tree_contains(h, "dir_a"))
-        .unwrap();
-
-    // Opening file_a replaces the initial `[No Name]` buffer in place;
-    // opening file_b creates a new buffer. Both change which *file* is
-    // active, so both sync the explorer, and the highlight lands on
-    // file_b.txt.
-    harness
-        .editor_mut()
-        .open_file(&project_root.join("dir_a/file_a.txt"))
-        .unwrap();
-    harness
-        .editor_mut()
-        .open_file(&project_root.join("dir_b/file_b.txt"))
-        .unwrap();
-    harness
-        .wait_until(|h| explorer_row_highlighted(h, "file_b.txt"))
-        .unwrap();
-
-    // Precondition: the highlight sits on file_b.txt, not on file_a.txt.
-    // That is what the tab switch has to change — unlike "file_a.txt is
-    // absent from the tree", which stops being true the moment opening
-    // file_a expands dir_a.
-    assert!(
-        !explorer_row_highlighted(&harness, "file_a.txt"),
-        "Precondition: the sidebar's selection highlight should still be on \
-         file_b.txt before the tab switch.\nScreen:\n{}",
-        harness.screen_to_string()
-    );
-
-    // Switch the active tab back to file_a. With the sync hook in place the
-    // highlight follows onto file_a.txt's row. Without it, it stays parked
-    // on file_b.txt and this wait never completes.
-    harness.editor_mut().prev_buffer();
-    harness
-        .wait_until(|h| explorer_row_highlighted(h, "file_a.txt"))
-        .unwrap();
-}
-
-/// Returns `true` when `name` appears on a screen line that also contains a
-/// tree connector, matching the existing `wait_for_file_explorer_item`
-/// heuristic. Reads only rendered output.
-fn explorer_tree_contains(harness: &EditorTestHarness, name: &str) -> bool {
-    harness
-        .screen_to_string()
-        .lines()
-        .any(|line| line.contains(name) && line.contains('│'))
-}
-
 /// The file-explorer sidebar's content rectangle, located from the panel's
 /// own border glyphs: `(first content column, one past the last content
 /// column, first content row, one past the last content row)`.
@@ -4066,9 +4249,21 @@ fn explorer_panel_rect(harness: &EditorTestHarness) -> Option<(u16, u16, u16, u1
 /// naming a theme color, so it holds for either highlight the explorer uses
 /// (`selection_bg` when the tree has the keyboard, `current_line_bg` when it
 /// does not) and under any theme.
+///
+/// **The pinned band is off the plain ground too, but it is not a highlight.**
+/// Its rows are the sticky ancestors, so the vote leaves out whatever colour
+/// the theme names for `ui.file_explorer_pinned_bg`; otherwise a test that
+/// scrolls far enough to pin a folder would read the band as the selection.
 pub(crate) fn explorer_highlighted_rows(harness: &EditorTestHarness) -> Vec<String> {
     let Some((x0, x1, y0, y1)) = explorer_panel_rect(harness) else {
         return Vec::new();
+    };
+    let band_bg = {
+        let theme = harness.editor().theme();
+        format!(
+            "{:?}",
+            theme.resolve_theme_key("ui.file_explorer_pinned_bg")
+        )
     };
     let rows: Vec<(String, String)> = (y0..y1)
         .map(|y| {
@@ -4095,7 +4290,7 @@ pub(crate) fn explorer_highlighted_rows(harness: &EditorTestHarness) -> Vec<Stri
     };
 
     rows.iter()
-        .filter(|(_, bg)| *bg != plain_bg)
+        .filter(|(_, bg)| *bg != plain_bg && *bg != band_bg)
         .map(|(text, _)| text.trim().to_string())
         .collect()
 }
@@ -4596,5 +4791,159 @@ fn test_respect_gitignore_true_hides_ignored_files() {
         "a gitignored file must stay hidden under the default \
          respect_gitignore = true.\nScreen:\n{}",
         screen
+    );
+}
+
+/// Where a tree row's name starts: the column of its first character, and the
+/// row. Looked up inside the sidebar's border (see [`explorer_panel_rect`]) so
+/// that nothing outside the panel — the tab strip, the editor pane, the status
+/// line, each of which can echo a file name — can answer for it.
+///
+/// Cell by cell rather than by indexing into a joined row string, because a
+/// double-width glyph occupies two cells and would put every column after it
+/// one off.
+fn explorer_name_cell(harness: &EditorTestHarness, name: &str) -> Option<(u16, u16)> {
+    let (x0, x1, y0, y1) = explorer_panel_rect(harness)?;
+    let want: Vec<String> = name.chars().map(|c| c.to_string()).collect();
+    let span = want.len() as u16;
+    for y in y0..y1 {
+        for x in x0..=x1.saturating_sub(span) {
+            let hit = want
+                .iter()
+                .enumerate()
+                .all(|(i, c)| harness.get_cell(x + i as u16, y).as_ref() == Some(c));
+            if hit {
+                return Some((x, y));
+            }
+        }
+    }
+    None
+}
+
+/// The foreground the sidebar painted `name`'s first character in.
+///
+/// Debug-formatted, as [`explorer_highlighted_rows`] does it, so comparing
+/// colours needs no colour type imported here. Rendered output: the colour
+/// comes off the painted cell.
+fn explorer_name_fg(harness: &EditorTestHarness, name: &str) -> String {
+    let (x, y) = explorer_name_cell(harness, name).unwrap_or_else(|| {
+        panic!(
+            "no tree row for {name}.\nScreen:\n{}",
+            harness.screen_to_string()
+        )
+    });
+    format!(
+        "{:?}",
+        harness.get_cell_style(x, y).and_then(|style| style.fg)
+    )
+}
+
+/// `editor.line_number_fg`, the recessed foreground cut rows already use.
+///
+/// Named rather than sampled from elsewhere on screen, because *which*
+/// recessed key the explorer reuses is the open question on #3283: the issue
+/// also floats a dedicated `file_explorer.gitignored_fg`, and this is the line
+/// that would have to change if one is ever added.
+fn recessed_fg(harness: &EditorTestHarness) -> String {
+    format!(
+        "{:?}",
+        harness
+            .editor()
+            .theme()
+            .resolve_theme_key("editor.line_number_fg")
+    )
+}
+
+/// Issue #3283: an ignored entry the tree *shows* is drawn recessed, not in
+/// the same ink as everything else.
+///
+/// `respect_gitignore = false` already put `build_output.txt` on screen — that
+/// is `test_respect_gitignore_false_shows_ignored_files` above. What it did not
+/// do was make it distinguishable: the row came out in exactly the foreground
+/// its un-ignored sibling gets, so "show everything" on a real project is a
+/// wall of `target/` and `node_modules/` rows with nothing to say which ones
+/// git does not track. The name must now be painted in `editor.line_number_fg`
+/// while the un-ignored sibling keeps the ordinary one.
+#[test]
+fn test_shown_gitignored_entry_is_dimmed() {
+    let mut config = Config::default();
+    config.file_explorer.respect_gitignore = false;
+
+    let mut harness = EditorTestHarness::with_temp_project_and_config(120, 40, config).unwrap();
+    let project_root = harness.project_dir().unwrap();
+
+    fs::write(project_root.join(".gitignore"), "build_output.txt\n").unwrap();
+    fs::write(project_root.join("build_output.txt"), "generated").unwrap();
+    fs::write(project_root.join("visible_file.txt"), "visible").unwrap();
+
+    harness.editor_mut().focus_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+    // Both rows, then one paint: the two foregrounds below are read off the
+    // same buffer, so they cannot come from different frames.
+    harness
+        .wait_for_file_explorer_item("visible_file.txt")
+        .unwrap();
+    harness
+        .wait_for_file_explorer_item("build_output.txt")
+        .unwrap();
+    harness.render().unwrap();
+
+    let ignored_fg = explorer_name_fg(&harness, "build_output.txt");
+    let plain_fg = explorer_name_fg(&harness, "visible_file.txt");
+    let recessed = recessed_fg(&harness);
+    let screen = harness.screen_to_string();
+
+    assert_eq!(
+        ignored_fg, recessed,
+        "a shown-but-gitignored row should draw its name in \
+         editor.line_number_fg.\nScreen:\n{screen}"
+    );
+    assert_ne!(
+        plain_fg, ignored_fg,
+        "the un-ignored sibling must keep the ordinary explorer foreground, \
+         or the dimming distinguishes nothing.\nScreen:\n{screen}"
+    );
+}
+
+/// The other half of #3283's case: `show_gitignored` on, `respect_gitignore`
+/// left at its default. The rules *are* consulted here, so the entry was
+/// always reportable as ignored — what was missing was anyone asking at render
+/// time. Same recessed foreground, reached down the other path.
+#[test]
+fn test_gitignored_entry_is_dimmed_when_show_gitignored_is_on() {
+    let mut config = Config::default();
+    config.file_explorer.show_gitignored = true;
+
+    let mut harness = EditorTestHarness::with_temp_project_and_config(120, 40, config).unwrap();
+    let project_root = harness.project_dir().unwrap();
+
+    fs::write(project_root.join(".gitignore"), "build_output.txt\n").unwrap();
+    fs::write(project_root.join("build_output.txt"), "generated").unwrap();
+    fs::write(project_root.join("visible_file.txt"), "visible").unwrap();
+
+    harness.editor_mut().focus_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+    harness
+        .wait_for_file_explorer_item("visible_file.txt")
+        .unwrap();
+    harness
+        .wait_for_file_explorer_item("build_output.txt")
+        .unwrap();
+    harness.render().unwrap();
+
+    let ignored_fg = explorer_name_fg(&harness, "build_output.txt");
+    let plain_fg = explorer_name_fg(&harness, "visible_file.txt");
+    let recessed = recessed_fg(&harness);
+    let screen = harness.screen_to_string();
+
+    assert_eq!(
+        ignored_fg, recessed,
+        "a gitignored row shown by 'Show Gitignored Files' should draw its \
+         name in editor.line_number_fg.\nScreen:\n{screen}"
+    );
+    assert_ne!(
+        plain_fg, ignored_fg,
+        "the un-ignored sibling must keep the ordinary explorer \
+         foreground.\nScreen:\n{screen}"
     );
 }

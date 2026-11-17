@@ -11,7 +11,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-BUILTIN_THEMES=(dark light high-contrast nostalgia dracula nord solarized-dark)
+BUILTIN_THEMES=(dark light high-contrast nostalgia dracula nord solarized-dark tokyo-night gruvbox)
 
 cd "$ROOT_DIR"
 
@@ -32,7 +32,7 @@ for theme in "${THEMES[@]}"; do
 
     FRESH_THEME="$theme" cargo nextest run \
         --package fresh-editor \
-        --test e2e_tests \
+        --test all_tests \
         -E 'test(theme_screenshot_gallery)' \
         --run-ignored ignored-only \
         --no-capture \

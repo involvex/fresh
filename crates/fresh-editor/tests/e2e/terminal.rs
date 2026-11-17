@@ -11,6 +11,7 @@
 //! - Terminal mode switching
 //! - ANSI escape sequence handling (cursor, colors, attributes)
 
+use crate::common::global_state::pin_posix_shell;
 use crate::common::harness::EditorTestHarness;
 use crossterm::event::{KeyCode, KeyModifiers};
 use fresh::config::{Config, TerminalShellConfig};
@@ -417,8 +418,8 @@ fn menu_item_fg(
 /// A terminal is a real buffer, so it satisfied the menu's `has_buffer`
 /// condition and Save ran on it: the terminal's own scrollback transcript was
 /// written back over its backing file, reporting "Saved" — and once the
-/// terminal had appended to that file since the last sync, a "File changed on
-/// disk. (o)verwrite, (C)ancel?" prompt for a file the user never edited.
+/// terminal had appended to that file since the last sync, a "File Changed on
+/// Disk" confirmation for a file the user never edited.
 #[test]
 fn test_file_menu_disables_save_for_a_terminal_buffer() {
     let mut harness = harness_or_return!(120, 30);
@@ -1005,7 +1006,10 @@ fn test_terminal_buffer_cursor_movement() {
     // Get initial cursor position. Exiting terminal mode anchors the cursor
     // at the top of the just-exited visible screen (see
     // `sync_terminal_to_buffer`), so navigate downward into the content.
-    let initial_pos = harness.editor().get_cursor_position(buffer_id);
+    let initial_pos = harness
+        .editor()
+        .active_window()
+        .get_cursor_position(buffer_id);
 
     // Move cursor down
     harness
@@ -1013,7 +1017,10 @@ fn test_terminal_buffer_cursor_movement() {
         .handle_key(KeyCode::Down, KeyModifiers::NONE)
         .unwrap();
 
-    let pos_after_down = harness.editor().get_cursor_position(buffer_id);
+    let pos_after_down = harness
+        .editor()
+        .active_window()
+        .get_cursor_position(buffer_id);
 
     // Cursor should have moved (arrow keys do buffer navigation, not PTY input,
     // once terminal mode is disabled).
@@ -1837,6 +1844,9 @@ fn test_prompt_typing_works_in_terminal_mode() {
 #[test]
 #[cfg(not(windows))] // Uses Unix shell
 fn test_split_terminal_scrollback_does_not_freeze_other_split() {
+    // `$(seq ...)` below is POSIX; pin a shell rather than take the
+    // runner's login shell (see `pin_posix_shell`).
+    let _sh = pin_posix_shell();
     let mut harness = harness_or_return!(120, 30);
 
     // Open a terminal in the sole split; it starts in terminal mode.
@@ -1929,6 +1939,9 @@ fn test_split_terminal_scrollback_does_not_freeze_other_split() {
 #[test]
 #[cfg(not(windows))] // Uses Unix shell
 fn test_unfocused_split_retains_scrollback_independently() {
+    // `$(seq ...)` below is POSIX; pin a shell rather than take the
+    // runner's login shell (see `pin_posix_shell`).
+    let _sh = pin_posix_shell();
     let mut harness = harness_or_return!(120, 30);
 
     harness.editor_mut().open_terminal();
@@ -2966,6 +2979,9 @@ fn test_session_restore_terminal_scrollback() {
 #[test]
 #[cfg(not(windows))] // Uses Unix shell
 fn test_scrollback_captured_after_session_restore() {
+    // `$(seq ...)` below is POSIX; pin a shell rather than take the
+    // runner's login shell (see `pin_posix_shell`).
+    let _sh = pin_posix_shell();
     use fresh::config::Config;
     use fresh::config_io::DirectoryContext;
     use portable_pty::{native_pty_system, PtySize};
@@ -3163,6 +3179,9 @@ fn test_scrollback_captured_after_session_restore() {
 #[test]
 #[cfg(not(windows))] // Uses Unix shell
 fn test_scrollback_stable_after_multiple_mode_toggles() {
+    // `$(seq ...)` below is POSIX; pin a shell rather than take the
+    // runner's login shell (see `pin_posix_shell`).
+    let _sh = pin_posix_shell();
     let mut harness = harness_or_return!(80, 24);
 
     // Open a terminal
@@ -3385,6 +3404,9 @@ fn test_open_file_from_terminal_uses_correct_directory() {
 #[test]
 #[cfg(not(windows))] // Uses Unix shell
 fn test_scrollback_viewport_resets_on_reentry() {
+    // `$(seq ...)` below is POSIX; pin a shell rather than take the
+    // runner's login shell (see `pin_posix_shell`).
+    let _sh = pin_posix_shell();
     let mut harness = harness_or_return!(80, 24);
 
     // Open a terminal
@@ -3487,6 +3509,9 @@ fn test_scrollback_viewport_resets_on_reentry() {
 #[test]
 #[cfg(not(windows))] // Uses Unix shell
 fn test_scrollback_viewport_resets_on_reentry_mouse_scroll() {
+    // `$(seq ...)` below is POSIX; pin a shell rather than take the
+    // runner's login shell (see `pin_posix_shell`).
+    let _sh = pin_posix_shell();
     let mut harness = harness_or_return!(80, 24);
 
     // Open a terminal
@@ -3659,6 +3684,136 @@ fn test_terminal_exit_keeps_buffer_with_message() {
     );
 }
 
+fn close_on_exit_harness_or_skip() -> Option<EditorTestHarness> {
+    if native_pty_system()
+        .openpty(PtySize {
+            rows: 1,
+            cols: 1,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .is_err()
+    {
+        eprintln!("Skipping terminal test: PTY not available in this environment");
+        return None;
+    }
+    let mut config = Config::default();
+    config.terminal.close_on_exit = true;
+    EditorTestHarness::with_config(80, 24, config).ok()
+}
+
+/// With `terminal.close_on_exit`, a shell that exits takes its tab with it,
+/// and a pane the terminal was the only tab of collapses — instead of the
+/// default read-only "(exited)" scrollback.
+#[test]
+#[cfg(not(windows))] // Uses Unix shell
+fn test_terminal_close_on_exit_closes_tab_and_split() {
+    let Some(mut harness) = close_on_exit_harness_or_skip() else {
+        return;
+    };
+
+    harness
+        .editor_mut()
+        .open_terminal_split(fresh::model::event::SplitDirection::Vertical);
+    harness.render().unwrap();
+    assert!(harness.editor().is_terminal_mode());
+    assert_eq!(harness.editor().active_window().get_split_count(), 2);
+    let buffer_id = harness.editor().active_buffer_id();
+
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .send_terminal_input(b"exit\n");
+
+    harness
+        .wait_until(|h| h.editor().active_window().get_split_count() == 1)
+        .unwrap();
+    harness.render().unwrap();
+
+    assert!(
+        harness.editor().get_buffer_content(buffer_id).is_none(),
+        "the exited terminal's buffer should be closed"
+    );
+    assert!(
+        harness
+            .editor()
+            .active_window()
+            .exited_terminal(buffer_id)
+            .is_none(),
+        "a closed tab must not leave a restart record behind"
+    );
+    assert!(!harness.editor().is_terminal_mode());
+    assert!(!harness.screen_to_string().contains("(exited)"));
+}
+
+/// Run `echo <marker>` in a command terminal and wait for it to exit with
+/// `terminal.close_on_exit` on; `setup` marks the terminal as whatever kind it
+/// should be before the exit is processed. Once the tab shows the exit, the
+/// terminal must still be the active buffer with its output intact.
+#[cfg(not(windows))]
+fn assert_command_terminal_survives_exit(
+    setup: impl FnOnce(
+        &mut EditorTestHarness,
+        fresh::services::terminal::TerminalId,
+        fresh::model::event::BufferId,
+    ),
+) {
+    let Some(mut harness) = close_on_exit_harness_or_skip() else {
+        return;
+    };
+    let argv = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "echo COMMAND_OUTPUT_MARKER".to_string(),
+    ];
+    let (terminal_id, buffer_id) = harness
+        .editor_mut()
+        .active_window_mut()
+        .open_local_command_terminal(argv, "cmd".to_string())
+        .expect("spawn command terminal");
+    setup(&mut harness, terminal_id, buffer_id);
+
+    harness
+        .wait_until(|h| h.screen_to_string().contains("(exited)"))
+        .unwrap();
+
+    assert_eq!(harness.editor().active_buffer_id(), buffer_id);
+    let content = harness
+        .editor()
+        .get_buffer_content(buffer_id)
+        .unwrap_or_default();
+    assert!(
+        content.contains("COMMAND_OUTPUT_MARKER"),
+        "Content:\n{content}"
+    );
+}
+
+/// `terminal.close_on_exit` is for the user's shells: an agent's terminal keeps
+/// its output when it finishes, since reading it is the point.
+#[test]
+#[cfg(not(windows))] // Uses Unix shell
+fn test_terminal_close_on_exit_keeps_agent_terminals() {
+    assert_command_terminal_survives_exit(|harness, terminal_id, _| {
+        harness
+            .editor_mut()
+            .active_window_mut()
+            .mark_terminal_restorable(terminal_id, Some(vec!["agent".to_string()]), None);
+    });
+}
+
+/// The self-update terminal is where the update's outcome is read, so it stays
+/// open under `terminal.close_on_exit` too.
+#[test]
+#[cfg(not(windows))] // Uses Unix shell
+fn test_terminal_close_on_exit_keeps_self_update_terminal() {
+    assert_command_terminal_survives_exit(|harness, terminal_id, buffer_id| {
+        let window = harness.editor().active_window_id();
+        harness
+            .editor_mut()
+            .begin_self_update(terminal_id, window, buffer_id);
+    });
+}
+
 /// Test Windows terminal shows prompt and responds to commands
 ///
 /// This test verifies that the DSR (Device Status Report) cursor position
@@ -3777,6 +3932,284 @@ fn test_bracket_paste_in_terminal_mode() {
     assert!(harness.editor().is_terminal_mode());
 
     // Clean up: send Ctrl+D to exit cat
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .send_terminal_input(b"\x04");
+}
+
+/// Spawn a terminal whose child is `sh -c <script>` rather than an interactive
+/// shell, so the test drives one known program: no prompt, no readline, and
+/// nothing that re-announces its own terminal modes between our writes.
+///
+/// Returns `None` when there is no PTY (or no `/bin/sh`) to run it on, which
+/// the paste tests below treat as "skip", like the rest of this file.
+fn harness_running_or_skip(script: &str) -> Option<EditorTestHarness> {
+    harness_running_with_config_or_skip(script, Config::default())
+}
+
+/// [`harness_running_or_skip`] on top of `config`.
+fn harness_running_with_config_or_skip(
+    script: &str,
+    mut config: Config,
+) -> Option<EditorTestHarness> {
+    if native_pty_system()
+        .openpty(PtySize {
+            rows: 1,
+            cols: 1,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .is_err()
+        || !std::path::Path::new("/bin/sh").exists()
+    {
+        eprintln!("Skipping terminal test: no PTY or /bin/sh in this environment");
+        return None;
+    }
+
+    config.terminal.shell = Some(TerminalShellConfig {
+        command: "/bin/sh".to_string(),
+        args: vec!["-c".to_string(), script.to_string()],
+    });
+    EditorTestHarness::with_config(80, 24, config).ok()
+}
+
+/// A paste into a live terminal whose child asked for bracketed paste
+/// (DECSET 2004) must arrive wrapped in `ESC[200~` … `ESC[201~`.
+///
+/// Regression: fresh used to hand the child the raw clipboard bytes. A line
+/// editor that turns 2004 on — readline in bash/zsh/fish, an agent CLI's input
+/// box — then reads every embedded newline as the Enter key, so a multi-line
+/// paste ran (or submitted) every line but the last and only the tail was left
+/// on the input line.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)] // Uses Unix shell commands (stty/cat)
+fn test_paste_is_bracketed_when_child_requests_it() {
+    // `cat -v` renders the control bytes it reads: an ESC comes back as `^[`,
+    // so the markers are visible on screen. `-icanon` makes it echo what it
+    // reads without waiting for a line, `-echo` keeps the line discipline from
+    // re-injecting our paste into the emulator itself.
+    let Some(mut harness) = harness_running_or_skip(
+        "stty -echo -icanon; printf '\\033[?2004h'; printf 'CAT_READY\\n'; cat -v",
+    ) else {
+        return;
+    };
+
+    harness.editor_mut().open_terminal();
+    harness.render().unwrap();
+
+    // Wait until the emulator has actually seen the DECSET — that is the state
+    // the paste path reads, and it lands only once the child's output arrives.
+    harness
+        .wait_until(|h| {
+            h.screen_to_string().contains("CAT_READY")
+                && h.editor()
+                    .active_window()
+                    .get_active_terminal_state()
+                    .is_some_and(|s| s.is_bracketed_paste())
+        })
+        .unwrap();
+
+    harness
+        .editor_mut()
+        .paste_text("PASTE_L1\nPASTE_L2".to_string());
+
+    harness
+        .wait_until(|h| h.screen_to_string().contains("PASTE_L2^[[201~"))
+        .unwrap();
+
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("^[[200~PASTE_L1"),
+        "paste should reach the child wrapped in the start marker. Screen:\n{}",
+        screen
+    );
+    assert!(
+        screen.contains("PASTE_L2^[[201~"),
+        "paste should reach the child wrapped in the end marker. Screen:\n{}",
+        screen
+    );
+
+    // Clean up: Ctrl+D to exit cat.
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .send_terminal_input(b"\x04");
+}
+
+/// With bracketed paste *off*, the child cannot tell a paste from typing, so
+/// the paste is sent as the keystrokes it would be: line breaks become `\r`,
+/// the byte the Enter key produces (`\n` alone is not what a keyboard sends,
+/// and a raw-mode reader that only accepts CR would swallow the line break).
+#[test]
+#[cfg_attr(target_os = "windows", ignore)] // Uses Unix shell commands (stty/cat)
+fn test_paste_without_bracketed_paste_sends_carriage_returns() {
+    // `-icrnl` keeps the line discipline from rewriting our CR as NL, so what
+    // `cat -v` prints (`^M`) is exactly what the child received.
+    let Some(mut harness) =
+        harness_running_or_skip("stty -echo -icanon -icrnl; printf 'CAT_READY\\n'; cat -v")
+    else {
+        return;
+    };
+
+    harness.editor_mut().open_terminal();
+    harness.render().unwrap();
+
+    harness
+        .wait_until(|h| h.screen_to_string().contains("CAT_READY"))
+        .unwrap();
+
+    assert!(
+        !harness
+            .editor()
+            .active_window()
+            .get_active_terminal_state()
+            .is_some_and(|s| s.is_bracketed_paste()),
+        "plain `cat` never asks for bracketed paste"
+    );
+
+    harness.editor_mut().paste_text("P1\nP2".to_string());
+
+    harness
+        .wait_until(|h| h.screen_to_string().contains("P1^MP2"))
+        .unwrap();
+
+    harness.assert_screen_contains("P1^MP2");
+
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .send_terminal_input(b"\x04");
+}
+
+/// Ctrl+V in a terminal pane, with a system clipboard that holds no text (an
+/// image, say), reaches the program as the key, and pastes no stale yank.
+///
+/// Regression (#3129): the paste fell back to the internal clipboard, so an
+/// old yank was typed into the program, and the program — an agent CLI that
+/// reads the image from the clipboard itself on Ctrl+V — never saw the key.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)] // Uses Unix shell commands (stty/cat)
+fn test_ctrl_v_reaches_terminal_when_clipboard_has_no_text() {
+    use fresh::services::clipboard::SystemClipboard;
+
+    // `cat -v` shows the byte Ctrl+V sends as `^V`; `-icanon` makes it echo
+    // without waiting for a line, `-echo` keeps the line discipline from
+    // echoing it as well, and `-iexten` from taking ^V as its literal-next.
+    let Some(mut harness) =
+        harness_running_or_skip("stty -echo -icanon -iexten; printf 'CAT_READY\\n'; cat -v")
+    else {
+        return;
+    };
+    harness
+        .editor_mut()
+        .set_clipboard_for_test("STALE_YANK".to_string());
+    harness
+        .editor_mut()
+        .set_system_clipboard_probe_for_test(|| SystemClipboard::NoText);
+
+    harness.editor_mut().open_terminal();
+    harness.render().unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("CAT_READY"))
+        .unwrap();
+
+    harness
+        .send_key(KeyCode::Char('v'), KeyModifiers::CONTROL)
+        .unwrap();
+    // A marker after it, so the wait has something that arrives after ^V.
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .send_terminal_input(b"END");
+    harness
+        .wait_until(|h| h.screen_to_string().contains("END"))
+        .unwrap();
+
+    harness.assert_screen_contains("^VEND");
+    harness.assert_screen_not_contains("STALE_YANK");
+
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .send_terminal_input(b"\x04");
+}
+
+/// With `terminal.pass_ctrl_v_without_text` off, a clipboard with no text
+/// pastes the internal clipboard into the terminal, as before #3129.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)] // Uses Unix shell commands (stty/cat)
+fn test_ctrl_v_in_terminal_pastes_yank_when_pass_through_is_off() {
+    use fresh::services::clipboard::SystemClipboard;
+
+    let mut config = Config::default();
+    config.terminal.pass_ctrl_v_without_text = false;
+    let Some(mut harness) = harness_running_with_config_or_skip(
+        "stty -echo -icanon -iexten; printf 'CAT_READY\\n'; cat -v",
+        config,
+    ) else {
+        return;
+    };
+    harness
+        .editor_mut()
+        .set_clipboard_for_test("INTERNAL_YANK".to_string());
+    harness
+        .editor_mut()
+        .set_system_clipboard_probe_for_test(|| SystemClipboard::NoText);
+
+    harness.editor_mut().open_terminal();
+    harness.render().unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("CAT_READY"))
+        .unwrap();
+
+    harness
+        .send_key(KeyCode::Char('v'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("INTERNAL_YANK"))
+        .unwrap();
+    harness.assert_screen_not_contains("^V");
+
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .send_terminal_input(b"\x04");
+}
+
+/// With a system clipboard that can't be read at all, Ctrl+V in a terminal
+/// pane still pastes the internal clipboard (the #3129 change keeps that).
+#[test]
+#[cfg_attr(target_os = "windows", ignore)] // Uses Unix shell commands (stty/cat)
+fn test_ctrl_v_in_terminal_pastes_internal_clipboard_when_system_unavailable() {
+    use fresh::services::clipboard::SystemClipboard;
+
+    let Some(mut harness) =
+        harness_running_or_skip("stty -echo -icanon -iexten; printf 'CAT_READY\\n'; cat -v")
+    else {
+        return;
+    };
+    harness
+        .editor_mut()
+        .set_clipboard_for_test("INTERNAL_YANK".to_string());
+    harness
+        .editor_mut()
+        .set_system_clipboard_probe_for_test(|| SystemClipboard::Unavailable);
+
+    harness.editor_mut().open_terminal();
+    harness.render().unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("CAT_READY"))
+        .unwrap();
+
+    harness
+        .send_key(KeyCode::Char('v'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("INTERNAL_YANK"))
+        .unwrap();
+    harness.assert_screen_not_contains("^V");
+
     harness
         .editor_mut()
         .active_window_mut()
@@ -3921,7 +4354,7 @@ fn test_arrow_keys_in_less() {
             }
 
             // Periodic progress logging (every ~5s)
-            if iter % 100 == 0 && iter > 0 {
+            if iter.is_multiple_of(100) && iter > 0 {
                 let screen = harness.screen_to_string();
                 let elapsed = start.elapsed();
                 tracing::info!(
@@ -4404,14 +4837,21 @@ fn test_terminal_mode_hides_scrollbar_and_reclaims_width() {
 
     // While in terminal mode the split shows no scrollbar column.
     let (live_content_width, live_scrollbar_width) = {
-        let (_, _, content_rect, scrollbar_rect, _, _) = harness
+        let pane = harness
             .editor()
             .get_split_areas()
             .iter()
-            .find(|(_, buf, _, _, _, _)| *buf == terminal_buffer)
-            .copied()
+            .find(|(_, buf, ..)| *buf == terminal_buffer)
+            .map(|(pane, ..)| *pane)
             .expect("terminal split should be present");
-        (content_rect.width, scrollbar_rect.width)
+        // A pane with no scrollbar places a zero-width node, which the tree
+        // drops — so "no bar" reads back as `None`, not as a width of zero.
+        let content = harness
+            .editor()
+            .pane_content_rect(pane)
+            .expect("the shell laid the terminal pane out");
+        let bar = harness.editor().pane_vscroll_rect(pane);
+        (content.width, bar.map_or(0, |r| r.width))
     };
     assert_eq!(
         live_scrollbar_width, 0,
@@ -4443,14 +4883,21 @@ fn test_terminal_mode_hides_scrollbar_and_reclaims_width() {
     harness.render().unwrap();
 
     let (scrollback_content_width, scrollback_scrollbar_width) = {
-        let (_, _, content_rect, scrollbar_rect, _, _) = harness
+        let pane = harness
             .editor()
             .get_split_areas()
             .iter()
-            .find(|(_, buf, _, _, _, _)| *buf == terminal_buffer)
-            .copied()
+            .find(|(_, buf, ..)| *buf == terminal_buffer)
+            .map(|(pane, ..)| *pane)
             .expect("terminal split should be present");
-        (content_rect.width, scrollbar_rect.width)
+        // A pane with no scrollbar places a zero-width node, which the tree
+        // drops — so "no bar" reads back as `None`, not as a width of zero.
+        let content = harness
+            .editor()
+            .pane_content_rect(pane)
+            .expect("the shell laid the terminal pane out");
+        let bar = harness.editor().pane_vscroll_rect(pane);
+        (content.width, bar.map_or(0, |r| r.width))
     };
     assert_eq!(
         scrollback_scrollbar_width, 1,
@@ -4498,7 +4945,11 @@ fn test_terminal_buffers_always_grid_wrap() {
     harness.render().unwrap();
     let win = harness.editor().active_window();
     let (mgr, view_states) = win.buffers.splits().unwrap();
-    let vp = &view_states.get(&mgr.active_split()).unwrap().viewport;
+    let vp = &view_states
+        .get(&mgr.active_split())
+        .unwrap()
+        .buffer_tab_state()
+        .viewport;
     assert!(
         vp.line_wrap_enabled && vp.grid_wrap,
         "terminal viewport must be healed into grid-wrap mode (line_wrap_enabled={}, grid_wrap={})",
@@ -4536,7 +4987,7 @@ fn primary_selection_active(harness: &EditorTestHarness) -> bool {
     view_states
         .get(&mgr.active_split())
         .map(|vs| {
-            let c = vs.cursors.primary();
+            let c = vs.buffer_tab_state().cursors.primary();
             c.anchor.is_some_and(|a| a != c.position)
         })
         .unwrap_or(false)
@@ -5205,4 +5656,317 @@ fn test_tab_drag_split_resizes_terminal() {
          re-wrapping so the tail of the line stays on screen. Screen:\n{}",
         screen
     );
+}
+
+/// fresh#3151: scrollback that streams to the backing file *while the
+/// scroll-back view is open* must survive the return to live mode.
+///
+/// The backing file is `[streamed scrollback][temporary visible-screen tail]`,
+/// and returning to live mode truncates it back to the scrollback end. But the
+/// PTY read loop keeps appending scrolled-off lines the whole time, and those
+/// land past the tail — so the truncation deleted them, permanently: the
+/// stream pointer had already counted them as persisted, so no later flush
+/// re-emitted them. The symptom is a gap in the scroll-back exactly where the
+/// live screen used to start.
+///
+/// Drives: fill history with a first batch, split so one pane keeps rendering
+/// live output, drop the focused pane into scroll-back, print a second batch
+/// (which streams past the tail), return to live (the truncation), then read
+/// the whole scroll-back back by paging through it. Every line printed must
+/// still be there.
+///
+/// The split is what makes this deterministic without a timer: the focused
+/// pane stays parked in scroll-back while the *other* pane renders the second
+/// batch, so the test can wait for that batch on screen before triggering the
+/// truncation. A lost line is by construction one that scrolled off, so it can
+/// never be on the live pane's grid — the sweep below cannot pass on the live
+/// pane's rendering.
+#[test]
+#[cfg(not(windows))] // Uses a Unix shell
+fn test_scrollback_survives_output_during_a_scrollback_visit() {
+    // `$(seq ...)` below is POSIX; pin a shell rather than take the
+    // runner's login shell (see `pin_posix_shell`).
+    let _sh = pin_posix_shell();
+    const FIRST: usize = 60;
+    const SECOND: usize = 60;
+
+    let mut harness = harness_or_return!(100, 30);
+
+    harness.editor_mut().open_terminal();
+    harness.render().unwrap();
+    assert!(harness.editor().is_terminal_mode());
+
+    // Stay in scroll-back while the shell keeps producing output; the manual
+    // Ctrl+Space below is what returns to live, so the truncation happens at a
+    // point the test controls.
+    harness
+        .editor_mut()
+        .set_terminal_jump_to_end_on_output(false);
+
+    // First batch: pushes plenty of lines into streamed scrollback.
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .send_terminal_input(format!("for i in $(seq 1 {FIRST}); do echo B_$i; done\n").as_bytes());
+    harness
+        .wait_until(|h| h.screen_to_string().contains(&format!("B_{FIRST}")))
+        .unwrap();
+
+    // Split vertically: both panes show the same terminal, both live.
+    harness.editor_mut().split_pane_vertical();
+    harness.render().unwrap();
+
+    // Drop the focused pane into read-only scroll-back. This appends the
+    // temporary visible-screen tail to the backing file.
+    harness
+        .send_key(KeyCode::Char(' '), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    assert!(
+        !harness.editor().is_terminal_mode(),
+        "Ctrl+Space should drop the focused split into read-only scrollback"
+    );
+
+    // Second batch, printed while the scroll-back view is open: the PTY read
+    // loop streams it into the backing file past that tail. The other (live)
+    // pane is what puts it on screen, so waiting for it needs no timer.
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .send_terminal_input(
+            format!("for i in $(seq 1 {SECOND}); do echo A_$i; done\n").as_bytes(),
+        );
+    harness
+        .wait_until(|h| h.screen_to_string().contains(&format!("A_{SECOND}")))
+        .unwrap();
+
+    // Back to live — this is the truncation.
+    harness
+        .send_key(KeyCode::Char(' '), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    assert!(
+        harness.editor().is_terminal_mode(),
+        "Ctrl+Space should return the focused split to the live grid"
+    );
+
+    // ...and back into scroll-back to read the history, from the very top.
+    harness
+        .send_key(KeyCode::Char(' '), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Home, KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+
+    let missing = missing_markers_in_scrollback(
+        &mut harness,
+        (1..=FIRST)
+            .map(|i| format!("B_{i}"))
+            .chain((1..=SECOND).map(|i| format!("A_{i}"))),
+    );
+    assert!(
+        missing.is_empty(),
+        "{} printed lines are unreachable in scroll-back: {:?}",
+        missing.len(),
+        missing
+    );
+}
+
+/// Page down through the scroll-back view from wherever it is parked,
+/// collecting everything rendered on the way, and return the `markers` that
+/// never showed up.
+///
+/// Only rendered output is inspected, so a marker counts as reachable exactly
+/// when a user scrolling the pane would see it.
+///
+/// Two limits worth knowing before reusing this:
+///
+/// * Entering scroll-back re-appends the current visible screen, so a marker
+///   that survives *only* in that temporary tail still scores as reachable.
+///   Fine for callers whose missing lines are older than the last screenful;
+///   not a way to tell "durably in the scrollback" from "in the volatile tail".
+/// * The sweep stops when a page renders identically to the one before it,
+///   which is end-of-buffer for dense numbered output but would stop early on
+///   a run of blank rows or a repeated frame. That direction is fail-safe — it
+///   reports markers as missing rather than passing vacuously.
+fn missing_markers_in_scrollback(
+    harness: &mut EditorTestHarness,
+    markers: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let mut seen = harness.screen_to_string();
+    // Each page advances by at least one row, so a page per row of content is
+    // a safe ceiling; the loop normally stops much earlier, when the view
+    // stops moving.
+    let mut pages_left = 10_000;
+    loop {
+        let before = harness.screen_to_string();
+        harness
+            .send_key(KeyCode::PageDown, KeyModifiers::NONE)
+            .unwrap();
+        harness.render().unwrap();
+        let after = harness.screen_to_string();
+        seen.push_str(&after);
+        if after == before {
+            break;
+        }
+        pages_left -= 1;
+        assert!(pages_left > 0, "scroll-back paging did not terminate");
+    }
+
+    markers
+        .into_iter()
+        .filter(|m| !contains_marker(&seen, m))
+        .collect()
+}
+
+/// Whether `marker` appears in `text` as a whole token — `A_1` must not be
+/// satisfied by `A_10`.
+fn contains_marker(text: &str, marker: &str) -> bool {
+    text.match_indices(marker).any(|(idx, _)| {
+        text[idx + marker.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_digit())
+    })
+}
+
+/// fresh#3151, the trigger that needs no scroll-back visit at all: resuming a
+/// terminal that is *already* live still truncated its backing file.
+///
+/// "Focus Terminal" (and the tab-switch path behind `focus_terminal_buffer`)
+/// call `enter_terminal_mode` unconditionally — the split need not have been
+/// in scroll-back — and that cut the backing file back to the recorded end of
+/// scrollback. The PTY read loop recorded that end from `metadata()` *before*
+/// flushing its own `BufWriter`, so every recorded end was one batch short and
+/// the truncation ate the lines that had most recently scrolled off: exactly
+/// the rows just above the top of the screen.
+///
+/// Drives: print a batch into scrollback, run Focus Terminal on the live
+/// terminal, then read the scroll-back back by paging through it.
+#[test]
+#[cfg(not(windows))] // Uses a Unix shell
+fn test_focusing_an_already_live_terminal_keeps_its_scrollback() {
+    // `$(seq ...)` below is POSIX; pin a shell rather than take the
+    // runner's login shell (see `pin_posix_shell`).
+    let _sh = pin_posix_shell();
+    const LINES: usize = 60;
+
+    let mut harness = harness_or_return!(100, 30);
+
+    harness.editor_mut().open_terminal();
+    harness.render().unwrap();
+    assert!(harness.editor().is_terminal_mode());
+
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .send_terminal_input(format!("for i in $(seq 1 {LINES}); do echo L_$i; done\n").as_bytes());
+    harness
+        .wait_until(|h| h.screen_to_string().contains(&format!("L_{LINES}")))
+        .unwrap();
+
+    // Resume a terminal that is already live, via the command palette. No
+    // scroll-back view is ever opened before this point.
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness.type_text("Focus Terminal").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    assert!(
+        harness.editor().is_terminal_mode(),
+        "Focus Terminal should leave the terminal live. Screen:\n{}",
+        harness.screen_to_string()
+    );
+
+    // Now read the history back.
+    harness
+        .send_key(KeyCode::Char(' '), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Home, KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+
+    let missing =
+        missing_markers_in_scrollback(&mut harness, (1..=LINES).map(|i| format!("L_{i}")));
+    assert!(
+        missing.is_empty(),
+        "{} printed lines are unreachable in scroll-back: {:?}",
+        missing.len(),
+        missing
+    );
+}
+
+/// A checkpoint while a terminal is in scroll-back rewrites the screen saved
+/// at the end of its backing file, after the lines printed since. A view of
+/// a large transcript reads that file lazily, and must keep showing what it
+/// showed rather than whatever the rewrite put there (issue #3645).
+#[test]
+#[cfg_attr(target_os = "windows", ignore)] // Unix shell loop
+fn test_checkpoint_leaves_a_lazily_read_scrollback_view_intact() {
+    if native_pty_system()
+        .openpty(PtySize {
+            rows: 1,
+            cols: 1,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .is_err()
+    {
+        eprintln!("Skipping terminal test: PTY not available in this environment");
+        return;
+    }
+    let mut config = Config::default();
+    // Any transcript is "large": the view reads it lazily
+    config.editor.large_file_threshold_bytes = 64;
+    let mut harness = EditorTestHarness::with_config(80, 24, config).unwrap();
+
+    harness.editor_mut().open_terminal();
+    let buffer_id = harness.editor().active_buffer_id();
+    let terminal_id = harness
+        .editor()
+        .active_window()
+        .get_terminal_id(buffer_id)
+        .unwrap();
+    let backing = harness.editor().active_window().terminal_backing_files[&terminal_id].clone();
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .send_terminal_input(b"for i in $(seq 1 60); do echo row$i; done\n");
+    harness
+        .wait_until(|h| h.screen_to_string().contains("row60"))
+        .unwrap();
+
+    // Into scroll-back, without drawing it (which would load what it shows)
+    harness
+        .editor_mut()
+        .handle_key(KeyCode::Char(']'), KeyModifiers::CONTROL)
+        .unwrap();
+    assert!(harness.editor().active_state().buffer.is_large_file());
+    let shown = std::fs::read(&backing).unwrap();
+
+    // More output scrolls past the saved screen, then a checkpoint
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .send_terminal_input(b"for i in $(seq 61 120); do echo row$i; done\n");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::fs::read(&backing).unwrap().len() <= shown.len() {
+        assert!(std::time::Instant::now() < deadline, "no output streamed");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    harness.editor_mut().save_workspace().unwrap();
+    assert_ne!(std::fs::read(&backing).unwrap()[..shown.len()], shown[..]);
+
+    // The view reads what it showed
+    let buffer = &mut harness.editor_mut().active_state_mut().buffer;
+    let len = buffer.len();
+    assert_eq!(buffer.get_text_range_mut(0, len).unwrap(), shown);
 }

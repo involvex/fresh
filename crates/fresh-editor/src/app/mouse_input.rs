@@ -10,57 +10,130 @@
 use super::chrome::in_rect;
 use super::*;
 use crate::services::plugins::hooks::HookArgs;
-use crate::view::popup_mouse::{popup_areas_to_layout_info, PopupHitTester};
 use crate::view::prompt::PromptType;
 use anyhow::Result as AnyhowResult;
-use ratatui::layout::Rect;
+use std::time::{Duration, Instant};
 
-/// Map a screen row on a suggestion list's scrollbar track to the prompt
-/// scroll offset that puts the thumb's top on exactly that row.
+/// Columns one notch of a sideways wheel pans. Horizontal panning has no
+/// line-oriented setting to follow — `mouse_wheel_scroll_lines` counts lines
+/// — so it takes the same fixed step a pan keystroke does, which is what
+/// [`PAN_COLUMNS`] is for.
 ///
-/// Shared by the press and the drag-follow-up so the thumb tracks the cursor
-/// identically in both. [`ScrollbarState::offset_for_thumb_top`] is the real
-/// inverse of the thumb geometry the renderer draws — the ONE track mapping
-/// (its off-by-a-row `click_to_offset` sibling is deleted).
+/// [`PAN_COLUMNS`]: crate::widgets::render::PAN_COLUMNS
+const WHEEL_COLUMNS: i32 = crate::widgets::render::PAN_COLUMNS;
+
+/// How long one line of a smoothed wheel gesture is meant to take.
+/// Roughly a frame at 60Hz, so a three-line notch walks across about
+/// three frames — enough to read as a slide rather than a jump, and
+/// short enough that the view never feels behind the wheel.
+const SMOOTH_SCROLL_LINE: Duration = Duration::from_millis(16);
+
+/// How often a drag resting past a list's edge scrolls it another step
+/// (`fresh_ui::Ui::drag_autoscroll`). Slow enough to stop on the row wanted,
+/// fast enough to cross a long list; the tree makes the step bigger the
+/// farther past the edge the pointer is.
+const DRAG_AUTOSCROLL_STEP: Duration = Duration::from_millis(60);
+
+/// A drag held past the edge of the list it was lifted from, which keeps
+/// scrolling it while it rests there.
 ///
-/// Rows above/below the track clamp to its ends rather than being rejected,
-/// so a fast drag doesn't drop the thumb.
-pub(super) fn prompt_scrollbar_offset_for_row(
-    total: usize,
-    visible: usize,
-    scroll_offset: usize,
-    sb_rect: Rect,
+/// **The tree decides what the drag means; this only supplies the time.**
+/// A step is a pointer move — the tree scrolls the window toward a drag
+/// that moves past its edge — and a drag held still produces no moves, so
+/// the host repeats the pointer where it rests, through the same dispatch
+/// the real moves took, for as long as the tree says a repeat would scroll.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DragAutoscroll {
+    col: u16,
     row: u16,
-) -> usize {
-    use crate::view::ui::scrollbar::ScrollbarState;
-    let clamped_row = row.clamp(sb_rect.y, sb_rect.y + sb_rect.height.saturating_sub(1));
-    let track_row = clamped_row.saturating_sub(sb_rect.y) as usize;
-    ScrollbarState::new(total, visible, scroll_offset)
-        .offset_for_thumb_top(sb_rect.height as usize, track_row)
+    /// When the last step was taken. Advanced by the interval, so the pace
+    /// does not drift with frame times.
+    last_step: Instant,
+}
+
+/// A wheel gesture still playing out.
+///
+/// One notch asks for several lines at once. Handing them over one at a
+/// time makes the view slide instead of jumping — and gives the scroll
+/// fade a row at a time to work with — but only while the frames to
+/// show it in are actually arriving. So the walk is paced by the clock
+/// rather than by frames: whatever the last frame did not get to is
+/// still owed, and a caller that has been away long enough for all of
+/// it delivers the remainder in one go. A terminal too slow to animate
+/// therefore gets the plain jump it had before, rather than a scroll
+/// that drags on behind the wheel.
+pub(crate) struct PendingWheelScroll {
+    /// Where the pointer was. The lines still owed are replayed through
+    /// the same dispatch as the original event, so they land on
+    /// whatever surface that event routed to.
+    col: u16,
+    row: u16,
+    /// -1 for up, +1 for down.
+    direction: i32,
+    /// Lines still owed to that surface.
+    remaining: u32,
+    /// How many lines may stay owed before the walk starts handing over
+    /// the surplus with the current frame. Two notches' worth, so the
+    /// view never trails the wheel by more than a moment.
+    max_backlog: u32,
+    /// When the last line was handed over. Advanced by exactly the
+    /// lines delivered, so the pace does not drift with frame times.
+    last_step: Instant,
+}
+
+/// How many of `remaining` lines the clock has made due after
+/// `elapsed`, at one line per `interval`: none until the first comes
+/// due, and the whole remainder at once for a caller that has been away
+/// long enough for all of them.
+fn lines_due(elapsed: Duration, interval: Duration, remaining: u32) -> u32 {
+    if interval.is_zero() {
+        return remaining;
+    }
+    let due = elapsed.as_nanos() / interval.as_nanos();
+    u32::try_from(due).unwrap_or(u32::MAX).min(remaining)
+}
+
+/// Lines to hand over this frame: the ones the clock has made due, plus
+/// anything past `max_backlog` that would otherwise leave the view
+/// trailing the wheel.
+///
+/// The backlog is what keeps a flick honest. Notches can arrive faster
+/// than a line a frame, and a gesture must travel exactly as far as it
+/// asks for — dropping the excess would make fast scrolling cover less
+/// ground than slow scrolling. So nothing is ever dropped: past the
+/// backlog the surplus rides along with this frame's line, and the walk
+/// degrades toward the jump it replaced instead of falling behind.
+fn lines_to_deliver(
+    elapsed: Duration,
+    interval: Duration,
+    remaining: u32,
+    max_backlog: u32,
+) -> u32 {
+    lines_due(elapsed, interval, remaining).max(remaining.saturating_sub(max_backlog))
 }
 
 impl Editor {
     /// Handle a mouse event.
     /// Returns true if a re-render is needed.
-    ///
-    /// Memo contract: unlike keys, mouse events bump the UI generation on
-    /// EXIT, and only when the event changed something (`needs_render`). A
-    /// quiet mouse-motion stream — the highest-frequency input the editor
-    /// sees — then reuses one chrome tree across MANY events, while any
-    /// event that mutates state (click opens a menu, drag moves a
-    /// separator) invalidates for the next one. This gate is a coarse
-    /// epoch, not the correctness story: `chrome_tree` additionally
-    /// validates each hit against a fresh `overlay_stack` build, and its
-    /// debug oracle cross-checks every hit against a full rebuild.
     pub fn handle_mouse(
         &mut self,
         mouse_event: crossterm::event::MouseEvent,
     ) -> AnyhowResult<bool> {
-        let result = self.handle_mouse_impl(mouse_event);
-        if matches!(result, Ok(true)) {
-            self.bump_ui_gen();
-        }
-        result
+        // As `handle_key`: routed over a tree laid out from the facts as they
+        // stand. What it leaves stale is decided where the event is spent —
+        // a fact says whether it changed anything routing reads
+        // (`UiFact::is_pointer_transient`), and the legacy walk, which cannot,
+        // marks the description stale for every press and release it takes.
+        self.mark_plugin_snapshot_dirty();
+        self.lay_out_shell_if_stale();
+        self.handle_mouse_routed(mouse_event)
+    }
+
+    fn handle_mouse_routed(
+        &mut self,
+        mouse_event: crossterm::event::MouseEvent,
+    ) -> AnyhowResult<bool> {
+        self.handle_mouse_impl(mouse_event)
     }
 
     fn handle_mouse_impl(
@@ -74,35 +147,18 @@ impl Editor {
 
         let (is_double_click, is_triple_click) = self.detect_multi_click(&mouse_event, col, row);
 
-        // Modal mouse-capture, offered in RANK order over the derived
-        // overlay stack: the first component whose modal surface is up
-        // claims the whole mouse channel. Every capturing component
-        // declares a layer from the same activity predicate its
-        // capture gates on, so walking the owner-stamped stack visits
-        // exactly the capturing candidates — and deletes the old
-        // registry-order duplicate of the precedence (two hand-synced
-        // encodings, comment-only sync). Rank IS the one source now,
-        // for the keyboard walk and the capture band alike.
-        {
-            let stack = self.overlay_stack();
-            let mut seen = std::collections::HashSet::new();
-            for entry in &stack {
-                // The hardcoded event-debug head has no owner; a
-                // component contributing several layers is offered
-                // the capture once, at its highest rank.
-                let Some(owner) = entry.owner else { continue };
-                if !seen.insert(owner) {
-                    continue;
-                }
-                if let Some(result) = super::chrome::components()[owner].capture_mouse(
-                    self,
-                    mouse_event,
-                    is_double_click,
-                ) {
-                    return result;
-                }
-            }
-        }
+        // The modal mouse-capture band is gone. It walked the overlay stack
+        // in rank order and gave the whole mouse channel to the first modal
+        // that was up — a second routing engine, ahead of the shell's, and
+        // the reason `placed_surface_outranks_shell` had to exist. A modal is
+        // a `Modality::Exclusive` layer in the tree now, so the tree answers
+        // the same question in the same walk as everything else.
+        //
+        // The event it routes stays here rather than travelling as a fact: a
+        // full-screen modal's interior hit-tests rectangles its own painter
+        // recorded and tells a drag from a move, which a tree `Event`
+        // deliberately cannot. See `view::shell::modal`.
+        self.shell_pointer_event = Some((mouse_event, is_double_click));
 
         // Cancel the LSP-rename prompt on ANY mouse interaction that
         // reaches normal routing. RULING — a pre-WALK observer of the
@@ -140,167 +196,108 @@ impl Editor {
             row
         );
 
-        // Check if we should forward mouse events to the terminal
-        // Forward if: in terminal mode, mouse is over terminal buffer, and terminal is in alternate screen mode
+        // Then the migration shell. It used to run *after* a capture band,
+        // because a full-screen modal had to outrank anything in the tree and
+        // running the shell first would have inverted that — and it consulted
+        // `placed_surface_outranks_shell` for the same reason at the level of
+        // individual surfaces, restating the `z` a migrated box used to carry
+        // so a modal drawn over the file explorer still owned its own cells.
         //
-        // ...unless a chrome drag is in progress (dock-border resize, split
-        // separator, or file-explorer width). That drag owns the mouse until
-        // release, so don't let an alternate-screen terminal swallow the
-        // motion once the pointer crosses over it — *growing* the dock drags
-        // the cursor rightward across a full-screen `btop`, and forwarding
-        // there both stalls the resize and eats the mouse-up that ends it,
-        // leaving the drag stuck. Shrinking happened to work only because the
-        // pointer stays left of the terminal the whole time.
-        let chrome_drag_active = super::chrome::pointer_grab(self).is_some();
-        // An open native context menu (tab / "+" new-tab / file-explorer)
-        // takes mouse precedence over terminal forwarding. These menus render
-        // on top of — and frequently overlap — an alternate-screen terminal
-        // that has captured the mouse (e.g. right-clicking a terminal's tab
-        // opens the tab menu directly over the terminal's content). Without
-        // this gate the terminal-forward path below would swallow clicks/moves
-        // aimed at the menu, so menu items couldn't be selected (they'd inject
-        // mouse escape codes into the PTY instead). Skipping forwarding lets
-        // the event fall through to the normal pipeline, where
-        // `handle_click_context_menus` (select / dismiss) and the hover
-        // hit-test (highlight-follows-pointer) already handle it. The menu's
-        // precedence itself lives in the chrome walk/capture ordering (its
-        // boxes ride the top routable band); this fork only keeps the PTY
-        // from swallowing the events first.
-        let context_menu_open = self.active_window().context_menu_core().is_some();
-        // DERIVED suppression for everything with opaque geometry: a
-        // pointer-opaque chrome box over the cell (an info popup, the
-        // suggestions dropdown, the theme-info popup) must take the
-        // event in the walk — forwarding it would inject mouse codes
-        // into the PTY *through* the popup. This replaces growing the
-        // hand list one surface at a time; the context-menu check
-        // above stays NAMED by ruling because its boxes are
-        // deliberately not opaque (its close-guard backdrop owns
-        // outside clicks), so opacity cannot express it.
-        // ONE tree per event, built AFTER the pre-band observers above
-        // (the LSP-rename cancel can close a prompt, which changes the
-        // geometry) and shared by the forward gate and every dispatch
-        // arm below — the per-event-freshness ruling holds (same
-        // event, same state), and a mouse-move stream no longer pays
-        // two collects + two hit_stack sorts per event.
-        let tree = super::chrome::chrome_tree(self);
-        let opaque_chrome_over_point =
-            crate::widgets::layout_box::hit_stack(&tree, row as u32, col as u32)
-                .into_iter()
-                .any(|i| tree[i].lb.pointer_opaque);
-        if !chrome_drag_active && !context_menu_open && !opaque_chrome_over_point {
-            let forwarding = self.config.terminal.mouse_forwarding;
-            if let Some(result) = self.active_window_mut().try_forward_mouse_to_terminal(
-                col,
-                row,
-                mouse_event,
-                forwarding,
-            ) {
-                return result;
+        // Both are gone. The modals are `Modality::Exclusive` layers, and no
+        // placed box above the shell's band is left — the split grid's sit at
+        // 70 and 80, below it. So there is one walk, and it is this one; the
+        // legacy walk below stays the floor.
+        //
+        // Whether the tree took the event is reported by `dispatch`, not
+        // inferred from whether it had anything to say: a hover moves a
+        // highlight without claiming, and a right-click outside a menu closes
+        // it while staying available to open the next one.
+        //
+        // Which press of a run this is, as the editor's own multi-click
+        // detector saw it. The tree carries it to its handlers on
+        // `Event::clicks`; nothing in the library counts.
+        let clicks = if is_triple_click {
+            3
+        } else if is_double_click {
+            2
+        } else {
+            1
+        };
+        // A notch is worth `mouse_wheel_scroll_lines` on the vertical axis and
+        // `WHEEL_COLUMNS` sideways — the same rule `begin_wheel_scroll` states
+        // for the walk below, because a surface that moved into the tree must
+        // not scroll at a different speed from the one beside it.
+        let wheel_lines = self.config.editor.mouse_wheel_scroll_lines.max(1) as i32;
+        // **A multi-line notch slides rather than jumping**, and the split has
+        // to happen here, ahead of dispatch. The first line goes with this
+        // event and the rest are owed, walked one at a time by
+        // `step_pending_wheel_scroll`. It used to sit between the tree's
+        // dispatch and the legacy walk — which meant it applied only to the
+        // notches the tree *declined*, and once a surface's wheel became a node
+        // that was none of that surface's.
+        //
+        // The walk is only *armed* once routing has said where the notch went
+        // (`arm_wheel_walk`, below): a terminal child takes a notch whole.
+        let (wheel_lines, walk) = self.plan_wheel_walk(mouse_event, col, row, wheel_lines);
+        let dispatched =
+            crate::view::shell::input::mouse(mouse_event, clicks, wheel_lines, WHEEL_COLUMNS)
+                .map(|input| self.shell_dispatch(input));
+        self.arm_wheel_walk(walk, dispatched.map(|d| d.applied).unwrap_or_default());
+        if let Some(d) = dispatched {
+            if d.claimed {
+                return Ok(true);
             }
+            // Declined, but not necessarily inert: a hover restyles the
+            // surface under the pointer and lets the event go on to the
+            // trackers below, so the frame is stale even though the walk
+            // continues. See `Dispatched`.
+            needs_render = needs_render || d.changed;
         }
-
-        // Ctrl+Click on a file path printed in the live terminal opens it in
-        // Fresh (jumping to any :line:col it encodes). Handled before normal
-        // click routing so it doesn't disturb cursor/selection state.
-        if let Some(result) = self.try_open_terminal_link(col, row, mouse_event) {
+        // **The legacy walk cannot say what it changed**, so a press or a
+        // release it takes leaves the description stale for routing. A
+        // motion report is spent on trackers and grabs that change nothing
+        // routing reads, and a drag along a divider must not cost a layout
+        // per report.
+        if !matches!(
+            mouse_event.kind,
+            MouseEventKind::Moved | MouseEventKind::Drag(_)
+        ) {
+            self.shell_description_stale = true;
+        }
+        // A live terminal's own mouse, and the Ctrl+Click that opens a path it
+        // printed. Both belong to a pane's *content*, and the pane's content
+        // is a node — so its handlers ask this first, before placing a caret
+        // (`Editor::pane_content_takes_pointer`). This call is for the event
+        // kinds that node does not claim: a motion or a release mid-drag, and
+        // anything landing outside a pane. One rule, asked wherever the
+        // pointer can reach the content.
+        if let Some(result) = self.pane_content_takes_pointer(col, row, mouse_event) {
             return result;
         }
 
         match mouse_event.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                // NOTE: the fold-toggle double/triple check lives in
-                // `Splits::on_pointer`'s Double/Triple arm — inside the
-                // walk, so a popup's opaque box or the overlay prompt's
-                // swallow blocks it by construction (it used to sit
-                // here pre-walk, hit-testing `split_areas` directly and
-                // bypassing every guard the walk enforces).
-                if is_triple_click {
-                    // Triple click detected - select entire line
-                    self.handle_mouse_triple_click(&tree, col, row)?;
-                    needs_render = true;
-                    return Ok(needs_render);
-                }
-                if is_double_click {
-                    // Double click detected - both clicks within time threshold AND at same position
-                    self.handle_mouse_double_click(&tree, col, row)?;
-                    needs_render = true;
-                    return Ok(needs_render);
-                }
-                self.handle_mouse_click(&tree, col, row, mouse_event.modifiers)?;
-                needs_render = true;
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                self.handle_mouse_drag(col, row)?;
-                needs_render = true;
-            }
+            // A drag the tree declined moves nothing: every press-to-release
+            // gesture is a node's own capture now, and the last one that was
+            // not — the markdown document's drag-to-select — is the run's.
+            MouseEventKind::Drag(MouseButton::Left) => {}
             MouseEventKind::Up(MouseButton::Left) => {
-                // Release is GRAB-KEYED like the Drag arm: the derived
-                // `pointer_grab` names which press-to-release routing is
-                // ending, and its arm runs that grab's finalizer — no
-                // more per-surface field-poke ladder that had to be kept
-                // in sync with the grab roster by hand. Grabs without a
-                // finalizer just fall to the blanket clear below.
-                let grab = super::chrome::pointer_grab(self);
-                match grab {
-                    // End a dock-resize drag and persist the chosen
-                    // width so it survives toggling the dock off/on.
-                    Some(super::chrome::PointerGrab::DockResize) => {
-                        self.dock_resizing = false;
-                        if let Some(super::PanelPlacement::LeftDock { width_cols }) =
-                            self.dock.as_ref().map(|f| f.placement)
-                        {
-                            self.dock_width = Some(width_cols);
-                        }
-                        return Ok(true);
-                    }
-                    // Complete a tab drop before the drag state clears.
-                    Some(super::chrome::PointerGrab::TabDrag) => {
-                        if let Some(drag_state) =
-                            self.active_window_mut().mouse_state.dragging_tab.take()
-                        {
-                            if drag_state.is_dragging() {
-                                if let Some(drop_zone) = drag_state.drop_zone {
-                                    self.execute_tab_drop(
-                                        drag_state.buffer_id,
-                                        drag_state.source_split_id,
-                                        drop_zone,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-
-                // Blanket sweep: every remaining drag flag drops here,
-                // so no grab can outlive its release even if its
-                // finalizer above was skipped.
-                self.release_widget_scrollbar();
-                self.release_split_widget_scrollbar();
-                self.widget_text_drag = None;
-                self.clear_active_window_drag_state();
-
-                // A finished split-separator drag changed the ratios:
-                // reflow through the single layout funnel (after the
-                // sweep, as before).
-                if matches!(grab, Some(super::chrome::PointerGrab::SplitSeparator)) {
-                    self.relayout();
-                }
-
+                // A release ends whatever press was held. Every gesture's own
+                // release is captured by the node that took the press and
+                // never reaches this walk; this is for a press that was not.
+                self.active_window_mut().mouse_state.drag = None;
                 needs_render = true;
             }
             MouseEventKind::Moved => {
                 // Dispatch MouseMove hook to plugins (fire-and-forget, no blocking check)
                 {
-                    // Find content rect for the split under the mouse
-                    let content_rect = self
-                        .active_layout()
-                        .split_areas
-                        .iter()
-                        .find(|(_, _, content_rect, _, _, _)| in_rect(col, row, *content_rect))
-                        .map(|(_, _, rect, _, _, _)| *rect);
-
-                    let (content_x, content_y) = content_rect.map(|r| (r.x, r.y)).unwrap_or((0, 0));
+                    // Where the pane under the pointer starts, so a plugin can
+                    // turn a screen cell into a content one. `pane_content_at`
+                    // is the one answer to that; this used to scan
+                    // `split_areas` for it.
+                    let (content_x, content_y) = self
+                        .pane_content_at(col, row)
+                        .map(|(_, r)| (r.x, r.y))
+                        .unwrap_or((0, 0));
 
                     self.plugin_manager.read().unwrap().run_hook(
                         "mouse_move",
@@ -313,10 +310,10 @@ impl Editor {
                     );
                 }
 
-                // Only re-render if hover target actually changed
-                // (preserve needs_render if already set, e.g., for GPM cursor updates)
-                let hover_changed = self.update_hover_target(&tree, col, row);
-                needs_render = needs_render || hover_changed;
+                // The cell-keyed fan-out was here, for one reaction: the
+                // dock's overlay scrollbar. Its column is a node and reports
+                // its own Enter and Leave, so every motion event no longer has
+                // to be offered to every component to find out.
 
                 // Ctrl+hover over a resolvable path in the live terminal
                 // underlines it to signal it's clickable. RULING: stays
@@ -330,48 +327,16 @@ impl Editor {
                     self.update_terminal_link_hover(col, row, mouse_event.modifiers);
                 needs_render = needs_render || term_link_changed;
 
-                // Track LSP hover state for mouse-triggered hover popups
-                self.update_lsp_hover_state(col, row);
-
-                // Bare icon buttons inside a panel (the dock's `×`) light up
-                // under the pointer, the way the tab and file explorer `×`
-                // do. Tracked off the same motion events as the dock's
-                // scrollbar reveal (`Dock::on_hover_change`), and likewise
-                // re-rendering only on the enter/leave transition.
-                needs_render = self.update_widget_hover(col, row, None) || needs_render;
-            }
-            MouseEventKind::ScrollUp => {
-                self.handle_vertical_scroll(&tree, col, row, mouse_event.modifiers, -3)?;
-                needs_render = true;
-            }
-            MouseEventKind::ScrollDown => {
-                self.handle_vertical_scroll(&tree, col, row, mouse_event.modifiers, 3)?;
-                needs_render = true;
-            }
-            MouseEventKind::ScrollLeft => {
-                // Native horizontal scroll left
-                self.handle_horizontal_scroll(&tree, col, row, -3)?;
-                needs_render = true;
-            }
-            MouseEventKind::ScrollRight => {
-                // Native horizontal scroll right
-                self.handle_horizontal_scroll(&tree, col, row, 3)?;
-                needs_render = true;
-            }
-            MouseEventKind::Down(MouseButton::Right) => {
-                // One walk for every right-click flavor: the overlay
-                // prompt's guard box swallows (mouse-modal), the theme
-                // inspector's trigger claims Ctrl+Right-Click, and the
-                // routable surfaces below take plain right-clicks.
-                self.handle_right_click(&tree, col, row, mouse_event.modifiers)?;
-                needs_render = true;
+                // Track LSP hover state for mouse-triggered hover popups.
+                // Dismissing the popup is a repaint, and this is the only
+                // party that knows it happened — see the docstring.
+                needs_render = self.update_lsp_hover_state(col, row) || needs_render;
             }
             _ => {
                 // Ignore other mouse events for now
             }
         }
 
-        self.active_window_mut().mouse_state.last_position = Some((col, row));
         Ok(needs_render)
     }
 
@@ -413,112 +378,248 @@ impl Editor {
         (is_double, is_triple)
     }
 
-    /// Dispatch a vertical scroll event (ScrollUp/ScrollDown): Shift
-    /// pans horizontally; otherwise the wheel scans the chrome tree
-    /// top-down (`hit_stack`), offering each box to its owning
-    /// component until one consumes — surfaces with no wheel handler
-    /// decline, so the wheel keeps falling (scroll chaining) down to
-    /// the `chrome:base` fallback.
-    /// THE wheel dispatch engine — one walk for both axes. Build the
-    /// per-event chrome tree, scan the boxes under the point top-down
-    /// (`hit_stack`), offer the delta to each box's owning component
-    /// (`on_wheel` / `on_hwheel` by axis) until one consumes.
-    /// Deliberately NO opacity gate: wheel chains through declining
-    /// surfaces (scroll chaining). Deliberately NO per-surface dedup
-    /// either (unlike `dispatch_pointer`): chaining wants every box's
-    /// own at-bound check, including a second box of the same surface.
-    /// Adding a scroll surface never touches this — write a
-    /// component, register it, contribute boxes.
-    fn dispatch_wheel(
+    /// Split one wheel notch into the line that lands now and the walk that
+    /// would owe the rest, returning both. `lines` is the notch's full worth.
+    ///
+    /// A notch is worth `mouse_wheel_scroll_lines`. The first lands with the
+    /// event itself, so the view answers the wheel on the same frame; the rest
+    /// are owed and walked one at a time by [`Self::step_pending_wheel_scroll`],
+    /// which is what makes a multi-line notch slide rather than jump. The walk
+    /// is returned, not armed: whether the notch's surface wants its lines one
+    /// at a time is known only once the notch is routed
+    /// ([`Self::arm_wheel_walk`]).
+    ///
+    /// A gesture still playing out is settled here, before the notch is
+    /// routed: its lines carry into this walk, or are delivered now.
+    fn plan_wheel_walk(
         &mut self,
-        tree: &[super::chrome::ChromeBox],
-        horizontal: bool,
+        ev: crossterm::event::MouseEvent,
         col: u16,
         row: u16,
-        delta: i32,
-    ) -> AnyhowResult<()> {
-        for i in crate::widgets::layout_box::hit_stack(tree, row as u32, col as u32) {
-            let b = &tree[i];
-            let c = super::chrome::components()[b.owner];
-            let disp = if horizontal {
-                c.on_hwheel(self, &b.lb, col, row, delta)?
-            } else {
-                c.on_wheel(self, &b.lb, col, row, delta)?
-            };
-            match disp {
-                super::chrome::Disposition::Consumed => return Ok(()),
-                super::chrome::Disposition::PassAfter | super::chrome::Disposition::Pass => {}
+        lines: i32,
+    ) -> (i32, Option<PendingWheelScroll>) {
+        use crossterm::event::{KeyModifiers, MouseEventKind};
+        // Only a vertical notch walks. Anything else — a press, a motion, a
+        // sideways wheel — leaves the gesture in progress alone; it plays out
+        // on its own frames.
+        let direction = match ev.kind {
+            MouseEventKind::ScrollDown => 1,
+            MouseEventKind::ScrollUp => -1,
+            _ => return (lines, None),
+        };
+        // Shift turns the wheel horizontal. That pans by columns, which the
+        // line-oriented setting has nothing to say about and there is no
+        // line-by-line walk for — so it ends any gesture in flight rather than
+        // letting one keep playing under a sideways scroll.
+        let sideways = ev.modifiers.contains(KeyModifiers::SHIFT);
+        // Nothing to walk for a single-line notch, and a user who turned
+        // motion off gets the jump.
+        let walk = !sideways
+            && lines > 1
+            && self.config.editor.smooth_scroll
+            && self.config.editor.animations;
+        if !walk {
+            self.flush_pending_wheel_scroll();
+            return (lines, None);
+        }
+
+        // A flick sends notches faster than they can be walked, so the lines
+        // the last one still owed carry over into this one — the walk tracks a
+        // single running total rather than a queue of notches. One aimed
+        // elsewhere, or the other way, cannot carry over; its lines are handed
+        // to the surface they were routed to instead, so a nudge of the mouse
+        // mid-scroll cannot swallow distance. Either way nothing is dropped.
+        let lines = lines as u32;
+        let carried = match self.pending_wheel_scroll.take() {
+            Some(pending)
+                if pending.direction == direction && (pending.col, pending.row) == (col, row) =>
+            {
+                pending.remaining
             }
-        }
-        Ok(())
+            Some(pending) => {
+                self.deliver_owed(&pending);
+                0
+            }
+            None => 0,
+        };
+        let walk = PendingWheelScroll {
+            col,
+            row,
+            direction,
+            remaining: carried + lines - 1,
+            max_backlog: lines * 2,
+            last_step: Instant::now(),
+        };
+        (1, Some(walk))
     }
 
-    fn handle_vertical_scroll(
+    /// Arm the walk a notch planned, now that routing has said where the
+    /// notch went. A live terminal whose child takes the mouse got the notch
+    /// forwarded whole — the child scrolls by its own rule, one report per
+    /// notch — so it has no lines owed; a replay would forward it again.
+    fn arm_wheel_walk(
         &mut self,
-        tree: &[super::chrome::ChromeBox],
-        col: u16,
-        row: u16,
-        modifiers: crossterm::event::KeyModifiers,
-        delta: i32,
-    ) -> AnyhowResult<()> {
-        // Shift turns the wheel horizontal (same engine, other axis).
-        let horizontal = modifiers.contains(crossterm::event::KeyModifiers::SHIFT);
-        self.dispatch_wheel(tree, horizontal, col, row, delta)
+        walk: Option<PendingWheelScroll>,
+        applied: crate::app::shell_host::Applied,
+    ) {
+        if applied.wheel_forwarded {
+            return;
+        }
+        if let Some(walk) = walk {
+            self.pending_wheel_scroll = Some(walk);
+        }
     }
 
-    /// Route a horizontal scroll (Shift+wheel, native ScrollLeft /
-    /// ScrollRight) through the SAME engine as every other gesture —
-    /// surfaces with a horizontal axis (split panes, tab strips)
-    /// claim their boxes; everything else declines and the base
-    /// drops it.
-    pub(super) fn handle_horizontal_scroll(
-        &mut self,
-        tree: &[super::chrome::ChromeBox],
-        col: u16,
-        row: u16,
-        delta: i32,
-    ) -> AnyhowResult<()> {
-        self.dispatch_wheel(tree, true, col, row, delta)
+    /// Hand a gesture the lines it still owes, all at once, to the
+    /// surface its own notches were routed to.
+    fn deliver_owed(&mut self, pending: &PendingWheelScroll) {
+        if pending.remaining == 0 {
+            return;
+        }
+        self.deliver_wheel(
+            pending.col,
+            pending.row,
+            pending.direction,
+            pending.remaining,
+        );
     }
 
-    /// Update the current hover target based on mouse position.
-    /// Returns true if a re-render is needed. This is the generic
-    /// engine only: walk the tree for the new target, diff, store,
-    /// then offer the transition to every registered component
-    /// (`on_hover_change`) — the per-surface hover REACTIONS (menu
-    /// auto-switch/submenu machine, context-menu highlight, explorer
-    /// tooltip) live with their components, not here.
-    pub(super) fn update_hover_target(
+    /// Hand `lines` of owed wheel to whatever is under `(col, row)`, through
+    /// the same route a real notch takes.
+    ///
+    /// **One route.** The walk replays into the tree, exactly as the notch it
+    /// came from did, so the surface that took the first line takes the rest
+    /// — rather than the walk having a delivery path of its own that could
+    /// route somewhere else.
+    fn deliver_wheel(
         &mut self,
-        tree: &[super::chrome::ChromeBox],
         col: u16,
         row: u16,
-    ) -> bool {
-        // Same cell, same TREE SEQUENCE → nothing below can produce a
-        // different answer: `ui_tree_seq` advances only when `chrome_tree`
-        // actually rebuilds, and a non-rebuild is a VALIDATED claim (gen
-        // match + overlay-stack equality, see `chrome_tree`) that the
-        // tree's inputs didn't change — so the walk and every hover
-        // reaction already ran for this exact (col, row) against this
-        // exact tree. Terminals emit Moved events far faster than the
-        // cell grid changes, so this collapses the common motion burst to
-        // one walk per cell. If a hover reaction mutates state, the next
-        // event's tree query misses its memo, the seq advances, and this
-        // key misses with it.
-        if self.hover_cell_memo.get() == Some((self.ui_tree_seq.get(), col, row)) {
-            return false;
+        direction: i32,
+        lines: u32,
+    ) -> crate::app::shell_host::Applied {
+        use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+        let ev = MouseEvent {
+            kind: match direction {
+                d if d > 0 => MouseEventKind::ScrollDown,
+                _ => MouseEventKind::ScrollUp,
+            },
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+        crate::view::shell::input::mouse(ev, 1, lines as i32, WHEEL_COLUMNS)
+            .map(|input| self.shell_dispatch(input).applied)
+            .unwrap_or_default()
+    }
+
+    /// End any playing-out gesture, delivering what it still owes rather
+    /// than dropping it. A wheel turned sideways, or a walk switched off
+    /// mid-gesture, must not cost the view the distance already asked
+    /// for.
+    fn flush_pending_wheel_scroll(&mut self) {
+        let Some(pending) = self.pending_wheel_scroll.take() else {
+            return;
+        };
+        self.deliver_owed(&pending);
+    }
+
+    /// True while a wheel gesture still owes lines. The event loop keeps
+    /// producing frames while it does — without them the walk would
+    /// stall part-way through a notch.
+    pub fn has_pending_wheel_scroll(&self) -> bool {
+        self.pending_wheel_scroll.is_some()
+    }
+
+    /// When the next owed line comes due, for the loop's wait.
+    pub fn pending_wheel_scroll_deadline(&self) -> Option<Instant> {
+        self.pending_wheel_scroll
+            .as_ref()
+            .map(|pending| pending.last_step + SMOOTH_SCROLL_LINE)
+    }
+
+    /// Hand the surface under the pointer however many lines a
+    /// playing-out wheel gesture owes it by now. Called once per frame,
+    /// before layout, so the lines land in the frame about to be
+    /// painted.
+    pub(crate) fn step_pending_wheel_scroll(&mut self) {
+        let Some(pending) = self.pending_wheel_scroll.as_mut() else {
+            return;
+        };
+        let due = lines_to_deliver(
+            pending.last_step.elapsed(),
+            SMOOTH_SCROLL_LINE,
+            pending.remaining,
+            pending.max_backlog,
+        );
+        if due == 0 {
+            return;
         }
-        let old_target = self.active_window_mut().mouse_state.hover_target.clone();
-        let new_target = self.compute_hover_target(tree, col, row);
-        let mut needs_render = old_target != new_target;
-        self.active_window_mut().mouse_state.hover_target = new_target.clone();
-        for c in super::chrome::components() {
-            needs_render |=
-                c.on_hover_change(self, old_target.as_ref(), new_target.as_ref(), col, row);
+        let (col, row, direction) = (pending.col, pending.row, pending.direction);
+        pending.remaining -= due;
+        // Advance by what was delivered rather than to now, so a late
+        // frame does not push the rest of the walk back with it.
+        pending.last_step += SMOOTH_SCROLL_LINE * due;
+        if pending.remaining == 0 {
+            self.pending_wheel_scroll = None;
         }
-        self.hover_cell_memo
-            .set(Some((self.ui_tree_seq.get(), col, row)));
-        needs_render
+
+        // The surface under the walk can stop wanting its lines one at a
+        // time — a terminal's child that turned the mouse on mid-walk takes
+        // the line whole — and then the rest of the walk is not owed either.
+        if self.deliver_wheel(col, row, direction, due).wheel_forwarded {
+            self.pending_wheel_scroll = None;
+        }
+    }
+
+    /// Record where the tree says a drag rests past a list's edge, after a
+    /// dispatch. A drag that was already scrolling keeps its pace; one that
+    /// has just arrived there took its first step with the move that
+    /// brought it.
+    pub(crate) fn note_drag_autoscroll(&mut self, at: Option<fresh_ui::Point>) {
+        let last_step = self
+            .drag_autoscroll
+            .map_or_else(Instant::now, |d| d.last_step);
+        self.drag_autoscroll = at.map(|p| DragAutoscroll {
+            col: p.x.max(0) as u16,
+            row: p.y.max(0) as u16,
+            last_step,
+        });
+    }
+
+    /// True while a drag rests where the tree would scroll the list under
+    /// it. The event loop keeps producing frames while it does.
+    pub fn has_drag_autoscroll(&self) -> bool {
+        self.drag_autoscroll.is_some()
+    }
+
+    /// When the held drag's next step comes due, for the loop's wait.
+    pub fn drag_autoscroll_deadline(&self) -> Option<Instant> {
+        self.drag_autoscroll
+            .map(|d| d.last_step + DRAG_AUTOSCROLL_STEP)
+    }
+
+    /// Repeat the pointer where a drag rests past a list's edge, once its
+    /// step is due. Called once per frame, before layout, beside the wheel
+    /// walk, so the step lands in the frame about to be painted.
+    pub(crate) fn step_drag_autoscroll(&mut self) {
+        let Some(d) = self.drag_autoscroll.as_mut() else {
+            return;
+        };
+        if d.last_step.elapsed() < DRAG_AUTOSCROLL_STEP {
+            return;
+        }
+        d.last_step += DRAG_AUTOSCROLL_STEP;
+        // A loop away for a long while does not owe the steps it missed: the
+        // pace restarts from now rather than scrolling them all at once.
+        if d.last_step.elapsed() >= DRAG_AUTOSCROLL_STEP {
+            d.last_step = Instant::now();
+        }
+        let pos = fresh_ui::Point::new(d.col as i32, d.row as i32);
+        self.shell_dispatch(fresh_ui::Input::Move {
+            pos,
+            mods: fresh_ui::Mods::NONE,
+        });
     }
 
     /// Update LSP hover state based on mouse position
@@ -528,7 +629,29 @@ impl Editor {
     /// - Mouse is over the hover popup itself
     /// - Mouse is within the hovered symbol range
     ///
-    /// Hover is dismissed when mouse leaves the editor area entirely.
+    /// Hover is dismissed when the pointer leaves the editor's content — and
+    /// **the condition there is the popup, not the request**. Those are two
+    /// different facts, and gating the dismissal on the second one is what
+    /// stranded tooltips (F.7). `lsp_hover_state` is the debounce state
+    /// machine — *which byte a request is pending for* — and the branches
+    /// below for the gutter and for the space past a line's end deliberately
+    /// clear it while keeping the popup up, because passing over a line
+    /// number must not tear the card down. So a pointer that left the editor
+    /// *through the gutter* arrived at the leave-the-editor branch with the
+    /// state already `None`, that branch skipped its own dismissal, and the
+    /// card sat there until a key or a click removed it. What the branch
+    /// means is "a transient popup is up and the pointer has left", so that
+    /// is what it now asks: `popups.is_visible()` with a `transient` popup on
+    /// top — the same three facts `is_mouse_over_transient_popup` reads, and
+    /// exactly the popup `dismiss_transient_popups` would take down.
+    ///
+    /// One transient popup on that stack is **not** this pipeline's: the file
+    /// explorer's status tooltip, which `FileExplorer::on_hover_change` shows
+    /// while the pointer rests on a status indicator. The sidebar is not pane
+    /// content, so this branch runs on the very same motion event that put
+    /// the tooltip up and would pop it before it was ever painted. Hovering
+    /// that indicator is therefore held out by name — see
+    /// `chrome_owns_transient_popup`.
     ///
     /// RULING — this pipeline stays OUTSIDE the `HoverTarget` walk: it
     /// is not a "name the surface under the pointer" question but a
@@ -539,7 +662,17 @@ impl Editor {
     /// names chrome, these trackers own editor-content reactions.
     /// Folding it in is recorded in the plan doc as part of the
     /// mounted-panel/hover unification arc, not chrome registration.
-    fn update_lsp_hover_state(&mut self, col: u16, row: u16) {
+    ///
+    /// **Reports whether the frame is stale**, which is the half of
+    /// `update_hover_target` that had no replacement. That walk returned "the
+    /// target moved, redraw" and every tracker rode on it; the tree reports
+    /// its own hover now, but a pointer over ground the tree does not describe
+    /// — the `~` filler past the last line, the padding right of the text —
+    /// crosses no element and produces neither a message nor a mutation. So
+    /// the one transition here that changes pixels, dismissing the popup, has
+    /// to say so itself. Nothing else does: clearing `lsp_hover_state` moves
+    /// the request state machine, not the screen.
+    fn update_lsp_hover_state(&mut self, col: u16, row: u16) -> bool {
         tracing::trace!(col, row, "update_lsp_hover_state: raw mouse position");
 
         // Suppress LSP hover when a popup is already visible (the theme
@@ -568,27 +701,26 @@ impl Editor {
                 self.active_window_mut().mouse_state.lsp_hover_state = None;
                 self.active_window_mut().mouse_state.lsp_hover_request_sent = false;
                 self.dismiss_transient_popups();
+                return true;
             }
-            return;
+            return false;
         }
 
         // Check if mouse is over a transient popup - if so, keep hover active
         if self.is_mouse_over_transient_popup(col, row) {
-            return;
+            return false;
         }
 
-        // Find which split the mouse is over
+        // Which split the mouse is over, and the rectangle to project through.
         let split_info = self
-            .active_layout()
-            .split_areas
-            .iter()
-            .find(|(_, _, content_rect, _, _, _)| in_rect(col, row, *content_rect))
-            .map(|(split_id, buffer_id, content_rect, _, _, _)| {
-                (*split_id, *buffer_id, *content_rect)
-            });
+            .pane_content_at(col, row)
+            .and_then(|(pane, rect)| Some((pane, self.active_window().pane_buffer(pane)?, rect)));
 
         let Some((split_id, buffer_id, content_rect)) = split_info else {
-            // Mouse is not over editor content - clear hover state and dismiss popup
+            // Mouse is not over editor content. Two independent things happen
+            // here, and the bug was treating them as one: the pending request
+            // is dropped *if there is one*, and the popup comes down *if there
+            // is one*. Neither implies the other — see the docstring.
             if self
                 .active_window_mut()
                 .mouse_state
@@ -597,17 +729,21 @@ impl Editor {
             {
                 self.active_window_mut().mouse_state.lsp_hover_state = None;
                 self.active_window_mut().mouse_state.lsp_hover_request_sent = false;
-                self.dismiss_transient_popups();
             }
-            return;
+            if self.transient_popup_showing() && !self.chrome_owns_transient_popup() {
+                self.dismiss_transient_popups();
+                // Only this path repainted, so only this path is stale.
+                return true;
+            }
+            return false;
         };
 
-        // Get cached mappings and gutter width for this split
+        // The rows the pane's last text pass drew, as its leaf keeps them,
+        // and the gutter width for this split.
         let cached_mappings = self
-            .active_layout()
-            .view_line_mappings
-            .get(&split_id)
-            .cloned();
+            .active_window()
+            .pane_view(split_id)
+            .map(|v| v.rows.clone());
         let gutter_width = self
             .buffers()
             .get(&buffer_id)
@@ -621,13 +757,10 @@ impl Editor {
 
         // Get compose width for this split
         let compose_width = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
+            .active_window()
+            .split_view_states()
             .get(&split_id)
-            .and_then(|vs| vs.compose_width);
+            .and_then(|vs| vs.buffer_tab_state().compose_width);
 
         // Convert screen position to buffer byte position
         let Some(byte_pos) = super::click_geometry::screen_to_buffer_position(
@@ -635,7 +768,7 @@ impl Editor {
             row,
             content_rect,
             gutter_width,
-            &cached_mappings,
+            cached_mappings.as_deref(),
             fallback,
             false, // Don't include gutter
             compose_width,
@@ -652,7 +785,7 @@ impl Editor {
                 self.active_window_mut().mouse_state.lsp_hover_state = None;
                 self.active_window_mut().mouse_state.lsp_hover_request_sent = false;
             }
-            return;
+            return false;
         };
 
         // Check if mouse is past the end of line content - don't trigger hover for empty space
@@ -663,21 +796,14 @@ impl Editor {
         let line_info = cached_mappings
             .as_ref()
             .and_then(|mappings| mappings.get(visual_row))
-            .map(|line_mapping| {
-                (
-                    line_mapping.visual_to_char.len(),
-                    line_mapping.line_end_byte,
-                )
-            });
+            .map(|line_mapping| (line_mapping.content_end_col(), line_mapping.line_end_byte));
 
+        // Past the last content cell (the newline and decoration cells
+        // don't count, so an empty line is always "past") there is no
+        // symbol to hover. The cell count can't be used here: a
+        // one-character line has one cell (issue #3351).
         let is_past_line_end_or_empty = line_info
-            .map(|(line_len, _)| {
-                // Empty lines (just newline) should not trigger hover
-                if line_len <= 1 {
-                    return true;
-                }
-                text_col >= line_len
-            })
+            .map(|(content_end_col, _)| text_col >= content_end_col)
             // If mouse is below all mapped lines (no mapping), don't trigger hover
             .unwrap_or(true);
 
@@ -711,14 +837,14 @@ impl Editor {
                 self.active_window_mut().mouse_state.lsp_hover_state = None;
                 self.active_window_mut().mouse_state.lsp_hover_request_sent = false;
             }
-            return;
+            return false;
         }
 
         // Check if mouse is within the hovered symbol range - if so, keep hover active
         if let Some((start, end)) = self.active_window_mut().hover.symbol_range() {
             if byte_pos >= start && byte_pos < end {
                 // Mouse is still over the hovered symbol - keep hover state
-                return;
+                return false;
             }
         }
 
@@ -728,7 +854,7 @@ impl Editor {
         {
             if old_pos == byte_pos && old_buf == buffer_id {
                 // Same position - keep existing state
-                return;
+                return false;
             }
             // Position changed outside the hovered symbol range. Don't dismiss
             // the popup here: a new hover request will fire after the debounce
@@ -743,117 +869,77 @@ impl Editor {
         self.active_window_mut().mouse_state.lsp_hover_state =
             Some((byte_pos, std::time::Instant::now(), col, row, buffer_id));
         self.active_window_mut().mouse_state.lsp_hover_request_sent = false;
+        false
     }
 
-    /// Check if mouse position is over a transient popup (hover, signature help)
+    /// Is the pointer over a transient popup (hover, signature help)?
+    ///
+    /// The LSP hover keep-alive's one question, asked directly. It used to go
+    /// through `view::popup_mouse` — a `PopupHitTester` over a
+    /// `Vec<PopupLayoutInfo>` built by converting the cached tuples into a
+    /// struct with seven fields, of which this reads one. That module's other
+    /// half (click, hover, drag dispatch) was replaced by the popups
+    /// component and then by the tree; what was left was scaffolding around a
+    /// rectangle test, with a doc comment naming a second caller that no
+    /// longer exists.
     fn is_mouse_over_transient_popup(&self, col: u16, row: u16) -> bool {
-        let layouts = popup_areas_to_layout_info(&self.active_chrome().popup_areas);
-        let hit_tester = PopupHitTester::new(&layouts, &self.active_state().popups);
-        hit_tester.is_over_transient_popup(col, row)
+        if !self.transient_popup_showing() {
+            return false;
+        }
+        // The boxes the tree placed, asked by key. This read
+        // `ChromeLayout::popup_areas`, a cache `render` filled from this same
+        // read — one of the two whose deletion retires the paint-recorded
+        // roster. Only the buffer's stack is on screen for this question, and
+        // those are the description's first `buffer_n` popups.
+        let (buffer_n, _) = self.popup_counts();
+        self.popup_rects()
+            .iter()
+            .take(buffer_n)
+            .any(|outer| in_rect(col, row, *outer))
     }
 
-    /// Check if mouse position is over any popup (including non-transient ones like completion)
-    pub(super) fn is_mouse_over_any_popup(&self, col: u16, row: u16) -> bool {
-        // Editor-level popup overlays absorb every click within their outer
-        // rect so the buffer below doesn't receive a stray cursor placement.
-        for (_, popup_area, _, _, _) in &self.active_chrome().global_popup_areas {
-            if in_rect(col, row, *popup_area) {
-                return true;
-            }
-        }
-        // The prompt's suggestions popup also absorbs clicks across its full
-        // outer rect (border + items): clicking the chrome must not move the
-        // buffer cursor below.
-        if let Some(outer) = self.active_chrome().suggestions_outer_area {
-            if in_rect(col, row, outer) {
-                return true;
-            }
-        }
-        let layouts = popup_areas_to_layout_info(&self.active_chrome().popup_areas);
-        let hit_tester = PopupHitTester::new(&layouts, &self.active_state().popups);
-        hit_tester.is_over_popup(col, row)
+    /// Is a transient popup (hover, signature help) actually on screen?
+    ///
+    /// The keep-alive's question minus the pointer, and the one the
+    /// leave-the-editor dismissal wants: it names the popup
+    /// `dismiss_transient_popups` would take down, so it is also the honest
+    /// answer to "would dismissing change any pixels". Asking
+    /// `lsp_hover_state.is_some()` instead — the gate that used to stand here
+    /// — answers a different question entirely (is a debounced request
+    /// pending), and the two come apart every time the pointer crosses the
+    /// gutter.
+    fn transient_popup_showing(&self) -> bool {
+        let popups = &self.active_state().popups;
+        popups.is_visible() && popups.top().is_some_and(|p| p.transient)
     }
 
-    /// Check if mouse position is over the file browser popup
-    pub(super) fn is_mouse_over_file_browser(&self, col: u16, row: u16) -> bool {
-        self.active_window()
-            .file_browser_layout
-            .as_ref()
-            .is_some_and(|layout| layout.contains(col, row))
+    /// Is the transient popup on top one that a chrome surface under the
+    /// pointer owns, rather than this pipeline?
+    ///
+    /// Only one is: the file explorer's git-status tooltip. It is pushed by
+    /// `FileExplorer::on_hover_change` when the pointer enters a status
+    /// indicator and popped by the same reaction when it leaves, so "the
+    /// pointer is on a status indicator" and "that tooltip is up" are the
+    /// same fact — no stale answer is possible. Hand-listed for the same
+    /// reason the theme-info and LSP-status popups are hand-listed at the top
+    /// of `update_lsp_hover_state`: a popup does not record who put it there.
+    ///
+    /// Without this, `update_lsp_hover_state` would dismiss the tooltip on
+    /// the very motion event that created it — the shell's hover fact is
+    /// applied first, then the same event falls through to the trackers, and
+    /// the sidebar is not pane content, so the leave-the-editor branch runs
+    /// and finds a transient popup on top.
+    fn chrome_owns_transient_popup(&self) -> bool {
+        matches!(
+            self.hovered(),
+            Some(crate::app::types::HoverTarget::FileExplorerStatusIndicator(
+                _
+            ))
+        )
     }
 
     // `split_at_position` lives on `impl Window` — call it via
     // `self.active_window().split_at_position(col, row)`.
-
-    /// Compute what hover target is at the given position
-    fn compute_hover_target(
-        &mut self,
-        tree: &[super::chrome::ChromeBox],
-        col: u16,
-        row: u16,
-    ) -> Option<HoverTarget> {
-        // The hover surfaces, as chrome boxes — the same geometric walk
-        // as wheel/click/right-click/double-click, in query form: the
-        // highest-z box whose handler names a target wins, and handlers
-        // whose geometry is finer than their rectangle (context-menu
-        // borders, tab-bar background) decline so the point falls
-        // through to the boxes below. No per-surface dedup here
-        // (unlike `dispatch_pointer`): the first `Some` ends the walk,
-        // so re-offering a surface's second box is harmless and dedup
-        // would only add state.
-        for i in crate::widgets::layout_box::hit_stack(tree, row as u32, col as u32) {
-            let b = &tree[i];
-            if let Some(t) = super::chrome::components()[b.owner].hover(self, &b.lb, col, row) {
-                return Some(t);
-            }
-            // Opacity gate: a declining opaque surface (a popup) stops
-            // the scan — nothing beneath it is hoverable through it.
-            if b.lb.pointer_opaque {
-                return None;
-            }
-        }
-        None
-    }
-
-    /// Handle mouse double click (down event)
-    /// Double-click in editor area selects the word under the cursor:
-    /// the suggestion-confirm (#1660), overlay swallow, popup
-    /// block/dismiss guard, file-open dialog, explorer body, and the
-    /// split word-select arm are all component arms in the engine's
-    /// one scan — no post-walk special cases.
-    pub(super) fn handle_mouse_double_click(
-        &mut self,
-        tree: &[super::chrome::ChromeBox],
-        col: u16,
-        row: u16,
-    ) -> AnyhowResult<()> {
-        self.dispatch_pointer(
-            tree,
-            super::chrome::PointerPress::Double,
-            col,
-            row,
-            crossterm::event::KeyModifiers::empty(),
-        )
-    }
-
-    /// Handle mouse triple click (down event)
-    /// Triple-click in editor area selects the entire line under the
-    /// cursor — same engine, same arms (the Splits line-select arm
-    /// takes what the overlay/popup guards let through).
-    pub(super) fn handle_mouse_triple_click(
-        &mut self,
-        tree: &[super::chrome::ChromeBox],
-        col: u16,
-        row: u16,
-    ) -> AnyhowResult<()> {
-        self.dispatch_pointer(
-            tree,
-            super::chrome::PointerPress::Triple,
-            col,
-            row,
-            crossterm::event::KeyModifiers::empty(),
-        )
-    }
 
     /// True while a floating-overlay prompt (e.g. Live Grep / Universal
     /// Search) owns the screen. Such overlays are **mouse-modal**: their own
@@ -868,228 +954,139 @@ impl Editor {
             .is_some_and(|p| p.overlay)
     }
 
-    /// THE pointer dispatch engine — ONE walk for every press kind
-    /// (left, right, double, triple). Build the per-event chrome
-    /// tree, scan the boxes under the point top-down (`hit_stack`),
-    /// offer the press to each box's owning component, and honor the
-    /// dispositions: `Consumed` stops the walk, `PassAfter` acts then
-    /// continues (guards), and a DECLINED opaque box absorbs the
-    /// press (nothing routes through a popup). Multi-box surfaces
-    /// (one box per popup / dropdown level) are dispatched once per
-    /// surface — their handlers resolve by position over the whole
-    /// collection; the dedup is keyed on (owner, kind) so it never
-    /// couples two components through the flat kind-string namespace
-    /// (a reused string in another component still dispatches).
-    /// DEDUP POLICY per walk, deliberate: presses dedup (this walk);
-    /// the wheel walk offers EVERY hit box (scroll chaining wants
-    /// each surface's own bound check); the hover walk offers every
-    /// box too (first Some wins, dedup would be a no-op). Adding a
-    /// chrome surface never touches this engine: write a component,
-    /// register it, contribute boxes.
-    fn dispatch_pointer(
+    /// Whether the pane's content under the pointer takes this event before
+    /// anything the editor would do with it.
+    ///
+    /// Two things do. A **live terminal** that has asked for the mouse gets
+    /// it; and a **Ctrl+Click on a path** the terminal printed opens it in
+    /// Fresh, before normal click routing, so it does not disturb the cursor
+    /// or the selection.
+    ///
+    /// Forwarding is suppressed in two cases, both of which would otherwise
+    /// have their events swallowed by the PTY:
+    ///
+    /// * **A chrome drag is in progress** — a dock-border resize, a split
+    ///   separator, the file-explorer width. That drag owns the mouse until
+    ///   release, and an alternate-screen terminal must not take the motion
+    ///   once the pointer crosses it. *Growing* the dock drags the cursor
+    ///   rightward across a full-screen `btop`; forwarding there both stalls
+    ///   the resize and eats the mouse-up that ends it, leaving the drag
+    ///   stuck. Shrinking only ever worked because the pointer stays left of
+    ///   the terminal.
+    /// * **A native context menu is open** — the tab menu, the "+" menu, the
+    ///   explorer's. They render over, and often overlap, an alternate-screen
+    ///   terminal that has captured the mouse: right-clicking a terminal's tab
+    ///   opens its menu directly over that terminal's content. The menu is a
+    ///   `Modality::Inert` layer, so it does not claim a press aimed past it,
+    ///   and this fork is what keeps the PTY from swallowing one before the
+    ///   menu's own dismissal sees it.
+    ///
+    /// The opacity suppression that used to sit beside these is gone with the
+    /// surfaces it derived from. It said a pointer-opaque chrome box over the
+    /// cell — an info popup, the suggestions dropdown, the theme inspector —
+    /// had to take the event, because forwarding it would inject mouse codes
+    /// into the PTY *through* the popup. Every one of those is a node now, and
+    /// the tree is offered the pointer first: a surface that claims stops the
+    /// event there.
+    ///
+    /// `Some` means handled — nothing else should see the event.
+    pub(super) fn pane_content_takes_pointer(
         &mut self,
-        tree: &[super::chrome::ChromeBox],
-        press: super::chrome::PointerPress,
         col: u16,
         row: u16,
-        modifiers: crossterm::event::KeyModifiers,
-    ) -> AnyhowResult<()> {
-        let mut seen = std::collections::HashSet::new();
-        for i in crate::widgets::layout_box::hit_stack(tree, row as u32, col as u32) {
-            let b = &tree[i];
-            if !seen.insert((b.owner, b.lb.kind)) {
-                continue;
-            }
-            let ev = super::chrome::ChromePointer {
-                press,
-                col,
-                row,
-                modifiers,
-            };
-            let disp = super::chrome::components()[b.owner].on_pointer(self, &b.lb, &ev)?;
-            // Consumed stops; the PassAfter/Pass-vs-opacity contract is
-            // `pointer_walk_step` (pure, unit-tested).
-            if disp == super::chrome::Disposition::Consumed {
-                return Ok(());
-            }
-            if super::chrome::pointer_walk_step(disp, b.lb.pointer_opaque)
-                == super::chrome::PointerWalkStep::Stop
-            {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    pub(super) fn handle_mouse_click(
-        &mut self,
-        tree: &[super::chrome::ChromeBox],
-        col: u16,
-        row: u16,
-        modifiers: crossterm::event::KeyModifiers,
-    ) -> AnyhowResult<()> {
-        // (The centered modal's precedence over everything here is the
-        // FloatingModal component's whole-channel capture — this path
-        // is unreachable while it is up. Dock routing — column clicks,
-        // the resize-border grab, blur-on-outside — is the Dock
-        // component's boxes and arms in the engine's scan.)
-        self.dispatch_pointer(tree, super::chrome::PointerPress::Left, col, row, modifiers)
-    }
-
-    /// Handle mouse drag event
-    pub(super) fn handle_mouse_drag(&mut self, col: u16, row: u16) -> AnyhowResult<()> {
-        use super::chrome::PointerGrab;
-        // THE grab slot: the press-to-release owner derived from live
-        // drag state (`chrome::pointer_grab`) routes every motion —
-        // no re-hit-testing mid-drag (the btop-resize ruling), no
-        // hand-ordered flag ladder. `pointer_grab`'s check order
-        // preserves the old ladder's precedence.
-        let Some(grab) = super::chrome::pointer_grab(self) else {
-            return Ok(());
-        };
-        // Mouse-modal overlay: the only legitimate drags are the
-        // overlay's own result-list scrollbar and the grabs the old
-        // ladder ran ahead of the swallow (dock resize, widget text,
-        // widget scrollbar). Anything else — text selection in the
-        // buffer, a buffer scrollbar behind the overlay — is
-        // swallowed so the buffer stays put.
-        if self.overlay_prompt_active()
-            && !matches!(
-                grab,
-                PointerGrab::PromptScrollbar
-                    | PointerGrab::DockResize
-                    | PointerGrab::WidgetText
-                    | PointerGrab::WidgetScrollbar
-            )
-        {
-            return Ok(());
-        }
-        match grab {
-            // Dock resize drag: track the pointer column as the new dock
-            // width (the right border follows the cursor), clamped so it
-            // can't swallow the chrome.
-            PointerGrab::DockResize => {
-                self.handle_dock_resize_drag(col);
-            }
-            // Drag-to-select on a widget markdown/text document: armed by the
-            // press that placed the caret; every Drag extends the selection to
-            // the pointer.
-            PointerGrab::WidgetText => {
-                self.handle_widget_text_selection_drag(col, row);
-            }
-            // Floating-panel list scrollbar drag — the modal panel
-            // owns the input channel while it's up.
-            PointerGrab::WidgetScrollbar => {
-                let _ = self.try_widget_scrollbar_drag(super::PanelSlot::Dock, row)
-                    || self.try_widget_scrollbar_drag(super::PanelSlot::Floating, row)
-                    // Buffer-mounted panels (review-diff sidebar, Search &
-                    // Replace) keep their tracks on the editor.
-                    || self.try_split_widget_scrollbar_drag(row);
-            }
-            // Vertical scrollbar drag: update scroll position.
-            PointerGrab::VScrollbar => {
-                self.handle_vscrollbar_drag(col, row)?;
-            }
-            // Horizontal scrollbar drag: update horizontal scroll position.
-            PointerGrab::HScrollbar => {
-                self.handle_hscrollbar_drag(col, row)?;
-            }
-            // Selecting text in an info popup: extend the selection.
-            PointerGrab::PopupSelect => {
-                self.handle_popup_select_drag(col, row);
-            }
-            // The floating-overlay prompt's scrollbar (issue #1796):
-            // update its scroll_offset using the same math as the
-            // click handler. Same shared-widget logic the
-            // popup-scrollbar drag uses below.
-            PointerGrab::PromptScrollbar => {
-                self.handle_prompt_scrollbar_drag(row);
-            }
-            // A buffer popup's scrollbar: update its scroll position.
-            PointerGrab::PopupScrollbar => {
-                self.handle_popup_scrollbar_drag(row);
-            }
-            // Split-separator drag: update the split ratio.
-            PointerGrab::SplitSeparator => {
-                if let Some((split_id, direction)) =
-                    self.active_window_mut().mouse_state.dragging_separator
-                {
-                    self.handle_separator_drag(col, row, split_id, direction)?;
+        mouse_event: crossterm::event::MouseEvent,
+    ) -> Option<AnyhowResult<bool>> {
+        let context_menu_open = self.active_window().context_menu_core().is_some();
+        if !context_menu_open {
+            let forwarding = self.config.terminal.mouse_forwarding;
+            // Which terminal, and where its grid is: a question about the
+            // shell's tree, so it is asked on this side and handed down.
+            if let Some(at) = self.terminal_pane_at(col, row) {
+                if let Some(result) = self.active_window_mut().try_forward_mouse_to_terminal(
+                    col,
+                    row,
+                    at,
+                    mouse_event,
+                    forwarding,
+                ) {
+                    return Some(result);
                 }
             }
-            // File-explorer border drag: update its width.
-            PointerGrab::ExplorerWidth => {
-                self.handle_file_explorer_border_drag(col)?;
-            }
-            // A drag whose press landed on a live terminal grid: this is
-            // selection intent (a bare click only focuses — see
-            // `handle_editor_click`). Drop the split into read-only scrollback
-            // and start a normal text-selection drag anchored at the press.
-            PointerGrab::TerminalSelectPending => {
-                if let Some((split_id, buffer_id, ocol, orow)) =
-                    self.active_window().mouse_state.terminal_drag_pending
-                {
-                    self.begin_terminal_grid_selection(split_id, buffer_id, ocol, orow, col, row)?;
-                }
-            }
-            // Text-selection drag: extend from the anchor.
-            PointerGrab::TextSelection => {
-                self.handle_text_selection_drag(col, row)?;
-            }
-            // Tab drag: update position and compute the drop zone.
-            PointerGrab::TabDrag => {
-                self.handle_tab_drag(col, row)?;
-            }
         }
+        self.try_open_terminal_link(col, row, mouse_event)
+    }
+}
 
-        Ok(())
+#[cfg(test)]
+mod smooth_scroll_tests {
+    use super::{lines_due, lines_to_deliver, SMOOTH_SCROLL_LINE};
+    use std::time::Duration;
+
+    /// The walk is paced by the clock: a line comes due once its share
+    /// of time has passed, and not before.
+    #[test]
+    fn lines_come_due_one_interval_at_a_time() {
+        assert_eq!(lines_due(Duration::ZERO, SMOOTH_SCROLL_LINE, 4), 0);
+        assert_eq!(
+            lines_due(
+                SMOOTH_SCROLL_LINE - Duration::from_millis(1),
+                SMOOTH_SCROLL_LINE,
+                4
+            ),
+            0
+        );
+        assert_eq!(lines_due(SMOOTH_SCROLL_LINE, SMOOTH_SCROLL_LINE, 4), 1);
+        assert_eq!(lines_due(SMOOTH_SCROLL_LINE * 3, SMOOTH_SCROLL_LINE, 4), 3);
     }
 
-    /// Handle right-click event — same engine. Ordering rides z; the
-    /// anywhere-clears (tab "+" menu, close-split confirm) are the
-    /// Splits component's top-band PassAfter guard, the overlay
-    /// prompt's swallow and the theme inspector's Ctrl+Right trigger
-    /// are boxes above the routable surfaces.
-    pub(super) fn handle_right_click(
-        &mut self,
-        tree: &[super::chrome::ChromeBox],
-        col: u16,
-        row: u16,
-        modifiers: crossterm::event::KeyModifiers,
-    ) -> AnyhowResult<()> {
-        self.dispatch_pointer(
-            tree,
-            super::chrome::PointerPress::Right,
-            col,
-            row,
-            modifiers,
-        )
+    /// A frame rate too slow to show the walk collapses it back into a
+    /// jump rather than letting the view lag behind the wheel: a caller
+    /// away long enough for every remaining line gets all of them at
+    /// once, and never more than it is owed.
+    #[test]
+    fn a_slow_frame_delivers_the_whole_remainder_at_once() {
+        assert_eq!(
+            lines_due(Duration::from_millis(250), SMOOTH_SCROLL_LINE, 4),
+            4
+        );
+        assert_eq!(lines_due(Duration::from_secs(60), SMOOTH_SCROLL_LINE, 2), 2);
+        // Nothing owed, nothing delivered, however long the wait.
+        assert_eq!(lines_due(Duration::from_secs(60), SMOOTH_SCROLL_LINE, 0), 0);
     }
 
-    /// Clear all in-progress drag state on the active window's mouse state.
-    /// The active text/popup selection is intentionally preserved — only the
-    /// drag bookkeeping fields are reset.
-    fn clear_active_window_drag_state(&mut self) {
-        let ms = &mut self.active_window_mut().mouse_state;
-        ms.dragging_scrollbar = None;
-        ms.drag_start_row = None;
-        ms.drag_start_top_byte = None;
-        ms.dragging_horizontal_scrollbar = None;
-        ms.drag_start_hcol = None;
-        ms.drag_start_left_column = None;
-        ms.dragging_separator = None;
-        ms.drag_start_position = None;
-        ms.drag_start_ratio = None;
-        ms.dragging_file_explorer = false;
-        ms.drag_start_explorer_width = None;
-        ms.dragging_text_selection = false;
-        ms.drag_selection_split = None;
-        ms.drag_selection_anchor = None;
-        ms.drag_selection_by_words = false;
-        ms.drag_selection_word_end = None;
-        ms.terminal_drag_pending = None;
-        ms.dragging_popup_scrollbar = None;
-        ms.dragging_prompt_scrollbar = false;
-        ms.selecting_in_popup = None;
+    /// A zero interval is a walk with no pacing at all — everything at
+    /// once, rather than a division by zero.
+    #[test]
+    fn a_zero_interval_delivers_everything() {
+        assert_eq!(lines_due(Duration::ZERO, Duration::ZERO, 7), 7);
+    }
+
+    /// Notches can arrive faster than a line a frame. Whatever the walk
+    /// cannot pace out within the backlog rides along with this frame,
+    /// so a flick covers exactly the ground it asked for — dropping the
+    /// surplus instead would make fast scrolling travel less far than
+    /// slow scrolling.
+    #[test]
+    fn a_backlog_past_the_limit_rides_along_with_this_frame() {
+        // Within the backlog, only the clock decides.
+        assert_eq!(
+            lines_to_deliver(Duration::ZERO, SMOOTH_SCROLL_LINE, 6, 6),
+            0
+        );
+        // Past it, the surplus comes too.
+        assert_eq!(
+            lines_to_deliver(Duration::ZERO, SMOOTH_SCROLL_LINE, 10, 6),
+            4
+        );
+        // The clock still wins when it is further along.
+        assert_eq!(
+            lines_to_deliver(SMOOTH_SCROLL_LINE * 8, SMOOTH_SCROLL_LINE, 10, 6),
+            8
+        );
+        // And never more than is owed.
+        assert_eq!(
+            lines_to_deliver(SMOOTH_SCROLL_LINE * 99, SMOOTH_SCROLL_LINE, 3, 6),
+            3
+        );
     }
 }

@@ -16,9 +16,9 @@
 //! [`FileSystem`]: crate::model::filesystem::FileSystem
 
 use crate::app::Editor;
-use crate::primitives::path_utils::expand_tilde;
 use anyhow::Result as AnyhowResult;
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use fresh_editor_core::model::host_path::AsHostPath;
 use std::path::{Path, PathBuf};
 
 impl Editor {
@@ -40,12 +40,13 @@ impl Editor {
         // Try the live grid first, then the scrollback buffer view (only one
         // of the two is showing for any given terminal).
         let (link, term_cwd) = self
-            .active_window()
-            .detect_terminal_link_at(col, row)
+            .terminal_pane_at(col, row)
+            .and_then(|at| self.active_window().detect_terminal_link_at(col, row, at))
             .map(|(_, _, link, cwd)| (link, cwd))
             .or_else(|| {
+                let at = self.pane_content_at(col, row)?;
                 self.active_window()
-                    .detect_terminal_scrollback_link_at(col, row)
+                    .detect_terminal_scrollback_link_at(col, row, at)
                     .map(|(_, link, cwd)| (link, cwd))
             })?;
         let resolved = self.resolve_terminal_path(&link.path, term_cwd.as_deref())?;
@@ -90,8 +91,9 @@ impl Editor {
         col: u16,
         row: u16,
     ) -> Option<crate::app::window::TerminalLinkHover> {
+        let at = self.terminal_pane_at(col, row)?;
         let (buffer_id, term_row, link, term_cwd) =
-            self.active_window().detect_terminal_link_at(col, row)?;
+            self.active_window().detect_terminal_link_at(col, row, at)?;
         // Only highlight paths that actually resolve — otherwise the underline
         // would promise a link that clicking can't honor.
         self.resolve_terminal_path(&link.path, term_cwd.as_deref())?;
@@ -110,22 +112,31 @@ impl Editor {
     /// file. Directories and non-existent paths yield `None` (so the link is
     /// inert).
     fn resolve_terminal_path(&self, raw: &str, term_cwd: Option<&Path>) -> Option<PathBuf> {
-        let expanded = expand_tilde(raw);
+        // The terminal runs on the host, so the path it printed is the host's
+        // and every question about it belongs to the host's filesystem: where
+        // `~` is, whether the path is already rooted, and how to join it onto
+        // a base. Asking `std::path` asked the client.
+        let fs = &self.authority().filesystem;
+        let expanded = fs.expand_tilde(raw);
 
-        let candidates: Vec<PathBuf> = if expanded.is_absolute() {
-            vec![expanded]
+        let candidates: Vec<PathBuf> = if fs.at(&expanded).is_absolute() {
+            vec![expanded.into_path_buf()]
         } else {
+            let relative = expanded.to_wire_string();
             let mut v = Vec::new();
             if let Some(cwd) = term_cwd {
-                v.push(cwd.join(&expanded));
+                v.push(fs.at(cwd.as_host()).join_rel(&relative).into_path_buf());
             }
-            v.push(self.working_dir().join(&expanded));
+            v.push(
+                fs.at(self.working_dir().as_host())
+                    .join_rel(&relative)
+                    .into_path_buf(),
+            );
             v
         };
 
-        let fs = &self.authority().filesystem;
         candidates
             .into_iter()
-            .find(|p| fs.is_file(p).unwrap_or(false))
+            .find(|p| fs.is_file(p.as_host()).unwrap_or(false))
     }
 }

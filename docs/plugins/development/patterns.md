@@ -73,21 +73,29 @@ editor.registerCommand("my_goto_result", "Go to result", "my_goto_result", "my-r
 
 ### Running External Commands
 
-Use `spawnProcess` to run shell commands:
+Use `runOnTarget` to run a command on the active window's machine — on its
+SSH host or in its container when the workspace is remote. No shell is
+involved: pass the program and its arguments already split.
 
 ```typescript
 globalThis.run_tests = async function(): Promise<void> {
   editor.setStatus("Running tests...");
 
-  const result = await editor.spawnProcess("cargo", ["test"], null);
+  const result = await editor.runOnTarget("cargo", ["test"], editor.getCwd());
 
-  if (result.exit_code === 0) {
+  if (result.code === 0) {
     editor.setStatus("Tests passed!");
   } else {
     editor.setStatus(`Tests failed: ${result.stderr.split('\n')[0]}`);
   }
 };
 ```
+
+To run a command in another window's workspace, use the machine
+`editor.openMachine({ kind: "window", window: id })` returns: its `run` takes
+the same arguments and runs where that window's files are. Both return a
+handle you can `await` or `kill()`. `spawnProcess` is deprecated: it does the
+same as `runOnTarget` but resolves with `exit_code` instead of `code`.
 
 ### Invoking LSP Requests
 
@@ -118,7 +126,9 @@ globalThis.process_file = async function(): Promise<void> {
   if (editor.fileExists(path)) {
     const content = await editor.readFile(path);
     const modified = content.replace(/TODO/g, "DONE");
-    await editor.writeFile(path + ".processed", modified);
+    // `replaceFile`, not `writeFile`: running this twice on the same buffer
+    // should rewrite the output, and `writeFile` refuses a path that exists.
+    await editor.replaceFile(path + ".processed", modified);
   }
 };
 ```

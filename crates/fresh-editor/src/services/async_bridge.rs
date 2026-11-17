@@ -40,6 +40,11 @@ pub enum RemoteAttachMode {
     Window {
         label: String,
         command: Option<Vec<String>>,
+        /// Grow this preparing window into the session rather than minting a
+        /// new one, so the user is already standing in the workspace when the
+        /// connect lands — and is already looking at the page that reports it
+        /// if the connect fails. `None` mints a window, as before.
+        adopt: Option<fresh_core::WindowId>,
     },
     /// Reconnect an **existing dormant** session: a remote session restored
     /// from disk (its backend spec known, but its live authority still the
@@ -47,6 +52,11 @@ pub enum RemoteAttachMode {
     /// window's* authority at the freshly-connected backend and park the
     /// keepalive — no new window, no editor restart.
     Reconnect { window_id: fresh_core::WindowId },
+    /// No window: a plugin opened this machine to read it (`editor.openMachine`).
+    /// The connection is registered and handed back as a machine handle. Its
+    /// authority is built under `TrustLevel::Blocked`, so it cannot run commands.
+    #[cfg(feature = "plugins")]
+    Machine,
 }
 
 /// A completed remote-agent attach: the assembled authority plus the
@@ -138,6 +148,22 @@ pub enum AsyncMessage {
         server_name: String,
         /// Capabilities reported by this server
         capabilities: crate::services::lsp::manager::ServerCapabilitySummary,
+    },
+
+    /// A request to an initialized LSP server expired without a reply.
+    ///
+    /// Emitted per timeout so the editor can tell the user that the
+    /// server is not answering, rather than leaving the status bar on
+    /// "ready" while features silently do nothing (issue #2197).
+    LspRequestTimeout {
+        language: String,
+        server_name: String,
+        /// The LSP method that timed out, e.g. `textDocument/hover`.
+        method: String,
+        /// How long the request waited before being cancelled.
+        timeout: std::time::Duration,
+        /// Timeouts on this server since its last answered request.
+        consecutive: u32,
     },
 
     /// LSP server crashed or failed
@@ -343,6 +369,9 @@ pub enum AsyncMessage {
         terminal: fresh_core::WindowTerminalId,
     },
 
+    /// A program in a terminal asked to set the clipboard via OSC 52.
+    TerminalClipboardStore { text: String },
+
     /// Result of an asynchronous system-clipboard read. The main loop
     /// blocks input dispatch while a paste is in flight; the matching
     /// `request_id` ensures a late result that arrived after the
@@ -421,11 +450,29 @@ pub enum AsyncMessage {
         params: Option<Value>,
     },
 
+    /// LSP server notification (server -> client) whose method the editor
+    /// does not handle itself (e.g. clangd's `textDocument/clangd.fileStatus`).
+    /// Forwarded to plugins via the `lsp/custom_notification` hook.
+    LspCustomNotification {
+        language: String,
+        server_name: String,
+        method: String,
+        params: Option<Value>,
+    },
+
     /// Response for a plugin-initiated LSP request
     PluginLspResponse {
         language: String,
         request_id: u64,
         result: Result<Value, String>,
+    },
+
+    /// Host work a plugin is awaiting finished off the editor thread (a
+    /// `compareBuffers` diff, say): resolve its promise with the JSON
+    /// result, or reject it with the error.
+    PluginCallbackResult {
+        request_id: u64,
+        result: Result<String, String>,
     },
 
     /// Plugin process completed with output
@@ -465,6 +512,8 @@ pub enum AsyncMessage {
         /// the editor drop results that arrive after the user has
         /// switched windows/projects (the cache is keyed by cwd).
         cwd: String,
+        /// The load these files come from; only the latest is kept.
+        generation: u64,
         files: std::sync::Arc<Vec<crate::input::quick_open::providers::FileEntry>>,
         complete: bool,
     },
@@ -559,6 +608,14 @@ pub enum LspServerStatus {
     Starting,
     Initializing,
     Running,
+    /// Initialized and alive, but requests are timing out.
+    ///
+    /// A server can complete `initialize` and then answer nothing — pyright
+    /// 1.1.408 does exactly that (issue #2197) — and the editor used to
+    /// keep reporting "ready" while every hover, definition and diagnostic
+    /// request silently expired after 30s. This status is what makes that
+    /// visible; it reverts to `Running` as soon as a request is answered.
+    Unresponsive,
     Error,
     Shutdown,
 }
@@ -616,16 +673,6 @@ impl AsyncBridge {
         }
 
         messages
-    }
-
-    /// Check if there are pending messages (non-blocking)
-    pub fn has_messages(&self) -> bool {
-        // Note: This is racy but safe - only used for optimization
-        if let Ok(receiver) = self.receiver.lock() {
-            receiver.try_recv().is_ok()
-        } else {
-            false
-        }
     }
 }
 

@@ -9,7 +9,8 @@
 //! Also includes tab navigation (next/prev/cycle, navigate_back/forward,
 //! switch_buffer) which depends on the same focus-history machinery.
 
-use rust_i18n::t;
+use fresh_editor_core::model::host_path::AsHostPath;
+use fresh_i18n::t;
 
 use crate::model::event::{BufferId, Event, LeafId};
 use crate::view::prompt::PromptType;
@@ -29,9 +30,28 @@ struct CloseReplacement {
     return_to_group: Option<LeafId>,
 }
 
+/// Who closed a buffer, which decides whether Recent Files offers it
+/// again: a tab the user closed is; a buffer the editor closed on its own —
+/// a replaced or dismissed preview, a duplicate dropped because another
+/// workspace has the file, the buffer of a file the user deleted — is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CloseCause {
+    User,
+    Editor,
+}
+
 impl Editor {
     /// Close the given buffer
     pub fn close_buffer(&mut self, id: BufferId) -> anyhow::Result<()> {
+        self.close_buffer_by(id, CloseCause::User)
+    }
+
+    /// [`Self::close_buffer`], naming who closed it.
+    pub(crate) fn close_buffer_by(
+        &mut self,
+        id: BufferId,
+        cause: CloseCause,
+    ) -> anyhow::Result<()> {
         // Check for unsaved changes
         if let Some(state) = self
             .windows
@@ -44,13 +64,22 @@ impl Editor {
                 return Err(anyhow::anyhow!("Buffer has unsaved changes"));
             }
         }
-        self.close_buffer_internal(id, false)
+        self.close_buffer_internal(id, false, cause)
     }
 
     /// Force close the given buffer without checking for unsaved changes
     /// Use this when the user has already confirmed they want to discard changes
     pub fn force_close_buffer(&mut self, id: BufferId) -> anyhow::Result<()> {
-        self.close_buffer_internal(id, false)
+        self.force_close_buffer_by(id, CloseCause::User)
+    }
+
+    /// [`Self::force_close_buffer`], naming who closed it.
+    pub(crate) fn force_close_buffer_by(
+        &mut self,
+        id: BufferId,
+        cause: CloseCause,
+    ) -> anyhow::Result<()> {
+        self.close_buffer_internal(id, false, cause)
     }
 
     /// Close the last editor tab while a Utility Dock is present, keeping the
@@ -63,8 +92,95 @@ impl Editor {
         id: BufferId,
         split_id: LeafId,
     ) -> anyhow::Result<()> {
-        self.split_manager_mut().set_active_split(split_id);
-        self.close_buffer_internal(id, true)
+        self.active_window_mut()
+            .split_manager_mut()
+            .set_active_split(split_id);
+        self.close_buffer_internal(id, true, CloseCause::User)
+    }
+
+    /// Close `buffer_id` once the user has confirmed closing its last tab
+    /// (Discard, or Save once the file is written). When that tab is the
+    /// only one of its split and another editor split exists, the split
+    /// closes first, as when closing an unmodified buffer's last tab in
+    /// [`Editor::close_tab_in_split`]; without that, the emptied pane would
+    /// be refilled with some unrelated buffer.
+    pub(crate) fn close_confirmed_buffer(&mut self, id: BufferId) -> anyhow::Result<()> {
+        let hosts: Vec<LeafId> = self
+            .active_window()
+            .split_view_states()
+            .iter()
+            .filter(|(&split_id, view_state)| {
+                view_state.has_buffer(id) && !self.active_window().is_borrowing_panel(split_id, id)
+            })
+            .map(|(&split_id, _)| split_id)
+            .collect();
+        // A buffer that is still a tab of another split keeps its view
+        // there; no split closes. A buffer-group panel that borrows the
+        // buffer is no tab of it (it closes with the buffer), so it does not
+        // count, as in `close_tab_in_split`.
+        let collapsed = match hosts[..] {
+            [split_id] => self.close_split_if_sole_tab(split_id, id),
+            _ => false,
+        };
+        let closed = self.force_close_buffer(id);
+        if collapsed {
+            // Focus moved to the surviving split; restore terminal mode for
+            // its buffer after the close, as `close_tab_in_split` does
+            // (issue #2485).
+            self.sync_terminal_mode_to_active_buffer();
+        }
+        closed
+    }
+
+    /// How many of `split_id`'s tabs survive closing `closing`: every tab
+    /// but the buffer's own and those of the groups showing it in a panel,
+    /// which close with it (`close_groups_borrowing`). A group tab counts
+    /// otherwise: a pane holding the tab of a group that does not show the
+    /// buffer is not left empty by the close, and closing the pane would
+    /// close that group with it (issue #3688).
+    fn tabs_left_after_closing(&self, split_id: LeafId, closing: BufferId) -> usize {
+        use crate::view::split::TabTarget;
+        let window = self.active_window();
+        let Some(vs) = window.split_view_states().get(&split_id) else {
+            return 0;
+        };
+        vs.open_buffers
+            .iter()
+            .filter(|t| match t {
+                TabTarget::Buffer(b) => *b != closing,
+                TabTarget::Group(leaf) => !window.buffer_groups.values().any(|g| {
+                    g.representative_split == Some(*leaf) && g.borrowed_buffers.contains(&closing)
+                }),
+            })
+            .count()
+    }
+
+    /// Close `split_id` when it holds no tab that outlives closing `closing` and another
+    /// EDITOR split exists to take its space. Returns whether it closed.
+    ///
+    /// The Utility Dock is a role-tagged leaf, NOT an editor split, so it
+    /// must be excluded from this count (issue #2283). Counting it took the
+    /// "close the whole split" path when the sole editor tab was closed,
+    /// collapsing the editor leaf and promoting the dock's terminals into
+    /// the main tab bar.
+    fn close_split_if_sole_tab(&mut self, split_id: LeafId, closing: BufferId) -> bool {
+        let sole_tab = self.tabs_left_after_closing(split_id, closing) == 0;
+        let has_other_editor_splits = self
+            .windows
+            .get(&self.active_window)
+            .and_then(|w| w.buffers.splits())
+            .map(|(mgr, _)| {
+                use crate::view::split::SplitRole;
+                mgr.root().leaf_split_ids().iter().any(|&lid| {
+                    lid != split_id && mgr.leaf_role(lid) != Some(SplitRole::UtilityDock)
+                })
+            })
+            .expect("active window must have a populated split layout");
+        if !(sole_tab && has_other_editor_splits) {
+            return false;
+        }
+        self.handle_close_split(split_id.into());
+        true
     }
 
     /// Internal helper to close a buffer (shared by close_buffer and force_close_buffer)
@@ -72,6 +188,7 @@ impl Editor {
         &mut self,
         id: BufferId,
         force_empty_placeholder: bool,
+        cause: CloseCause,
     ) -> anyhow::Result<()> {
         // Discard any async pastes whose anchors live in this buffer:
         // when the result arrives the buffer state will be gone, and
@@ -79,6 +196,16 @@ impl Editor {
         // first so the rest of close doesn't observe a transient
         // pending entry that points at a half-torn-down buffer.
         self.cancel_pending_pastes_for_buffer(id);
+
+        // A group showing this buffer in a panel it borrowed closes first, so
+        // no panel is left on a buffer that is gone.
+        self.close_groups_borrowing(id);
+
+        // Remember the file for Recent Files. Before preview tracking is
+        // cleared below: a preview tab the user closes is not recorded.
+        if cause == CloseCause::User {
+            self.record_closed_file(id);
+        }
 
         // Clear preview tracking if we're closing the current preview buffer.
         // This keeps `preview` from pointing at a freed buffer id.
@@ -110,11 +237,15 @@ impl Editor {
             tracing::debug!("Failed to delete buffer recovery on close: {}", e);
         }
 
+        self.active_window_mut().notify_lsp_buffer_closed(id);
+
         // If closing a terminal buffer, tear down its terminal-side state.
         // Removing the entry drops the buffer's remembered mode with it.
         if let Some(tb) = self.active_window_mut().terminal_buffers.remove(&id) {
             self.cleanup_closed_terminal(id, tb.terminal_id);
         }
+        // An exited terminal has nothing left to restart once its tab is gone.
+        self.active_window_mut().exited_terminals.remove(&id);
 
         // Capture before resolving the replacement: the last-resort
         // `new_buffer()` path calls `set_active_buffer`, which would change
@@ -122,13 +253,7 @@ impl Editor {
         let closing_active = self.active_buffer() == id;
 
         // The split the replacement lands in.
-        let active_split = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split();
+        let active_split = self.active_window().split_manager().active_split();
 
         let CloseReplacement {
             buffer: replacement_buffer,
@@ -140,14 +265,24 @@ impl Editor {
         // Only needed when the closing buffer is the one the user is
         // looking at — otherwise the current active buffer stays.
         if closing_active {
+            // Whether the replacement already has a tab in the host split,
+            // read before `set_active_buffer` gives it one.
+            let was_tab = self
+                .active_window()
+                .split_view_states()
+                .get(&active_split)
+                .is_some_and(|vs| vs.has_buffer(replacement_buffer));
+
             self.set_active_buffer(replacement_buffer);
 
-            // If we landed on a hidden panel buffer to fill the Group-case
-            // housekeeping slot, scrub the *visible* side effects
-            // (`open_buffers`, `focus_history`) so the panel buffer doesn't
-            // appear as a tab. The `keyed_states` entry `switch_buffer`
-            // inserted has to stay — `active_state()` requires
-            // `active_buffer ∈ keyed_states` — but it's harmless as long as
+            // If we landed on a buffer that had no tab here to fill the
+            // Group-case housekeeping slot, scrub the *visible* side effects
+            // (`open_buffers`, `focus_history`) so it doesn't appear as a
+            // tab. That is a hidden panel buffer, or a file a group panel
+            // borrowed without a tab of its own — the files of a
+            // `--diff` comparison (issue #3688). The view state
+            // `set_buffer_tab` inserted has to stay — the buffer tab always
+            // has one — but it's harmless as long as
             // the plugin-snapshot lookup skips it; see
             // `snapshot_source_split` in `update_plugin_state_snapshot`.
             let hidden = self
@@ -155,13 +290,11 @@ impl Editor {
                 .buffer_metadata
                 .get(&replacement_buffer)
                 .is_some_and(|m| m.hidden_from_tabs);
-            if return_to_group.is_some() && hidden {
+            if return_to_group.is_some() && (hidden || !was_tab) {
                 use crate::view::split::TabTarget;
                 if let Some(vs) = self
-                    .windows
-                    .get_mut(&self.active_window)
-                    .and_then(|w| w.split_view_states_mut())
-                    .expect("active window must have a populated split layout")
+                    .active_window_mut()
+                    .split_view_states_mut()
                     .get_mut(&active_split)
                 {
                     vs.open_buffers
@@ -177,13 +310,7 @@ impl Editor {
         // matching `SplitViewState` stay consistent — updating only the
         // tree left SVS pointing at the buffer we were about to free,
         // which caused the click panic in issue #1620.
-        let splits_to_update = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .splits_for_buffer(id);
+        let splits_to_update = self.active_window().split_manager().splits_for_buffer(id);
         for split_id in splits_to_update {
             self.active_window_mut()
                 .set_pane_buffer(split_id, replacement_buffer);
@@ -211,8 +338,17 @@ impl Editor {
         // through the plugin's own close command).
         self.plugin_manager.read().unwrap().run_hook(
             "buffer_closed",
-            fresh_core::hooks::HookArgs::BufferClosed { buffer_id: id },
+            fresh_core::hooks::HookArgs::BufferClosed {
+                buffer_id: id,
+                window_id: self.active_window.0,
+            },
         );
+        // The sidebar sections scoped to this buffer go with it.
+        self.drop_sidebar_sections_for_buffer(id);
+
+        // Its file lock, if no other buffer here holds the file: an editor
+        // waiting on the file gets it now
+        self.sync_file_locks();
 
         Ok(())
     }
@@ -226,6 +362,29 @@ impl Editor {
         id: BufferId,
         terminal_id: crate::services::terminal::TerminalId,
     ) {
+        // Leave its backing file as a checkpoint would, the screen after the
+        // scrollback with no tail left in between, before it is kept below
+        // for search: a tail with lines streamed past it would otherwise
+        // stay in the kept file, those lines in it twice.
+        if let (Some(path), Some(handle)) = (
+            self.active_window()
+                .terminal_backing_files
+                .get(&terminal_id)
+                .cloned(),
+            self.active_window().terminal_manager.get(terminal_id),
+        ) {
+            if let Ok(mut state) = handle.state.lock() {
+                let fs = crate::app::terminal::terminal_backing_fs();
+                let mut file = crate::services::terminal::BackingFileAt {
+                    fs: fs.as_ref(),
+                    path: &path,
+                };
+                if let Err(e) = state.write_backing_file_tail(&mut file) {
+                    tracing::warn!("Failed to sync closing terminal's backing file: {}", e);
+                }
+            }
+        }
+
         // Close the terminal process
         self.active_window_mut().terminal_manager.close(terminal_id);
         // Drop any explicit-title marker / cached foreground name so the
@@ -264,7 +423,8 @@ impl Editor {
                     if backing.as_ref() != Some(&log_file) {
                         // Best-effort cleanup of temporary terminal files.
                         #[allow(clippy::let_underscore_must_use)]
-                        let _ = crate::app::terminal::terminal_backing_fs().remove_file(&log_file);
+                        let _ = crate::app::terminal::terminal_backing_fs()
+                            .remove_file(log_file.as_host());
                     }
                 }
             });
@@ -315,11 +475,8 @@ impl Editor {
         }
 
         let replacement_target: Option<crate::view::split::TabTarget> = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
+            .active_window()
+            .split_view_states()
             .get(&active_split)
             .and_then(|vs| {
                 use crate::view::split::TabTarget;
@@ -385,24 +542,20 @@ impl Editor {
             _ => None,
         };
 
-        // Prefer a buffer already keyed in the host split: `switch_buffer`
-        // inserts a default BufferViewState for any new active_buffer, which
+        // Prefer a buffer already keyed in the host split: `set_buffer_tab`
+        // inserts a default BufferViewState for any new buffer tab, which
         // for hidden panel buffers becomes a shadow entry (cursor=0) that
         // the plugin-state snapshot could non-deterministically prefer over
         // the panel split's authoritative copy. Picking something already
         // keyed sidesteps that insert. (We clean up after the fact if a
         // shadow does get created — see the caller.)
         let already_keyed = return_to_group.and_then(|_| {
-            self.windows
-                .get(&self.active_window)
-                .and_then(|w| w.buffers.splits())
-                .map(|(_, vs)| vs)
-                .expect("active window must have a populated split layout")
+            self.active_window()
+                .split_view_states()
                 .get(&active_split)?
-                .keyed_states
-                .keys()
-                .find(|&&bid| bid != id)
-                .copied()
+                .buffer_states()
+                .map(|(bid, _)| *bid)
+                .find(|&bid| bid != id)
         });
 
         // Absolute last-resort pool for the Group case: any buffer at all,
@@ -455,6 +608,9 @@ impl Editor {
     /// logs, semantic-token bookkeeping, the panel-id mapping, and each
     /// split's open-buffers / focus-history lists.
     fn purge_buffer_state(&mut self, id: BufferId) {
+        // Widget panels painting into this buffer go with it — they are
+        // editor-level state, so nothing below would have touched them.
+        self.drop_widget_panels_for_buffer(id);
         self.windows
             .get_mut(&self.active_window)
             .map(|w| &mut w.buffers)
@@ -500,10 +656,8 @@ impl Editor {
 
         // Remove buffer from all splits' open_buffers lists and focus history
         for view_state in self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
-            .expect("active window must have a populated split layout")
+            .active_window_mut()
+            .split_view_states_mut()
             .values_mut()
         {
             // `remove_buffer` drops the tab and its focus-history entry.
@@ -543,7 +697,7 @@ impl Editor {
     /// If the tab is the last viewport of the underlying buffer, do the same as close_buffer
     /// (including triggering the save/discard prompt for modified buffers).
     ///
-    /// When the active tab is a buffer group (its `active_group_tab` is set),
+    /// When the active tab is a buffer group (the pane shows a group),
     /// this closes the entire group rather than the currently-focused inner
     /// panel buffer. Individual panels are internal details of the group —
     /// the user closes them all together by closing the group tab.
@@ -552,21 +706,12 @@ impl Editor {
         // rather than just the focused panel buffer — only the Close-Tab
         // command (or keybinding) can express "close the group I'm viewing",
         // so this prelude stays here rather than in `close_tab_in_split`.
-        let active_split = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split();
-        if let Some(group_leaf_id) = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
+        let active_split = self.active_window().split_manager().active_split();
+        if let Some(crate::view::split::TabTarget::Group(group_leaf_id)) = self
+            .active_window()
+            .split_view_states()
             .get(&active_split)
-            .and_then(|vs| vs.active_group_tab)
+            .map(|vs| vs.active_target())
         {
             self.close_buffer_group_by_leaf(group_leaf_id);
             self.set_status_message(t!("buffer.tab_closed").to_string());
@@ -575,8 +720,18 @@ impl Editor {
 
         // Delegate to `close_tab_in_split` so the Close-Buffer command,
         // Alt+W, and the mouse × button all run the same code path —
-        // there should be no difference in behavior between them.
-        let buffer_id = self.active_buffer();
+        // there should be no difference in behavior between them. The tab
+        // is the pane's: a group shown in a buffer's tab has a panel with
+        // the keyboard, on a buffer that need not be the tab's.
+        let buffer_id = match self
+            .active_window()
+            .split_view_states()
+            .get(&active_split)
+            .map(|vs| vs.active_target())
+        {
+            Some(crate::view::split::TabTarget::Buffer(b)) => b,
+            _ => self.active_buffer(),
+        };
         self.close_tab_in_split(buffer_id, active_split);
     }
 
@@ -599,25 +754,18 @@ impl Editor {
 
         // Count how many splits have this buffer in their open_buffers
         let buffer_in_other_splits = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
+            .active_window()
+            .split_view_states()
             .iter()
-            .filter(|(&sid, view_state)| sid != split_id && view_state.has_buffer(buffer_id))
+            .filter(|(&sid, view_state)| {
+                sid != split_id
+                    && view_state.has_buffer(buffer_id)
+                    && !self.active_window().is_borrowing_panel(sid, buffer_id)
+            })
             .count();
 
-        // Get the split's open buffers
-        let split_tabs = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
-            .get(&split_id)
-            .map(|vs| vs.buffer_tab_ids_vec())
-            .unwrap_or_default();
+        // The tabs the close leaves in the split, group tabs included.
+        let tabs_left = self.tabs_left_after_closing(split_id, buffer_id);
 
         let is_last_viewport = buffer_in_other_splits == 0;
 
@@ -633,19 +781,28 @@ impl Editor {
                 if state.buffer.is_modified() {
                     // Buffer has unsaved changes - prompt for confirmation
                     let name = self.get_buffer_display_name(buffer_id);
-                    let save_key = t!("prompt.key.save").to_string();
-                    let discard_key = t!("prompt.key.discard").to_string();
-                    let cancel_key = t!("prompt.key.cancel").to_string();
-                    self.start_prompt(
-                        t!(
-                            "prompt.buffer_modified",
-                            name = name,
-                            save_key = save_key,
-                            discard_key = discard_key,
-                            cancel_key = cancel_key
-                        )
-                        .to_string(),
+                    let body = t!("prompt.buffer_modified", name = name).to_string();
+                    let confirm = crate::view::confirm::Confirm::new(
+                        t!("dialog.title.unsaved_changes").into_owned(),
+                        body.clone(),
+                        vec![
+                            crate::view::confirm::Choice::new(
+                                t!("dialog.btn.save").into_owned(),
+                                t!("prompt.key.save").into_owned(),
+                                crate::view::confirm::Tone::Safe,
+                            ),
+                            crate::view::confirm::Choice::new(
+                                t!("dialog.btn.discard").into_owned(),
+                                t!("prompt.key.discard").into_owned(),
+                                crate::view::confirm::Tone::Destructive,
+                            ),
+                            crate::app::confirm_dialog::cancel(),
+                        ],
+                    );
+                    self.start_confirm_prompt(
+                        body,
                         PromptType::ConfirmCloseBuffer { buffer_id },
+                        confirm,
                     );
                     return false;
                 }
@@ -656,28 +813,7 @@ impl Editor {
             // Close Buffer/Close Tab commands behave the same — without
             // this, the × button leaves a leftover split showing some
             // unrelated buffer (observed with the Search/Replace panel).
-            //
-            // The Utility Dock is a role-tagged leaf, NOT an editor split, so
-            // it must be excluded from this count (issue #2283). Counting it
-            // took the "close the whole split" path when the sole editor tab
-            // was closed, collapsing the editor leaf and promoting the dock's
-            // terminals into the main tab bar. See `LayoutRoles` below.
-            let (has_other_editor_splits, dock_present, this_is_dock) = self
-                .windows
-                .get(&self.active_window)
-                .and_then(|w| w.buffers.splits())
-                .map(|(mgr, _)| {
-                    use crate::view::split::SplitRole;
-                    let has_other_editor_splits = mgr.root().leaf_split_ids().iter().any(|&lid| {
-                        lid != split_id && mgr.leaf_role(lid) != Some(SplitRole::UtilityDock)
-                    });
-                    let dock_present = mgr.find_leaf_by_role(SplitRole::UtilityDock).is_some();
-                    let this_is_dock = mgr.leaf_role(split_id) == Some(SplitRole::UtilityDock);
-                    (has_other_editor_splits, dock_present, this_is_dock)
-                })
-                .expect("active window must have a populated split layout");
-            if split_tabs.len() <= 1 && has_other_editor_splits {
-                self.handle_close_split(split_id.into());
+            if self.close_split_if_sole_tab(split_id, buffer_id) {
                 // handle_close_split also disposes the buffer-less split;
                 // buffer lifetime cleanup happens via its own path.
                 if let Err(e) = self.close_buffer(buffer_id) {
@@ -694,11 +830,22 @@ impl Editor {
                 self.set_status_message(t!("buffer.tab_closed").to_string());
                 return true;
             }
+            let (dock_present, this_is_dock) = self
+                .windows
+                .get(&self.active_window)
+                .and_then(|w| w.buffers.splits())
+                .map(|(mgr, _)| {
+                    use crate::view::split::SplitRole;
+                    let dock_present = mgr.find_leaf_by_role(SplitRole::UtilityDock).is_some();
+                    let this_is_dock = mgr.leaf_role(split_id) == Some(SplitRole::UtilityDock);
+                    (dock_present, this_is_dock)
+                })
+                .expect("active window must have a populated split layout");
             // Sole editor tab, a Utility Dock is the only other leaf: keep the
             // editor leaf alive but EMPTY (placeholder empty-state) instead of
             // collapsing it into the dock or adopting a dock terminal buffer
             // (issue #2283).
-            if split_tabs.len() <= 1 && dock_present && !this_is_dock {
+            if tabs_left == 0 && dock_present && !this_is_dock {
                 if let Err(e) = self.close_tab_keeping_editor_leaf_empty(buffer_id, split_id) {
                     self.set_status_message(
                         t!("file.cannot_close", error = e.to_string()).to_string(),
@@ -726,11 +873,8 @@ impl Editor {
             // even when a group tab remains to fall back to (the "git log
             // disappears" bug).
             let targets: Vec<TabTarget> = self
-                .windows
-                .get(&self.active_window)
-                .and_then(|w| w.buffers.splits())
-                .map(|(_, vs)| vs)
-                .expect("active window must have a populated split layout")
+                .active_window()
+                .split_view_states()
                 .get(&split_id)
                 .map(|vs| vs.open_buffers.clone())
                 .unwrap_or_default();
@@ -761,7 +905,7 @@ impl Editor {
             };
 
             // Activate the replacement tab and drop the closed one. The buffer
-            // case must move the split tree AND the `SplitViewState.active_buffer`
+            // case must move the split tree AND the view state's buffer tab
             // together: routing it through `set_pane_buffer` (not the tree-only
             // `set_split_buffer`) is the fix for the cursor desync — updating
             // only the tree stranded the view-state on the just-closed buffer,
@@ -775,10 +919,8 @@ impl Editor {
                     // buffer also frees its keyed view-state (`remove_buffer`
                     // refuses to drop the state of whatever is still active).
                     if let Some(view_state) = self
-                        .windows
-                        .get_mut(&self.active_window)
-                        .and_then(|w| w.split_view_states_mut())
-                        .expect("active window must have a populated split layout")
+                        .active_window_mut()
+                        .split_view_states_mut()
                         .get_mut(&split_id)
                     {
                         view_state.remove_buffer(buffer_id);
@@ -788,10 +930,8 @@ impl Editor {
                     // Drop the closed buffer's tab before activating the group,
                     // matching the original ordering for the group path.
                     if let Some(view_state) = self
-                        .windows
-                        .get_mut(&self.active_window)
-                        .and_then(|w| w.split_view_states_mut())
-                        .expect("active window must have a populated split layout")
+                        .active_window_mut()
+                        .split_view_states_mut()
                         .get_mut(&split_id)
                     {
                         view_state.remove_buffer(buffer_id);
@@ -812,11 +952,8 @@ impl Editor {
     pub fn close_other_tabs_in_split(&mut self, keep_buffer_id: BufferId, split_id: LeafId) {
         // Get the split's open buffers
         let split_tabs = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
+            .active_window()
+            .split_view_states()
             .get(&split_id)
             .map(|vs| vs.buffer_tab_ids_vec())
             .unwrap_or_default();
@@ -839,10 +976,8 @@ impl Editor {
         }
 
         // Make sure the kept buffer is active
-        self.windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_manager_mut())
-            .expect("active window must have a populated split layout")
+        self.active_window_mut()
+            .split_manager_mut()
             .set_split_buffer(split_id, keep_buffer_id);
 
         self.reseat_tab_scroll_for_split(split_id);
@@ -853,11 +988,8 @@ impl Editor {
     pub fn close_tabs_to_right_in_split(&mut self, buffer_id: BufferId, split_id: LeafId) {
         // Get the split's open buffers
         let split_tabs = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
+            .active_window()
+            .split_view_states()
             .get(&split_id)
             .map(|vs| vs.buffer_tab_ids_vec())
             .unwrap_or_default();
@@ -888,11 +1020,8 @@ impl Editor {
     pub fn close_tabs_to_left_in_split(&mut self, buffer_id: BufferId, split_id: LeafId) {
         // Get the split's open buffers
         let split_tabs = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
+            .active_window()
+            .split_view_states()
             .get(&split_id)
             .map(|vs| vs.buffer_tab_ids_vec())
             .unwrap_or_default();
@@ -923,11 +1052,8 @@ impl Editor {
     pub fn close_all_tabs_in_split(&mut self, split_id: LeafId) {
         // Get the split's open buffers
         let split_tabs = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
+            .active_window()
+            .split_view_states()
             .get(&split_id)
             .map(|vs| vs.buffer_tab_ids_vec())
             .unwrap_or_default();
@@ -970,9 +1096,8 @@ impl Editor {
         else {
             return;
         };
-        let tabs_width = self.active_window().split_tabs_width(split_id);
-        self.active_window_mut()
-            .ensure_active_tab_visible(split_id, active_buffer, tabs_width);
+        let _ = active_buffer;
+        self.active_window().reveal_active_tab(split_id);
     }
 
     /// Set status message for batch close operations
@@ -999,22 +1124,20 @@ impl Editor {
 
         // Count how many splits have this buffer in their open_buffers
         let buffer_in_other_splits = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
+            .active_window()
+            .split_view_states()
             .iter()
-            .filter(|(&sid, view_state)| sid != split_id && view_state.has_buffer(buffer_id))
+            .filter(|(&sid, view_state)| {
+                sid != split_id
+                    && view_state.has_buffer(buffer_id)
+                    && !self.active_window().is_borrowing_panel(sid, buffer_id)
+            })
             .count();
 
         // Get the split's open buffers
         let split_tabs = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
+            .active_window()
+            .split_view_states()
             .get(&split_id)
             .map(|vs| vs.buffer_tab_ids_vec())
             .unwrap_or_default();
@@ -1085,10 +1208,8 @@ impl Editor {
 
             // Remove buffer from this split's tabs
             if let Some(view_state) = self
-                .windows
-                .get_mut(&self.active_window)
-                .and_then(|w| w.split_view_states_mut())
-                .expect("active window must have a populated split layout")
+                .active_window_mut()
+                .split_view_states_mut()
                 .get_mut(&split_id)
             {
                 view_state.remove_buffer(buffer_id);
@@ -1119,21 +1240,8 @@ impl Editor {
     fn cycle_tab(&mut self, direction: i32) {
         use crate::view::split::TabTarget;
 
-        let active_split = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split();
-        let Some(view_state) = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
-            .get(&active_split)
-        else {
+        let active_split = self.active_window().split_manager().active_split();
+        let Some(view_state) = self.active_window().split_view_states().get(&active_split) else {
             return;
         };
 
@@ -1193,8 +1301,10 @@ impl Editor {
         // from the left. Wraparound still follows the user's intent
         // (Next wraps right, Prev wraps left) so the animation
         // direction matches the keystroke rather than the idx delta.
-        self.active_window_mut()
-            .animate_tab_switch(active_split, direction.signum());
+        if let Some(area) = self.pane_or_group_content_rect(active_split) {
+            self.active_window_mut()
+                .animate_tab_switch(area, direction.signum());
+        }
 
         match targets[next_idx] {
             TabTarget::Buffer(buffer_id) => {
@@ -1261,13 +1371,7 @@ impl Editor {
                     old_sticky_column,
                     new_sticky_column: None, // Reset sticky column for navigation
                 };
-                let split_id = self
-                    .windows
-                    .get(&self.active_window)
-                    .and_then(|w| w.buffers.splits())
-                    .map(|(mgr, _)| mgr)
-                    .expect("active window must have a populated split layout")
-                    .active_split();
+                let split_id = self.effective_active_split();
                 self.active_window_mut()
                     .apply_event_to_buffer(target_buffer, split_id, &event);
                 // Position-history entries can land anywhere in the buffer;
@@ -1317,13 +1421,7 @@ impl Editor {
                     old_sticky_column,
                     new_sticky_column: None, // Reset sticky column for navigation
                 };
-                let split_id = self
-                    .windows
-                    .get(&self.active_window)
-                    .and_then(|w| w.buffers.splits())
-                    .map(|(mgr, _)| mgr)
-                    .expect("active window must have a populated split layout")
-                    .active_split();
+                let split_id = self.effective_active_split();
                 self.active_window_mut()
                     .apply_event_to_buffer(target_buffer, split_id, &event);
                 // Position-history entries can land anywhere in the buffer;
@@ -1357,7 +1455,8 @@ impl Editor {
             .unwrap_or(0);
         let retained = parent.join(format!("{stem}-closed-{epoch_ms}.txt"));
         #[allow(clippy::let_underscore_must_use)]
-        let _ = crate::app::terminal::terminal_backing_fs().rename(path, &retained);
+        let _ =
+            crate::app::terminal::terminal_backing_fs().rename(path.as_host(), retained.as_host());
         Self::gc_retained_terminal_backings(parent);
     }
 
@@ -1367,7 +1466,8 @@ impl Editor {
     /// backing files (no `-closed-` marker) are never touched.
     fn gc_retained_terminal_backings(dir: &std::path::Path) {
         const MAX_RETAINED: usize = 200;
-        let Ok(entries) = crate::app::terminal::terminal_backing_fs().read_dir(dir) else {
+        let Ok(entries) = crate::app::terminal::terminal_backing_fs().read_dir(dir.as_host())
+        else {
             return;
         };
         let mut retained: Vec<(u128, std::path::PathBuf)> = entries
@@ -1376,7 +1476,7 @@ impl Editor {
                 let rest = e.name.strip_suffix(".txt")?;
                 let idx = rest.rfind("-closed-")?;
                 let epoch: u128 = rest[idx + "-closed-".len()..].parse().ok()?;
-                Some((epoch, e.path))
+                Some((epoch, e.path.into_path_buf()))
             })
             .collect();
         if retained.len() <= MAX_RETAINED {
@@ -1386,7 +1486,7 @@ impl Editor {
         let remove_count = retained.len() - MAX_RETAINED;
         for (_, p) in retained.into_iter().take(remove_count) {
             #[allow(clippy::let_underscore_must_use)]
-            let _ = crate::app::terminal::terminal_backing_fs().remove_file(&p);
+            let _ = crate::app::terminal::terminal_backing_fs().remove_file(p.as_host());
         }
     }
 }

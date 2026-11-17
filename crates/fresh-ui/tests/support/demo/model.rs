@@ -94,7 +94,18 @@ impl Visible {
     }
 }
 
+/// The two documents the demo switches between.
+///
+/// The demo has one task list, deliberately: what changes with the project is
+/// not the model but the *scope* the view is built under, which is the whole
+/// point. `Ctrl-P` switches, and the scratch note beside the status bar is
+/// per-project incidental state — owned by the element, restored by
+/// `Persisted`, and never touched by this model.
+pub const PROJECTS: [&str; 2] = ["alpha", "beta"];
+
 pub struct App {
+    /// Index into [`PROJECTS`]. The view keys and scopes on it.
+    pub project: usize,
     pub tasks: Rc<Vec<Task>>,
     pub filter: Filter,
     pub selected: usize,
@@ -105,10 +116,17 @@ pub struct App {
     pub quit: bool,
     pub draft: String,
     pub status: String,
+    /// The last row press and how many presses in its run — shown on the
+    /// ribbon, where the row's own `toggled #N` status cannot overwrite it.
+    pub last_click: Option<(usize, u8)>,
     pub sidebar: u16,
     pub resizing: bool,
     pub theme: Rc<Theme>,
     pub preview: bool,
+    /// Whether the overflow panel bounds its children. On by default, because
+    /// `border()` turns it on; the palette's "Toggle clipping" turns it off so
+    /// the escape is visible.
+    pub clip: bool,
     /// The row a context menu is open for, and where it was raised.
     pub context: Option<(usize, Point)>,
     /// The task a delete confirmation is open for.
@@ -124,7 +142,13 @@ pub struct App {
     pub sync_slot: super::view::SyncSlot,
 }
 
-pub const COMMANDS: [&str; 4] = ["Toggle theme", "Toggle preview", "Clear done", "Sync"];
+pub const COMMANDS: [&str; 5] = [
+    "Toggle theme",
+    "Toggle preview",
+    "Toggle clipping",
+    "Clear done",
+    "Sync",
+];
 
 impl Default for App {
     fn default() -> Self {
@@ -196,6 +220,7 @@ impl App {
     pub fn with_tasks(tasks: Vec<Task>) -> Self {
         let next_id = tasks.iter().map(|t| t.id).max().unwrap_or(0) + 1;
         App {
+            project: 0,
             tasks: Rc::new(tasks),
             filter: Filter::All,
             selected: 0,
@@ -203,10 +228,12 @@ impl App {
             quit: false,
             draft: String::new(),
             status: "ready".into(),
+            last_click: None,
             sidebar: 12,
             resizing: false,
             theme: Rc::new(LIGHT),
             preview: false,
+            clip: true,
             context: None,
             confirm: None,
             palette: None,
@@ -265,6 +292,9 @@ impl App {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Msg {
+    /// Switch documents. Nothing else in the model changes — the view's scope
+    /// does, and the element state under it goes with it.
+    NextProject,
     Draft(String),
     Add,
     Toggle(usize),
@@ -289,11 +319,28 @@ pub enum Msg {
     EndResize,
     /// Reported by the sync task, from another thread.
     Synced(usize),
+    /// A row was pressed, and how many presses in a run this was — 1 for a
+    /// single, 2 for a double, 3 for a triple. The count comes from the host
+    /// (`Event::clicks`), which is the only party with a clock.
+    Clicked(usize, u8),
+    /// The ribbon's button. It sits on a `PointerMode::Transparent` strip
+    /// drawn over the list, so this fires only from the button's own cells —
+    /// everywhere else on the strip the press reaches the row behind it.
+    RibbonClear,
 }
 
 /// The whole of the application's behaviour, in one place.
 pub fn update(app: &mut App, msg: Msg) {
     match msg {
+        Msg::NextProject => {
+            app.project = (app.project + 1) % PROJECTS.len();
+            app.status = format!("project: {}", PROJECTS[app.project]);
+        }
+        Msg::Clicked(i, n) => app.last_click = Some((i, n)),
+        Msg::RibbonClear => {
+            app.filter = Filter::All;
+            app.status = "ribbon: filter cleared (the strip let the rest through)".into();
+        }
         Msg::Draft(s) => app.draft = s,
         Msg::Add => {
             let title = std::mem::take(&mut app.draft);
@@ -368,11 +415,18 @@ pub fn update(app: &mut App, msg: Msg) {
                     app.status = format!("preview {}", app.preview);
                 }
                 Some(2) => {
+                    app.clip = !app.clip;
+                    app.status = format!(
+                        "clip {} — watch the panel's right wall",
+                        if app.clip { "on" } else { "off" }
+                    );
+                }
+                Some(3) => {
                     Rc::make_mut(&mut app.tasks).retain(|t| !t.done);
                     app.selected = 0;
                     app.status = "cleared done".into();
                 }
-                Some(3) => app.status = "syncing…".into(),
+                Some(4) => app.status = "syncing…".into(),
                 _ => {}
             }
         }

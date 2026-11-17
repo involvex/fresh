@@ -14,12 +14,26 @@ the core; each frontend only renders it.
   projections** in `crates/fresh-editor/src/view/scene.rs` (`Editor::menu_view()`,
   `tab_bar_view()`, `status_view()`, `palette_view()`, `popups_view()`,
   `file_explorer_view()`, `file_browser_view()`, `trust_dialog_view()`,
-  `widgets_view()`, `context_menu_view()`, `keybinding_editor_view()`,
+  `context_menu_view()`, `keybinding_editor_view()`,
   `settings_view()`): menu bar
   + dropdowns, tabs, status bar, command palette, popups, file explorer, the
   Open File / Save As / Switch Project browser, trust
-  dialog, context menus, plugin widgets/dock, the keybinding editor and the full
+  dialog, context menus, the keybinding editor and the full
   Settings modal.
+- **Plugin panels are the display list** — the orchestrator dock, floating
+  panels and plugin sidebar sections are not projected as a spec for the
+  browser to lay out; the tree's own items (`Editor::tree_view()` →
+  `regions.tree`) are folded into DOM at the cells the tree placed them at
+  (`js/72-tree.js`), and a click comes back as a cell like a terminal click.
+  See `docs/internal/retained-mode-ui.md`, "The web".
+  Each item carries **both the fold's colours and the theme keys they were read
+  from** — `--fold-bg` / `--fold-fg` inline, `data-fg` / `data-bg` naming the
+  keys, and `data-surface-kind` naming the surface — so a web theme dresses a
+  panel by re-mapping the handful of keys it cares about
+  (`.tree-item[data-surface-kind="dock"][data-bg="ui.popup_selection_bg"]{--ink-bg:…}`)
+  and inherits the fold's answer everywhere else. `--ink-*` is the theme's say
+  and always wins, because the fold's answer is the *fallback* in the `var()`
+  chain rather than an inline value.
 - **Buffer interior is SVG** — the pipeline's real, syntax-highlighted cells. The
   line-number gutter is emitted as its own block (kept out of the buffer-text
   flow), and every glyph is pinned to its exact cell column. The cell size is
@@ -94,6 +108,8 @@ Pick a numeric prefix that places a new file where its concern belongs; gaps
 | `30-palette.css` | command palette / picker |
 | `35-editor.css` | file explorer, pane surfaces, separators, scrollbars, caret |
 | `40-widgets.css` | trust dialog, plugin widgets, Settings, keybinding editor, aux modals |
+| `45-tree.css` | the display-list layer: surface grounds, items, grid text, rules, the `--fold-*` / `--ink-*` paint chain |
+| `46-native.css` | natively laid-out surfaces (`regions.native`): the confirmation card, plugin panels and floating cards, grid rows |
 | `50-popups.css` | completion/hover/action popups, cell SVG, `#err` |
 | `60-polish.css` | visual polish pass: radii, hairlines, hovers, selection pills |
 | `70-mobile.css` | mobile / portrait touch shell |
@@ -101,7 +117,7 @@ Pick a numeric prefix that places a new file where its concern belongs; gaps
 | `90-cosmos.css` | COSMOS shell (the Cosmos web theme): wallpaper, device bezel, glass dock, motion |
 | `91-theme-switch.css` | the web-theme switcher pill + drop menu (token-driven, re-skinned per theme) |
 | `92-theme-macos.css` | macOS web themes (Light + Dark): title bar + traffic lights, vibrancy, SF font — one token-driven structural pass, gated on `body.macfam` |
-| `94-theme-compact.css` | Compact web theme: full-bleed, dense spacing, flat surfaces |
+| `94-theme-compact.css` | Compact web theme: full-bleed, dense spacing, UI font, cards; colours derived from the editor theme |
 
 | JS | concern |
 |---|---|
@@ -114,8 +130,44 @@ Pick a numeric prefix that places a new file where its concern belongs; gaps
 | `60-popups.js` | native popups |
 | `65-widgets.js` | plugin widget tree + Settings / keybinding editor / aux modals |
 | `70-panels.js` | trust dialog, file explorer, border drag handles |
+| `72-tree.js` | the plugin panels (dock, floating panels, sidebar sections), folded from the display list |
+| `73-native.js` | natively laid-out surfaces: the confirmation card and plugin panels from `regions.native`, pressed back by key or widget identity |
 | `75-app.js` | mobile shell + transport (WS frames, resize, clipboard) |
 | `80-input.js` | keyboard/mouse/touch input, native selection, boot |
+| `00-ffi.js` | the few untyped escape hatches the type check can't see into (see below) |
+
+### Type checking (inty)
+
+The JS is plain JavaScript that [inty](https://github.com/sinelaw/inty) type
+checks with full inference — no build step, no annotations required, though
+the code carries some (`/** function f(Pane, Rect) => El */`,
+`/** let scene: Scene | Null */`) where they document a shape or pin down a
+type shared across files.
+
+```
+web-ui/typecheck.sh        # needs `inty` on PATH (or INTY=/path/to/inty)
+```
+
+It checks `js/*.js` the way the page runs them — concatenated into one
+program — against three declaration files:
+
+- `types/dom.d.js` — the browser API the UI uses, typed precisely (one
+  recursive element type `El`, one event type `UiEvent`, `style` with its
+  CSS properties). It shadows inty's generic stdlib DOM.
+- `types/scene.d.js` — the server protocol: the scene (`Scene`, `Regions`,
+  `Pane`, `Palette`, `WidgetSpec`, …) and the WebSocket messages, transcribed
+  from the serde types in `src/view/scene.rs` / `src/view/native.rs` /
+  `src/webui/mod.rs`. Keep it in step with them.
+- `types/ffi.d.js` — the types of `js/00-ffi.js`, the one file the check
+  leaves out: `listen` (a listener with options), `jsonAs` (a frame value
+  given its field's type), `exposeTestHook`, `toFixed`.
+
+inty is strict where JavaScript isn't, which shapes the code: no
+`number + string` (use a template literal), narrowing only of bindings that
+are never reassigned (copy `scene` or a field into a `const` before a null
+check), closed records (a map is a `Dict<V>`), and `let`/`const` are
+function-scoped for the checker (two block-local `const x` of different
+types in one function need different names).
 
 ## Web themes (chrome look) vs the TUI colour theme
 
@@ -128,15 +180,45 @@ in the same class as zoom / palette placement / Alt-selection — a view
 preference persisted in `localStorage` (`fresh.webtheme`), never sent to the
 editor. Four ship:
 
-- **Cosmos** (default) — the abstract wallpaper, `COSMOS-991` hardware bezel and
-  frosted-glass dock (`90-cosmos.css`). Unchanged from before the theme system.
+- **Cosmos** (default) — the abstract wallpaper, the `COSMOS-991` hardware
+  bezel around the grid, and the frosted-glass orchestrator dock
+  (`90-cosmos.css`).
 - **macOS Light / macOS Dark** — a native-feeling desktop app: a title bar with
   traffic lights + the document name, the SF system (proportional) chrome font,
   light or dark vibrancy panels, the system accent blue and a Finder-style
   source-list dock. Both variants are one token-driven structural pass gated on
   `body.macfam`; only their colour tokens differ.
-- **Compact** — a dense, chrome-light IDE: no wallpaper/bezel, a ~8% smaller
-  measured grid, tight paddings, hairline rules and flat surfaces.
+- **Compact** — a quiet, professional IDE frame: no wallpaper/bezel, a ~8%
+  smaller measured grid, a proportional UI font for the chrome, tight
+  paddings, hairline rules and lifted cards. Its colours are not a fixed
+  palette: `deriveCompact()` computes them from the editor theme's own
+  background (a shade lighter on a dark theme, darker on a light one, neutral
+  inks, one accent), so the frame matches whatever theme the buffer uses.
+  Fresh Desktop opens on this theme.
+
+Compact and the two macOS themes also lay the shell's **surfaces** out
+natively: the confirmation card is a real dialog, and a plugin panel (the
+dock, a floating panel, a sidebar section) is its widget spec drawn with
+flexbox and native controls rather than the display list's character cells
+(`js/73-native.js`, `regions.native`; see `docs/internal/web-ui.md` §1.1).
+Presses still go to the tree: by node key, or as the widget's identity the
+bridge resolves against the mounted spec. `fresh.nativePanels` in
+localStorage (`on`/`off`) overrides the theme's choice.
+
+A *page* mounted into a pane (the Welcome screen) is laid out in the same
+column the terminal sets it in (its `composeWidth`), and is scrolled by the
+editor, not the browser: the wheel goes to the editor as over any buffer, and
+the page follows the editor's window (`regions.native.panels[].page`: the
+offset, and the content row each keyed widget starts on), so the wheel, the
+page keys and a card's "jump ↓" are one scroll position.
+
+Every control the page draws says what it is to assistive tech: a role
+(`button`, `switch`, `radio`, `combobox`/`listbox`, `textbox`, `tree`,
+`menubar`/`menu`/`menuitem`, `dialog`/`alertdialog`), a name (its label, or a
+field's label or placeholder) and its state (`aria-checked`,
+`aria-selected`, `aria-expanded`, `aria-disabled`) — the `aria()` helper in
+`js/65-widgets.js`. Nothing takes the keyboard focus: the editor owns every
+key, as it does for the rest of the page.
 
 `js/15-theme.js` is the whole mechanism. `applyWebTheme()` (called from
 `render()` right after `applyTheme()`) does two things: it sets the
@@ -144,9 +226,10 @@ editor. Four ship:
 which drives all *structural* CSS (`92/94-theme-*.css`, plus the Cosmos-gated
 wallpaper/bezel/dock rules in `90-cosmos.css`) — and it layers the theme's
 *chrome colour tokens* inline over `applyTheme()`'s TUI-derived values (`--bg`
-is never overridden, so the buffer stays the TUI theme's). The buffer's
-`svg.cells` are pinned to `--mono-family`, so a theme may repoint the chrome's
-`--font-family` at a proportional stack without disturbing the monospace grid.
+is never overridden, so the buffer stays the TUI theme's). Everything drawn on the cell
+grid — the buffer's `svg.cells` and the display list's `.tree-line` runs — is
+pinned to `--mono-family` at the measured size, so a theme may repoint the
+chrome's `--font-family` at a proportional stack without disturbing the grid.
 
 Users switch it three ways, all frontend-owned: the floating **theme pill** in
 the top-right corner (a menu of the four), the **Ctrl/Cmd+Alt+T** chord
@@ -279,8 +362,12 @@ clipboard, Ctrl+Space resumes, a bare click only focuses), and Alt-hold
 native browser selection over the SVG grid. It also drives the **web-theme
 switch** (Cosmos ↔ macOS Light ↔ macOS Dark ↔ Compact): the body class, the bezel/title-bar swap,
 the buffer staying monospace under a proportional chrome font, the denser
-Compact grid, `localStorage` persistence, and the switcher menu.
-**171 assertions** across the chrome surfaces, plus screenshots.
+Compact grid, `localStorage` persistence, and the switcher menu. The
+natively laid-out surfaces are found the way assistive tech finds them — by
+role and name (`getByRole('dialog', { name: 'New Workspace' })`,
+`getByRole('switch', { name: /^Case/ })`) — so a control that only looks
+right fails.
+**204 assertions** across the chrome surfaces, plus screenshots.
 
 One command runs the whole thing — build the bridge, install the Playwright
 deps (`test/package.json`) on first use, start the server, run the suite,

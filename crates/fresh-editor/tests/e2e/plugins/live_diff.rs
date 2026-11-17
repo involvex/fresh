@@ -8,7 +8,7 @@
 //! These tests assert only on rendered output (`screen_to_string`), per the
 //! "E2E tests observe, not inspect" rule in CONTRIBUTING.md.
 
-use crate::common::git_test_helper::{DirGuard, GitTestRepo};
+use crate::common::git_test_helper::GitTestRepo;
 use crate::common::harness::EditorTestHarness;
 use fresh::config::Config;
 
@@ -86,8 +86,7 @@ fn test_live_diff_added_line_shows_plus_in_gutter() {
     repo.setup_typical_project();
     repo.setup_live_diff_plugin();
 
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     // Insert one new line at the top vs HEAD.
     repo.modify_file(
@@ -128,8 +127,7 @@ fn test_live_diff_modified_line_shows_old_content_above() {
     repo.setup_typical_project();
     repo.setup_live_diff_plugin();
 
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     // Replace the `format!` line with a deliberately rewrite-style
     // line: the new content must share so little with the original
@@ -199,8 +197,7 @@ fn test_live_diff_updates_on_buffer_edit() {
     repo.setup_typical_project();
     repo.setup_live_diff_plugin();
 
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
         120,
@@ -245,8 +242,7 @@ fn test_live_diff_handles_surrogate_pair_content() {
     repo.setup_typical_project();
     repo.setup_live_diff_plugin();
 
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     // 🎉 (U+1F389) is a 4-byte UTF-8 char that needs a surrogate pair
     // in JS strings. Modify the line so the diff has actual content.
@@ -292,8 +288,7 @@ fn test_live_diff_highlights_empty_added_line() {
     repo.setup_typical_project();
     repo.setup_live_diff_plugin();
 
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     // Original utils.rs ends after `validate_config`. Append three new
     // lines: a blank line, then a function, then another blank line.
@@ -384,8 +379,7 @@ fn test_live_diff_highlights_empty_removed_line() {
     repo.git_add(&["src/utils.rs"]);
     repo.git_commit("init");
 
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     repo.modify_file("src/utils.rs", "head\ntail\n");
 
@@ -469,8 +463,7 @@ fn test_live_diff_does_not_skip_empty_lines_on_arrow_keys() {
     repo.git_add(&["src/utils.rs"]);
     repo.git_commit("init");
 
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     // Working tree: "head\n" + two empty lines + "tail\n". The two
     // blank middle lines are added empty lines — the ones the user
@@ -587,8 +580,7 @@ fn test_live_diff_virtual_line_anchored_to_correct_modified_line() {
     repo.git_add(&["code.rs"]);
     repo.git_commit("init");
 
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     // Wide viewport so the marker line + the long appended payload fit
     // on a single visual row — wrap would invalidate the row-index
@@ -742,8 +734,7 @@ fn test_live_diff_down_arrow_traverses_deletion_block() {
     repo.git_add(&["src/utils.rs"]);
     repo.git_commit("init");
 
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     // Working tree: drop the 12 middle lines. The plugin should render
     // them as virtual `-` rows anchored above `after_01`.
@@ -851,8 +842,7 @@ fn test_live_diff_removed_line_not_split_per_char_at_tiny_width() {
     repo.git_commit("baseline");
     repo.setup_live_diff_plugin();
 
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     // Working tree: rewrite the body line into something with very low
     // Sørensen–Dice similarity to the original, so the hunk splits into
@@ -864,13 +854,13 @@ fn test_live_diff_removed_line_not_split_per_char_at_tiny_width() {
         "pub fn greet() {\n    panic!(\"COMPLETELY_DIFFERENT_REWRITE_PAYLOAD_DROPPING_SIMILARITY_FAR_BELOW_THE_THRESHOLD\");\n}\n",
     );
 
-    // `wrap_column = 2` drives the per-row content width below the gutter
+    // `wrap_column = 1` drives the per-row content width below 2
     // (`effective_width - gutter_width < 2`) regardless of the 120-col
     // window — the same degenerate condition a narrow split pane or a
     // very wide gutter would reach.
     let mut config = Config::default();
     config.editor.line_wrap = true;
-    config.editor.wrap_column = Some(2);
+    config.editor.wrap_column = Some(1);
 
     let mut harness =
         EditorTestHarness::with_config_and_working_dir(120, 40, config, repo.path.clone()).unwrap();
@@ -950,8 +940,7 @@ fn test_live_diff_word_highlight_on_low_similarity_removed_added_pair() {
     repo.git_add(&["note.txt"]);
     repo.git_commit("baseline");
 
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     repo.modify_file(
         "note.txt",
@@ -1062,8 +1051,7 @@ fn test_live_diff_clears_after_commit() {
     repo.git_add(&["src/demo.txt"]);
     repo.git_commit("init");
 
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     repo.modify_file("src/demo.txt", "line one\nline two\nline three ADDED\n");
 
@@ -1142,8 +1130,7 @@ fn test_live_diff_old_revision_large_middle_renders_full_detail() {
     repo.git_add(&["src/big.rs"]);
     repo.git_commit("old revision of big file");
 
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     // The working tree holds the "new revision"; the buffer diffs it
     // against the committed old one — the same shape as checking out an
@@ -1195,8 +1182,7 @@ fn test_live_diff_near_total_rewrite_degrades_but_renders() {
     repo.git_add(&["src/big.rs"]);
     repo.git_commit("ancient revision");
 
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     let mut new_text = String::new();
     for i in 0..6_000 {
@@ -1231,4 +1217,394 @@ fn test_live_diff_near_total_rewrite_degrades_but_renders() {
             has_glyph(&screen, '~') && screen.contains("Live Diff: large change")
         })
         .unwrap();
+}
+
+/// A Shift-JIS file that matches HEAD except for one appended ASCII line
+/// must show exactly that one line as changed. The baseline (`git show`
+/// output / the file on disk) used to be decoded as UTF-8 regardless of
+/// the buffer's encoding, so every Japanese line differed from the buffer
+/// and was shown as changed, with mojibake on the old side. Issue #3246.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn test_live_diff_shift_jis_file_diffs_against_decoded_baseline() {
+    let repo = GitTestRepo::new();
+    repo.setup_live_diff_plugin();
+
+    let head_text = "#include \"pch.h\"\n\
+        // コンフィグウィンドウ：ベース\n\
+        // 初期化\n\
+        bool on_init()\n\
+        {\n\
+        \t// ウィンドウ表示\n\
+        \treturn true;\n\
+        }\n";
+    let sjis = |text: &str| encoding_rs::SHIFT_JIS.encode(text).0.into_owned();
+    let path = repo.path.join("cfg_wnd_base.cpp");
+    std::fs::write(&path, sjis(head_text)).unwrap();
+    repo.git_add(&["cfg_wnd_base.cpp"]);
+    repo.git_commit("init");
+
+    let _guard = repo.change_to_repo_dir();
+    std::fs::write(&path, sjis(&format!("{head_text}int appended_marker;\n"))).unwrap();
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        40,
+        Config::default(),
+        repo.path.clone(),
+    )
+    .unwrap();
+
+    enable_live_diff_globally(&mut harness);
+    open_file(&mut harness, &repo.path, "cfg_wnd_base.cpp");
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Shift-JIS"))
+        .unwrap();
+
+    // The appended line is flagged once the diff has been computed.
+    harness
+        .wait_until(|h| has_glyph(&h.screen_to_string(), '+'))
+        .unwrap();
+
+    let screen = harness.screen_to_string();
+    assert!(
+        !screen.contains('\u{FFFD}'),
+        "the old side must be decoded as Shift-JIS, not show mojibake:\n{screen}"
+    );
+    // Rows whose gutter (the part before the `│` separator) carries a
+    // diff glyph; virtual old-side lines count too.
+    let changed: Vec<&str> = content_lines(&screen)
+        .into_iter()
+        .filter(|l| {
+            l.split_once('│')
+                .is_some_and(|(gutter, _)| gutter.contains(['+', '~', '-']))
+        })
+        .collect();
+    assert_eq!(
+        changed.len(),
+        1,
+        "only the appended line differs from HEAD:\n{screen}"
+    );
+    assert!(changed[0].contains("appended_marker"), "{screen}");
+}
+
+/// The WARN-and-above records emitted on this thread while `run` runs, as
+/// text. The editor handles plugin commands on the thread that ticks it.
+fn warnings_during(run: impl FnOnce()) -> String {
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, run);
+    let bytes = captured.0.lock().unwrap().clone();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// A HEAD move refreshes every buffer Live Diff tracks, including one in a
+/// background window. Its recompute then asked for the buffer's text, which
+/// buffer commands look up in the active window only: each refresh logged
+/// the cross-window warning and a "Buffer … not found" error. It waits for
+/// its window instead, and catches up when that window comes back.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn test_live_diff_waits_for_a_background_windows_buffer() {
+    let repo = GitTestRepo::new();
+    repo.setup_live_diff_plugin();
+    repo.create_file("src/demo.txt", "line one\nline two\n");
+    repo.git_add(&["src/demo.txt"]);
+    repo.git_commit("init");
+    let _guard = repo.change_to_repo_dir();
+    repo.modify_file("src/demo.txt", "line one\nline two\nline three ADDED\n");
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        40,
+        Config::default(),
+        repo.path.clone(),
+    )
+    .unwrap();
+    enable_live_diff_globally(&mut harness);
+    open_file(&mut harness, &repo.path, "src/demo.txt");
+    harness
+        .wait_until(|h| has_glyph(&h.screen_to_string(), '+'))
+        .unwrap();
+
+    // Move to another window, then commit the change and refocus.
+    let first = harness.editor().active_window_id();
+    let other = tempfile::TempDir::new().unwrap();
+    let second = harness
+        .editor_mut()
+        .create_window_at(other.path().to_path_buf(), "other".to_string());
+    harness.editor_mut().set_active_window(second);
+    harness
+        .wait_until(|h| !h.screen_to_string().contains("demo.txt"))
+        .unwrap();
+    repo.git_add_all();
+    repo.git_commit("commit the added line");
+
+    let warnings = warnings_during(|| {
+        harness.editor_mut().focus_gained();
+        harness.wait_for_async_quiescence(10).unwrap();
+    });
+    assert!(
+        !warnings.contains("another window"),
+        "a background window's buffer must not be recomputed through the active \
+         window:\n{warnings}"
+    );
+
+    // Back in its window, the buffer matches HEAD and the `+` clears.
+    harness.editor_mut().set_active_window(first);
+    harness
+        .wait_until(|h| {
+            let screen = h.screen_to_string();
+            screen.contains("line three ADDED") && !has_glyph(&screen, '+')
+        })
+        .unwrap();
+}
+
+/// Guards the whole-file replacement: a CRLF working tree over an LF
+/// blob (`core.autocrlf=true`, or `eol=crlf`) diffed as every old line
+/// deleted above every new line added, because the line diff counts the
+/// terminator as part of the line.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn test_live_diff_crlf_worktree_against_lf_blob_diffs_per_line() {
+    let repo = GitTestRepo::new();
+    repo.setup_live_diff_plugin();
+
+    // Only to build the fixture: makes `git add` store an LF blob
+    // whatever the host's core.autocrlf is.
+    repo.create_file(".gitattributes", "*.rs text eol=crlf\n");
+    repo.create_file(
+        "src/utils.rs",
+        "UNCHANGED_HEAD_MARKER\r\nsecond\r\nthird\r\nUNCHANGED_TAIL_MARKER\r\n",
+    );
+    repo.git_add_all();
+    repo.git_commit("init");
+
+    let _guard = repo.change_to_repo_dir();
+
+    repo.modify_file(
+        "src/utils.rs",
+        "UNCHANGED_HEAD_MARKER\r\nsecond\r\nINSERTED_LINE_MARKER\r\nthird\r\nUNCHANGED_TAIL_MARKER\r\n",
+    );
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        30,
+        Config::default(),
+        repo.path.clone(),
+    )
+    .unwrap();
+
+    enable_live_diff_globally(&mut harness);
+    open_file(&mut harness, &repo.path, "src/utils.rs");
+
+    harness
+        .wait_until(|h| {
+            let s = h.screen_to_string();
+            has_glyph(&s, '+') && has_text(&s, "INSERTED_LINE_MARKER")
+        })
+        .unwrap();
+
+    let screen = harness.screen_to_string();
+    for marker in ["UNCHANGED_HEAD_MARKER", "UNCHANGED_TAIL_MARKER"] {
+        let rows = content_lines(&screen)
+            .iter()
+            .filter(|l| l.contains(marker))
+            .count();
+        assert_eq!(
+            rows, 1,
+            "unchanged line {marker} must appear once (no deletion copy from a \
+             whole-file replacement); screen:\n{screen}"
+        );
+    }
+    assert!(
+        !has_glyph(&screen, '-'),
+        "a pure insertion must not render any deletion rows; screen:\n{screen}"
+    );
+}
+
+/// Same, for a working tree that mixes CRLF and LF (a tool writing LF
+/// lines into a CRLF checkout): no single form of the baseline matches
+/// every line, so an exact comparison flagged unchanged ones.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn test_live_diff_mixed_line_endings_diff_per_line() {
+    let repo = GitTestRepo::new();
+    repo.setup_live_diff_plugin();
+
+    // LF content commits as an LF blob, so no attribute is needed here.
+    repo.create_file(
+        "src/utils.rs",
+        "UNCHANGED_HEAD_MARKER\nsecond\nthird\nUNCHANGED_TAIL_MARKER\n",
+    );
+    repo.git_add_all();
+    repo.git_commit("init");
+
+    let _guard = repo.change_to_repo_dir();
+
+    repo.modify_file(
+        "src/utils.rs",
+        "UNCHANGED_HEAD_MARKER\r\nsecond\nINSERTED_LINE_MARKER\r\nthird\nUNCHANGED_TAIL_MARKER\r\n",
+    );
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        30,
+        Config::default(),
+        repo.path.clone(),
+    )
+    .unwrap();
+
+    enable_live_diff_globally(&mut harness);
+    open_file(&mut harness, &repo.path, "src/utils.rs");
+
+    harness
+        .wait_until(|h| {
+            let s = h.screen_to_string();
+            has_glyph(&s, '+') && has_text(&s, "INSERTED_LINE_MARKER")
+        })
+        .unwrap();
+
+    let screen = harness.screen_to_string();
+    for marker in ["UNCHANGED_HEAD_MARKER", "UNCHANGED_TAIL_MARKER"] {
+        let rows: Vec<&str> = content_lines(&screen)
+            .into_iter()
+            .filter(|l| l.contains(marker))
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "unchanged line {marker} must appear once; screen:\n{screen}"
+        );
+        assert!(
+            !rows[0].contains('~') && !rows[0].contains('+') && !rows[0].contains('-'),
+            "unchanged line {marker} must carry no diff glyph; screen:\n{screen}"
+        );
+    }
+    assert!(
+        !has_glyph(&screen, '-'),
+        "a pure insertion must not render any deletion rows; screen:\n{screen}"
+    );
+
+    // A whole-file mismatch can also show as the "modified" background
+    // with no glyph, so check the background too. `Config::default()` is
+    // the `high-contrast` theme.
+    use ratatui::style::Color;
+    let diff_bgs = [
+        Some(Color::Rgb(0, 80, 0)),  // diff_add_bg
+        Some(Color::Rgb(60, 55, 0)), // diff_modify_bg
+        Some(Color::Rgb(100, 0, 0)), // diff_remove_bg
+    ];
+    let buf = harness.buffer();
+    for marker in ["UNCHANGED_HEAD_MARKER", "UNCHANGED_TAIL_MARKER"] {
+        let y = (0..buf.area.height)
+            .find(|&y| {
+                let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+                row.contains(marker)
+            })
+            .unwrap_or_else(|| panic!("{marker} not on screen"));
+        let bg = buf[(40, y)].style().bg;
+        assert!(
+            !diff_bgs.contains(&bg),
+            "unchanged line {marker} must not carry a diff background, saw {bg:?}; \
+             screen:\n{screen}"
+        );
+    }
+}
+
+/// The mirror: a CRLF blob under a working copy converted to LF. `git
+/// diff` reports every line of this until `git add --renormalize`
+/// rewrites the blob; the editor compares content only. An earlier
+/// revision got this direction wrong by keying off the blob's endings.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)]
+fn test_live_diff_crlf_blob_against_lf_worktree_diffs_per_line() {
+    let repo = GitTestRepo::new();
+    repo.setup_live_diff_plugin();
+
+    // Pin locally so the blob is stored CRLF whatever the host's
+    // global/system core.autocrlf is (true by default on Windows).
+    let out = crate::common::git_test_helper::git_command(&repo.path)
+        .args(["config", "--local", "core.autocrlf", "false"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git config failed");
+
+    repo.create_file(
+        "src/utils.rs",
+        "UNCHANGED_HEAD_MARKER\r\nsecond\r\nthird\r\nUNCHANGED_TAIL_MARKER\r\n",
+    );
+    repo.git_add_all();
+    repo.git_commit("init");
+
+    let _guard = repo.change_to_repo_dir();
+
+    // The insertion is what the test waits on, so "nothing else is
+    // marked" is never asserted before live diff has produced a result.
+    repo.modify_file(
+        "src/utils.rs",
+        "UNCHANGED_HEAD_MARKER\nsecond\nINSERTED_LINE_MARKER\nthird\nUNCHANGED_TAIL_MARKER\n",
+    );
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        30,
+        Config::default(),
+        repo.path.clone(),
+    )
+    .unwrap();
+
+    enable_live_diff_globally(&mut harness);
+    open_file(&mut harness, &repo.path, "src/utils.rs");
+
+    harness
+        .wait_until(|h| {
+            let s = h.screen_to_string();
+            has_glyph(&s, '+') && has_text(&s, "INSERTED_LINE_MARKER")
+        })
+        .unwrap();
+
+    let screen = harness.screen_to_string();
+    for marker in ["UNCHANGED_HEAD_MARKER", "UNCHANGED_TAIL_MARKER"] {
+        let rows: Vec<&str> = content_lines(&screen)
+            .into_iter()
+            .filter(|l| l.contains(marker))
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "unchanged line {marker} must appear once (no deletion copy from a \
+             whole-file replacement); screen:\n{screen}"
+        );
+        assert!(
+            !rows[0].contains('~') && !rows[0].contains('+') && !rows[0].contains('-'),
+            "unchanged line {marker} must carry no diff glyph; screen:\n{screen}"
+        );
+    }
+    assert!(
+        !has_glyph(&screen, '-'),
+        "a pure insertion must not render any deletion rows; screen:\n{screen}"
+    );
 }

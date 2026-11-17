@@ -6,7 +6,7 @@ use super::calibration_wizard::{CalibrationWizard, WizardAction};
 use super::Editor;
 use crate::input::handler::InputResult;
 use crossterm::event::KeyEvent;
-use rust_i18n::t;
+use fresh_i18n::t;
 
 impl Editor {
     /// Open the calibration wizard
@@ -92,10 +92,5 @@ impl Editor {
         }
 
         InputResult::Consumed
-    }
-
-    /// Check if calibration wizard is active
-    pub fn is_calibration_active(&self) -> bool {
-        self.calibration_wizard.is_some()
     }
 }

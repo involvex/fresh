@@ -10,7 +10,7 @@
 
 use crate::input::key_translator::{KeyEventKey, KeyTranslator};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use rust_i18n::t;
+use fresh_i18n::t;
 use std::collections::{HashMap, HashSet};
 
 /// What the user's key SHOULD produce (the expected/normalized key)
@@ -348,6 +348,7 @@ impl CalibrationWizard {
     }
 
     /// Check if a group was skipped
+    #[cfg(test)]
     pub fn is_group_skipped(&self, group_idx: usize) -> bool {
         self.skipped_groups.contains(&group_idx)
     }

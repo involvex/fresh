@@ -4,16 +4,23 @@ import sys
 import os
 import json
 import base64
+import codecs
+import hashlib
 import stat
 import shutil
 import subprocess
 import re
 import threading
 import select
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 CHUNK = 65536
 VERSION = 1
+# How often an `exec` stream says "still running" while the process is quiet.
+# Must stay well below the client's STREAM_IDLE_TIMEOUT (channel.rs), which
+# gives up on a stream that goes silent for that long.
+EXEC_KEEPALIVE_SECS = 10
 
 # Active background processes: id -> Popen
 procs = {}
@@ -166,6 +173,9 @@ def cmd_stat(id, p):
             "dir": stat.S_ISDIR(st.st_mode),
             "file": stat.S_ISREG(st.st_mode),
             "link": is_link,
+            # Asked here, as the remote user: the client's own uid/groups say
+            # nothing about who it is on this host.
+            "writable": os.access(path, os.W_OK),
         },
     )
 
@@ -350,6 +360,22 @@ def cmd_count_lf(id, p):
     send(id, r={"count": count})
 
 
+def cmd_digest(id, p):
+    """Size and SHA-256 of a file, streamed, so the file stays on this host."""
+    path = validate_path(p["path"])
+
+    h = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(CHUNK)
+            if not chunk:
+                break
+            h.update(chunk)
+            size += len(chunk)
+    send(id, r={"size": size, "sha256": h.hexdigest()})
+
+
 def cmd_exists(id, p):
     """Check if path exists."""
     try:
@@ -359,6 +385,42 @@ def cmd_exists(id, p):
         send(id, r={"exists": False})
 
 
+def cmd_find_up(id, p):
+    """Ancestors of a path that directly contain one of `markers`, nearest first.
+
+    Answers the whole "climb to the project root" question in one exchange.
+    Done client-side it would be a stat per directory per marker, and each of
+    those is a network round trip on the editor's UI thread.
+    """
+    try:
+        path = validate_path(p["path"])
+    except (ValueError, OSError):
+        send(id, r={"dirs": []})
+        return
+
+    markers = p.get("markers") or []
+    max_dirs = p.get("max_dirs")
+    dirs = []
+    visited = 0
+    current = path
+
+    while max_dirs is None or visited < max_dirs:
+        try:
+            if any(os.path.exists(os.path.join(current, m)) for m in markers):
+                dirs.append(current)
+        except OSError:
+            # Unreadable directory: skip it, keep climbing. "What we could
+            # see" is the contract, same as the local implementation.
+            pass
+        visited += 1
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+
+    send(id, r={"dirs": dirs})
+
+
 def cmd_info(id, p):
     """Get system info (home directory, cwd, temp directory, etc.)."""
     import tempfile
@@ -366,102 +428,147 @@ def cmd_info(id, p):
         "home": os.path.expanduser("~"),
         "cwd": os.getcwd(),
         "temp_dir": tempfile.gettempdir(),
+        # The separator this host's paths use, so the editor is told rather
+        # than guessing from how a path happens to be spelled. "/" here,
+        # "\\" on a Windows host. An older agent omits it.
+        "sep": os.sep,
     })
+
+
+# Mirrors the local search (default_search_file and SearchQuery in the Rust
+# core) so a search over SSH finds what a local one does: the whole file in
+# one call; the same files skipped (the binary-extension list is checked on
+# the Rust side, before the request); the text as the editor opens it, so
+# offsets are where the editor will jump; `^`/`$` at every line break, whole
+# words around the whole pattern, Unicode case folding and `\b`; matches in
+# order and non-overlapping as Rust's find_iter gives them; line and column
+# from the line's real start; and the match's line around it (without
+# `\r`, and cut as the local search cuts a long one) as context. What still
+# differs: the regex dialect itself (Python `re`: its
+# syntax, and `.` matching, and `$` not matching before, the `\r` of a
+# `\r\n`), and a file in a legacy code page other than Windows-1252 (the
+# editor guesses which; this reads them all as Windows-1252).
+DETECT_SAMPLE = 8 * 1024
+# Control bytes no text holds (all but tab, LF, VT, FF, CR and ESC; and DEL).
+BINARY_CONTROL = re.compile(b"[\x00-\x08\x0e-\x1a\x1c-\x1f\x7f]")
+# Windows-1252 as the editor decodes it: its five unassigned bytes are the
+# C1 controls they'd be in Latin-1.
+CP1252 = {b: bytes([b]).decode("cp1252", errors="ignore") or chr(b) for b in range(0x80, 0xA0)}
+
+
+def editor_text(data):
+    """The file's text as the editor opens it, or None if it isn't text."""
+    sample = data[:DETECT_SAMPLE]
+    if b"\x00" in data or sample.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return None  # binary, or UTF-16, which a byte regex can't search
+    if sample.startswith(b"\xef\xbb\xbf"):
+        text = data[3:].decode("utf-8", errors="surrogateescape")
+    elif BINARY_CONTROL.search(sample):
+        return None
+    else:
+        try:
+            # UTF-8 if the sample is, allowing a character cut at its end.
+            decoder = codecs.getincrementaldecoder("utf-8")()
+            decoder.decode(sample, final=len(data) <= DETECT_SAMPLE)
+            text = data.decode("utf-8", errors="surrogateescape")
+        except UnicodeDecodeError:
+            text = data.decode("latin-1").translate(CP1252)
+    # A Classic-Mac file (mostly lone `\r` line breaks) has them made `\n`.
+    head = text.encode("utf-8", errors="surrogateescape")[:DETECT_SAMPLE]
+    crlf = head.count(b"\r\n")
+    cr, lf = head.count(b"\r") - crlf, head.count(b"\n") - crlf
+    if cr > lf and cr > crlf and "\r" in text[:-1]:
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return text
 
 
 def cmd_search_file(id, p):
-    """Search for a pattern in a file, returning matches with line/column info."""
+    """Search a file for a pattern, returning matches with line/column info."""
     path = validate_path(p["path"])
     pattern = p["pattern"]
-    fixed_string = p.get("fixed_string", False)
+    fixed_string = p.get("fixed_string", True)
     case_sensitive = p.get("case_sensitive", True)
     whole_word = p.get("whole_word", False)
     max_matches = p.get("max_matches", 100)
-    offset = p.get("offset", 0)
-    running_line = p.get("running_line", 1)
-    end_offset = p.get("end_offset")  # None = search to EOF
+    # The local search's own limits, sent with each request.
+    max_file_size = p["max_file_size"]
+    context_bytes = p["context_bytes"]
 
-    file_size = os.path.getsize(path)
-    effective_end = min(end_offset, file_size) if end_offset is not None else file_size
-
-    # Binary detection: check first 8192 bytes for null byte (only for full-file searches)
-    if offset == 0 and end_offset is None:
+    size = os.path.getsize(path)
+    text = None
+    if max_matches > 0 and 0 < size <= max_file_size:
         with open(path, "rb") as f:
-            header = f.read(8192)
-            if b"\x00" in header:
-                send(id, r={"matches": [], "next_offset": file_size,
-                             "running_line": running_line, "done": True})
-                return
+            text = editor_text(f.read())
+    if text is None:
+        return send(id, r={"matches": []})
 
-    # Build regex pattern (bytes)
-    pat = pattern
-    if fixed_string:
-        pat = re.escape(pat)
+    pat = re.escape(pattern) if fixed_string else pattern
     if whole_word:
-        pat = r"\b" + pat + r"\b"
-    pat_bytes = pat.encode("utf-8")
-
-    flags = 0
+        pat = r"\b(?:" + pat + r")\b"
+    flags = re.MULTILINE
     if not case_sensitive:
         flags |= re.IGNORECASE
-    regex = re.compile(pat_bytes, flags)
+    if not fixed_string and "\n" in pattern:
+        flags |= re.DOTALL
+    regex = re.compile(pat, flags)
 
-    # Read one chunk
-    CHUNK_SIZE = 1048576  # 1MB
-    overlap = max(len(pattern), 256)
-    read_start = max(0, offset - overlap)
-    read_end = min(read_start + CHUNK_SIZE, effective_end)
+    def encode(s):
+        return s.encode("utf-8", errors="surrogateescape")
 
-    with open(path, "rb") as f:
-        f.seek(read_start)
-        chunk = f.read(read_end - read_start)
+    def continues(b):
+        return b & 0xC0 == 0x80
 
-    overlap_len = offset - read_start
-
-    # Count newlines in the overlap region to adjust running_line
-    line_at = running_line - chunk[:overlap_len].count(b"\n")
-
-    # Scan for matches
     matches = []
-    last_pos = 0
-    for m in regex.finditer(chunk):
-        if m.end() <= overlap_len:
+    last_end = None
+    char_pos, byte_pos = 0, 0  # a character offset and its byte offset
+    line, line_start, line_start_byte = 1, 0, 0  # the line at char_pos
+    for m in regex.finditer(text):
+        start, end = m.start(), m.end()
+        # As Rust's find_iter: no empty match where the last match ended.
+        if start == end and start == last_end:
             continue
+        last_end = end
+        between = text[char_pos:start]
+        last_newline = between.rfind("\n")
+        if last_newline != -1:
+            line += between.count("\n")
+            line_start = char_pos + last_newline + 1
+            line_start_byte = byte_pos + len(encode(between[:last_newline + 1]))
+        byte_pos += len(encode(between))
+        char_pos = start
+        # The line around the match, context_bytes at most on each side, cut
+        # where a character starts — as the local search gives it.
+        head = encode(text[max(line_start, start - context_bytes):start])
+        if len(head) > context_bytes:
+            cut = len(head) - context_bytes
+            while cut < len(head) and continues(head[cut]):
+                cut += 1
+            head = head[cut:]
+        newline = text.find("\n", start, end + context_bytes)
+        if start <= newline < end:
+            body, tail = encode(text[start:newline]), b""
+        else:
+            body = encode(text[start:end])
+            tail = encode(text[end:newline if newline != -1 else end + context_bytes])
+            if len(tail) > context_bytes:
+                cut = context_bytes
+                while cut > 0 and continues(tail[cut]):
+                    cut -= 1
+                tail = tail[:cut]
+        context = head + body + tail
+        if context.endswith(b"\r"):
+            context = context[:-1]
+        matches.append({
+            "byte_offset": byte_pos,
+            "length": len(encode(text[start:end])),
+            "line": line,
+            "column": byte_pos - line_start_byte + 1,
+            "context": context.decode("utf-8", errors="replace"),
+            "context_offset": len(head),
+        })
         if len(matches) >= max_matches:
             break
-
-        # Count newlines from last_pos to match start to track line number
-        line_at += chunk[last_pos:m.start()].count(b"\n")
-        last_pos = m.start()
-
-        # Find line boundaries for context
-        line_start = chunk.rfind(b"\n", 0, m.start())
-        line_start = line_start + 1 if line_start != -1 else 0
-        line_end = chunk.find(b"\n", m.end())
-        if line_end == -1:
-            line_end = len(chunk)
-
-        context = chunk[line_start:line_end].decode("utf-8", errors="replace")
-        col = m.start() - line_start + 1
-        byte_offset = read_start + m.start()
-
-        matches.append({
-            "byte_offset": byte_offset,
-            "length": m.end() - m.start(),
-            "line": line_at,
-            "column": col,
-            "context": context,
-        })
-
-    # Update running_line by counting newlines in new data
-    new_running_line = running_line + chunk[overlap_len:].count(b"\n")
-
-    send(id, r={
-        "matches": matches,
-        "next_offset": read_end,
-        "running_line": new_running_line,
-        "done": read_end >= effective_end,
-    })
+    send(id, r={"matches": matches})
 
 
 # === Process Operations ===
@@ -493,6 +600,9 @@ def cmd_exec(id, p):
     def stream_output():
         """Stream process output in a background thread."""
         try:
+            # Pipes still open; one at EOF leaves the set or select() reports it forever.
+            live = [proc.stdout, proc.stderr]
+            last_sent = time.monotonic()
             while proc.poll() is None:
                 # Check for cancellation
                 if id in cancelled:
@@ -504,15 +614,26 @@ def cmd_exec(id, p):
                     send(id, e="cancelled")
                     return
 
-                # Non-blocking read from stdout and stderr
-                readable, _, _ = select.select(
-                    [proc.stdout, proc.stderr], [], [], 0.05
-                )
+                if live:
+                    readable, _, _ = select.select(live, [], [], 0.05)
+                else:
+                    time.sleep(0.05)
+                    readable = []
                 for fd in readable:
-                    data = fd.read(4096)
-                    if data:
-                        key = "out" if fd == proc.stdout else "err"
-                        send(id, d={key: b64(data)})
+                    # os.read, not fd.read(n): the latter blocks until n bytes or
+                    # EOF, so a quiet command streamed nothing until it exited.
+                    data = os.read(fd.fileno(), CHUNK)
+                    if not data:
+                        live.remove(fd)
+                        continue
+                    key = "out" if fd == proc.stdout else "err"
+                    send(id, d={key: b64(data)})
+                    last_sent = time.monotonic()
+
+                # A quiet process is not a dead link; say so on the keepalive cadence.
+                if time.monotonic() - last_sent >= EXEC_KEEPALIVE_SECS:
+                    send(id, d={})
+                    last_sent = time.monotonic()
 
             # Drain any remaining output
             out, err = proc.communicate(timeout=5)
@@ -560,6 +681,86 @@ def cmd_cancel(id, p):
         proc.terminate()
 
     send(id, r={})
+
+
+def cmd_walk_entries(id, p):
+    """Recursively walk a directory, streaming entries in batches.
+
+    The general form of cmd_walk_files: honours include_hidden, include_dirs
+    and max_depth, and carries each entry's kind, mtime and size, which
+    scandir has already stat'd.
+    """
+    root = validate_path(p["path"])
+    skip_dirs = set(p.get("skip_dirs", []))
+    include_hidden = bool(p.get("include_hidden", False))
+    include_dirs = bool(p.get("include_dirs", False))
+    max_depth = p.get("max_depth")
+    if max_depth is None:
+        max_depth = 1 << 62
+    max_files = p.get("max_files", 50000)
+    batch_size = 500
+
+    count = 0
+    batch = []
+    # (dir, depth); depth 1 is a direct child of root.
+    stack = [(root, 1)]
+
+    while stack:
+        if id in cancelled:
+            send(id, r={"count": count, "cancelled": True})
+            return
+
+        d, depth = stack.pop()
+        if depth > max_depth:
+            continue
+        try:
+            entries = os.scandir(d)
+        except OSError:
+            continue
+
+        for entry in entries:
+            if id in cancelled:
+                send(id, r={"count": count, "cancelled": True})
+                return
+
+            if not include_hidden and entry.name.startswith("."):
+                continue
+
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+                is_link = entry.is_symlink()
+                kind = "dir" if is_dir else ("symlink" if is_link else "file")
+
+                if not is_dir or include_dirs:
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                        mtime, size = st.st_mtime, st.st_size
+                    except OSError:
+                        mtime, size = 0, 0
+                    batch.append({
+                        "rel": os.path.relpath(entry.path, root),
+                        "kind": kind,
+                        "mtime": mtime,
+                        "size": size,
+                    })
+                    count += 1
+                    if len(batch) >= batch_size:
+                        send(id, d={"entries": batch})
+                        batch = []
+                    if count >= max_files:
+                        if batch:
+                            send(id, d={"entries": batch})
+                        send(id, r={"count": count, "truncated": True})
+                        return
+
+                if is_dir and entry.name not in skip_dirs:
+                    stack.append((entry.path, depth + 1))
+            except OSError:
+                continue
+
+    if batch:
+        send(id, d={"entries": batch})
+    send(id, r={"count": count})
 
 
 def cmd_walk_files(id, p):
@@ -640,13 +841,16 @@ METHODS = {
     "truncate": cmd_truncate,
     "patch": cmd_patch,
     "count_lf": cmd_count_lf,
+    "digest": cmd_digest,
     "exists": cmd_exists,
+    "find_up": cmd_find_up,
     "info": cmd_info,
     "search_file": cmd_search_file,
     "exec": cmd_exec,
     "kill": cmd_kill,
     "cancel": cmd_cancel,
     "walk_files": cmd_walk_files,
+    "walk_entries": cmd_walk_entries,
 }
 
 

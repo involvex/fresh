@@ -19,16 +19,43 @@
 //! that happen to watch the same path, which matters once
 //! Orchestrator's collision radar is watching one path per worktree
 //! across N sessions.
+//!
+//! **Why non-recursive watches poll on macOS.** notify's kqueue backend
+//! needs one open fd per watched file, and when a watched directory gains
+//! or loses an entry it re-adds the first entry it isn't yet watching
+//! *recursively*, whatever mode the directory was registered with
+//! (`notify` 8.2, `kqueue.rs`). A non-recursive watch on a project root
+//! therefore opens all of `target/` or `.git` the first time something at
+//! the root changes, one more top-level entry per change, and unwatching
+//! the root never closes them — the daemon ran out of fds (#3523). It
+//! also loses a watch on a single file once the file is replaced by a
+//! rename, which is how git writes `.git/HEAD`. A `PollWatcher` holds no
+//! fds between scans and stats by path, so on macOS every non-recursive
+//! watch goes to one shared poller instead. Recursive watches stay on
+//! kqueue: they open the whole tree by design and do not ratchet.
 
 use crate::services::async_bridge::{AsyncBridge, AsyncMessage, PathChangeKind};
 use notify::{
-    event::{CreateKind, EventKind, ModifyKind, RemoveKind},
-    RecommendedWatcher, RecursiveMode, Watcher,
+    event::{AccessKind, AccessMode, CreateKind, EventKind, ModifyKind, RemoveKind},
+    PollWatcher, RecommendedWatcher, RecursiveMode, Watcher,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// How often the poller re-scans its watches where non-recursive
+/// watches poll (macOS). Matches `auto_revert_poll_interval_ms`'s default.
+const NON_RECURSIVE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Which watcher a handle's path is registered with, so `unwatch`
+/// removes it from the same one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    Native,
+    Poll,
+}
 
 /// Allocate a process-globally-unique watch handle. The notify-callback
 /// lookup table ([`handle_map`]) is process-global, so handles must be
@@ -50,18 +77,35 @@ pub struct FileWatcherManager {
     /// The single shared notify `Watcher`. `None` until the first
     /// successful `watch` call wires up the AsyncBridge route.
     watcher: Option<RecommendedWatcher>,
-    /// `handle → (path, recursive)`. Used by `unwatch` to find
-    /// what `notify::Watcher::unwatch` should be called with;
-    /// also lets us forward only paths that are still watched
-    /// when notify fires events for a path that was just
-    /// unwatched (rare but possible — events are queued).
-    handles: HashMap<u64, (PathBuf, RecursiveMode)>,
+    /// The single shared poller for non-recursive watches, where
+    /// [`Self::poll_non_recursive`] routes them here. `None` until the
+    /// first such watch.
+    poller: Option<PollWatcher>,
+    /// `Some(interval)` sends non-recursive watches to [`Self::poller`],
+    /// scanning at `interval`; `None` keeps every watch on the native
+    /// backend. See the module docs for why macOS polls.
+    poll_non_recursive: Option<Duration>,
+    /// `handle → (path, backend)`. Used by `unwatch` to find
+    /// what `notify::Watcher::unwatch` should be called with,
+    /// and on which watcher.
+    handles: HashMap<u64, (PathBuf, Backend)>,
 }
 
 impl FileWatcherManager {
     pub fn new() -> Self {
+        Self::with_non_recursive_polling(
+            cfg!(target_os = "macos").then_some(NON_RECURSIVE_POLL_INTERVAL),
+        )
+    }
+
+    /// A manager whose non-recursive watches poll at `interval` (or use
+    /// the native backend when `None`) regardless of platform, so the
+    /// macOS routing is testable everywhere.
+    fn with_non_recursive_polling(interval: Option<Duration>) -> Self {
         Self {
             watcher: None,
+            poller: None,
+            poll_non_recursive: interval,
             handles: HashMap::new(),
         }
     }
@@ -80,23 +124,40 @@ impl FileWatcherManager {
         path: &Path,
         recursive: bool,
     ) -> Result<u64, String> {
-        if self.watcher.is_none() {
-            self.watcher = Some(build_watcher(bridge.clone())?);
-        }
         let mode = if recursive {
             RecursiveMode::Recursive
         } else {
             RecursiveMode::NonRecursive
         };
-        let watcher = self
-            .watcher
-            .as_mut()
-            .expect("just constructed above if missing");
-        watcher
-            .watch(path, mode)
-            .map_err(|e| format!("watchPath({}): {}", path.display(), e))?;
+        let watched = match self.poll_non_recursive {
+            Some(interval) if !recursive => {
+                // `PollWatcher::watch` accepts a missing path silently;
+                // fail it here as the native backends do.
+                std::fs::metadata(path)
+                    .map_err(|e| format!("watchPath({}): {}", path.display(), e))?;
+                if self.poller.is_none() {
+                    self.poller = Some(build_poller(bridge.clone(), interval)?);
+                }
+                let poller = self
+                    .poller
+                    .as_mut()
+                    .expect("just constructed above if missing");
+                poller.watch(path, mode).map(|()| Backend::Poll)
+            }
+            _ => {
+                if self.watcher.is_none() {
+                    self.watcher = Some(build_watcher(bridge.clone())?);
+                }
+                let watcher = self
+                    .watcher
+                    .as_mut()
+                    .expect("just constructed above if missing");
+                watcher.watch(path, mode).map(|()| Backend::Native)
+            }
+        };
+        let backend = watched.map_err(|e| format!("watchPath({}): {}", path.display(), e))?;
         let handle = alloc_global_handle();
-        self.handles.insert(handle, (path.to_path_buf(), mode));
+        self.handles.insert(handle, (path.to_path_buf(), backend));
         // The notify event callback uses a shared `handles` map
         // (set up below in `build_watcher`) to look up which
         // handle owns each event. Update that here too — but the
@@ -108,17 +169,19 @@ impl FileWatcherManager {
 
     /// Drop a registered watcher. Unknown handles are ignored.
     pub fn unwatch(&mut self, handle: u64) {
-        if let Some((path, _mode)) = self.handles.remove(&handle) {
+        if let Some((path, backend)) = self.handles.remove(&handle) {
             unregister_handle(handle);
-            if let Some(w) = self.watcher.as_mut() {
-                if let Err(e) = w.unwatch(&path) {
-                    tracing::debug!(
-                        "unwatchPath({}): notify returned {}; \
-                         continuing — the editor's view is now consistent",
-                        path.display(),
-                        e
-                    );
-                }
+            let unwatched = match backend {
+                Backend::Native => self.watcher.as_mut().map(|w| w.unwatch(&path)),
+                Backend::Poll => self.poller.as_mut().map(|w| w.unwatch(&path)),
+            };
+            if let Some(Err(e)) = unwatched {
+                tracing::debug!(
+                    "unwatchPath({}): notify returned {}; \
+                     continuing — the editor's view is now consistent",
+                    path.display(),
+                    e
+                );
             }
         }
     }
@@ -199,8 +262,18 @@ fn matches_handle(watch_path: &Path, recursive: RecursiveMode, event_path: &Path
     }
 }
 
-fn classify_kind(kind: &EventKind) -> PathChangeKind {
-    match kind {
+/// The kind of change an event reports, or `None` for an event that changes
+/// nothing: an open, a read, or the close of a file opened for reading
+/// (`EventKind::Access`). inotify reports those for every read of a watched
+/// file, so forwarding them told plugins a file changed whenever anything
+/// read it — `git_statusbar` re-ran `git` on each `.git/HEAD` read, and that
+/// `git` read HEAD again (#3607). Closing a file opened for writing is kept,
+/// as a `Modify`: for a write through `mmap` it is the only event inotify
+/// sends.
+fn classify_kind(kind: &EventKind) -> Option<PathChangeKind> {
+    Some(match kind {
+        EventKind::Access(AccessKind::Close(AccessMode::Write)) => PathChangeKind::Modify,
+        EventKind::Access(_) => return None,
         EventKind::Create(CreateKind::File)
         | EventKind::Create(CreateKind::Folder)
         | EventKind::Create(CreateKind::Any)
@@ -212,12 +285,27 @@ fn classify_kind(kind: &EventKind) -> PathChangeKind {
         EventKind::Modify(ModifyKind::Name(_)) => PathChangeKind::Rename,
         EventKind::Modify(_) => PathChangeKind::Modify,
         _ => PathChangeKind::Other,
-    }
+    })
 }
 
 fn build_watcher(bridge: AsyncBridge) -> Result<RecommendedWatcher, String> {
+    notify::recommended_watcher(event_handler(bridge))
+        .map_err(|e| format!("notify::recommended_watcher: {}", e))
+}
+
+fn build_poller(bridge: AsyncBridge, interval: Duration) -> Result<PollWatcher, String> {
+    PollWatcher::new(
+        event_handler(bridge),
+        notify::Config::default().with_poll_interval(interval),
+    )
+    .map_err(|e| format!("notify::PollWatcher: {}", e))
+}
+
+/// The callback both watchers share: route each event path to every
+/// handle that covers it.
+fn event_handler(bridge: AsyncBridge) -> impl Fn(notify::Result<notify::Event>) + Send + 'static {
     let bridge = Arc::new(bridge);
-    let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+    move |res: notify::Result<notify::Event>| {
         let event = match res {
             Ok(e) => e,
             Err(e) => {
@@ -225,7 +313,9 @@ fn build_watcher(bridge: AsyncBridge) -> Result<RecommendedWatcher, String> {
                 return;
             }
         };
-        let kind = classify_kind(&event.kind);
+        let Some(kind) = classify_kind(&event.kind) else {
+            return;
+        };
         let map = match handle_map().lock() {
             Ok(m) => m,
             Err(_) => return,
@@ -242,9 +332,7 @@ fn build_watcher(bridge: AsyncBridge) -> Result<RecommendedWatcher, String> {
                 }
             }
         }
-    })
-    .map_err(|e| format!("notify::recommended_watcher: {}", e))?;
-    Ok(watcher)
+    }
 }
 
 #[cfg(test)]
@@ -279,6 +367,71 @@ mod tests {
         ));
     }
 
+    /// Wait (semantically; nextest bounds it) for a `PathChanged` on
+    /// `handle` that satisfies `pred`, draining everything else.
+    fn wait_for_change(
+        bridge: &AsyncBridge,
+        handle: u64,
+        pred: impl Fn(&Path, PathChangeKind) -> bool,
+    ) {
+        loop {
+            for msg in bridge.try_recv_all() {
+                if let AsyncMessage::PathChanged {
+                    handle: h,
+                    path,
+                    kind,
+                } = msg
+                {
+                    if h == handle && pred(&path, kind) {
+                        return;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Where non-recursive watches poll (macOS), one on a directory
+    /// reports entries created in it, and a recursive watch still goes
+    /// to the native backend.
+    #[test]
+    fn non_recursive_watch_polls_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let bridge = AsyncBridge::new();
+        let mut manager =
+            FileWatcherManager::with_non_recursive_polling(Some(Duration::from_millis(50)));
+
+        let handle = manager.watch(&bridge, &root, false).unwrap();
+        assert_eq!(manager.handles[&handle].1, Backend::Poll);
+        let recursive = manager.watch(&bridge, &root, true).unwrap();
+        assert_eq!(manager.handles[&recursive].1, Backend::Native);
+        manager.unwatch(recursive);
+
+        let marker = root.join(".envrc");
+        std::fs::write(&marker, "x").unwrap();
+        wait_for_change(&bridge, handle, |path, kind| {
+            path == marker && matches!(kind, PathChangeKind::Create)
+        });
+
+        manager.unwatch(handle);
+        assert!(manager.handles.is_empty());
+    }
+
+    /// `PollWatcher::watch` accepts a missing path; the manager still
+    /// fails it, as the native backends do, so plugins see the error.
+    #[test]
+    fn polled_watch_on_missing_path_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = AsyncBridge::new();
+        let mut manager =
+            FileWatcherManager::with_non_recursive_polling(Some(Duration::from_millis(50)));
+        assert!(manager
+            .watch(&bridge, &dir.path().join("missing"), false)
+            .is_err());
+        assert!(manager.handles.is_empty());
+    }
+
     /// Kind classification buckets every notify-supplied variant
     /// into one of the five exposed strings.
     #[test]
@@ -286,19 +439,63 @@ mod tests {
         use notify::event::*;
         assert!(matches!(
             classify_kind(&EventKind::Create(CreateKind::File)),
-            PathChangeKind::Create
+            Some(PathChangeKind::Create)
         ));
         assert!(matches!(
             classify_kind(&EventKind::Remove(RemoveKind::File)),
-            PathChangeKind::Delete
+            Some(PathChangeKind::Delete)
         ));
         assert!(matches!(
             classify_kind(&EventKind::Modify(ModifyKind::Data(DataChange::Content))),
-            PathChangeKind::Modify
+            Some(PathChangeKind::Modify)
         ));
         assert!(matches!(
             classify_kind(&EventKind::Modify(ModifyKind::Name(RenameMode::Both))),
-            PathChangeKind::Rename
+            Some(PathChangeKind::Rename)
         ));
+        // Reads change nothing (#3607)
+        assert!(classify_kind(&EventKind::Access(AccessKind::Open(AccessMode::Any))).is_none());
+        assert!(classify_kind(&EventKind::Access(AccessKind::Close(AccessMode::Read))).is_none());
+        assert!(matches!(
+            classify_kind(&EventKind::Access(AccessKind::Close(AccessMode::Write))),
+            Some(PathChangeKind::Modify)
+        ));
+    }
+
+    /// Reading a watched file reports no change; writing it does (#3607).
+    ///
+    /// The file is read first, then written, so the first event the watch
+    /// delivers would be the read's, had reads been forwarded.
+    #[test]
+    fn reading_a_watched_file_reports_no_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = dir.path().join("HEAD");
+        std::fs::write(&head, "ref: refs/heads/main\n").unwrap();
+        let bridge = AsyncBridge::new();
+        // The native backend, where reads are reported (inotify), on every
+        // platform: macOS polls non-recursive watches by default, and the
+        // poller compares whole-second mtimes, so it would never see a write
+        // made in the same second as the watch began.
+        let mut manager = FileWatcherManager::with_non_recursive_polling(None);
+        let handle = manager.watch(&bridge, &head, false).unwrap();
+
+        let _ = std::fs::read(&head).unwrap();
+        std::fs::write(&head, "ref: refs/heads/other\n").unwrap();
+
+        let first = std::cell::Cell::new(None);
+        wait_for_change(&bridge, handle, |_, kind| {
+            first.set(Some(kind));
+            true
+        });
+        assert!(
+            // FSEvents may coalesce the file's creation into the write.
+            matches!(
+                first.get(),
+                Some(PathChangeKind::Modify | PathChangeKind::Create)
+            ),
+            "the read was reported as a change: {:?}",
+            first.get()
+        );
+        manager.unwatch(handle);
     }
 }

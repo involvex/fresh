@@ -11,14 +11,16 @@
 //! deciding which split to focus. Each variant differs only in how it
 //! handles encoding errors, focus, and "no file at this path yet" cases.
 
+use fresh_editor_core::model::host_path::{AsHostPath, HostPathBuf};
 use std::path::Path;
 use std::sync::Arc;
 
-use rust_i18n::t;
+use fresh_i18n::t;
 
 use crate::model::event::BufferId;
 use crate::state::EditorState;
 
+use super::buffer_close::CloseCause;
 use super::Editor;
 
 /// How a file open treats the resulting buffer.
@@ -39,7 +41,180 @@ pub(crate) enum OpenKind {
     Preview,
 }
 
+/// Where opening a path in a window lands: see
+/// [`Window::resolve_open_path`](crate::app::window::Window::resolve_open_path).
+pub(crate) struct ResolvedOpenPath {
+    /// The path as the user named it, made absolute: what language
+    /// detection matches its globs against.
+    pub display_path: std::path::PathBuf,
+    /// The path the buffer is keyed by.
+    pub canonical_path: std::path::PathBuf,
+    pub file_exists: bool,
+}
+
+/// A file opened without focus is open in another workspace: a file has one
+/// buffer in the editor, never two, and it lives where it was opened first.
+/// An open that focuses switches to it there instead.
+#[derive(Debug)]
+pub(crate) struct OpenInAnotherWorkspace {
+    pub window: fresh_core::WindowId,
+    pub buffer: BufferId,
+    /// The workspace's label, for the message.
+    pub label: String,
+}
+
+impl std::fmt::Display for OpenInAnotherWorkspace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            t!("buffer.open_in_other_workspace", workspace = self.label)
+        )
+    }
+}
+
+impl std::error::Error for OpenInAnotherWorkspace {}
+
 impl Editor {
+    /// The workspace other than the active one that has `path` open, and the
+    /// buffer it has it in. A file is one buffer across all workspaces: a
+    /// second workspace opening it goes to the first's (see
+    /// [`OpenInAnotherWorkspace`]).
+    ///
+    /// The same path through another authority (a remote host) is another
+    /// file. Only buffers with a tab count: a plugin's hidden or virtual
+    /// buffer is no place to send the user.
+    pub(crate) fn file_open_in_other_window(&self, path: &Path) -> Option<OpenInAnotherWorkspace> {
+        let active = self.windows.get(&self.active_window)?;
+        let canonical = active.resolve_open_path(path).canonical_path;
+        self.window_with_file(&canonical, self.active_window)
+    }
+
+    /// Why the active window's buffer `own` must not be saved as `path`, if
+    /// it must not: the file's one buffer is in another workspace, or another
+    /// running Fresh has it open. Writing it from here would make a second
+    /// version of the file and save it over the one being edited there.
+    pub(crate) fn save_target_refusal(&mut self, path: &Path, own: BufferId) -> Option<String> {
+        if let Some(elsewhere) = self.file_open_in_other_window(path) {
+            return Some(elsewhere.to_string());
+        }
+        let window = self.windows.get(&self.active_window)?;
+        let canonical = window.resolve_open_path(path).canonical_path;
+        let already_own = window
+            .buffers
+            .get(&own)
+            .and_then(|state| state.buffer.file_path())
+            .is_some_and(|file| file == canonical.as_path());
+        // Locks cover local files only
+        if already_own || window.host_key().is_some() {
+            return None;
+        }
+        match self.recovery_service.lock().unwrap().lock_file(&canonical) {
+            crate::services::recovery::FileLock::Elsewhere { pid } => {
+                let file = canonical
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let pid = pid.map_or_else(|| "?".to_string(), |pid| pid.to_string());
+                Some(t!("buffer.open_in_other_editor", file = file, pid = pid).to_string())
+            }
+            crate::services::recovery::FileLock::Ours => None,
+        }
+    }
+
+    /// The first window other than `except`, on the same authority, with a
+    /// tab on the file at canonical `path`.
+    fn window_with_file(
+        &self,
+        path: &Path,
+        except: fresh_core::WindowId,
+    ) -> Option<OpenInAnotherWorkspace> {
+        let host = self.windows.get(&except).map(|w| w.host_key());
+        let mut others: Vec<_> = self
+            .windows
+            .iter()
+            .filter(|(id, w)| **id != except && Some(w.host_key()) == host)
+            .collect();
+        // The same answer every time a file is open in more than one
+        others.sort_by_key(|(id, _)| id.0);
+        others.into_iter().find_map(|(id, w)| {
+            w.tab_file_buffers()
+                .find(|(_, file)| *file == path)
+                .map(|(buffer_id, _)| OpenInAnotherWorkspace {
+                    window: *id,
+                    buffer: buffer_id,
+                    label: w.label.clone(),
+                })
+        })
+    }
+
+    /// Close the clean hidden buffers other windows have for `path` (a
+    /// plugin's, left by a replace across files): the file is about to have
+    /// its one buffer here. One with unsaved changes is left alone.
+    fn close_hidden_copies_elsewhere(&mut self, path: &Path) {
+        let Some(active) = self.windows.get(&self.active_window) else {
+            return;
+        };
+        let canonical = active.resolve_open_path(path).canonical_path;
+        let host = active.host_key();
+        let copies: Vec<(fresh_core::WindowId, BufferId)> = self
+            .windows
+            .iter()
+            .filter(|(id, w)| **id != self.active_window && w.host_key() == host)
+            .flat_map(|(id, w)| {
+                w.file_buffers(true)
+                    .filter(|(buffer_id, file)| {
+                        *file == canonical.as_path()
+                            && w.buffer_metadata
+                                .get(buffer_id)
+                                .is_some_and(|meta| meta.hidden_from_tabs)
+                            && w.buffers
+                                .get(buffer_id)
+                                .is_some_and(|state| !state.buffer.is_modified())
+                    })
+                    .map(|(buffer_id, _)| (*id, buffer_id))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for (window, buffer_id) in copies {
+            let closed = self.with_window_retargeted(window, |editor| {
+                editor.force_close_buffer_by(buffer_id, CloseCause::Editor)
+            });
+            if let Err(e) = closed {
+                tracing::debug!("Failed to close a hidden copy of {}: {e}", path.display());
+            }
+        }
+    }
+
+    /// Close in window `id` the clean tabs of files another workspace has
+    /// open: a workspace restored after another took the file comes back
+    /// without its own copy. Before any recovery runs, so nothing here has
+    /// unsaved work; a modified one is left alone all the same.
+    pub(crate) fn close_files_open_elsewhere(&mut self, id: fresh_core::WindowId) {
+        let Some(window) = self.windows.get(&id) else {
+            return;
+        };
+        let duplicates: Vec<BufferId> = window
+            .tab_file_buffers()
+            .filter(|(buffer_id, _)| {
+                window
+                    .buffers
+                    .get(buffer_id)
+                    .is_some_and(|state| !state.buffer.is_modified())
+            })
+            .filter(|(_, file)| self.window_with_file(file, id).is_some())
+            .map(|(buffer_id, _)| buffer_id)
+            .collect();
+        for buffer_id in duplicates {
+            let closed = self.with_window_retargeted(id, |editor| {
+                editor.force_close_buffer_by(buffer_id, CloseCause::Editor)
+            });
+            if let Err(e) = closed {
+                tracing::warn!("Failed to close a file open in another workspace: {e}");
+            }
+        }
+    }
+
     /// Helper to jump to a line/column position in the active buffer.
     ///
     /// Lives here (not in the plugin-gated command module) so non-plugin
@@ -74,11 +249,6 @@ impl Editor {
         // Ensure we don't go past the buffer end
         let buffer_len = state.buffer.len();
         let clamped_position = final_position.min(buffer_len);
-
-        // Update the cached line number so the status bar shows the correct
-        // position. Without this, the status bar reads a stale value from
-        // state.primary_cursor_line_number which was set before the jump.
-        state.primary_cursor_line_number = crate::model::buffer::LineNumber::Absolute(target_line);
 
         // Funnel through the navigation primitive so the cursor is guaranteed
         // visible in the viewport (#1689 — without this, jump_to_line_column
@@ -137,6 +307,20 @@ impl Editor {
         // `preferred_split_for_file` (which adds the new buffer as a
         // tab) and `set_active_buffer` (which makes it the active
         // buffer) — see a non-dock active leaf and route consistently.
+        // Open in another workspace: go there. A preview is only a look, and
+        // switching workspaces under one would be a jump nobody asked for.
+        if let Some(elsewhere) = self.file_open_in_other_window(path) {
+            if kind == OpenKind::Preview {
+                return Err(elsewhere.into());
+            }
+            let buffer_id = elsewhere.buffer;
+            self.set_active_window(elsewhere.window);
+            self.set_active_buffer(buffer_id);
+            self.reveal_active_split_if_hidden_by_maximize();
+            return Ok(buffer_id);
+        }
+
+        self.close_hidden_copies_elsewhere(path);
         self.active_window_mut()
             .redirect_active_split_away_from_dock_if_needed();
 
@@ -176,6 +360,40 @@ impl Editor {
 
         self.set_active_buffer(buffer_id);
 
+        // Read-only if another editor has it open
+        self.sync_file_locks();
+
+        // Its unsaved work, wherever it was left: the file's entry finds it
+        // from any project. A preview is only a look, and shows the file.
+        if kind == OpenKind::Commit && !self.adopting_recovery {
+            if let Some(file) = self
+                .buffers()
+                .get(&buffer_id)
+                .and_then(|state| state.buffer.file_path())
+                .map(Path::to_path_buf)
+            {
+                self.adopt_recovery_for_window(
+                    self.active_window,
+                    Some(std::slice::from_ref(&file)),
+                    super::recovery_actions::AdoptScope::OpenFiles,
+                );
+            }
+        }
+
+        // Deliberately opening the file that is currently being previewed is
+        // the commitment the preview was waiting for, so the tab stops being
+        // ephemeral here rather than at each gesture that can mean "open".
+        // The File Explorer's double-click promotes explicitly (it wants the
+        // status message either way); this covers everyone else — a finder
+        // confirming a result it was previewing, Quick Open landing on the
+        // same file, a plugin's `openFile`. Without it the tab a search
+        // opened stays marked `(preview)` and the next preview closes the
+        // file the user chose.
+        if kind == OpenKind::Commit {
+            self.active_window_mut()
+                .promote_buffer_from_preview(buffer_id);
+        }
+
         // Opening a file focuses a buffer in the active split. If a
         // *different* split is maximized (most commonly the docked
         // terminal), the renderer shows only the maximized split, so the
@@ -190,13 +408,9 @@ impl Editor {
         // as nothing changed and the extra hook would cause spurious refreshes
         // in plugins like the diagnostics panel.
         if !is_new_buffer && !active_had_path {
-            #[cfg(feature = "plugins")]
-            self.update_plugin_state_snapshot();
-
-            self.plugin_manager.read().unwrap().run_hook(
-                "buffer_activated",
-                crate::services::plugins::hooks::HookArgs::BufferActivated { buffer_id },
-            );
+            // The scratch buffer was re-pointed at this file in place: the
+            // buffer id did not change, so the announcer has to be told.
+            self.announce_focus_forced();
 
             // The active *file* changed even though the active *buffer* did
             // not, so `set_active_buffer` — where the follow-the-active-buffer
@@ -205,7 +419,6 @@ impl Editor {
             // never moves the explorer. Most visible when something opens that
             // first file for you: a code tour's opening step left the tree
             // parked at the root for the rest of the tour (issue #2988).
-            self.active_window_mut().follow_active_buffer_in_explorer();
         }
 
         // Use display_name from metadata for relative path display
@@ -223,13 +436,21 @@ impl Editor {
             .map(|s| s.buffer.is_binary())
             .unwrap_or(false);
 
+        // Another editor having it is the news, not that it opened
+        let open_elsewhere = self
+            .active_window()
+            .buffer_metadata
+            .get(&buffer_id)
+            .is_some_and(|meta| meta.open_elsewhere.is_some());
+
         // Show appropriate status message for binary vs regular files
-        if is_binary {
-            self.active_window_mut().status_message =
-                Some(t!("buffer.opened_binary", name = display_name).to_string());
-        } else {
-            self.active_window_mut().status_message =
-                Some(t!("buffer.opened", name = display_name).to_string());
+        if !open_elsewhere {
+            let message = if is_binary {
+                t!("buffer.opened_binary", name = display_name)
+            } else {
+                t!("buffer.opened", name = display_name)
+            };
+            self.active_window_mut().status_message = Some(message.to_string());
         }
 
         Ok(buffer_id)
@@ -238,8 +459,9 @@ impl Editor {
     /// Restore the split layout when the just-focused buffer would be
     /// hidden behind a maximized split.
     ///
-    /// `SplitManager::get_visible_buffers` renders *only* the maximized
-    /// split. A file open focuses its buffer in the active split, which —
+    /// A maximized split is the only one the frame places
+    /// (`SplitManager::visible_leaves` reports it alone). A file open
+    /// focuses its buffer in the active split, which —
     /// after `redirect_active_split_away_from_dock_if_needed` — is a
     /// regular editor leaf, not the maximized dock. With nothing reset, the
     /// new buffer renders behind the maximized terminal: the user sees no
@@ -247,7 +469,7 @@ impl Editor {
     /// blocks waiting for that invisible buffer to be closed, so the
     /// terminal appears to hang. Un-maximize so the focused buffer shows.
     fn reveal_active_split_if_hidden_by_maximize(&mut self) {
-        let mgr = self.split_manager();
+        let mgr = self.active_window().split_manager();
         let active: crate::model::event::SplitId = mgr.active_split().into();
         let hidden = matches!(mgr.maximized_split(), Some(maximized) if maximized != active);
         if !hidden {
@@ -255,7 +477,8 @@ impl Editor {
         }
         // `unmaximize_split` only errors when nothing is maximized, which
         // the `hidden` guard above already excludes.
-        self.split_manager_mut()
+        self.active_window_mut()
+            .split_manager_mut()
             .unmaximize_split()
             .expect("a split is maximized (checked above)");
         self.relayout();
@@ -284,14 +507,27 @@ impl Editor {
     /// Thin delegator: the open-file core lives on `impl Window` (rooted
     /// at the window's own `root` / `resources`). The editor forwards to
     /// the active window.
+    ///
+    /// A file open in another workspace stays there: this fails with
+    /// [`OpenInAnotherWorkspace`], since nothing here moves focus to it.
     pub fn open_file_no_focus(&mut self, path: &Path) -> anyhow::Result<BufferId> {
-        self.active_window_mut().open_file_no_focus(path)
+        if let Some(elsewhere) = self.file_open_in_other_window(path) {
+            return Err(elsewhere.into());
+        }
+        self.close_hidden_copies_elsewhere(path);
+        let buffer_id = self.active_window_mut().open_file_no_focus(path)?;
+        // Read-only if another editor has it open
+        self.sync_file_locks();
+        Ok(buffer_id)
     }
 
     /// Open a file without switching focus AND without ever
     /// repurposing the active "no name" buffer. Thin delegator to the
     /// active window's `Window::open_file_for_preview`.
     pub(super) fn open_file_for_preview(&mut self, path: &Path) -> anyhow::Result<BufferId> {
+        if let Some(elsewhere) = self.file_open_in_other_window(path) {
+            return Err(elsewhere.into());
+        }
         self.active_window_mut().open_file_for_preview(path)
     }
 
@@ -323,8 +559,8 @@ impl Editor {
         let canonical_path = self
             .authority()
             .filesystem
-            .canonicalize(&resolved_path)
-            .unwrap_or_else(|_| resolved_path.clone());
+            .canonicalize(resolved_path.as_host())
+            .unwrap_or_else(|_| HostPathBuf::from_path_buf(resolved_path.clone()));
         let path = canonical_path.as_path();
 
         // Check if already open
@@ -359,6 +595,7 @@ impl Editor {
             Arc::clone(&self.authority().filesystem),
             crate::model::buffer::BufferConfig {
                 estimated_line_length: self.config.editor.estimated_line_length,
+                large_file_threshold: Some(self.config.editor.large_file_threshold_bytes as usize),
             },
         )?;
         let first_line = buffer.first_line_lossy();
@@ -371,6 +608,7 @@ impl Editor {
                 &self.grammar_registry,
                 &self.config.languages,
                 self.config.default_language.as_deref(),
+                buffer.filesystem().as_ref(),
             );
 
         let mut state = EditorState::from_buffer_with_language(buffer, detected);
@@ -390,6 +628,7 @@ impl Editor {
             .insert(buffer_id, crate::model::event::EventLog::new());
 
         let metadata = super::types::BufferMetadata::with_file(
+            &*std::sync::Arc::clone(&self.authority().filesystem),
             path.to_path_buf(),
             &display_path,
             self.working_dir(),
@@ -409,7 +648,7 @@ impl Editor {
         if let Some(view_state) = self
             .windows
             .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
+            .and_then(|w| w.buffers.split_view_states_mut())
             .expect("active window must have a populated split layout")
             .get_mut(&target_split)
         {
@@ -467,6 +706,7 @@ impl Editor {
             Arc::clone(&self.authority().filesystem),
             crate::model::buffer::BufferConfig {
                 estimated_line_length: self.config.editor.estimated_line_length,
+                large_file_threshold: Some(self.config.editor.large_file_threshold_bytes as usize),
             },
         )?;
 
@@ -484,21 +724,13 @@ impl Editor {
         }
 
         // Reset cursor to start in the split view state
-        let split_id = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split();
+        let split_id = self.active_window().split_manager().active_split();
         if let Some(view_state) = self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
-            .expect("active window must have a populated split layout")
+            .active_window_mut()
+            .split_view_states_mut()
             .get_mut(&split_id)
         {
-            if let Some(buf_state) = view_state.keyed_states.get_mut(&buffer_id) {
+            if let Some(buf_state) = view_state.buffer_state_mut(buffer_id) {
                 buf_state.cursors = crate::model::cursor::Cursors::new();
             }
         }
@@ -527,8 +759,8 @@ impl Editor {
         let canonical_path = self
             .authority()
             .filesystem
-            .canonicalize(&resolved_path)
-            .unwrap_or_else(|_| resolved_path.clone());
+            .canonicalize(resolved_path.as_host())
+            .unwrap_or_else(|_| HostPathBuf::from_path_buf(resolved_path.clone()));
         let path = canonical_path.as_path();
 
         // Check if already open
@@ -549,6 +781,7 @@ impl Editor {
         // Load buffer with forced full loading (bypasses the large file encoding check)
         let buffer = crate::model::buffer::Buffer::load_large_file_confirmed(
             path,
+            self.config.editor.large_file_threshold_bytes as usize,
             Arc::clone(&self.authority().filesystem),
         )?;
         let first_line = buffer.first_line_lossy();
@@ -561,6 +794,7 @@ impl Editor {
                 &self.grammar_registry,
                 &self.config.languages,
                 self.config.default_language.as_deref(),
+                buffer.filesystem().as_ref(),
             );
 
         let mut state = EditorState::from_buffer_with_language(buffer, detected);
@@ -580,6 +814,7 @@ impl Editor {
             .insert(buffer_id, crate::model::event::EventLog::new());
 
         let metadata = super::types::BufferMetadata::with_file(
+            &*std::sync::Arc::clone(&self.authority().filesystem),
             path.to_path_buf(),
             &display_path,
             self.working_dir(),
@@ -599,7 +834,7 @@ impl Editor {
         if let Some(view_state) = self
             .windows
             .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
+            .and_then(|w| w.buffers.split_view_states_mut())
             .expect("active window must have a populated split layout")
             .get_mut(&target_split)
         {
@@ -675,7 +910,7 @@ impl Editor {
         // `open_file` focuses, which is what callers (goto-def,
         // workspace edits) expect — they want the cursor to land in
         // the destination buffer afterward.
-        if self.authority().filesystem.exists(&host_path) {
+        if self.authority().filesystem.exists(host_path.as_host()) {
             return self.open_file(&host_path);
         }
 
@@ -793,6 +1028,9 @@ impl Editor {
         // Detect language from the container path (the basename's
         // extension is what matters; the directory tree is
         // container-side and won't match host-relative globs anyway).
+        // For the same reason the buffer's host filesystem can't see that
+        // tree, so the `.h` C++ probe finds nothing here and a container
+        // header stays C — the pre-existing behaviour for this path.
         let first_line = buffer.first_line_lossy();
         let detected =
             crate::primitives::detected_language::DetectedLanguage::from_path_with_fallback(
@@ -801,6 +1039,7 @@ impl Editor {
                 &self.grammar_registry,
                 &self.config.languages,
                 self.config.default_language.as_deref(),
+                buffer.filesystem().as_ref(),
             );
         let mut state = EditorState::from_buffer_with_language(buffer, detected);
         state.editing_disabled = true;
@@ -846,7 +1085,7 @@ impl Editor {
         if let Some(view_state) = self
             .windows
             .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
+            .and_then(|w| w.buffers.split_view_states_mut())
             .expect("active window must have a populated split layout")
             .get_mut(&target_split)
         {
@@ -868,6 +1107,22 @@ impl Editor {
 }
 
 impl crate::app::window::Window {
+    /// Whether `buffer_id` is an untouched scratch buffer — empty,
+    /// unmodified, with no file — which a file or recovered content can take
+    /// over rather than opening beside it. Not a composite buffer (they look
+    /// empty but are special views), nor one hosting a widget panel: its rows
+    /// are the tree's mirror (`app::pane_mirror`), written on the next frame,
+    /// so it is empty between its mount and that frame.
+    pub(crate) fn is_pristine_scratch(&self, buffer_id: BufferId) -> bool {
+        self.buffers.get(&buffer_id).is_some_and(|state| {
+            !state.is_composite_buffer
+                && !state.interactive_widget_panel
+                && state.buffer.is_empty()
+                && !state.buffer.is_modified()
+                && state.buffer.file_path().is_none()
+        })
+    }
+
     /// Open a file without switching focus to it.
     ///
     /// Window-scoped core of the open-file path: creates a new buffer
@@ -878,7 +1133,9 @@ impl crate::app::window::Window {
     /// flip. If the file doesn't exist, creates an unsaved buffer with
     /// that filename.
     pub fn open_file_no_focus(&mut self, path: &Path) -> anyhow::Result<BufferId> {
-        self.open_file_no_focus_inner(path, true, OpenKind::Commit)
+        let buffer_id = self.open_file_no_focus_inner(path, true, OpenKind::Commit)?;
+        self.forget_unopened_file(path);
+        Ok(buffer_id)
     }
 
     /// `open_file_no_focus` with an explicit [`OpenKind`], so the Editor-side
@@ -889,7 +1146,22 @@ impl crate::app::window::Window {
         path: &Path,
         kind: OpenKind,
     ) -> anyhow::Result<BufferId> {
-        self.open_file_no_focus_inner(path, true, kind)
+        let buffer_id = self.open_file_no_focus_inner(path, true, kind)?;
+        self.forget_unopened_file(path);
+        Ok(buffer_id)
+    }
+
+    /// A file the restore could not open has now opened, so it no longer needs
+    /// holding: from here its tab is the record, and closing that tab drops
+    /// it from the workspace as for any other file.
+    fn forget_unopened_file(&mut self, path: &Path) {
+        if self.unopened_files.is_empty() {
+            return;
+        }
+        let root = &self.root;
+        let resolve = |p: &Path| root.join(p);
+        let opened = resolve(path);
+        self.unopened_files.retain(|f| resolve(&f.path) != opened);
     }
 
     /// Open a file without switching focus AND without ever
@@ -922,7 +1194,8 @@ impl crate::app::window::Window {
         let canonicalize = |p: &Path| {
             self.authority()
                 .filesystem
-                .canonicalize(p)
+                .canonicalize(p.as_host())
+                .map(HostPathBuf::into_path_buf)
                 .unwrap_or_else(|_| p.to_path_buf())
         };
         let canonical_data = canonicalize(&self.resources.dir_context.data_dir);
@@ -999,6 +1272,7 @@ impl crate::app::window::Window {
 
         // Create metadata for this buffer
         let mut metadata = crate::app::types::BufferMetadata::with_file(
+            &*std::sync::Arc::clone(&self.authority().filesystem),
             path.to_path_buf(),
             display_path,
             &self.root,
@@ -1018,7 +1292,7 @@ impl crate::app::window::Window {
         if file_exists
             && !metadata.read_only
             && self.resources.config.editor.auto_read_only
-            && !self.authority().filesystem.is_writable(path)
+            && !self.authority().filesystem.is_writable(path.as_host())
         {
             metadata.read_only = true;
         }
@@ -1039,6 +1313,123 @@ impl crate::app::window::Window {
         self.buffer_metadata.insert(buffer_id, metadata);
     }
 
+    /// Which authority this window's files are on: `None` for this machine,
+    /// the host for a remote one. The same path under two is two files.
+    ///
+    /// A remote workspace not connected yet runs on a local placeholder; its
+    /// files are still the remote host's, so it is keyed by the backend it
+    /// will reconnect to — never as this machine.
+    pub(crate) fn host_key(&self) -> Option<String> {
+        if let Some(host) = self.authority().filesystem.remote_connection_info() {
+            return Some(host.to_owned());
+        }
+        self.authority_spec.is_remote().then(|| {
+            format!(
+                "unconnected:{}",
+                serde_json::to_string(&self.authority_spec).unwrap_or_default()
+            )
+        })
+    }
+
+    /// This window's file buffers that have a tab, with their files: what a
+    /// file being "open" here means. A plugin's hidden or virtual buffer,
+    /// and a composite view, are not.
+    pub(crate) fn tab_file_buffers(&self) -> impl Iterator<Item = (BufferId, &Path)> {
+        self.file_buffers(false)
+    }
+
+    /// This window's file buffers, with their files: those with a tab, and
+    /// with `hidden` also a plugin's hidden ones (a replace across files
+    /// opens them) — every buffer that can write its file.
+    pub(crate) fn file_buffers(&self, hidden: bool) -> impl Iterator<Item = (BufferId, &Path)> {
+        self.buffers.iter().filter_map(move |(buffer_id, state)| {
+            let meta = self.buffer_metadata.get(buffer_id)?;
+            if state.is_composite_buffer || (meta.hidden_from_tabs && !hidden) || meta.is_virtual()
+            {
+                return None;
+            }
+            let file = state.buffer.file_path()?;
+            (!file.as_os_str().is_empty()).then_some((*buffer_id, file))
+        })
+    }
+
+    /// Where opening `path` in this window lands: relative paths resolved
+    /// against the window's base (the remote home, or its root), then
+    /// canonicalized — a missing file through its parent — so the same file
+    /// is one path however it was named. The key both this window's own
+    /// already-open check and the editor's across-workspace one compare.
+    pub(crate) fn resolve_open_path(&self, path: &Path) -> ResolvedOpenPath {
+        // Resolve relative paths against appropriate base directory.
+        // For remote mode, use the remote home directory; for local, use
+        // this window's root.
+        let base_dir = if self
+            .authority()
+            .filesystem
+            .remote_connection_info()
+            .is_some()
+        {
+            self.authority()
+                .filesystem
+                .home_dir()
+                .map(HostPathBuf::into_path_buf)
+                .unwrap_or_else(|_| self.root.clone())
+        } else {
+            self.root.clone()
+        };
+
+        let resolved_path = if path.is_relative() {
+            base_dir.join(path)
+        } else {
+            path.to_path_buf()
+        };
+
+        // Determine if we're opening a non-existent file (for creating new files)
+        // Use filesystem trait method to support remote files
+        let file_exists = self.authority().filesystem.exists(resolved_path.as_host());
+
+        // Save the user-visible (non-canonicalized) path for language detection.
+        // Glob patterns in language config should match the path as the user sees it,
+        // not the canonical path (e.g., on macOS /var -> /private/var symlinks).
+        let display_path = resolved_path.clone();
+
+        // Canonicalize the path to resolve symlinks and normalize path components
+        // This ensures consistent path representation throughout the editor
+        // For non-existent files, we need to canonicalize the parent directory and append the filename
+        let canonical_path = if file_exists {
+            self.authority()
+                .filesystem
+                .canonicalize(resolved_path.as_host())
+                .map(HostPathBuf::into_path_buf)
+                .unwrap_or_else(|_| resolved_path.clone())
+        } else {
+            // For non-existent files, canonicalize parent dir and append filename
+            if let Some(parent) = resolved_path.parent() {
+                let canonical_parent = if parent.as_os_str().is_empty() {
+                    // No parent means just a filename, use base dir
+                    base_dir.clone()
+                } else {
+                    self.authority()
+                        .filesystem
+                        .canonicalize(parent.as_host())
+                        .map(HostPathBuf::into_path_buf)
+                        .unwrap_or_else(|_| parent.to_path_buf())
+                };
+                if let Some(filename) = resolved_path.file_name() {
+                    canonical_parent.join(filename)
+                } else {
+                    resolved_path
+                }
+            } else {
+                resolved_path
+            }
+        };
+        ResolvedOpenPath {
+            display_path,
+            canonical_path,
+            file_exists,
+        }
+    }
+
     fn open_file_no_focus_inner(
         &mut self,
         path: &Path,
@@ -1057,73 +1448,22 @@ impl crate::app::window::Window {
             );
         }
 
-        // Resolve relative paths against appropriate base directory.
-        // For remote mode, use the remote home directory; for local, use
-        // this window's root.
-        let base_dir = if self
-            .authority()
-            .filesystem
-            .remote_connection_info()
-            .is_some()
-        {
-            self.authority()
-                .filesystem
-                .home_dir()
-                .unwrap_or_else(|_| self.root.clone())
-        } else {
-            self.root.clone()
-        };
-
-        let resolved_path = if path.is_relative() {
-            base_dir.join(path)
-        } else {
-            path.to_path_buf()
-        };
-
-        // Determine if we're opening a non-existent file (for creating new files)
-        // Use filesystem trait method to support remote files
-        let file_exists = self.authority().filesystem.exists(&resolved_path);
-
-        // Save the user-visible (non-canonicalized) path for language detection.
-        // Glob patterns in language config should match the path as the user sees it,
-        // not the canonical path (e.g., on macOS /var -> /private/var symlinks).
-        let display_path = resolved_path.clone();
-
-        // Canonicalize the path to resolve symlinks and normalize path components
-        // This ensures consistent path representation throughout the editor
-        // For non-existent files, we need to canonicalize the parent directory and append the filename
-        let canonical_path = if file_exists {
-            self.authority()
-                .filesystem
-                .canonicalize(&resolved_path)
-                .unwrap_or_else(|_| resolved_path.clone())
-        } else {
-            // For non-existent files, canonicalize parent dir and append filename
-            if let Some(parent) = resolved_path.parent() {
-                let canonical_parent = if parent.as_os_str().is_empty() {
-                    // No parent means just a filename, use base dir
-                    base_dir.clone()
-                } else {
-                    self.authority()
-                        .filesystem
-                        .canonicalize(parent)
-                        .unwrap_or_else(|_| parent.to_path_buf())
-                };
-                if let Some(filename) = resolved_path.file_name() {
-                    canonical_parent.join(filename)
-                } else {
-                    resolved_path
-                }
-            } else {
-                resolved_path
-            }
-        };
+        let ResolvedOpenPath {
+            display_path,
+            canonical_path,
+            file_exists,
+        } = self.resolve_open_path(path);
         let path = canonical_path.as_path();
 
         // Check if the path is a directory (after following symlinks via canonicalize)
         // Directories cannot be opened as files in the editor
         // Use filesystem trait method to support remote files
-        if self.authority().filesystem.is_dir(path).unwrap_or(false) {
+        if self
+            .authority()
+            .filesystem
+            .is_dir(path.as_host())
+            .unwrap_or(false)
+        {
             anyhow::bail!(t!("buffer.cannot_open_directory"));
         }
 
@@ -1139,16 +1479,14 @@ impl crate::app::window::Window {
         }
 
         // If the current buffer is empty and unmodified, replace it instead of creating a new one
-        // Note: Don't replace composite buffers (they appear empty but are special views).
+        // Note: Don't replace composite buffers (they appear empty but are special views),
+        // nor a buffer that hosts a widget panel: its rows are the tree's mirror
+        // (`app::pane_mirror`), written on the next frame, so it is empty between its
+        // mount and that frame — and it was the git log's own list buffer that a
+        // `git show` opened from the same tick replaced.
         // Suppressed when `allow_replace_empty` is false — see
         // `open_file_for_preview` for the rationale.
-        let replace_current = allow_replace_empty && {
-            let current_state = self.buffers.get(&self.active_buffer()).unwrap();
-            !current_state.is_composite_buffer
-                && current_state.buffer.is_empty()
-                && !current_state.buffer.is_modified()
-                && current_state.buffer.file_path().is_none()
-        };
+        let replace_current = allow_replace_empty && self.is_pristine_scratch(self.active_buffer());
 
         let buffer_id = if replace_current {
             // Reuse the current empty buffer
@@ -1181,15 +1519,35 @@ impl crate::app::window::Window {
                     &self.resources.grammar_registry,
                     &self.resources.config.languages,
                     self.resources.config.default_language.as_deref(),
+                    buffer.filesystem().as_ref(),
                 );
             EditorState::from_buffer_with_language(buffer, detected)
         } else {
             // File doesn't exist - create empty buffer with the file path set
-            let mut state = EditorState::new_with_path(
+            let buffer = crate::model::buffer::Buffer::new_with_path(
                 self.resources.config.editor.large_file_threshold_bytes as usize,
                 Arc::clone(&self.authority().filesystem),
                 path.to_path_buf(),
             );
+            // Detect the language from the name the user is about to create,
+            // as for an existing file. Left as plain text, the buffer only
+            // picked its language up at save time, so `languages.<lang>`
+            // settings (tab size, use_tabs, …) did not apply while the new
+            // file was being written (#3713).
+            //
+            // Without `default_language`: a name that matches nothing stays
+            // plain text, which is what lets save-time detection still read
+            // the shebang the user types into an extensionless script.
+            let detected =
+                crate::primitives::detected_language::DetectedLanguage::from_path_with_fallback(
+                    &display_path,
+                    None,
+                    &self.resources.grammar_registry,
+                    &self.resources.config.languages,
+                    None,
+                    buffer.filesystem().as_ref(),
+                );
+            let mut state = EditorState::from_buffer_with_language(buffer, detected);
             // Honor the configured default line ending for the file the
             // user is about to create — without this the buffer keeps the
             // hard-coded LF default and saving a brand-new file ignored
@@ -1226,11 +1584,7 @@ impl crate::app::window::Window {
         // Snapshot config values before taking the mutable view-states borrow
         // so the closure body doesn't have to re-borrow `self.resources`.
         let cfg = self.resources.config.editor.clone();
-        if let Some(view_state) = self
-            .split_view_states_mut()
-            .expect("active window must have a populated split layout")
-            .get_mut(&target_split)
-        {
+        if let Some(view_state) = self.split_view_states_mut().get_mut(&target_split) {
             view_state.add_buffer(buffer_id);
             // Initialize per-buffer view state for the new buffer with config defaults
             let buf_state = view_state.ensure_buffer_state(buffer_id);
@@ -1288,7 +1642,11 @@ impl crate::app::window::Window {
     pub(crate) fn run_after_file_open_hook(&self, buffer_id: BufferId, path: std::path::PathBuf) {
         self.resources.plugin_manager.read().unwrap().run_hook(
             "after_file_open",
-            crate::services::plugins::hooks::HookArgs::AfterFileOpen { buffer_id, path },
+            crate::services::plugins::hooks::HookArgs::AfterFileOpen {
+                buffer_id,
+                window_id: self.id.0,
+                path,
+            },
         );
     }
 

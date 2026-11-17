@@ -1,0 +1,3148 @@
+/// Text buffer that uses PieceTree with integrated line tracking
+/// Architecture where the tree is the single source of truth for text and line information
+use crate::model::encoding;
+use crate::model::filesystem::{ContentDigest, FileSystem};
+use crate::model::piece_tree::{
+    BufferData, BufferLocation, Cursor, PieceTree, PieceView, Position, StringBuffer, TreeStats,
+};
+use crate::model::piece_tree_diff::PieceTreeDiff;
+use crate::primitives::grapheme;
+use crate::recovery_types::HotExitEntry;
+use anyhow::{Context, Result};
+use std::io;
+
+use crate::model::host_path::AsHostPath;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+// Re-export Encoding for backward compatibility
+pub use encoding::Encoding;
+
+pub mod file_kind;
+pub mod format;
+pub mod persistence;
+mod recovery_chunks;
+pub mod save;
+pub mod search;
+pub use file_kind::BufferFileKind;
+pub use format::{BufferFormat, LineEnding};
+pub use persistence::Persistence;
+pub use recovery_chunks::RECOVERY_MERGE_GAP;
+pub use save::SudoSaveRequired;
+#[cfg(test)]
+pub(crate) use save::{RecipeAction, WriteRecipe};
+pub use search::{BufferSearch, RegexSearch, SearchMatch, SearchQuery, MATCH_CONTEXT};
+
+/// Error returned when a large file has a non-resynchronizable encoding
+/// and requires user confirmation before loading the entire file into memory.
+///
+/// Non-resynchronizable encodings (like Shift-JIS, GB18030, GBK, EUC-KR) cannot
+/// determine character boundaries when jumping into the middle of a file.
+/// This means the entire file must be loaded and decoded sequentially.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LargeFileEncodingConfirmation {
+    /// Path to the file
+    pub path: PathBuf,
+    /// Size of the file in bytes
+    pub file_size: usize,
+    /// The detected encoding that requires full loading
+    pub encoding: Encoding,
+}
+
+impl std::fmt::Display for LargeFileEncodingConfirmation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let size_mb = self.file_size as f64 / (1024.0 * 1024.0);
+        write!(
+            f,
+            "{} ({:.0} MB) requires full load. (l)oad, (e)ncoding, (C)ancel? ",
+            self.encoding.display_name(),
+            size_mb
+        )
+    }
+}
+
+impl std::error::Error for LargeFileEncodingConfirmation {}
+
+/// A work item for incremental line-feed scanning (one per leaf).
+#[derive(Debug, Clone)]
+pub struct LineScanChunk {
+    /// Index of the leaf in the piece tree's leaf array.
+    pub leaf_index: usize,
+    /// Number of bytes in this leaf.
+    pub byte_len: usize,
+    /// True if the leaf already had a known line_feed_cnt (no I/O needed).
+    pub already_known: bool,
+}
+
+// Re-export SearchMatch from filesystem — same type is used by both
+// FileSystem::search_file (project grep on disk) and the piece-tree
+// search below (in-editor Ctrl+F and dirty buffers).
+
+// Large file support configuration.
+//
+// There is intentionally no threshold constant here: the large-file
+// threshold is the single `editor.large_file_threshold_bytes` setting
+// (default `crate::config::LARGE_FILE_THRESHOLD_BYTES`), which callers pass
+// into the load functions below.
+/// Chunk size to load when lazy loading (1 MB)
+pub const LOAD_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// Chunk alignment for lazy loading (64 KB)
+pub const CHUNK_ALIGNMENT: usize = 64 * 1024;
+
+/// Configuration passed to TextBuffer constructors.
+#[derive(Debug, Clone)]
+pub struct BufferConfig {
+    /// Estimated average line length in bytes. Used for approximate line number
+    /// display in large files and for goto-line byte offset estimation.
+    pub estimated_line_length: usize,
+    /// The resolved `editor.large_file_threshold_bytes`, when the buffer was
+    /// built by a constructor given it. A save bigger than this records no
+    /// [`TextBuffer::saved_content`]: the changed-on-disk check doesn't
+    /// compare files that big, so hashing them would be wasted. `None`
+    /// records it at any size.
+    ///
+    /// Taken when the buffer is built: a later change of the setting reaches
+    /// the check (which reads it live) but not this buffer. Raised, saves
+    /// between the old and the new threshold go unfingerprinted, and a
+    /// drifted mtime on such a file counts as a change, as it did before
+    /// #3380; lowered, a few saves are hashed for nothing. Reopening the
+    /// file picks up the new value.
+    pub large_file_threshold: Option<usize>,
+}
+
+impl Default for BufferConfig {
+    fn default() -> Self {
+        Self {
+            estimated_line_length: 80,
+            large_file_threshold: None,
+        }
+    }
+}
+
+/// Represents a line number (simplified for new implementation)
+/// Legacy enum kept for backwards compatibility - always Absolute now
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineNumber {
+    /// Absolute line number - this is the actual line number in the file
+    Absolute(usize),
+    /// Relative line number (deprecated - now same as Absolute)
+    Relative {
+        line: usize,
+        from_cached_line: usize,
+    },
+}
+
+impl LineNumber {
+    /// Get the line number value
+    pub fn value(&self) -> usize {
+        match self {
+            Self::Absolute(line) | Self::Relative { line, .. } => *line,
+        }
+    }
+
+    /// Check if this is an absolute line number
+    pub fn is_absolute(&self) -> bool {
+        matches!(self, LineNumber::Absolute(_))
+    }
+
+    /// Check if this is a relative line number
+    pub fn is_relative(&self) -> bool {
+        matches!(self, LineNumber::Relative { .. })
+    }
+
+    /// Format the line number for display
+    pub fn format(&self) -> String {
+        match self {
+            Self::Absolute(line) => format!("{}", line + 1),
+            Self::Relative { line, .. } => format!("~{}", line + 1),
+        }
+    }
+}
+
+/// A text buffer that manages document content using a piece table
+/// with integrated line tracking
+pub struct TextBuffer {
+    /// The piece tree for efficient text manipulation with integrated line tracking
+    piece_tree: PieceTree,
+
+    /// List of string buffers containing chunks of text data.
+    /// Index 0 is typically the original/stored buffer.
+    /// Additional buffers are added for modifications.
+    buffers: Vec<StringBuffer>,
+
+    /// Next buffer ID to assign.
+    next_buffer_id: usize,
+
+    /// Filesystem handle, optional file path, dirty/recovery flags,
+    /// saved-root snapshot, and saved-file size — see
+    /// `persistence.rs`.
+    persistence: Persistence,
+
+    /// File-kind flags (large_file, line_feeds_scanned, is_binary) —
+    /// see `file_kind.rs`.
+    file_kind: BufferFileKind,
+
+    /// Encoding + line-ending state — see `format.rs`.
+    format: BufferFormat,
+
+    /// Monotonic version counter for change tracking.
+    version: u64,
+
+    /// Buffer configuration (estimated line length, etc.)
+    config: BufferConfig,
+}
+
+/// Snapshot of a TextBuffer's piece tree and associated string buffers.
+///
+/// Used by BulkEdit undo/redo to capture the complete buffer state.
+/// Without this, consolidate_after_save() would destroy the string buffers
+/// that a BulkEdit's piece tree snapshot references, causing corruption on undo.
+#[derive(Debug, Clone)]
+pub struct BufferSnapshot {
+    pub piece_tree: PieceTree,
+    pub buffers: Vec<StringBuffer>,
+    pub next_buffer_id: usize,
+}
+
+/// Whether `content` is a genuine Classic-Mac (CR) *text* document that
+/// should be normalized to the `\n`-based line model, as opposed to
+/// content that merely happens to contain `\r` bytes and must be
+/// preserved byte-for-byte.
+///
+/// The distinguishing property is an **interior** CR: a `\r` that has more
+/// content after it, i.e. a real line break *between two lines*. A file
+/// whose only `\r` is a lone trailing (or single) CR is a one-line
+/// document with a stray terminator — normalizing it would rewrite a `\r`
+/// the caller expects back verbatim (binary blobs, mixed-ending content,
+/// and the shadow-model / persistence round-trip invariants all rely on
+/// this). Multi-line Classic-Mac files (`"Line 1\rLine 2..."`) always have
+/// an interior CR, so they still split into rows and round-trip via
+/// reconstruct-on-save (issue #2736).
+///
+/// This heuristic is the deliberate "safe gating" for the normalize-on-
+/// load / reconstruct-on-save approach: it cannot tell a two-line CR file
+/// apart from two random bytes joined by a `\r`, but it guarantees a lone
+/// stray CR is never mutated, which is the case the content-preservation
+/// tests exercise.
+fn is_cr_delimited_text(content: &[u8]) -> bool {
+    // Some `\r` appears before the final byte => at least two CR lines.
+    content.len() >= 2 && content[..content.len() - 1].contains(&b'\r')
+}
+
+/// Normalize loaded content for the internal `\n`-based line model.
+///
+/// The buffer splits lines on `\n`. A genuine Classic-Mac (CR) file uses
+/// `\r` as the separator and contains no `\n`, so without this it loads as
+/// a single line with literal `<0D>` glyphs (issue #2736). When the
+/// detected ending is CR *and* the content is genuinely CR-delimited (see
+/// [`is_cr_delimited_text`]), rewrite every `\r` (and any stray `\r\n`) to
+/// `\n`; the CR ending is preserved in `BufferFormat` and reconstructed on
+/// save. Everything else — LF, CRLF, and content with only a stray/trailing
+/// `\r` — is returned untouched so its raw bytes round-trip exactly.
+///
+/// Returns `(content, normalized)` where `normalized` records whether the
+/// bytes were rewritten (used to gate reconstruct-on-save).
+fn normalize_for_line_ending(content: Vec<u8>, line_ending: LineEnding) -> (Vec<u8>, bool) {
+    if line_ending == LineEnding::CR && is_cr_delimited_text(&content) {
+        (format::normalize_line_endings(content), true)
+    } else {
+        (content, false)
+    }
+}
+
+impl TextBuffer {
+    /// Create a new text buffer with the given filesystem implementation.
+    /// `large_file_threshold` only caps what a save fingerprints
+    /// ([`BufferConfig::large_file_threshold`]).
+    pub fn new(large_file_threshold: usize, fs: Arc<dyn FileSystem + Send + Sync>) -> Self {
+        let piece_tree = PieceTree::empty();
+        let saved_root = piece_tree.root();
+        let line_ending = LineEnding::default();
+        let encoding = Encoding::default();
+        TextBuffer {
+            piece_tree,
+            buffers: vec![StringBuffer::new(0, Vec::new())],
+            next_buffer_id: 1,
+            persistence: Persistence::new(fs, None, saved_root, None),
+            file_kind: BufferFileKind::new(false, false),
+            format: BufferFormat::new(line_ending, encoding),
+            version: 0,
+            config: BufferConfig {
+                large_file_threshold: Some(large_file_threshold),
+                ..BufferConfig::default()
+            },
+        }
+    }
+
+    /// Create an empty buffer associated with a file path.
+    /// Used for files that don't exist yet — the path is set so saving will create the file.
+    pub fn new_with_path(
+        large_file_threshold: usize,
+        fs: Arc<dyn FileSystem + Send + Sync>,
+        path: PathBuf,
+    ) -> Self {
+        let mut buffer = Self::new(large_file_threshold, fs);
+        buffer.persistence.set_file_path(path);
+        buffer
+    }
+
+    /// Set [`BufferConfig::large_file_threshold`], for a buffer built by a
+    /// constructor that isn't given it (`from_bytes`) that may be saved.
+    pub fn set_large_file_threshold(&mut self, large_file_threshold: usize) {
+        self.config.large_file_threshold = Some(large_file_threshold);
+    }
+
+    /// Associate this buffer with `path` (title, dedup, save target). Used when
+    /// building a buffer from in-memory bytes that logically belongs to a file
+    /// — e.g. filling a restored remote placeholder with content read off-loop.
+    pub fn set_file_path(&mut self, path: PathBuf) {
+        self.persistence.set_file_path(path);
+    }
+
+    /// Current buffer version (monotonic, wraps on overflow)
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Get a reference to the filesystem implementation used by this buffer.
+    pub fn filesystem(&self) -> &Arc<dyn FileSystem + Send + Sync> {
+        self.persistence.fs()
+    }
+
+    #[inline]
+    fn bump_version(&mut self) {
+        self.version = self.version.wrapping_add(1);
+    }
+
+    #[inline]
+    fn mark_content_modified(&mut self) {
+        self.persistence.mark_dirty();
+        self.bump_version();
+    }
+
+    /// Create a text buffer from raw bytes WITHOUT encoding conversion.
+    /// Used for binary files where we want to preserve the exact bytes.
+    fn from_bytes_raw(content: Vec<u8>, fs: Arc<dyn FileSystem + Send + Sync>) -> Self {
+        let bytes = content.len();
+
+        // For binary files, detect line ending but don't convert encoding
+        let line_ending = format::detect_line_ending(&content);
+
+        // Create initial StringBuffer with ID 0
+        let buffer = StringBuffer::new(0, content);
+        let line_feed_cnt = buffer.line_feed_count();
+
+        let piece_tree = if bytes > 0 {
+            PieceTree::new(BufferLocation::Stored(0), 0, bytes, line_feed_cnt)
+        } else {
+            PieceTree::empty()
+        };
+
+        let saved_root = piece_tree.root();
+
+        TextBuffer {
+            piece_tree,
+            buffers: vec![buffer],
+            next_buffer_id: 1,
+            persistence: Persistence::new(fs, None, saved_root, Some(bytes)),
+            file_kind: BufferFileKind::new(false, true),
+            format: BufferFormat::new(line_ending, Encoding::Utf8),
+            version: 0,
+            config: BufferConfig::default(),
+        }
+    }
+
+    /// Create a text buffer from initial content with the given filesystem.
+    ///
+    /// A genuinely CR-delimited Classic-Mac file is normalized to `\n` so
+    /// the line model can split it into rows (issue #2736); the CR ending
+    /// is reconstructed on save. This is the in-memory / new-buffer
+    /// constructor and the editor's "open for editing" path — use
+    /// [`load_from_file`](Self::load_from_file) for a byte-preserving load.
+    pub fn from_bytes(content: Vec<u8>, fs: Arc<dyn FileSystem + Send + Sync>) -> Self {
+        Self::from_bytes_normalizing(content, fs, true)
+    }
+
+    /// Like [`from_bytes`](Self::from_bytes) but `normalize_cr` chooses
+    /// whether a CR-delimited file is normalized to `\n` (true, splits into
+    /// rows) or preserved byte-for-byte (false). Disk loads that must
+    /// round-trip exactly pass `false`.
+    fn from_bytes_normalizing(
+        content: Vec<u8>,
+        fs: Arc<dyn FileSystem + Send + Sync>,
+        normalize_cr: bool,
+    ) -> Self {
+        // Auto-detect encoding and convert to UTF-8 if needed
+        let (encoding, utf8_content) = format::detect_and_convert_encoding(&content);
+        Self::from_utf8_detected(utf8_content, encoding, fs, normalize_cr)
+    }
+
+    /// Create a text buffer from bytes with a specific encoding (no auto-detection).
+    pub fn from_bytes_with_encoding(
+        content: Vec<u8>,
+        encoding: Encoding,
+        fs: Arc<dyn FileSystem + Send + Sync>,
+    ) -> Self {
+        Self::from_bytes_with_encoding_normalizing(content, encoding, fs, true)
+    }
+
+    /// Like [`from_bytes_with_encoding`](Self::from_bytes_with_encoding) but
+    /// `normalize_cr` gates CR-delimited normalization (see
+    /// [`from_bytes_normalizing`](Self::from_bytes_normalizing)).
+    fn from_bytes_with_encoding_normalizing(
+        content: Vec<u8>,
+        encoding: Encoding,
+        fs: Arc<dyn FileSystem + Send + Sync>,
+        normalize_cr: bool,
+    ) -> Self {
+        // Convert from specified encoding to UTF-8
+        let utf8_content = encoding::convert_to_utf8(&content, encoding);
+        Self::from_utf8_detected(utf8_content, encoding, fs, normalize_cr)
+    }
+
+    /// Build a text buffer from already-UTF-8 content, detecting the line
+    /// ending and optionally normalizing a genuinely CR-delimited file to
+    /// `\n` (issue #2736). Shared by the `from_bytes*` constructors and the
+    /// small-file load path.
+    fn from_utf8_detected(
+        utf8_content: Vec<u8>,
+        encoding: Encoding,
+        fs: Arc<dyn FileSystem + Send + Sync>,
+        normalize_cr: bool,
+    ) -> Self {
+        // Auto-detect line ending format from content
+        let line_ending = format::detect_line_ending(&utf8_content);
+
+        // Only normalize CR -> `\n` when this is an "open for editing" load
+        // (`normalize_cr`) AND the content is genuinely CR-delimited. A
+        // byte-preserving load, binary content, or a lone stray `\r` is
+        // returned untouched so it round-trips exactly.
+        let (utf8_content, normalized) = if normalize_cr {
+            normalize_for_line_ending(utf8_content, line_ending)
+        } else {
+            (utf8_content, false)
+        };
+
+        let bytes = utf8_content.len();
+
+        // Create initial StringBuffer with ID 0
+        let buffer = StringBuffer::new(0, utf8_content);
+        let line_feed_cnt = buffer.line_feed_count();
+
+        let piece_tree = if bytes > 0 {
+            PieceTree::new(BufferLocation::Stored(0), 0, bytes, line_feed_cnt)
+        } else {
+            PieceTree::empty()
+        };
+
+        let saved_root = piece_tree.root();
+
+        TextBuffer {
+            piece_tree,
+            buffers: vec![buffer],
+            next_buffer_id: 1,
+            persistence: Persistence::new(fs, None, saved_root, Some(bytes)),
+            file_kind: BufferFileKind::new(false, false),
+            format: BufferFormat::with_normalization(line_ending, encoding, normalized),
+            version: 0,
+            config: BufferConfig::default(),
+        }
+    }
+
+    /// Create a text buffer from a string with the given filesystem.
+    pub fn from_str(
+        s: &str,
+        large_file_threshold: usize,
+        fs: Arc<dyn FileSystem + Send + Sync>,
+    ) -> Self {
+        let mut buffer = Self::from_bytes(s.as_bytes().to_vec(), fs);
+        buffer.config.large_file_threshold = Some(large_file_threshold);
+        buffer
+    }
+
+    /// Create an empty text buffer with the given filesystem.
+    pub fn empty(fs: Arc<dyn FileSystem + Send + Sync>) -> Self {
+        let piece_tree = PieceTree::empty();
+        let saved_root = piece_tree.root();
+        let line_ending = LineEnding::default();
+        let encoding = Encoding::default();
+        TextBuffer {
+            piece_tree,
+            buffers: vec![StringBuffer::new(0, Vec::new())],
+            next_buffer_id: 1,
+            persistence: Persistence::new(fs, None, saved_root, None),
+            file_kind: BufferFileKind::new(false, false),
+            format: BufferFormat::new(line_ending, encoding),
+            version: 0,
+            config: BufferConfig::default(),
+        }
+    }
+
+    /// Load a text buffer from a file using the given filesystem.
+    ///
+    /// This is the **byte-preserving** load: content is never rewritten, so
+    /// a file containing `\r` (binary, mixed endings, or a Classic-Mac CR
+    /// file) round-trips exactly. Use
+    /// [`load_from_file_for_editing`](Self::load_from_file_for_editing) to
+    /// get CR files split into rows in the editor (issue #2736).
+    pub fn load_from_file<P: AsRef<Path>>(
+        path: P,
+        large_file_threshold: usize,
+        fs: Arc<dyn FileSystem + Send + Sync>,
+    ) -> anyhow::Result<Self> {
+        Self::load_from_file_internal(path, large_file_threshold, fs, false, false)
+    }
+
+    /// Load a text buffer for interactive editing.
+    ///
+    /// Identical to [`load_from_file`](Self::load_from_file) except a
+    /// genuinely CR-delimited Classic-Mac file is normalized to `\n` so it
+    /// splits into rows; the CR ending is reconstructed on save (issue
+    /// #2736). This is the path the editor's file-open orchestrator uses.
+    /// Tests that assert byte-for-byte round-trips use the plain
+    /// `load_from_file` instead.
+    pub fn load_from_file_for_editing<P: AsRef<Path>>(
+        path: P,
+        large_file_threshold: usize,
+        fs: Arc<dyn FileSystem + Send + Sync>,
+    ) -> anyhow::Result<Self> {
+        Self::load_from_file_internal(path, large_file_threshold, fs, false, true)
+    }
+
+    /// Load a text buffer from a file, forcing it to be treated as text.
+    ///
+    /// Identical to [`load_from_file`](Self::load_from_file) but skips binary
+    /// detection entirely — the buffer is always loaded through the text path
+    /// and `is_binary` stays `false`. Used for the terminal scrollback backing
+    /// file, whose raw PTY output can contain control bytes that would
+    /// otherwise trip binary detection and suppress ANSI-color rendering in
+    /// scrollback mode (issue #2449).
+    pub fn load_from_file_force_text<P: AsRef<Path>>(
+        path: P,
+        large_file_threshold: usize,
+        fs: Arc<dyn FileSystem + Send + Sync>,
+    ) -> anyhow::Result<Self> {
+        Self::load_from_file_internal(path, large_file_threshold, fs, true, false)
+    }
+
+    fn load_from_file_internal<P: AsRef<Path>>(
+        path: P,
+        large_file_threshold: usize,
+        fs: Arc<dyn FileSystem + Send + Sync>,
+        force_text: bool,
+        normalize_cr: bool,
+    ) -> anyhow::Result<Self> {
+        let path = path.as_ref();
+
+        // Get file size to determine loading strategy
+        let metadata = fs.metadata(path.as_host())?;
+        let file_size = metadata.size as usize;
+
+        // Choose loading strategy based on file size. `large_file_threshold`
+        // is the resolved `editor.large_file_threshold_bytes` setting, passed
+        // in by the caller — the single source of truth, no local default.
+        let mut buffer = if file_size >= large_file_threshold {
+            Self::load_large_file_internal(path, file_size, fs, false, force_text, normalize_cr)?
+        } else {
+            Self::load_small_file(path, fs, force_text, normalize_cr)?
+        };
+        buffer.config.large_file_threshold = Some(large_file_threshold);
+        Ok(buffer)
+    }
+
+    /// Load a text buffer from a file with a specific encoding (no auto-detection).
+    pub fn load_from_file_with_encoding<P: AsRef<Path>>(
+        path: P,
+        encoding: Encoding,
+        fs: Arc<dyn FileSystem + Send + Sync>,
+        config: BufferConfig,
+    ) -> anyhow::Result<Self> {
+        let path = path.as_ref();
+        let contents = fs.read_file(path.as_host())?;
+
+        let mut buffer = Self::from_bytes_with_encoding(contents, encoding, fs);
+        buffer.persistence.set_file_path(path.to_path_buf());
+        buffer.persistence.clear_modified();
+        buffer.config = config;
+        Ok(buffer)
+    }
+
+    /// Load a small file with full eager loading and line indexing
+    ///
+    /// When `force_text` is true, binary detection is ignored and the file is
+    /// always loaded through the text path (see `load_from_file_force_text`).
+    fn load_small_file(
+        path: &Path,
+        fs: Arc<dyn FileSystem + Send + Sync>,
+        force_text: bool,
+        normalize_cr: bool,
+    ) -> anyhow::Result<Self> {
+        let contents = fs.read_file(path.as_host())?;
+
+        // Use unified encoding/binary detection
+        let (encoding, detected_binary) = format::detect_encoding_or_binary(&contents, false);
+        let is_binary = detected_binary && !force_text;
+
+        // For binary files, skip encoding conversion to preserve raw bytes.
+        // For text files, `normalize_cr` decides whether a CR-delimited
+        // Classic-Mac file is split into rows (editing open) or preserved
+        // byte-for-byte (the default byte-preserving load).
+        let mut buffer = if is_binary {
+            Self::from_bytes_raw(contents, fs)
+        } else {
+            Self::from_bytes_normalizing(contents, fs, normalize_cr)
+        };
+        buffer.persistence.set_file_path(path.to_path_buf());
+        buffer.persistence.clear_modified();
+        buffer.file_kind.set_large_file(false);
+        buffer.file_kind.set_binary(is_binary);
+        // For binary files, ensure encoding matches detection
+        if is_binary {
+            buffer.format.set_default_encoding(encoding);
+        }
+        // Note: line_ending and encoding are already set by from_bytes/from_bytes_raw
+        Ok(buffer)
+    }
+
+    /// Load a large file, optionally forcing full load for non-resynchronizable encodings.
+    ///
+    /// Called with `force_full_load=true` after user confirms the warning about
+    /// non-resynchronizable encodings requiring full file loading.
+    pub fn load_large_file_confirmed(
+        path: impl AsRef<Path>,
+        large_file_threshold: usize,
+        fs: Arc<dyn FileSystem + Send + Sync>,
+    ) -> anyhow::Result<Self> {
+        let path = path.as_ref();
+        let metadata = fs.metadata(path.as_host())?;
+        let file_size = metadata.size as usize;
+        let mut buffer = Self::load_large_file_internal(path, file_size, fs, true, false, true)?;
+        buffer.config.large_file_threshold = Some(large_file_threshold);
+        Ok(buffer)
+    }
+
+    /// Internal implementation for loading large files.
+    ///
+    /// When `force_text` is true, binary detection is ignored and the file is
+    /// always loaded through the text path (see `load_from_file_force_text`).
+    /// `normalize_cr` gates Classic-Mac CR normalization for the non-UTF-8
+    /// full-load branch (the lazy UTF-8 branch always preserves raw bytes).
+    fn load_large_file_internal(
+        path: &Path,
+        file_size: usize,
+        fs: Arc<dyn FileSystem + Send + Sync>,
+        force_full_load: bool,
+        force_text: bool,
+        normalize_cr: bool,
+    ) -> anyhow::Result<Self> {
+        use crate::model::piece_tree::{BufferData, BufferLocation};
+
+        // Read a sample of the file to detect encoding and whether it's binary
+        // We read the first 8KB for detection
+        let sample_size = file_size.min(8 * 1024);
+        let sample = fs.read_range(path.as_host(), 0, sample_size)?;
+
+        // Use unified encoding/binary detection
+        let (encoding, detected_binary) =
+            format::detect_encoding_or_binary(&sample, file_size > sample_size);
+        let is_binary = detected_binary && !force_text;
+
+        // Binary files skip encoding conversion to preserve raw bytes — and,
+        // like large text, are never slurped: reading a 2 GB zip whole cost
+        // ~1.2x its size resident and froze the editor thread for the read plus
+        // the line scan (issue #3142). A binary buffer opens read-only, so the
+        // lazy piece below serves it just as well.
+        //
+        // The `requires_full_load` gates below stop a non-resynchronizable
+        // *text* encoding being decoded chunk-wise; binary is never decoded, so
+        // they do not apply to it — as before, when it returned above them.
+        if !is_binary {
+            // Check if encoding requires full file loading
+            let requires_full_load = encoding.requires_full_file_load();
+
+            // For non-resynchronizable encodings, require confirmation unless forced
+            if requires_full_load && !force_full_load {
+                anyhow::bail!(LargeFileEncodingConfirmation {
+                    path: path.to_path_buf(),
+                    file_size,
+                    encoding,
+                });
+            }
+        }
+
+        // For encodings that require full load (non-resynchronizable or non-UTF-8),
+        // load the entire file and convert
+        if !is_binary && !matches!(encoding, Encoding::Utf8 | Encoding::Ascii) {
+            tracing::info!(
+                "Large file with non-UTF-8 encoding ({:?}), loading fully for conversion",
+                encoding
+            );
+            let contents = fs.read_file(path.as_host())?;
+            let mut buffer = Self::from_bytes_normalizing(contents, fs, normalize_cr);
+            buffer.persistence.set_file_path(path.to_path_buf());
+            buffer.persistence.clear_modified();
+            buffer.file_kind.set_large_file(true); // Still mark as large file for UI purposes
+            buffer.file_kind.set_binary(is_binary);
+            return Ok(buffer);
+        }
+
+        // UTF-8/ASCII files can use lazy loading
+        let line_ending = format::detect_line_ending(&sample);
+
+        // NOTE: unlike the small-file text path, lazy loading deliberately
+        // does NOT normalize CR (`\r`) separators to `\n`. The large-file
+        // path preserves raw on-disk bytes so that content which merely
+        // *contains* `\r` — binary, mixed line endings, or content that
+        // must round-trip byte-for-byte — is never rewritten. `line_ending`
+        // is still reported as CR for the status bar, but the buffer is left
+        // un-normalized (`line_endings_normalized` stays false), so save
+        // copies the bytes verbatim instead of reconstructing `\r` (issue
+        // #2736 vs. content-preservation invariants). A genuine Classic-Mac
+        // text file small enough to load eagerly still splits into rows via
+        // the small-file path.
+
+        // Create an unloaded buffer that references the entire file
+        let buffer = StringBuffer {
+            id: 0,
+            data: BufferData::Unloaded {
+                file_path: path.to_path_buf(),
+                file_offset: 0,
+                bytes: file_size,
+            },
+            stored_file_offset: None,
+        };
+
+        // Create piece tree with a single piece covering the whole file
+        // No line feed count (None) since we're not computing line indexing
+        let piece_tree = if file_size > 0 {
+            PieceTree::new(BufferLocation::Stored(0), 0, file_size, None)
+        } else {
+            PieceTree::empty()
+        };
+        let saved_root = piece_tree.root();
+
+        tracing::debug!(
+            "Buffer::load_from_file: loaded {} bytes, saved_file_size={}",
+            file_size,
+            file_size
+        );
+
+        Ok(TextBuffer {
+            piece_tree,
+            buffers: vec![buffer],
+            next_buffer_id: 1,
+            persistence: Persistence::new(
+                fs,
+                Some(path.to_path_buf()),
+                saved_root,
+                Some(file_size),
+            ),
+            file_kind: BufferFileKind::new(true, is_binary),
+            format: BufferFormat::new(line_ending, encoding),
+            version: 0,
+            config: BufferConfig::default(),
+        })
+    }
+
+    /// Save the buffer to its associated file (see [`Self::save_to_file`]).
+    pub fn save(&mut self, recovery_dir: &Path) -> anyhow::Result<()> {
+        if let Some(path) = self.persistence.file_path_owned() {
+            self.save_to_file(path, recovery_dir)
+        } else {
+            anyhow::bail!(io::Error::new(
+                io::ErrorKind::NotFound,
+                "No file path associated with buffer",
+            ))
+        }
+    }
+
+    /// Build a write recipe from the piece tree for saving.
+    ///
+    /// Delegates to `save::build_write_recipe`.
+    #[cfg(test)]
+    pub(crate) fn build_write_recipe(&self) -> io::Result<WriteRecipe> {
+        save::build_write_recipe(
+            &self.piece_tree,
+            &self.buffers,
+            &self.format,
+            &self.file_kind,
+            &self.persistence,
+        )
+    }
+
+    /// Save the buffer to a specific file
+    ///
+    /// Uses the write recipe approach for both local and remote filesystems:
+    /// - Copy ops reference unchanged regions in the source file
+    /// - Insert ops contain new/modified data
+    ///
+    /// For remote filesystems, the recipe is sent to the agent which reconstructs
+    /// the file server-side, avoiding transfer of unchanged content.
+    ///
+    /// A local file is replaced atomically where that keeps it the same file,
+    /// and written in place otherwise (see [`save::save_local`]), after
+    /// staging a copy of the new content in `recovery_dir` — the editor's
+    /// recovery directory (`DirectoryContext::recovery_dir`). Refused while
+    /// the file the unloaded parts of a large file are read back from may be
+    /// torn by an in-place write that failed part-way
+    /// ([`save::refuse_read_from_torn_file`]).
+    ///
+    /// If the line ending format has been changed (via set_line_ending), all content
+    /// will be converted to the new format during save.
+    pub fn save_to_file<P: AsRef<Path>>(
+        &mut self,
+        path: P,
+        recovery_dir: &Path,
+    ) -> anyhow::Result<()> {
+        let dest_path = path.as_ref();
+        let fs = Arc::clone(self.persistence.fs());
+        let local = fs.remote_connection_info().is_none();
+
+        // The unloaded parts are read back from the file they were loaded
+        // from, which must not be torn (issue #3382). The recovery metadata
+        // is kept on this host, so only says anything about a local file.
+        let read_from = self.file_read_by_save();
+        if let Some(src_path) = read_from.as_deref().filter(|_| local) {
+            save::refuse_read_from_torn_file(
+                &*fs,
+                recovery_dir,
+                src_path,
+                self.persistence.is_source_torn(),
+            )?;
+        }
+
+        // An emptied buffer is written as zero bytes: no BOM, nothing to copy.
+        let recipe = if self.total_bytes() == 0 {
+            save::WriteRecipe::empty()
+        } else {
+            save::build_write_recipe(
+                &self.piece_tree,
+                &self.buffers,
+                &self.format,
+                &self.file_kind,
+                &self.persistence,
+            )?
+        };
+
+        // What is about to be written, when every byte of it is in hand:
+        // cheaper than reading the file back to learn it (issue #3380). Not
+        // above the large-file threshold, where nothing compares it.
+        let written = if recipe.has_copy_ops() {
+            None
+        } else {
+            let chunks = || {
+                recipe.actions.iter().filter_map(|action| match action {
+                    save::RecipeAction::Insert { index } => {
+                        Some(recipe.insert_data[*index].as_slice())
+                    }
+                    save::RecipeAction::Copy { .. } => None,
+                })
+            };
+            let size: usize = chunks().map(<[u8]>::len).sum();
+            self.config
+                .large_file_threshold
+                .is_none_or(|threshold| size <= threshold)
+                .then(|| ContentDigest::of_chunks(chunks()))
+        };
+
+        // This write is what turns the buffer's hot-exit entry from unsaved
+        // work into a stale copy, and deleting the entry can't be made atomic
+        // with it. So the entry is told first, and a crash on either side of
+        // the write leaves something the next start can settle with a `stat`
+        // (see `SaveIntent`). Local files only: the store is on this host,
+        // and so is the `stat` that settles it.
+        let journaled = local && self.begin_hot_exit_save(dest_path, recipe.len());
+        if let Err(e) = self.write_recipe(&fs, local, dest_path, &recipe, recovery_dir, read_from) {
+            if journaled {
+                self.abandon_hot_exit_save();
+            }
+            return Err(e);
+        }
+        // Spent: the entry is no one's unsaved work any more, and a later
+        // save that failed must not take it back as such.
+        if journaled {
+            self.persistence.set_hot_exit_entry(None);
+        }
+
+        self.finalize_save(dest_path)?;
+        self.persistence.set_saved_content(written);
+        Ok(())
+    }
+
+    /// The write itself, for [`Self::save_to_file`].
+    fn write_recipe(
+        &mut self,
+        fs: &Arc<dyn FileSystem + Send + Sync>,
+        local: bool,
+        dest_path: &Path,
+        recipe: &save::WriteRecipe,
+        recovery_dir: &Path,
+        read_from: Option<PathBuf>,
+    ) -> anyhow::Result<()> {
+        if local {
+            if let Err(e) = save::save_local(fs, dest_path, recipe, recovery_dir) {
+                if e.is::<save::TornWrite>() {
+                    // The file's mtime moved by our own write: remember it,
+                    // so the change isn't taken for someone else's
+                    let mtime = fs
+                        .metadata(dest_path.as_host())
+                        .ok()
+                        .and_then(|m| m.modified);
+                    self.persistence
+                        .set_torn_write(mtime.map(|mtime| (dest_path.to_path_buf(), mtime)));
+                    // Tore the very file the unloaded parts are read from
+                    if read_from.as_deref() == Some(dest_path) {
+                        self.persistence.set_source_torn(true);
+                    }
+                }
+                return Err(e);
+            }
+        } else if recipe.has_copy_ops() {
+            // Remote with Copy ops: the agent rebuilds the file server-side
+            let src_for_patch = recipe.src_path.as_deref().unwrap_or(dest_path);
+            fs.write_patched(
+                src_for_patch.as_host(),
+                dest_path.as_host(),
+                &recipe.to_write_ops(),
+            )?;
+        } else {
+            fs.write_file(dest_path.as_host(), &recipe.flatten_inserts())?;
+        }
+        Ok(())
+    }
+
+    /// Record in the buffer's hot-exit entry that `size` bytes are about to
+    /// be written to `dest_path`. Returns whether it was recorded. A store
+    /// that can't be written doesn't stop the save: it only leaves the entry
+    /// as exposed to a crash as it was before saves recorded themselves.
+    fn begin_hot_exit_save(&self, dest_path: &Path, size: u64) -> bool {
+        let Some(entry) = self.persistence.hot_exit_entry() else {
+            return false;
+        };
+        match entry.begin_save(dest_path, size) {
+            Ok(recorded) => recorded,
+            Err(e) => {
+                tracing::warn!(
+                    "Could not record the save of {} in recovery entry {}: {}",
+                    dest_path.display(),
+                    entry.id(),
+                    e
+                );
+                false
+            }
+        }
+    }
+
+    /// The save failed: the hot-exit entry is the unsaved work again.
+    fn abandon_hot_exit_save(&self) {
+        let Some(entry) = self.persistence.hot_exit_entry() else {
+            return;
+        };
+        if let Err(e) = entry.abandon_save() {
+            tracing::warn!(
+                "Could not clear the failed save from recovery entry {}: {}",
+                entry.id(),
+                e
+            );
+        }
+    }
+
+    /// The file a save reads this buffer's unloaded parts back from, if it
+    /// has any left (a large file's): the one they were loaded from, or,
+    /// after a save, the one it wrote.
+    fn file_read_by_save(&self) -> Option<PathBuf> {
+        self.piece_tree
+            .iter_pieces_in_range(0, self.piece_tree.total_bytes())
+            .find_map(
+                |piece| match &self.buffers.get(piece.location.buffer_id())?.data {
+                    BufferData::Unloaded { file_path, .. } => Some(file_path.clone()),
+                    BufferData::Loaded { .. } => None,
+                },
+            )
+    }
+
+    /// The size and SHA-256 of what the last save of this buffer wrote, or
+    /// `None` when it wrote nothing yet, or streamed part of the file from
+    /// the old one, or wrote more than [`BufferConfig::large_file_threshold`],
+    /// or an external writer (sudo) did the writing.
+    pub fn saved_content(&self) -> Option<ContentDigest> {
+        self.persistence.saved_content()
+    }
+
+    /// The file this buffer's last save tore, writing it in place and
+    /// failing part-way ([`save::TornWrite`]), and the mtime that left on
+    /// it; `None` once a save succeeds. While the file still has that mtime,
+    /// what changed it was this buffer's own write, not another writer.
+    pub fn torn_write(&self) -> Option<(&Path, std::time::SystemTime)> {
+        self.persistence.torn_write()
+    }
+
+    /// Record that a write of `path` by this buffer's save, done outside it
+    /// (the sudo prompt's), failed after changing the file, leaving `mtime`
+    /// on it: see [`Self::torn_write`]. When `path` is the file this
+    /// buffer's unloaded parts are read from, a save that would read them
+    /// is refused from now on, as after a [`save::TornWrite`] of it.
+    pub fn record_torn_write(&mut self, path: PathBuf, mtime: std::time::SystemTime) {
+        if self.file_read_by_save().as_deref() == Some(path.as_path()) {
+            self.persistence.set_source_torn(true);
+        }
+        self.persistence.set_torn_write(Some((path, mtime)));
+    }
+
+    /// Forget [`Self::saved_content`], once the file is known to hold
+    /// something else, so nothing hashes the file again to compare.
+    pub fn forget_saved_content(&mut self) {
+        self.persistence.set_saved_content(None);
+    }
+
+    /// Finalize save state after successful write.
+    fn finalize_save(&mut self, dest_path: &Path) -> anyhow::Result<()> {
+        let new_size = self.persistence.fs().metadata(dest_path.as_host())?.size as usize;
+        tracing::debug!(
+            "Buffer::save: updating saved_file_size from {:?} to {}",
+            self.persistence.saved_file_size(),
+            new_size
+        );
+        self.persistence.set_saved_file_size(Some(new_size));
+        self.persistence.set_file_path(dest_path.to_path_buf());
+        // Consolidated below onto the file just written
+        self.persistence.set_source_torn(false);
+        self.persistence.set_torn_write(None);
+
+        // Consolidate the piece tree to synchronize with disk (for large files)
+        // or to simplify structure (for small files).
+        self.consolidate_after_save(dest_path, new_size);
+
+        self.mark_saved_snapshot();
+        self.format.promote_current_to_original();
+        Ok(())
+    }
+
+    /// Record in the hot-exit entry that a save done outside
+    /// [`Self::save_to_file`] — the sudo prompt's — is about to write `size`
+    /// bytes to `dest_path`, as `save_to_file` does before its own write.
+    /// Without it a crash between the write and the entry's deletion brought
+    /// the entry back as unsaved work, over the file just written (#3633,
+    /// A7). Returns whether it was recorded: never for a remote file, whose
+    /// `stat` the next start can't take.
+    ///
+    /// Pass the answer to [`Self::finalize_external_save`], or to
+    /// [`Self::abandon_external_save`] when the write fails.
+    pub fn begin_external_save(&self, dest_path: &Path, size: u64) -> bool {
+        self.persistence.fs().remote_connection_info().is_none()
+            && self.begin_hot_exit_save(dest_path, size)
+    }
+
+    /// The external save [`Self::begin_external_save`] recorded failed: the
+    /// hot-exit entry is the unsaved work again.
+    pub fn abandon_external_save(&self, journaled: bool) {
+        if journaled {
+            self.abandon_hot_exit_save();
+        }
+    }
+
+    /// Finalize buffer state after an external save operation (e.g., via sudo).
+    ///
+    /// This updates the saved snapshot and file size to match the new state on disk.
+    /// `journaled` is what [`Self::begin_external_save`] answered.
+    pub fn finalize_external_save(
+        &mut self,
+        dest_path: PathBuf,
+        journaled: bool,
+    ) -> anyhow::Result<()> {
+        // Spent, as after `save_to_file`'s own write: the entry is no one's
+        // unsaved work any more.
+        if journaled {
+            self.persistence.set_hot_exit_entry(None);
+        }
+        let new_size = self.persistence.fs().metadata(dest_path.as_host())?.size as usize;
+        self.persistence.set_saved_content(None);
+        self.persistence.set_saved_file_size(Some(new_size));
+        self.persistence.set_file_path(dest_path.clone());
+        // Consolidated below onto the file just written
+        self.persistence.set_source_torn(false);
+        self.persistence.set_torn_write(None);
+
+        // Consolidate the piece tree to synchronize with disk or simplify structure.
+        self.consolidate_after_save(&dest_path, new_size);
+
+        self.mark_saved_snapshot();
+        self.format.promote_current_to_original();
+        Ok(())
+    }
+
+    /// Consolidate the piece tree into a single piece.
+    /// For large files, this creates a reference to the disk file to save memory and sync offsets.
+    /// For small files, this flattens all edits into a single in-memory buffer.
+    fn consolidate_after_save(&mut self, path: &Path, file_size: usize) {
+        if self.file_kind.is_large_file() {
+            self.consolidate_large_file(path, file_size);
+        } else {
+            self.consolidate_small_file();
+        }
+    }
+
+    /// Consolidate large file piece tree into a single piece pointing to the new file.
+    /// This ensures that subsequent operations correctly reference the new content and offsets.
+    /// Preserves total line feed count from the old tree if a scan was previously done.
+    fn consolidate_large_file(&mut self, path: &Path, file_size: usize) {
+        // Preserve line feed count from the old tree if we had scanned it
+        let preserved_lf = if self.file_kind.has_line_feed_scan() {
+            self.piece_tree.line_count().map(|c| c.saturating_sub(1))
+        } else {
+            None
+        };
+
+        let buffer = StringBuffer {
+            id: 0,
+            data: BufferData::Unloaded {
+                file_path: path.to_path_buf(),
+                file_offset: 0,
+                bytes: file_size,
+            },
+            stored_file_offset: None,
+        };
+
+        self.piece_tree = if file_size > 0 {
+            PieceTree::new(BufferLocation::Stored(0), 0, file_size, preserved_lf)
+        } else {
+            PieceTree::empty()
+        };
+
+        self.buffers = vec![buffer];
+        self.next_buffer_id = 1;
+
+        tracing::debug!(
+            "Buffer::consolidate_large_file: consolidated into single piece of {} bytes",
+            file_size
+        );
+    }
+
+    /// Consolidate small file edits into a single in-memory buffer and re-index lines.
+    fn consolidate_small_file(&mut self) {
+        if let Some(bytes) = self.get_all_text() {
+            let line_feed_cnt = bytes.iter().filter(|&&b| b == b'\n').count();
+            let len = bytes.len();
+
+            // Create a single loaded buffer with line indexing
+            let buffer = StringBuffer::new_loaded(0, bytes, true);
+
+            self.piece_tree = if len > 0 {
+                PieceTree::new(BufferLocation::Stored(0), 0, len, Some(line_feed_cnt))
+            } else {
+                PieceTree::empty()
+            };
+
+            self.buffers = vec![buffer];
+            self.next_buffer_id = 1;
+
+            tracing::debug!(
+                "Buffer::consolidate_small_file: consolidated into single loaded buffer of {} bytes",
+                len
+            );
+        }
+    }
+
+    /// Get the total number of bytes in the document
+    pub fn total_bytes(&self) -> usize {
+        self.piece_tree.total_bytes()
+    }
+
+    /// Bytes of this buffer's content currently held in memory.
+    ///
+    /// For a lazily loaded file this is the chunks something actually asked
+    /// for, not the file's size — the gap between the two is the point of the
+    /// lazy path, and this is the only direct way to observe it.
+    pub fn resident_bytes(&self) -> usize {
+        self.buffers.iter().map(|b| b.resident_bytes()).sum()
+    }
+
+    /// Get the total number of lines in the document
+    /// Uses the piece tree's integrated line tracking
+    /// Returns None if line count is unknown (e.g., for large files without line indexing)
+    pub fn line_count(&self) -> Option<usize> {
+        self.piece_tree.line_count()
+    }
+
+    /// Snapshot the current tree as the saved baseline
+    pub fn mark_saved_snapshot(&mut self) {
+        self.persistence.mark_saved_snapshot(&self.piece_tree);
+    }
+
+    /// Refresh the saved root to match the current tree structure without
+    /// clearing the modified flag.  Call this after structural-only changes
+    /// (e.g. chunk_split_and_load during search scan) so that
+    /// `diff_since_saved()` can take the fast `Arc::ptr_eq` path.
+    pub fn refresh_saved_root_if_unmodified(&mut self) {
+        self.persistence
+            .refresh_saved_root_if_unmodified(&self.piece_tree);
+    }
+
+    /// Diff the current piece tree against the last saved snapshot.
+    ///
+    /// See `Persistence::diff_since_saved` for the algorithm.
+    /// Version of the state [`Self::diff_since_saved`] compares against.
+    ///
+    /// Changes on save, reload, and the first edit after either. A cache that
+    /// keys only on [`Self::version`] would miss a save, which replaces the
+    /// saved snapshot while leaving the content untouched.
+    pub fn save_state_version(&self) -> u64 {
+        self.persistence.save_state_version()
+    }
+
+    pub fn diff_since_saved(&self) -> PieceTreeDiff {
+        let _span = tracing::info_span!(
+            "diff_since_saved",
+            large_file = self.file_kind.is_large_file(),
+            modified = self.persistence.is_modified(),
+            lf_scanned = self.file_kind.has_line_feed_scan()
+        )
+        .entered();
+
+        self.persistence
+            .diff_since_saved(&self.piece_tree, &self.buffers, self.version)
+    }
+
+    /// Total bytes of the saved snapshot (the diff baseline's old side).
+    pub fn saved_total_bytes(&self) -> usize {
+        self.persistence.saved_total_bytes()
+    }
+
+    /// Read a byte range out of the saved snapshot. `None` when any piece
+    /// in the range is unreadable (unloaded chunk data).
+    pub fn extract_saved_range(&self, start: usize, end: usize) -> Option<Vec<u8>> {
+        self.persistence
+            .extract_saved_range(start, end, &self.buffers)
+    }
+
+    /// Convert a byte offset to a line/column position
+    pub fn offset_to_position(&self, offset: usize) -> Option<Position> {
+        self.piece_tree
+            .offset_to_position(offset, &self.buffers)
+            .map(|(line, column)| Position { line, column })
+    }
+
+    /// Convert a line/column position to a byte offset
+    pub fn position_to_offset(&self, position: Position) -> usize {
+        self.piece_tree
+            .position_to_offset(position.line, position.column, &self.buffers)
+    }
+
+    /// Insert text at the given byte offset
+    pub fn insert_bytes(&mut self, offset: usize, text: Vec<u8>) -> Cursor {
+        if text.is_empty() {
+            return self.piece_tree.cursor_at_offset(offset);
+        }
+
+        // Count line feeds in the text to insert
+        let line_feed_cnt = Some(text.iter().filter(|&&b| b == b'\n').count());
+
+        // Mark as modified (updates version)
+        self.mark_content_modified();
+
+        // Optimization: try to append to existing buffer if insertion is at piece boundary
+        let (buffer_location, buffer_offset, text_len) =
+            if let Some(append_info) = self.try_append_to_existing_buffer(offset, &text) {
+                append_info
+            } else {
+                // Create a new StringBuffer for this insertion
+                let buffer_id = self.next_buffer_id;
+                self.next_buffer_id += 1;
+                let buffer = StringBuffer::new(buffer_id, text.clone());
+                self.buffers.push(buffer);
+                (BufferLocation::Added(buffer_id), 0, text.len())
+            };
+
+        // When line feeds have been scanned, ensure the chunk at the insertion
+        // point is loaded so compute_line_feeds_static can recount during splits.
+        if self.file_kind.has_line_feed_scan() {
+            self.ensure_chunk_loaded_at(offset);
+        }
+
+        // Update piece tree (need to pass buffers reference)
+        self.piece_tree.insert(
+            offset,
+            buffer_location,
+            buffer_offset,
+            text_len,
+            line_feed_cnt,
+            &self.buffers,
+        )
+    }
+
+    /// Try to append to an existing buffer if insertion point aligns with buffer end
+    /// Returns (BufferLocation, buffer_offset, text_len) if append succeeds, None otherwise
+    fn try_append_to_existing_buffer(
+        &mut self,
+        offset: usize,
+        text: &[u8],
+    ) -> Option<(BufferLocation, usize, usize)> {
+        // Only optimize for non-empty insertions after existing content
+        if text.is_empty() || offset == 0 {
+            return None;
+        }
+
+        // Find the piece containing the byte just before the insertion point
+        // This avoids the saturating_sub issue
+        let piece_info = self.piece_tree.find_by_offset(offset - 1)?;
+
+        // Check if insertion is exactly at the end of this piece
+        // offset_in_piece tells us where (offset-1) is within the piece
+        // For insertion to be at piece end, (offset-1) must be the last byte
+        let offset_in_piece = piece_info.offset_in_piece?;
+        if offset_in_piece + 1 != piece_info.bytes {
+            return None; // Not at the end of the piece
+        }
+
+        // Only append to "Added" buffers (not original Stored buffers)
+        if !matches!(piece_info.location, BufferLocation::Added(_)) {
+            return None;
+        }
+
+        let buffer_id = piece_info.location.buffer_id();
+        let buffer = self.buffers.get_mut(buffer_id)?;
+
+        // Check if buffer is loaded
+        let buffer_len = buffer.get_data()?.len();
+
+        // Check if this piece ends exactly at the end of its buffer
+        if piece_info.offset + piece_info.bytes != buffer_len {
+            return None;
+        }
+
+        // Perfect! Append to this buffer
+        let append_offset = buffer.append(text);
+
+        Some((piece_info.location, append_offset, text.len()))
+    }
+
+    /// Insert text (from &str) at the given byte offset
+    pub fn insert(&mut self, offset: usize, text: &str) {
+        self.insert_bytes(offset, text.as_bytes().to_vec());
+    }
+
+    /// Insert text at a line/column position
+    /// This now uses the optimized piece_tree.insert_at_position() for a single traversal
+    pub fn insert_at_position(&mut self, position: Position, text: Vec<u8>) -> Cursor {
+        if text.is_empty() {
+            let offset = self.position_to_offset(position);
+            return self.piece_tree.cursor_at_offset(offset);
+        }
+
+        self.mark_content_modified();
+
+        // Count line feeds in the text to insert
+        let line_feed_cnt = text.iter().filter(|&&b| b == b'\n').count();
+
+        // Create a new StringBuffer for this insertion
+        let buffer_id = self.next_buffer_id;
+        self.next_buffer_id += 1;
+        let buffer = StringBuffer::new(buffer_id, text.clone());
+        self.buffers.push(buffer);
+
+        // Use the optimized position-based insertion (single traversal)
+        self.piece_tree.insert_at_position(
+            position.line,
+            position.column,
+            BufferLocation::Added(buffer_id),
+            0,
+            text.len(),
+            line_feed_cnt,
+            &self.buffers,
+        )
+    }
+
+    /// Delete text starting at the given byte offset
+    pub fn delete_bytes(&mut self, offset: usize, bytes: usize) {
+        if bytes == 0 || offset >= self.total_bytes() {
+            return;
+        }
+
+        // When line feeds have been scanned, ensure chunks at delete boundaries
+        // are loaded so compute_line_feeds_static can recount during splits.
+        if self.file_kind.has_line_feed_scan() {
+            self.ensure_chunk_loaded_at(offset);
+            let end = (offset + bytes).min(self.total_bytes());
+            if end > offset {
+                self.ensure_chunk_loaded_at(end.saturating_sub(1));
+            }
+        }
+
+        // Update piece tree
+        self.piece_tree.delete(offset, bytes, &self.buffers);
+
+        self.mark_content_modified();
+    }
+
+    /// Delete text in a range
+    pub fn delete(&mut self, range: Range<usize>) {
+        if range.end > range.start {
+            self.delete_bytes(range.start, range.end - range.start);
+        }
+    }
+
+    /// Delete text in a line/column range
+    /// This now uses the optimized piece_tree.delete_position_range() for a single traversal
+    pub fn delete_range(&mut self, start: Position, end: Position) {
+        // Use the optimized position-based deletion
+        self.piece_tree.delete_position_range(
+            start.line,
+            start.column,
+            end.line,
+            end.column,
+            &self.buffers,
+        );
+        self.mark_content_modified();
+    }
+
+    /// Replace the entire buffer content with new content
+    /// This is an O(n) operation that rebuilds the piece tree in a single pass,
+    /// avoiding the O(n²) complexity of applying individual edits.
+    ///
+    /// This is used for bulk operations like "replace all" where applying
+    /// individual edits would be prohibitively slow.
+    pub fn replace_content(&mut self, new_content: &str) {
+        let bytes = new_content.len();
+        let content_bytes = new_content.as_bytes().to_vec();
+
+        // Count line feeds in the new content
+        let line_feed_cnt = content_bytes.iter().filter(|&&b| b == b'\n').count();
+
+        // Create a new StringBuffer for the new content
+        let buffer_id = self.next_buffer_id;
+        self.next_buffer_id += 1;
+        let buffer = StringBuffer::new(buffer_id, content_bytes);
+        self.buffers.push(buffer);
+
+        // Rebuild the piece tree with a single piece containing all the new content
+        if bytes > 0 {
+            self.piece_tree = PieceTree::new(
+                BufferLocation::Added(buffer_id),
+                0,
+                bytes,
+                Some(line_feed_cnt),
+            );
+        } else {
+            self.piece_tree = PieceTree::empty();
+        }
+
+        self.mark_content_modified();
+    }
+
+    /// Restore a previously saved buffer state (for undo/redo of BulkEdit).
+    ///
+    /// This restores the piece tree AND the buffers list, which is critical
+    /// because consolidate_after_save() replaces self.buffers. Without restoring
+    /// buffers, the piece tree would reference buffer IDs that no longer exist.
+    pub fn restore_buffer_state(&mut self, snapshot: &BufferSnapshot) {
+        self.piece_tree = snapshot.piece_tree.clone();
+        self.buffers = snapshot.buffers.clone();
+        self.next_buffer_id = snapshot.next_buffer_id;
+        self.mark_content_modified();
+    }
+
+    /// Snapshot the current buffer state (piece tree + buffers) for BulkEdit undo/redo.
+    ///
+    /// The snapshot includes buffers because consolidate_after_save() can replace
+    /// self.buffers between the snapshot and restore, which would otherwise cause
+    /// the restored piece tree to reference nonexistent buffer IDs.
+    pub fn snapshot_buffer_state(&self) -> Arc<BufferSnapshot> {
+        Arc::new(BufferSnapshot {
+            piece_tree: self.piece_tree.clone(),
+            buffers: self.buffers.clone(),
+            next_buffer_id: self.next_buffer_id,
+        })
+    }
+
+    /// Apply bulk edits efficiently in a single pass
+    /// Returns the net change in bytes
+    pub fn apply_bulk_edits(&mut self, edits: &[(usize, usize, &str)]) -> isize {
+        // Pre-allocate buffers for all insert texts (only non-empty texts)
+        // This avoids the borrow conflict in the closure
+        // IMPORTANT: Only add entries for non-empty texts because the closure
+        // is only called for edits with non-empty insert text
+        let mut buffer_info: Vec<(BufferLocation, usize, usize, Option<usize>)> = Vec::new();
+
+        for (_, _, text) in edits {
+            if !text.is_empty() {
+                let buffer_id = self.next_buffer_id;
+                self.next_buffer_id += 1;
+                let content = text.as_bytes().to_vec();
+                let lf_cnt = content.iter().filter(|&&b| b == b'\n').count();
+                let bytes = content.len();
+                let buffer = StringBuffer::new(buffer_id, content);
+                self.buffers.push(buffer);
+                buffer_info.push((BufferLocation::Added(buffer_id), 0, bytes, Some(lf_cnt)));
+            }
+            // No placeholder for empty texts - the closure is only called for non-empty texts
+        }
+
+        // Now call apply_bulk_edits with a simple index-based closure
+        let mut idx = 0;
+        let delta = self
+            .piece_tree
+            .apply_bulk_edits(edits, &self.buffers, |_text| {
+                let info = buffer_info[idx];
+                idx += 1;
+                info
+            });
+
+        self.mark_content_modified();
+        delta
+    }
+
+    /// The bytes at `offset..offset + bytes`, or None if any of them aren't
+    /// loaded. PRIVATE: external code uses `get_text_range_mut`, which
+    /// loads what it reads.
+    fn get_text_range(&self, offset: usize, bytes: usize) -> Option<Vec<u8>> {
+        let result = self.piece_tree.read_range(&self.buffers, offset, bytes)?;
+        crate::counters::work::add_buffer_bytes_read(result.len() as u64);
+        Some(result)
+    }
+
+    /// Get text from a byte offset range with lazy loading
+    /// This will load unloaded chunks on-demand and always returns complete data
+    ///
+    /// Returns an error if loading fails or if data cannot be read for any reason.
+    ///
+    /// An unloaded piece is split so only the `LOAD_CHUNK_SIZE` chunk around
+    /// the read is loaded (`chunk_split_and_load`); it stays loaded, so a
+    /// later read of it costs nothing.
+    pub fn get_text_range_mut(&mut self, offset: usize, bytes: usize) -> Result<Vec<u8>> {
+        // `trace`, not `info`: this fires once per chunk of every line read, so
+        // on a long-line file an enabled span formats its fields thousands of
+        // times per frame — enough to show up as several percent of total CPU.
+        let _span = tracing::trace_span!("get_text_range_mut", offset, bytes).entered();
+        if bytes == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut result = Vec::with_capacity(bytes);
+        // Clamp end_offset to buffer length to handle reads beyond EOF
+        let end_offset = (offset + bytes).min(self.len());
+        let mut current_offset = offset;
+        let mut iteration_count = 0u32;
+
+        // Keep iterating until we've collected all requested bytes
+        while current_offset < end_offset {
+            iteration_count += 1;
+            let mut made_progress = false;
+            let mut restarted_iteration = false;
+
+            // Use the efficient piece iterator (single O(log n) traversal + O(N) iteration)
+            for piece_view in self
+                .piece_tree
+                .iter_pieces_in_range(current_offset, end_offset)
+            {
+                let buffer_id = piece_view.location.buffer_id();
+
+                // Check if buffer needs loading
+                let needs_loading = self
+                    .buffers
+                    .get(buffer_id)
+                    .map(|b| !b.is_loaded())
+                    .unwrap_or(false);
+
+                if needs_loading && self.chunk_split_and_load(&piece_view, current_offset)? {
+                    restarted_iteration = true;
+                    break;
+                }
+
+                // Calculate the range to read from this piece
+                let piece_start_in_doc = piece_view.doc_offset;
+                let piece_end_in_doc = piece_view.doc_offset + piece_view.bytes;
+
+                // Clip to the requested range
+                let read_start = current_offset.max(piece_start_in_doc);
+                let read_end = end_offset.min(piece_end_in_doc);
+
+                if read_end > read_start {
+                    let offset_in_piece = read_start - piece_start_in_doc;
+                    let bytes_to_read = read_end - read_start;
+
+                    let buffer_start = piece_view.buffer_offset + offset_in_piece;
+                    let buffer_end = buffer_start + bytes_to_read;
+
+                    // Buffer should be loaded now
+                    let buffer = self.buffers.get(buffer_id).context("Buffer not found")?;
+                    let data = buffer
+                        .get_data()
+                        .context("Buffer data unavailable after load")?;
+
+                    anyhow::ensure!(
+                        buffer_end <= data.len(),
+                        "Buffer range out of bounds: requested {}..{}, buffer size {}",
+                        buffer_start,
+                        buffer_end,
+                        data.len()
+                    );
+
+                    result.extend_from_slice(&data[buffer_start..buffer_end]);
+                    current_offset = read_end;
+                    made_progress = true;
+                }
+            }
+
+            // If we didn't make progress and didn't restart iteration, this is an error
+            if !made_progress && !restarted_iteration {
+                tracing::error!(
+                    "get_text_range_mut: No progress at offset {} (requested range: {}..{}, buffer len: {})",
+                    current_offset,
+                    offset,
+                    end_offset,
+                    self.len()
+                );
+                tracing::error!(
+                    "Piece tree stats: {} total bytes",
+                    self.piece_tree.stats().total_bytes
+                );
+                anyhow::bail!(
+                    "Failed to read data at offset {}: no progress made (requested {}..{}, buffer len: {})",
+                    current_offset,
+                    offset,
+                    end_offset,
+                    self.len()
+                );
+            }
+        }
+
+        if iteration_count > 1 {
+            tracing::info!(
+                iteration_count,
+                result_len = result.len(),
+                "get_text_range_mut: completed with multiple iterations"
+            );
+        }
+
+        crate::counters::work::add_buffer_bytes_read(result.len() as u64);
+        Ok(result)
+    }
+
+    /// Prepare a viewport for rendering
+    ///
+    /// This is called before rendering with &mut access to pre-load all data
+    /// that will be needed for the viewport. It estimates the number of bytes
+    /// needed based on the line count and pre-loads them.
+    ///
+    /// # Arguments
+    /// * `start_offset` - The byte offset where the viewport starts
+    /// * `line_count` - The number of lines to prepare (estimate)
+    ///
+    /// # Returns
+    /// Ok(()) if preparation succeeded, Err if loading failed
+    pub fn prepare_viewport(&mut self, start_offset: usize, line_count: usize) -> Result<()> {
+        let _span = tracing::info_span!("prepare_viewport", start_offset, line_count).entered();
+        // Estimate how many bytes we need (pessimistic assumption)
+        // Average line length is typically 80-100 bytes, but we use 200 to be safe
+        let estimated_bytes = line_count.saturating_mul(200);
+
+        // Cap the estimate at the remaining bytes in the document
+        let remaining_bytes = self.total_bytes().saturating_sub(start_offset);
+        let bytes_to_load = estimated_bytes.min(remaining_bytes);
+        tracing::trace!(
+            bytes_to_load,
+            total_bytes = self.total_bytes(),
+            "prepare_viewport loading"
+        );
+
+        // Pre-load with full chunk-splitting support
+        // This may load more than we need, but ensures all data is available
+        self.get_text_range_mut(start_offset, bytes_to_load)?;
+
+        Ok(())
+    }
+
+    /// Split a piece that references a large unloaded buffer, create a chunk
+    /// buffer for the region around `current_offset`, and load it.
+    ///
+    /// Returns `true` if the piece tree was modified (caller must restart its
+    /// iteration), `false` if the piece was small enough to load in-place.
+    fn chunk_split_and_load(
+        &mut self,
+        piece_view: &PieceView,
+        current_offset: usize,
+    ) -> Result<bool> {
+        let buffer_id = piece_view.location.buffer_id();
+
+        // The underlying buffer may be much larger than this piece (e.g. the
+        // whole-file Stored buffer after rebuild_with_pristine_saved_root).
+        // We must chunk-split if either the piece or its buffer exceeds
+        // LOAD_CHUNK_SIZE, because `load()` loads the entire buffer.
+        let buffer_bytes = self
+            .buffers
+            .get(buffer_id)
+            .and_then(|b| b.unloaded_bytes())
+            .unwrap_or(0);
+        let needs_chunk_split =
+            piece_view.bytes > LOAD_CHUNK_SIZE || buffer_bytes > piece_view.bytes;
+
+        tracing::info!(
+            buffer_id,
+            piece_bytes = piece_view.bytes,
+            buffer_bytes,
+            needs_chunk_split,
+            piece_doc_offset = piece_view.doc_offset,
+            current_offset,
+            "chunk_split_and_load: loading unloaded piece"
+        );
+
+        if !needs_chunk_split {
+            // Piece is small enough and its buffer matches — load in-place.
+            let _span = tracing::info_span!(
+                "load_small_buffer",
+                piece_bytes = piece_view.bytes,
+                buffer_id,
+            )
+            .entered();
+            self.buffers
+                .get_mut(buffer_id)
+                .context("Buffer not found")?
+                .load(&**self.persistence.fs())
+                .context("Failed to load buffer")?;
+            return Ok(false);
+        }
+
+        let _span = tracing::info_span!(
+            "chunk_split_and_load",
+            piece_bytes = piece_view.bytes,
+            buffer_id,
+        )
+        .entered();
+
+        let piece_start_in_doc = piece_view.doc_offset;
+        let offset_in_piece = current_offset.saturating_sub(piece_start_in_doc);
+
+        // When the piece already fits within LOAD_CHUNK_SIZE, create a chunk
+        // buffer for the exact piece range (no alignment/splitting needed).
+        // Alignment rounding is only useful when carving a sub-range out of a
+        // piece larger than LOAD_CHUNK_SIZE.
+        let (chunk_start_in_buffer, chunk_bytes) = if piece_view.bytes <= LOAD_CHUNK_SIZE {
+            (piece_view.buffer_offset, piece_view.bytes)
+        } else {
+            let start =
+                (piece_view.buffer_offset + offset_in_piece) / CHUNK_ALIGNMENT * CHUNK_ALIGNMENT;
+            let bytes = LOAD_CHUNK_SIZE
+                .min((piece_view.buffer_offset + piece_view.bytes).saturating_sub(start));
+            (start, bytes)
+        };
+
+        // Calculate document offsets for splitting
+        let chunk_start_offset_in_piece =
+            chunk_start_in_buffer.saturating_sub(piece_view.buffer_offset);
+        let split_start_in_doc = piece_start_in_doc + chunk_start_offset_in_piece;
+        let split_end_in_doc = split_start_in_doc + chunk_bytes;
+
+        // Split the piece to isolate the chunk
+        if chunk_start_offset_in_piece > 0 {
+            self.piece_tree
+                .split_at_offset(split_start_in_doc, &self.buffers);
+        }
+        if split_end_in_doc < piece_start_in_doc + piece_view.bytes {
+            self.piece_tree
+                .split_at_offset(split_end_in_doc, &self.buffers);
+        }
+
+        // Create a new buffer for this chunk
+        let chunk_buffer = self
+            .buffers
+            .get(buffer_id)
+            .context("Buffer not found")?
+            .create_chunk_buffer(self.next_buffer_id, chunk_start_in_buffer, chunk_bytes)
+            .context("Failed to create chunk buffer")?;
+
+        self.next_buffer_id += 1;
+        let new_buffer_id = chunk_buffer.id;
+        self.buffers.push(chunk_buffer);
+
+        // Update the piece to reference the new chunk buffer
+        self.piece_tree.replace_buffer_reference(
+            buffer_id,
+            piece_view.buffer_offset + chunk_start_offset_in_piece,
+            chunk_bytes,
+            BufferLocation::Added(new_buffer_id),
+        );
+
+        // Load the chunk buffer
+        self.buffers
+            .get_mut(new_buffer_id)
+            .context("Chunk buffer not found")?
+            .load(&**self.persistence.fs())
+            .context("Failed to load chunk")?;
+
+        // split_at_offset uses compute_line_feeds_static which returns None
+        // for unloaded buffers, destroying the scanned line feed counts.
+        // Fix up: the loaded chunk is counted from memory, remaining unloaded
+        // pieces use the filesystem's count_line_feeds_in_range.
+        if self.file_kind.has_line_feed_scan() {
+            let leaves = self.piece_tree.get_leaves();
+            let mut fixups: Vec<(usize, usize)> = Vec::new();
+            for (idx, leaf) in leaves.iter().enumerate() {
+                if leaf.line_feed_cnt.is_none() {
+                    if let Ok(count) = self.scan_leaf(leaf) {
+                        fixups.push((idx, count));
+                    }
+                }
+            }
+            if !fixups.is_empty() {
+                self.piece_tree.update_leaf_line_feeds_path_copy(&fixups);
+            }
+        }
+
+        // Keep saved_root in sync with viewport-loading tree restructures so
+        // that diff_since_saved() can match by (location, offset) identity.
+        //
+        // When !modified the current tree IS the saved state, so just snapshot.
+        // When modified, we must apply the same Stored→Added leaf replacement
+        // to saved_root so the diff doesn't see loaded-but-unedited regions as
+        // changed.
+        if !self.persistence.is_modified() {
+            self.persistence.set_saved_root(self.piece_tree.root());
+        } else {
+            self.persistence.apply_chunk_load_to_saved_root(
+                buffer_id,
+                chunk_start_in_buffer,
+                chunk_bytes,
+                new_buffer_id,
+            );
+        }
+
+        Ok(true)
+    }
+
+    /// Get all text as a single Vec<u8>
+    /// Returns None if any buffers are unloaded (lazy loading)
+    /// CRATE-PRIVATE: External code should use get_text_range_mut()
+    pub(crate) fn get_all_text(&self) -> Option<Vec<u8>> {
+        self.get_text_range(0, self.total_bytes())
+    }
+
+    /// Get text from a byte range as bytes
+    /// CRATE-PRIVATE: Returns empty vector if any buffers are unloaded (silently fails!)
+    /// Only use this when you KNOW the data is loaded (e.g., for syntax highlighting small regions)
+    /// External code should use get_text_range_mut()
+    pub fn slice_bytes(&self, range: Range<usize>) -> Vec<u8> {
+        self.get_text_range(range.start, range.end.saturating_sub(range.start))
+            .unwrap_or_default()
+    }
+
+    /// Get all text as a String
+    /// Returns None if any buffers are unloaded (lazy loading)
+    pub fn to_string(&self) -> Option<String> {
+        self.get_all_text()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Get the total number of bytes
+    pub fn len(&self) -> usize {
+        self.total_bytes()
+    }
+
+    /// Check if the buffer is empty
+    pub fn is_empty(&self) -> bool {
+        self.total_bytes() == 0
+    }
+
+    /// Get the file path associated with this buffer
+    pub fn file_path(&self) -> Option<&Path> {
+        self.persistence.file_path()
+    }
+
+    /// Update the file path after a rename operation on disk.
+    pub fn rename_file_path(&mut self, path: PathBuf) {
+        self.persistence.set_file_path(path);
+    }
+
+    /// Clear the file path (make buffer unnamed)
+    /// Note: This does NOT affect Unloaded chunk file_paths used for lazy loading.
+    /// Those still point to the original source file for chunk loading.
+    pub fn clear_file_path(&mut self) {
+        self.persistence.clear_file_path();
+    }
+
+    /// Extend buffer to include more bytes from a streaming source file.
+    /// Used for stdin streaming where the temp file grows over time, and
+    /// for plugin streaming via `RefreshBufferFromDisk`.
+    ///
+    /// Counts line feeds in the appended region so the new piece carries
+    /// a real `line_feed_cnt` instead of `None`. Without this, any
+    /// previously-known line count on the existing pieces propagates to
+    /// `line_count() = None` (the piece-tree's `total_line_feeds`
+    /// returns `None` if any piece is unknown), which in turn breaks the
+    /// visual-row index used by the scrollbar.
+    ///
+    /// Falls back to `None` only when the filesystem can't count
+    /// (errored stat / read). The buffer is still usable then — just
+    /// without precise line indexing, same as a large file opened
+    /// without a scan.
+    pub fn extend_streaming(&mut self, source_path: &Path, new_size: usize) {
+        let old_size = self.total_bytes();
+        if new_size <= old_size {
+            return;
+        }
+
+        let additional_bytes = new_size - old_size;
+
+        // Create new Unloaded buffer for the appended region
+        let buffer_id = self.next_buffer_id;
+        self.next_buffer_id += 1;
+
+        let new_buffer = StringBuffer::new_unloaded(
+            buffer_id,
+            source_path.to_path_buf(),
+            old_size,         // file_offset - where this chunk starts in the file
+            additional_bytes, // bytes - size of this chunk
+        );
+        self.buffers.push(new_buffer);
+
+        // Count line feeds in the appended region from disk so the
+        // piece carries a known line count. Counting is cheap — it's a
+        // streaming scan of `additional_bytes`, no buffer materialisation.
+        let line_feed_cnt = self
+            .persistence
+            .fs()
+            .count_line_feeds_in_range(source_path.as_host(), old_size as u64, additional_bytes)
+            .ok();
+
+        // Append piece at end of document (insert at offset == total_bytes)
+        self.piece_tree.insert(
+            old_size,
+            BufferLocation::Stored(buffer_id),
+            0,
+            additional_bytes,
+            line_feed_cnt,
+            &self.buffers,
+        );
+
+        // Content changed: layout caches (line-wrap cache, visual-row
+        // index) key on the version and would otherwise serve
+        // pre-append state.  Deliberately not `mark_content_modified`
+        // — the buffer still matches the on-disk stream, so it isn't
+        // dirty.
+        self.bump_version();
+    }
+
+    /// Check if the buffer has been modified since last save
+    pub fn is_modified(&self) -> bool {
+        self.persistence.is_modified()
+    }
+
+    /// Clear the modified flag (after save)
+    pub fn clear_modified(&mut self) {
+        self.persistence.clear_modified();
+    }
+
+    /// Set the modified flag explicitly
+    /// Used by undo/redo to restore the correct modified state
+    pub fn set_modified(&mut self, modified: bool) {
+        self.persistence.set_modified(modified);
+    }
+
+    /// Check if buffer has pending changes for recovery auto-save
+    pub fn is_recovery_pending(&self) -> bool {
+        self.persistence.is_recovery_pending()
+    }
+
+    /// Mark buffer as needing recovery auto-save (call after edits)
+    pub fn set_recovery_pending(&mut self, pending: bool) {
+        self.persistence.set_recovery_pending(pending);
+    }
+
+    /// The buffer's content is what hot-exit `entry` holds: just written
+    /// there, or restored from it. Nothing is pending for the recovery
+    /// auto-save, and a save of the buffer records itself in the entry
+    /// before writing its file ([`Self::save_to_file`]).
+    pub fn set_backed_by(&mut self, entry: HotExitEntry) {
+        self.persistence.set_recovery_pending(false);
+        self.persistence.set_hot_exit_entry(Some(entry));
+    }
+
+    /// The hot-exit entry holding this buffer's unsaved content, if any.
+    pub fn hot_exit_entry(&self) -> Option<&HotExitEntry> {
+        self.persistence.hot_exit_entry()
+    }
+
+    /// Forget the hot-exit entry: it was deleted.
+    pub fn clear_hot_exit_entry(&mut self) {
+        self.persistence.set_hot_exit_entry(None);
+    }
+
+    /// Ensure the buffer chunk at the given byte offset is loaded.
+    ///
+    /// When `line_feeds_scanned` is true, piece splits during insert/delete need
+    /// the buffer data to be loaded so `compute_line_feeds_static` can accurately
+    /// recount line feeds for each half. This method loads the chunk if needed.
+    fn ensure_chunk_loaded_at(&mut self, offset: usize) {
+        if let Some(piece_info) = self.piece_tree.find_by_offset(offset) {
+            let buffer_id = piece_info.location.buffer_id();
+            if let Some(buffer) = self.buffers.get_mut(buffer_id) {
+                if !buffer.is_loaded() {
+                    let buf_bytes = buffer.unloaded_bytes().unwrap_or(0);
+                    tracing::info!(
+                        "ensure_chunk_loaded_at: loading buffer {} ({} bytes) for offset {}",
+                        buffer_id,
+                        buf_bytes,
+                        offset
+                    );
+                    if let Err(e) = buffer.load(&**self.persistence.fs()) {
+                        tracing::warn!("Failed to load chunk at offset {offset}: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check if this is a large file with lazy loading enabled
+    pub fn is_large_file(&self) -> bool {
+        self.file_kind.is_large_file()
+    }
+
+    /// Check if line feeds have been scanned for this large file.
+    /// When true, `line_count()` returns exact values.
+    pub fn has_line_feed_scan(&self) -> bool {
+        self.file_kind.has_line_feed_scan()
+    }
+
+    /// Get the raw piece tree leaves (for storing alongside scan chunks).
+    pub fn piece_tree_leaves(&self) -> Vec<crate::model::piece_tree::LeafData> {
+        self.piece_tree.get_leaves()
+    }
+
+    /// Prepare work items for an incremental line scan.
+    ///
+    /// First splits any oversized leaves in the piece tree so every leaf is
+    /// at most `LOAD_CHUNK_SIZE` bytes.  Then returns one work item per leaf.
+    /// After scanning, `get_text_range_mut` will never need to split a scanned
+    /// leaf (it's already chunk-sized), so line-feed counts are preserved.
+    ///
+    /// Returns `(chunks, total_bytes)`.
+    pub fn prepare_line_scan(&mut self) -> (Vec<LineScanChunk>, usize) {
+        // Pre-split the tree so every leaf ≤ LOAD_CHUNK_SIZE.
+        self.piece_tree.split_leaves_to_chunk_size(LOAD_CHUNK_SIZE);
+
+        let leaves = self.piece_tree.get_leaves();
+        let total_bytes: usize = leaves.iter().map(|l| l.bytes).sum();
+        let mut chunks = Vec::new();
+
+        for (idx, leaf) in leaves.iter().enumerate() {
+            chunks.push(LineScanChunk {
+                leaf_index: idx,
+                byte_len: leaf.bytes,
+                already_known: leaf.line_feed_cnt.is_some(),
+            });
+        }
+
+        (chunks, total_bytes)
+    }
+
+    /// Count `\n` bytes in a single leaf.
+    ///
+    /// Uses `count_line_feeds_in_range` for unloaded buffers, which remote
+    /// filesystem implementations can override to count server-side.
+    pub fn scan_leaf(&self, leaf: &crate::model::piece_tree::LeafData) -> std::io::Result<usize> {
+        let buffer_id = leaf.location.buffer_id();
+        let buffer = self
+            .buffers
+            .get(buffer_id)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "buffer not found"))?;
+
+        let count = match &buffer.data {
+            crate::model::piece_tree::BufferData::Loaded { data, .. } => {
+                let end = (leaf.offset + leaf.bytes).min(data.len());
+                data[leaf.offset..end]
+                    .iter()
+                    .filter(|&&b| b == b'\n')
+                    .count()
+            }
+            crate::model::piece_tree::BufferData::Unloaded {
+                file_path,
+                file_offset,
+                ..
+            } => {
+                let read_offset = *file_offset as u64 + leaf.offset as u64;
+                self.persistence.fs().count_line_feeds_in_range(
+                    file_path.as_host(),
+                    read_offset,
+                    leaf.bytes,
+                )?
+            }
+        };
+        Ok(count)
+    }
+
+    /// Return the I/O parameters for an unloaded leaf, or `None` if loaded.
+    ///
+    /// Used by the incremental scan to distinguish leaves that can be counted
+    /// in-memory (via `scan_leaf`) from those that need filesystem I/O.
+    pub fn leaf_io_params(
+        &self,
+        leaf: &crate::model::piece_tree::LeafData,
+    ) -> Option<(std::path::PathBuf, u64, usize)> {
+        let buffer_id = leaf.location.buffer_id();
+        let buffer = self.buffers.get(buffer_id)?;
+        match &buffer.data {
+            crate::model::piece_tree::BufferData::Loaded { .. } => None,
+            crate::model::piece_tree::BufferData::Unloaded {
+                file_path,
+                file_offset,
+                ..
+            } => {
+                let read_offset = *file_offset as u64 + leaf.offset as u64;
+                Some((file_path.clone(), read_offset, leaf.bytes))
+            }
+        }
+    }
+
+    /// Apply the results of an incremental line scan.
+    pub fn apply_scan_updates(&mut self, updates: &[(usize, usize)]) {
+        self.piece_tree.update_leaf_line_feeds(updates);
+        self.file_kind.mark_line_feed_scan_complete();
+    }
+
+    /// After an incremental line-feed scan completes, rebuild the tree so that
+    /// `saved_root` and the current tree share `Arc` pointers for unedited
+    /// subtrees. This makes `diff_since_saved()` O(edited regions) instead of
+    /// O(file size).
+    pub fn rebuild_with_pristine_saved_root(&mut self, scan_updates: &[(usize, usize)]) {
+        let file_size = match self.persistence.saved_file_size() {
+            Some(s) => s,
+            None => {
+                // Fallback: no saved file size means we can't build a pristine
+                // tree. Just apply updates the old way.
+                self.apply_scan_updates(scan_updates);
+                return;
+            }
+        };
+
+        // --- Walk the current tree to extract deletions and insertions ---
+        let total = self.total_bytes();
+        // Deletions: gaps in Stored coverage (orig_offset, len).
+        let mut deletions: Vec<(usize, usize)> = Vec::new();
+        // Insertions: (post_delete_offset, location, buf_offset, bytes, lf_cnt).
+        // post_delete_offset = cumulative surviving Stored bytes before this point.
+        let mut insertions: Vec<(usize, BufferLocation, usize, usize, Option<usize>)> = Vec::new();
+        let mut orig_cursor: usize = 0;
+        let mut stored_bytes_in_doc: usize = 0;
+
+        for piece in self.piece_tree.iter_pieces_in_range(0, total) {
+            match piece.location {
+                BufferLocation::Stored(_) => {
+                    if piece.buffer_offset > orig_cursor {
+                        deletions.push((orig_cursor, piece.buffer_offset - orig_cursor));
+                    }
+                    orig_cursor = piece.buffer_offset + piece.bytes;
+                    stored_bytes_in_doc += piece.bytes;
+                }
+                BufferLocation::Added(id) => {
+                    // Check if this Added buffer was created by loading a chunk
+                    // from the stored file (via get_text_range_mut chunk loading).
+                    // If so, treat it as stored content, not a user edit.
+                    if let Some(file_off) = self.buffers.get(id).and_then(|b| b.stored_file_offset)
+                    {
+                        if file_off > orig_cursor {
+                            deletions.push((orig_cursor, file_off - orig_cursor));
+                        }
+                        orig_cursor = file_off + piece.bytes;
+                        stored_bytes_in_doc += piece.bytes;
+                    } else {
+                        insertions.push((
+                            stored_bytes_in_doc,
+                            piece.location,
+                            piece.buffer_offset,
+                            piece.bytes,
+                            piece.line_feed_cnt,
+                        ));
+                    }
+                }
+            }
+        }
+        // Trailing deletion.
+        if orig_cursor < file_size {
+            deletions.push((orig_cursor, file_size - orig_cursor));
+        }
+
+        // If there are no edits, the scanned tree already tiles the original
+        // file exactly, and its leaf order matches `scan_updates` (both come
+        // from the same `prepare_line_scan` split). Apply the counts to it
+        // first so every leaf carries its correct line-feed count, then rebuild
+        // a clean single-buffer pristine tree split at the SAME boundaries.
+        //
+        // Do NOT rebuild a *uniform* `LOAD_CHUNK_SIZE` pristine tree and index
+        // it with `scan_updates`: when a viewport chunk was loaded before the
+        // scan, that load carved the chunk on a `CHUNK_ALIGNMENT` (64 KB)
+        // boundary, so a uniform re-split has different leaf boundaries. The
+        // index-keyed updates would then land on the wrong leaves, dropping the
+        // line-feed counts of the leaves past the first misaligned boundary and
+        // undercounting the total (#2596).
+        if deletions.is_empty() && insertions.is_empty() {
+            self.piece_tree.update_leaf_line_feeds(scan_updates);
+
+            let pristine = if file_size > 0 {
+                let mut doc_offset = 0usize;
+                let pristine_leaves: Vec<crate::model::piece_tree::LeafData> = self
+                    .piece_tree
+                    .get_leaves()
+                    .iter()
+                    .map(|leaf| {
+                        // Map every scanned leaf onto the whole-file Stored(0)
+                        // buffer at its document offset (== original-file offset
+                        // when there are no edits), preserving its line-feed
+                        // count. This drops any loaded viewport chunk so the
+                        // pristine tree stays a single lazy buffer.
+                        let mapped = crate::model::piece_tree::LeafData::new(
+                            BufferLocation::Stored(0),
+                            doc_offset,
+                            leaf.bytes,
+                            leaf.line_feed_cnt,
+                        );
+                        doc_offset += leaf.bytes;
+                        mapped
+                    })
+                    .collect();
+                PieceTree::from_leaves(&pristine_leaves)
+            } else {
+                PieceTree::empty()
+            };
+
+            self.persistence.set_saved_root(pristine.root());
+            self.piece_tree = pristine;
+            self.file_kind.mark_line_feed_scan_complete();
+            return;
+        }
+
+        // --- Build pristine tree (full original file, pre-split, with lf counts) ---
+        let mut pristine = if file_size > 0 {
+            PieceTree::new(BufferLocation::Stored(0), 0, file_size, None)
+        } else {
+            PieceTree::empty()
+        };
+        pristine.split_leaves_to_chunk_size(LOAD_CHUNK_SIZE);
+        pristine.update_leaf_line_feeds(scan_updates);
+
+        // Snapshot the pristine tree as saved_root.
+        self.persistence.set_saved_root(pristine.root());
+
+        // --- Replay edits onto a clone of the pristine tree ---
+        let mut tree = pristine;
+
+        // Apply deletions from HIGH to LOW offset so earlier offsets stay valid.
+        deletions.sort_by_key(|b| std::cmp::Reverse(b.0));
+        for &(offset, len) in &deletions {
+            tree.delete(offset, len, &self.buffers);
+        }
+
+        // Apply insertions from LOW to HIGH. Each insertion shifts subsequent
+        // offsets by its byte count, tracked via insert_delta.
+        let mut insert_delta: usize = 0;
+        for &(offset, location, buf_offset, bytes, lf_cnt) in &insertions {
+            tree.insert(
+                offset + insert_delta,
+                location,
+                buf_offset,
+                bytes,
+                lf_cnt,
+                &self.buffers,
+            );
+            insert_delta += bytes;
+        }
+
+        // Path-copy insert/delete may split Stored leaves whose data is
+        // Unloaded, producing fragments with line_feed_cnt = None
+        // (compute_line_feeds_static can't read unloaded data). Fix them up
+        // by scanning any remaining None leaves.
+        let leaves = tree.get_leaves();
+        let mut fixups: Vec<(usize, usize)> = Vec::new();
+        for (idx, leaf) in leaves.iter().enumerate() {
+            if leaf.line_feed_cnt.is_none() {
+                if let Ok(count) = self.scan_leaf(leaf) {
+                    fixups.push((idx, count));
+                }
+            }
+        }
+        if !fixups.is_empty() {
+            tree.update_leaf_line_feeds_path_copy(&fixups);
+        }
+
+        self.piece_tree = tree;
+        self.file_kind.mark_line_feed_scan_complete();
+    }
+
+    /// Resolve the exact byte offset for a given line number (0-indexed).
+    ///
+    /// Uses the tree's line feed counts to find the piece containing the target line,
+    /// then loads/reads that piece's data to find the exact newline position.
+    /// This works even when buffers are unloaded (large file with scanned line index).
+    pub fn resolve_line_byte_offset(&mut self, target_line: usize) -> Option<usize> {
+        if target_line == 0 {
+            return Some(0);
+        }
+
+        // Use tree metadata to find the piece containing the target line
+        let (doc_offset, buffer_id, piece_offset, piece_bytes, lines_before) =
+            self.piece_tree.piece_info_for_line(target_line)?;
+
+        // We need to find the (target_line - lines_before)-th newline within this piece
+        let lines_to_skip = target_line - lines_before;
+
+        // Get the piece data — either from loaded buffer or read from disk
+        let buffer = self.buffers.get(buffer_id)?;
+        let piece_data: Vec<u8> = match &buffer.data {
+            crate::model::piece_tree::BufferData::Loaded { data, .. } => {
+                let end = (piece_offset + piece_bytes).min(data.len());
+                data[piece_offset..end].to_vec()
+            }
+            crate::model::piece_tree::BufferData::Unloaded {
+                file_path,
+                file_offset,
+                ..
+            } => {
+                let read_offset = *file_offset as u64 + piece_offset as u64;
+                self.persistence
+                    .fs()
+                    .read_range(file_path.as_host(), read_offset, piece_bytes)
+                    .ok()?
+            }
+        };
+
+        // Count newlines to find the target line start
+        let mut newlines_found = 0;
+        for (i, &byte) in piece_data.iter().enumerate() {
+            if byte == b'\n' {
+                newlines_found += 1;
+                if newlines_found == lines_to_skip {
+                    // The target line starts right after this newline
+                    return Some(doc_offset + i + 1);
+                }
+            }
+        }
+
+        // If we didn't find enough newlines, the line starts in the next piece
+        // Return the end of this piece as an approximation
+        Some(doc_offset + piece_bytes)
+    }
+
+    /// Get the saved file size (size of the file on disk after last load/save)
+    /// For large files, this is used during recovery to know the expected original file size.
+    /// Returns None for new unsaved buffers.
+    pub fn original_file_size(&self) -> Option<usize> {
+        // Return the tracked saved file size - this is updated when the file is
+        // loaded or saved, so it always reflects the current file on disk.
+        self.persistence.saved_file_size()
+    }
+
+    /// Check if this buffer contains binary content
+    pub fn is_binary(&self) -> bool {
+        self.file_kind.is_binary()
+    }
+
+    /// Get the line ending format for this buffer
+    pub fn line_ending(&self) -> LineEnding {
+        self.format.line_ending()
+    }
+
+    /// Set the line ending format for this buffer
+    ///
+    /// This marks the buffer as modified since the line ending format has changed.
+    /// On save, the buffer content will be converted to the new format.
+    pub fn set_line_ending(&mut self, line_ending: LineEnding) {
+        self.format.set_line_ending(line_ending);
+        self.mark_content_modified();
+    }
+
+    /// Set the default line ending format for a new/empty buffer
+    ///
+    /// Unlike `set_line_ending`, this does NOT mark the buffer as modified.
+    /// This should be used when initializing a new buffer with a configured default.
+    pub fn set_default_line_ending(&mut self, line_ending: LineEnding) {
+        self.format.set_default_line_ending(line_ending);
+    }
+
+    /// Get the encoding format for this buffer
+    pub fn encoding(&self) -> Encoding {
+        self.format.encoding()
+    }
+
+    /// Set the encoding format for this buffer
+    ///
+    /// This marks the buffer as modified since the encoding format has changed.
+    /// On save, the buffer content will be converted to the new encoding.
+    pub fn set_encoding(&mut self, encoding: Encoding) {
+        self.format.set_encoding(encoding);
+        self.mark_content_modified();
+    }
+
+    /// Set the default encoding format for a new/empty buffer
+    ///
+    /// Unlike `set_encoding`, this does NOT mark the buffer as modified.
+    /// This should be used when initializing a new buffer with a configured default.
+    pub fn set_default_encoding(&mut self, encoding: Encoding) {
+        self.format.set_default_encoding(encoding);
+    }
+
+    /// Get the first line of the buffer as a lossy UTF-8 string, suitable
+    /// for shebang / first-line grammar detection. Returns `None` for an
+    /// empty buffer. Non-UTF-8 bytes are replaced with U+FFFD.
+    pub fn first_line_lossy(&self) -> Option<String> {
+        let bytes = self.get_line(0)?;
+        if bytes.is_empty() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Get text for a specific line
+    pub fn get_line(&self, line: usize) -> Option<Vec<u8>> {
+        let (start, end) = self.piece_tree.line_range(line, &self.buffers)?;
+
+        let bytes = if let Some(end_offset) = end {
+            end_offset.saturating_sub(start)
+        } else {
+            self.total_bytes().saturating_sub(start)
+        };
+
+        self.get_text_range(start, bytes)
+    }
+
+    /// Get the byte offset where a line starts
+    pub fn line_start_offset(&self, line: usize) -> Option<usize> {
+        let (start, _) = self.piece_tree.line_range(line, &self.buffers)?;
+        Some(start)
+    }
+
+    /// Get tree statistics for debugging
+    pub fn stats(&self) -> TreeStats {
+        self.piece_tree.stats()
+    }
+
+    /// Replace a range with replacement text
+    pub fn replace_range(&mut self, range: Range<usize>, replacement: &str) -> bool {
+        if range.start >= self.len() {
+            return false;
+        }
+
+        let end = range.end.min(self.len());
+        if end > range.start {
+            self.delete_bytes(range.start, end - range.start);
+        }
+
+        if !replacement.is_empty() {
+            self.insert(range.start, replacement);
+        }
+
+        true
+    }
+
+    // LSP Support (UTF-16 conversions)
+
+    /// Convert byte position to (line, column) in bytes
+    pub fn position_to_line_col(&self, byte_pos: usize) -> (usize, usize) {
+        self.offset_to_position(byte_pos)
+            .map(|pos| (pos.line, pos.column))
+            .unwrap_or_else(|| (byte_pos / 80, 0)) // Estimate if metadata unavailable
+    }
+
+    /// Convert (line, character) to byte position - 0-indexed
+    /// character is in BYTES, not UTF-16 code units
+    /// Optimized to use single line_range() call instead of two
+    pub fn line_col_to_position(&self, line: usize, character: usize) -> usize {
+        if let Some((start, end)) = self.piece_tree.line_range(line, &self.buffers) {
+            // Calculate line length from the range
+            let line_len = if let Some(end_offset) = end {
+                end_offset.saturating_sub(start)
+            } else {
+                self.total_bytes().saturating_sub(start)
+            };
+            let byte_offset = character.min(line_len);
+            start + byte_offset
+        } else {
+            // Line doesn't exist, return end of buffer
+            self.len()
+        }
+    }
+
+    /// Convert byte position to LSP position (line, UTF-16 code units)
+    /// LSP protocol uses UTF-16 code units for character offsets
+    pub fn position_to_lsp_position(&self, byte_pos: usize) -> (usize, usize) {
+        let (line, column_bytes) = self
+            .offset_to_position(byte_pos)
+            .map(|pos| (pos.line, pos.column))
+            .unwrap_or_else(|| (byte_pos / 80, 0)); // Estimate if metadata unavailable
+
+        // Read only the prefix, not the whole line. `get_line` copies the
+        // entire line before the slice below discards everything past the
+        // cursor — on a file that is one enormous line that is a full copy per
+        // call, and this runs on every hover-timer tick.
+        let line_start = byte_pos.saturating_sub(column_bytes);
+        let prefix = self.slice_bytes(line_start..byte_pos);
+        let utf16_offset = String::from_utf8_lossy(&prefix).encode_utf16().count();
+        (line, utf16_offset)
+    }
+
+    /// Convert LSP position (line, UTF-16 code units) to byte position
+    /// LSP uses UTF-16 code units for character offsets, not bytes
+    /// Optimized to use single line_range() call instead of two
+    pub fn lsp_position_to_byte(&self, line: usize, utf16_offset: usize) -> usize {
+        if let Some((line_start, end)) = self.piece_tree.line_range(line, &self.buffers) {
+            // Calculate line length and get line content
+            let line_len = if let Some(end_offset) = end {
+                end_offset.saturating_sub(line_start)
+            } else {
+                self.total_bytes().saturating_sub(line_start)
+            };
+
+            if line_len > 0 {
+                // If data is unloaded, return line_start as fallback
+                let Some(line_bytes) = self.get_text_range(line_start, line_len) else {
+                    return line_start;
+                };
+                let line_str = String::from_utf8_lossy(&line_bytes);
+
+                // Convert UTF-16 offset to byte offset
+                let mut utf16_count = 0;
+                let mut byte_offset = 0;
+
+                for ch in line_str.chars() {
+                    if utf16_count >= utf16_offset {
+                        break;
+                    }
+                    utf16_count += ch.len_utf16();
+                    byte_offset += ch.len_utf8();
+                }
+
+                line_start + byte_offset
+            } else {
+                line_start
+            }
+        } else {
+            // Line doesn't exist, return end of buffer
+            self.len()
+        }
+    }
+
+    // Navigation helpers
+
+    /// Find the previous character boundary (UTF-8 aware)
+    pub fn prev_char_boundary(&self, pos: usize) -> usize {
+        if pos == 0 {
+            return 0;
+        }
+
+        // Get a few bytes before pos to find the character boundary
+        let start = pos.saturating_sub(4);
+        let Some(bytes) = self.get_text_range(start, pos - start) else {
+            // Data unloaded, return pos as fallback
+            return pos;
+        };
+
+        // Walk backwards to find a UTF-8 leading byte
+        for i in (0..bytes.len()).rev() {
+            let byte = bytes[i];
+            // Check if this is a UTF-8 leading byte (not a continuation byte)
+            if (byte & 0b1100_0000) != 0b1000_0000 {
+                return start + i;
+            }
+        }
+
+        // Fallback
+        pos.saturating_sub(1)
+    }
+
+    /// Find the next character boundary (UTF-8 aware)
+    pub fn next_char_boundary(&self, pos: usize) -> usize {
+        let len = self.len();
+        if pos >= len {
+            return len;
+        }
+
+        // Get a few bytes after pos to find the character boundary
+        let end = (pos + 5).min(len);
+        let Some(bytes) = self.get_text_range(pos, end - pos) else {
+            // Data unloaded, return pos as fallback
+            return pos;
+        };
+
+        // Start from index 1 (we want the NEXT boundary)
+        for (i, &byte) in bytes.iter().enumerate().skip(1) {
+            // Check if this is a UTF-8 leading byte (not a continuation byte)
+            if (byte & 0b1100_0000) != 0b1000_0000 {
+                return pos + i;
+            }
+        }
+
+        // If we got here, we're at the end or found no boundary in the range
+        end
+    }
+
+    /// Check if a byte is a UTF-8 continuation byte (not at a char boundary)
+    /// UTF-8 continuation bytes have the pattern 10xxxxxx (0x80-0xBF)
+    /// This is the same check that str::is_char_boundary uses internally.
+    #[inline]
+    fn is_utf8_continuation_byte(byte: u8) -> bool {
+        (byte & 0b1100_0000) == 0b1000_0000
+    }
+
+    /// Snap position to a valid UTF-8 character boundary
+    /// If already at a boundary, returns the same position.
+    /// Otherwise, moves to the previous valid boundary.
+    pub fn snap_to_char_boundary(&self, pos: usize) -> usize {
+        let len = self.len();
+        if pos == 0 || pos >= len {
+            return pos.min(len);
+        }
+
+        // Get the byte at pos to check if we're at a character boundary
+        let Some(bytes) = self.get_text_range(pos, 1) else {
+            // Data unloaded, return pos as fallback
+            return pos;
+        };
+
+        // A position is at a char boundary if the byte there is NOT a continuation byte
+        if !Self::is_utf8_continuation_byte(bytes[0]) {
+            // Already at a character boundary
+            return pos;
+        }
+
+        // Not at a boundary, find the previous one
+        self.prev_char_boundary(pos)
+    }
+
+    /// `pos`, or the first character boundary after it.
+    ///
+    /// For offsets that come from arithmetic rather than from the text — a
+    /// bounded search that gave up, a reach backwards, a byte the user typed
+    /// into "Go to Byte Offset" — and that are about to be read from, drawn at
+    /// or edited at. Anchoring any of those inside a character puts replacement
+    /// glyphs on screen and lets an insertion split the character in two.
+    ///
+    /// Loads the bytes it needs, unlike [`Self::snap_to_char_boundary`], which
+    /// gives up on data that is not resident — exactly the state of a large
+    /// file far from where it was last read. UTF-8 continuation bytes are
+    /// `0b10xxxxxx` and a character is at most four bytes, so at most three are
+    /// stepped over. A read that fails leaves `pos` alone: this is a repair,
+    /// not a place to invent an answer.
+    pub fn char_boundary_at_or_after(&mut self, pos: usize) -> usize {
+        let len = self.len();
+        if pos == 0 || pos >= len {
+            return pos.min(len);
+        }
+        let Ok(bytes) = self.get_text_range_mut(pos, 4.min(len - pos)) else {
+            return pos;
+        };
+        let step = bytes
+            .iter()
+            .position(|&b| !Self::is_utf8_continuation_byte(b))
+            .unwrap_or(bytes.len());
+        pos + step
+    }
+
+    /// Find the previous grapheme cluster boundary (for proper cursor movement with combining characters)
+    ///
+    /// This handles complex scripts like Thai where multiple Unicode code points
+    /// form a single visual character (grapheme cluster). For example, Thai "ที่"
+    /// is 3 code points but 1 grapheme cluster.
+    ///
+    /// The lookahead window starts at 32 bytes but grows whenever the
+    /// returned boundary sits at the start of the chunk — that is, whenever
+    /// the chunk might not contain the full grapheme. This matters for ZWJ
+    /// emoji sequences and Zalgo strings with many combining marks, which
+    /// can easily exceed 32 bytes.
+    pub fn prev_grapheme_boundary(&self, pos: usize) -> usize {
+        if pos == 0 {
+            return 0;
+        }
+
+        let mut lookback: usize = 32;
+        loop {
+            // IMPORTANT: Align start to a valid character boundary to avoid invalid UTF-8
+            // when get_text_range starts mid-character
+            let raw_start = pos.saturating_sub(lookback);
+            let start = if raw_start == 0 {
+                0
+            } else {
+                // Find the character boundary at or before raw_start
+                self.prev_char_boundary(raw_start + 1)
+            };
+
+            let Some(bytes) = self.get_text_range(start, pos - start) else {
+                // Data unloaded, fall back to char boundary
+                return self.prev_char_boundary(pos);
+            };
+
+            let text = match std::str::from_utf8(&bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    // Still got invalid UTF-8 (shouldn't happen after alignment)
+                    // Try using just the valid portion
+                    let valid_bytes = &bytes[..e.valid_up_to()];
+                    match std::str::from_utf8(valid_bytes) {
+                        Ok(s) if !s.is_empty() => s,
+                        _ => return self.prev_char_boundary(pos),
+                    }
+                }
+            };
+
+            // Use shared grapheme utility with relative position
+            let rel_pos = pos - start;
+            let new_rel_pos = grapheme::prev_grapheme_boundary(text, rel_pos);
+
+            // If the returned boundary is at the start of our chunk, the
+            // grapheme may extend further back. Only trust the answer when
+            // either we already reached the beginning of the buffer or the
+            // boundary sits strictly inside the chunk.
+            if new_rel_pos > 0 || start == 0 {
+                return start + new_rel_pos;
+            }
+
+            // Expand the lookback window and retry. Cap at the full buffer.
+            if lookback >= pos {
+                return 0;
+            }
+            lookback = lookback.saturating_mul(2);
+        }
+    }
+
+    /// Find the next grapheme cluster boundary (for proper cursor movement with combining characters)
+    ///
+    /// This handles complex scripts like Thai where multiple Unicode code points
+    /// form a single visual character (grapheme cluster). For example, Thai "ที่"
+    /// is 3 code points but 1 grapheme cluster.
+    ///
+    /// The lookahead window grows whenever the first grapheme reaches the
+    /// end of the chunk — otherwise ZWJ emoji and Zalgo strings whose byte
+    /// length exceeds the initial 32-byte window would be split mid-cluster.
+    pub fn next_grapheme_boundary(&self, pos: usize) -> usize {
+        let len = self.len();
+        if pos >= len {
+            return len;
+        }
+
+        let mut lookahead: usize = 32;
+        loop {
+            let end = (pos + lookahead).min(len);
+            let Some(bytes) = self.get_text_range(pos, end - pos) else {
+                // Data unloaded, fall back to char boundary
+                return self.next_char_boundary(pos);
+            };
+
+            // Convert to UTF-8 string, handling the case where we might have
+            // grabbed bytes that end mid-character (truncate to valid UTF-8)
+            let text = match std::str::from_utf8(&bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    // The bytes end in an incomplete UTF-8 sequence
+                    // Use only the valid portion (which includes at least the first grapheme)
+                    let valid_bytes = &bytes[..e.valid_up_to()];
+                    match std::str::from_utf8(valid_bytes) {
+                        Ok(s) if !s.is_empty() => s,
+                        _ => return self.next_char_boundary(pos),
+                    }
+                }
+            };
+
+            let new_rel_pos = grapheme::next_grapheme_boundary(text, 0);
+
+            // If the first grapheme reaches the end of our chunk and there
+            // is more buffer left beyond it, the grapheme may extend further.
+            // Expand the window and retry.
+            if new_rel_pos == text.len() && end < len {
+                if lookahead >= len - pos {
+                    return len;
+                }
+                lookahead = lookahead.saturating_mul(2);
+                continue;
+            }
+
+            return pos + new_rel_pos;
+        }
+    }
+
+    /// Fill in the piece tree's line-feed count for `view`, if it is unknown
+    /// and the piece's bytes are already in hand, and report what is known.
+    ///
+    /// The tree carries a count of `\n` per piece — that is what makes
+    /// `line_count` and line-number lookup possible — and leaves it `None`
+    /// for a piece nobody has read. The scans below read pieces as they walk,
+    /// so they are exactly the place to answer the question the tree is
+    /// missing: counting a resident piece costs one pass over bytes that were
+    /// loaded anyway, and every later frame that reaches this piece gets its
+    /// answer from metadata instead of walking it again. Knowledge recorded
+    /// this way also survives editing, because the tree already maintains
+    /// these counts across inserts and deletes.
+    ///
+    /// `None` means still unknown, and unknown is never treated as zero: a
+    /// piece that is not loaded, that reaches past its buffer, or that is too
+    /// large to sweep in one go is left alone for the bounded scan to handle.
+    fn index_piece_line_feeds(&mut self, view: &PieceView) -> Option<usize> {
+        if let Some(known) = view.line_feed_cnt {
+            return Some(known);
+        }
+        // A piece larger than a load chunk is a region nobody has faulted in
+        // yet; sweeping it would be the unbounded read this whole path exists
+        // to avoid.
+        if view.bytes == 0 || view.bytes > LOAD_CHUNK_SIZE {
+            return None;
+        }
+        let lo = view.buffer_offset;
+        let hi = lo.checked_add(view.bytes)?;
+        let count = {
+            let data = self
+                .buffers
+                .get(view.location.buffer_id())
+                .and_then(|b| b.get_data())?;
+            if hi > data.len() {
+                return None;
+            }
+            crate::counters::work::add_buffer_bytes_read(view.bytes as u64);
+            data[lo..hi].iter().filter(|&&b| b == b'\n').count()
+        };
+        self.piece_tree
+            .set_leaf_line_feeds_at(view.doc_offset, view.bytes, count);
+        Some(count)
+    }
+
+    /// Byte just past the next `\n` at or after `from`, searching at most `cap`
+    /// bytes — the start of the next line, without reading the line.
+    ///
+    /// `None` means no line break within `cap` bytes (or the buffer ends
+    /// first). The cap is not optional: on a file that is one enormous line an
+    /// unbounded search is a scan of the whole file, and the callers here —
+    /// scroll clamping, row counting, cursor visibility — run several times per
+    /// keystroke.
+    ///
+    /// Scans the piece tree's own storage rather than copying a range out of
+    /// it, so answering "where does this line end" costs the bytes it walks and
+    /// nothing else. A lazily-loaded chunk is loaded as the scan reaches it,
+    /// exactly as a read would, and no further. Pieces the tree already knows
+    /// to hold no line feed are stepped over without reading them at all, and
+    /// pieces it does not know about are counted on the way past — so on a file
+    /// that is one enormous line this search stops repeating itself.
+    pub fn next_line_start_within(&mut self, from: usize, cap: usize) -> Option<usize> {
+        let total = self.total_bytes();
+        if from >= total || cap == 0 {
+            return None;
+        }
+        let end = from.saturating_add(cap).min(total);
+        let mut pos = from;
+
+        while pos < end {
+            let mut advanced = false;
+            for view in self.piece_tree.iter_pieces_in_range(pos, end) {
+                let piece_start = view.doc_offset;
+                let piece_end = piece_start + view.bytes;
+
+                // Already answered by the tree: step over the piece without
+                // reading a byte of it, and without faulting it in.
+                if view.line_feed_cnt == Some(0) {
+                    if piece_end > pos {
+                        pos = piece_end;
+                        advanced = true;
+                    }
+                    continue;
+                }
+
+                let buffer_id = view.location.buffer_id();
+                let needs_loading = self
+                    .buffers
+                    .get(buffer_id)
+                    .map(|b| !b.is_loaded())
+                    .unwrap_or(false);
+                if needs_loading {
+                    // Splitting invalidates the piece list; restart the walk
+                    // from where it got to, as `get_text_range_mut` does.
+                    match self.chunk_split_and_load(&view, pos) {
+                        Ok(true) => {
+                            advanced = true;
+                            break;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::warn!("next_line_start_within: load failed: {e}");
+                            return None;
+                        }
+                    }
+                }
+
+                if self.index_piece_line_feeds(&view) == Some(0) {
+                    if piece_end > pos {
+                        pos = piece_end;
+                        advanced = true;
+                    }
+                    continue;
+                }
+
+                let scan_start = pos.max(piece_start);
+                let scan_end = end.min(piece_end);
+                if scan_end <= scan_start {
+                    continue;
+                }
+                let Some(data) = self.buffers.get(buffer_id).and_then(|b| b.get_data()) else {
+                    continue;
+                };
+                let lo = view.buffer_offset + (scan_start - piece_start);
+                let hi = view.buffer_offset + (scan_end - piece_start);
+                if hi > data.len() {
+                    continue;
+                }
+                crate::counters::work::add_buffer_bytes_read((hi - lo) as u64);
+                if let Some(i) = data[lo..hi].iter().position(|&b| b == b'\n') {
+                    return Some(scan_start + i + 1);
+                }
+                pos = scan_end;
+                advanced = true;
+            }
+            if !advanced {
+                break;
+            }
+        }
+
+        None
+    }
+
+    /// Start of the line containing `from`, searching back at most `cap` bytes.
+    ///
+    /// `None` means the line began more than `cap` bytes above — on the files
+    /// this exists for, that means "further up than anything you are about to
+    /// draw or measure". The forward twin is
+    /// [`next_line_start_within`](Self::next_line_start_within); like it, this
+    /// scans the piece tree's storage rather than copying a range out of it,
+    /// steps over pieces already known to hold no line feed, and records what
+    /// it learns about the ones it does read.
+    pub fn prev_line_start_within(&mut self, from: usize, cap: usize) -> Option<usize> {
+        let from = from.min(self.total_bytes());
+        if from == 0 {
+            return Some(0);
+        }
+        let floor = from.saturating_sub(cap);
+        let mut pos = from;
+
+        while pos > floor {
+            let mut advanced = false;
+            // Collected front-to-back, walked back-to-front: the line start is
+            // the *last* newline before `pos`.
+            let views: Vec<_> = self.piece_tree.iter_pieces_in_range(floor, pos).collect();
+            for view in views.into_iter().rev() {
+                let piece_start = view.doc_offset;
+
+                if view.line_feed_cnt == Some(0) {
+                    if piece_start < pos {
+                        pos = piece_start.max(floor);
+                        advanced = true;
+                    }
+                    continue;
+                }
+
+                let buffer_id = view.location.buffer_id();
+                let needs_loading = self
+                    .buffers
+                    .get(buffer_id)
+                    .map(|b| !b.is_loaded())
+                    .unwrap_or(false);
+                if needs_loading {
+                    match self.chunk_split_and_load(&view, view.doc_offset.max(floor)) {
+                        Ok(true) => {
+                            advanced = true;
+                            break;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::warn!("prev_line_start_within: load failed: {e}");
+                            return None;
+                        }
+                    }
+                }
+
+                if self.index_piece_line_feeds(&view) == Some(0) {
+                    if piece_start < pos {
+                        pos = piece_start.max(floor);
+                        advanced = true;
+                    }
+                    continue;
+                }
+
+                let scan_start = floor.max(piece_start);
+                let scan_end = pos.min(piece_start + view.bytes);
+                if scan_end <= scan_start {
+                    continue;
+                }
+                let Some(data) = self.buffers.get(buffer_id).and_then(|b| b.get_data()) else {
+                    continue;
+                };
+                let lo = view.buffer_offset + (scan_start - piece_start);
+                let hi = view.buffer_offset + (scan_end - piece_start);
+                if hi > data.len() {
+                    continue;
+                }
+                crate::counters::work::add_buffer_bytes_read((hi - lo) as u64);
+                if let Some(i) = data[lo..hi].iter().rposition(|&b| b == b'\n') {
+                    return Some(scan_start + i + 1);
+                }
+                pos = scan_start;
+                advanced = true;
+            }
+            if !advanced {
+                break;
+            }
+        }
+
+        (floor == 0).then_some(0)
+    }
+
+    /// Whether the piece tree already knows `range` holds no `\n`.
+    ///
+    /// Answered from the per-piece line-feed counts the tree maintains, so it
+    /// reads no buffer data and faults in no lazily-loaded chunk; a piece
+    /// whose count is unknown makes the answer `false` rather than a guess.
+    /// The counts are filled in by whatever walked the region first — see
+    /// [`next_line_start_within`](Self::next_line_start_within) — which is why
+    /// this is worth asking at all on a file that is one enormous line.
+    ///
+    /// Public so the probes that only have `&Buffer` — the fold and
+    /// indentation-guide line scans — can skip a region the render path has
+    /// already been through.
+    pub fn known_newline_free(&self, range: Range<usize>) -> bool {
+        range.start < range.end && self.piece_tree.range_line_feed_free(range.start, range.end)
+    }
+
+    /// Walk `lines` line starts forward from `from`, spending at most
+    /// `total_cap` bytes of scanning, and report the byte reached.
+    ///
+    /// The question "where does the window starting here end" — asked by
+    /// cursor-visibility clamping and by anything that highlights the visible
+    /// region — answered without materialising a single line. A walk that runs
+    /// out of budget or line breaks returns as far as it looked, which is the
+    /// honest answer for a file whose next line break is megabytes away: the
+    /// window extends at least that far.
+    pub fn advance_lines_within(&mut self, from: usize, lines: usize, total_cap: usize) -> usize {
+        let total = self.total_bytes();
+        let mut pos = from.min(total);
+        let mut budget = total_cap;
+        for _ in 0..lines {
+            if budget == 0 {
+                break;
+            }
+            match self.next_line_start_within(pos, budget) {
+                Some(next) => {
+                    budget = budget.saturating_sub(next - pos);
+                    pos = next;
+                }
+                None => return pos.saturating_add(budget).min(total),
+            }
+        }
+        pos
+    }
+
+    /// Create a line iterator starting at the given byte position
+    ///
+    /// This iterator lazily loads chunks as needed, never scanning the entire file.
+    /// For large files with unloaded buffers, chunks are loaded on-demand (1MB at a time).
+    pub fn line_iterator(
+        &mut self,
+        byte_pos: usize,
+        estimated_line_length: usize,
+    ) -> LineIterator<'_> {
+        LineIterator::new(self, byte_pos, estimated_line_length)
+    }
+
+    /// Iterate forward from exactly `byte_pos`, with no backward scan.
+    ///
+    /// See [`LineIterator::from_mid_line`]: the caller must have obtained
+    /// `byte_pos` from the wrap index, so it is known to be a visual-row start.
+    pub fn line_iterator_from_mid_line(
+        &mut self,
+        byte_pos: usize,
+        estimated_line_length: usize,
+    ) -> LineIterator<'_> {
+        LineIterator::from_mid_line(self, byte_pos, estimated_line_length)
+    }
+
+    // Legacy API methods for backwards compatibility
+
+    /// Get the line number for a given byte offset
+    ///
+    /// Returns exact line number if metadata available, otherwise estimates based on bytes.
+    ///
+    /// # Behavior by File Size:
+    /// - **Small files (< 1MB)**: Returns exact line number from piece tree's `line_starts` metadata
+    /// - **Large files (≥ 1MB)**: Returns estimated line number using `byte_offset / estimated_line_length`
+    ///
+    /// Large files don't maintain line metadata for performance reasons. The estimation
+    /// uses the configured `estimated_line_length` (default 80 bytes).
+    pub fn get_line_number(&self, byte_offset: usize) -> usize {
+        self.offset_to_position(byte_offset)
+            .map(|pos| pos.line)
+            .unwrap_or_else(|| {
+                // Estimate line number based on configured average line length
+                byte_offset / self.config.estimated_line_length
+            })
+    }
+
+    /// Get the configured estimated line length for approximate line number calculations.
+    pub fn estimated_line_length(&self) -> usize {
+        self.config.estimated_line_length
+    }
+
+    /// Get the starting line number at a byte offset (used for viewport rendering)
+    ///
+    /// # Line Cache Architecture (Post-Refactoring):
+    ///
+    /// The concept of a separate "line cache" is **now obsolete**. After the refactoring,
+    /// line tracking is integrated directly into the piece tree via:
+    /// ```rust
+    /// BufferData::Loaded {
+    ///     data: Arc<Vec<u8>>,
+    ///     line_starts: Option<Arc<Vec<usize>>>  // None = large file mode (no line metadata)
+    /// }
+    /// ```
+    ///
+    /// ## Why This Method Still Exists:
+    /// The rendering code needs to know what line number to display in the margin at the
+    /// top of the viewport. This method returns that line number, handling both small
+    /// and large file modes transparently.
+    ///
+    /// ## Small vs Large File Modes:
+    /// - **Small files**: `line_starts = Some(vec)` → returns exact line number from metadata
+    /// - **Large files**: `line_starts = None` → returns estimated line number (byte_offset / estimated_line_length)
+    ///
+    /// ## Bug Fix (2025-11):
+    /// Previously this method always returned `0`, causing line numbers in the margin
+    /// to always show 1, 2, 3... regardless of scroll position. Now it correctly returns
+    /// the actual line number at `start_byte`.
+    pub fn populate_line_cache(&mut self, start_byte: usize, _line_count: usize) -> usize {
+        // No-op for cache population: LineIndex maintains all line starts automatically
+        // But we need to return the actual line number at start_byte for rendering
+        self.get_line_number(start_byte)
+    }
+
+    // Test helper methods
+
+    /// Test-only access to persistence internals (diff-memo assertions).
+    #[cfg(test)]
+    pub(crate) fn persistence_for_test(&self) -> &Persistence {
+        &self.persistence
+    }
+
+    /// Create a buffer from a string for testing.
+    ///
+    /// Not `#[cfg(test)]`: most of its callers are tests in `fresh-editor`,
+    /// which is a different crate and so never sees this crate's `test` cfg.
+    #[doc(hidden)]
+    pub fn from_str_test(s: &str) -> Self {
+        Self::from_bytes(
+            s.as_bytes().to_vec(),
+            std::sync::Arc::new(crate::model::filesystem::StdFileSystem),
+        )
+    }
+}
+
+/// Type alias for backwards compatibility
+pub type Buffer = TextBuffer;
+
+// Re-export LineIterator from the line_iterator module
+pub use crate::primitives::line_iterator::LineIterator;
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod property_tests;

@@ -43,7 +43,8 @@ The goals, in full:
 Explicit non-goals include a reactive dependency graph (no signals or
 observers — state flows down through constructor arguments, events flow up
 through callbacks), cell-level damage tracking, an animation system, mutable
-descriptions, and sub-cell precision. The full list is in the design doc.
+descriptions, and sub-cell precision. The full list is §1.3 of
+`docs/internal/retained-mode-ui.md`.
 
 ## The model — three trees
 
@@ -70,6 +71,13 @@ render tree (constraints down, sizes up, parents place children), and fold the
 result into a display list. Input runs the other way: hit-test the render tree,
 then capture → target → bubble along the resulting path.
 
+**Layout may over-constrain; paint and hit need not follow it out.** A child is
+normally clamped to the space its parent has left, but a floor it cannot
+satisfy — `min_w` / `min_h` — is a promise layout keeps even when keeping it
+places a sibling outside the parent. A node that says `clip(true)` bounds what
+its descendants may paint *and* hit to its content rect; `border()` implies it,
+because a frame its own content can paint over is not a frame.
+
 ## Subsystems
 
 | Area | What it does | Source |
@@ -80,7 +88,7 @@ then capture → target → bubble along the resulting path.
 | Layout | box constraints in integer cells, relayout boundaries, the constraint cache, incremental relink/arrange | [`src/render/layout.rs`](src/render/layout.rs), [`src/render/geom.rs`](src/render/geom.rs) |
 | Render objects | the `RenderObject` trait and the primitives' implementations | [`src/render/object.rs`](src/render/object.rs), [`src/render/prim.rs`](src/render/prim.rs) |
 | Display list | the flat, ordered, absolute, keyed `LayoutSpec` seam, and the paint walk | [`src/render/spec.rs`](src/render/spec.rs), [`src/render/paint.rs`](src/render/paint.rs) |
-| Pointer | hit-testing, capture/target/bubble, stacked paths, pointer capture, scroll chaining | [`src/hit.rs`](src/hit.rs) |
+| Pointer | hit-testing, capture/target/bubble, stacked paths, pointer capture, drag and drop, scroll chaining | [`src/hit.rs`](src/hit.rs) |
 | Focus | a separate focus tree, reading-order and directional traversal, the Shortcuts → Intents → Actions chain | [`src/focus/`](src/focus/) |
 | Events | `Input`, `Event`, `GestureKind`, `Flow`, keys and modifiers | [`src/event.rs`](src/event.rs) |
 | Behaviors | `Tasks`, `Ticker`, `Cache`, `Controller`, `Anchor`, `Persisted`, `Focusable` | [`src/behavior/`](src/behavior/) |
@@ -133,9 +141,8 @@ test binaries and the examples.
 
 ## Further reading
 
-- [`docs/internal/widget-library-design.md`](../../docs/internal/widget-library-design.md)
-  — the design specification: goals, the three trees, layout, focus, layers,
-  events, state and effects, and worked examples. The authority on architecture.
-- [`docs/internal/widget-library-implementation-plan.md`](../../docs/internal/widget-library-implementation-plan.md)
-  — the build plan, the deviation registers recording where the code diverged
-  from the design and how each divergence was closed, and the migration plan.
+- [`docs/internal/retained-mode-ui.md`](../../docs/internal/retained-mode-ui.md)
+  — the design authority for this library and the editor built on it: the
+  model as built (§1.1), the capabilities it still owes and the consumer each
+  one has (§1.2), what it does not do by decision (§1.3), and the road the
+  editor takes to using nothing else (§5).

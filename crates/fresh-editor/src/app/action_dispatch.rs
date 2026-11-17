@@ -9,9 +9,10 @@
 //! separate from *doing what the action says*.
 
 use super::*;
+use crate::view::confirm::{Choice, Confirm, Tone};
 use anyhow::Result as AnyhowResult;
 use crossterm::event::KeyModifiers as KM;
-use rust_i18n::t;
+use fresh_i18n::t;
 
 impl Editor {
     /// Change the current workspace's trust level, persist it, and report it.
@@ -72,13 +73,19 @@ impl Editor {
     /// Handle an action (for normal mode and command execution).
     /// Used by the app module internally and by the GUI module for native menu dispatch.
     pub(crate) fn handle_action(&mut self, action: Action) -> AnyhowResult<()> {
+        self.mark_plugin_snapshot_dirty();
         use crate::input::keybindings::Action;
 
         // Actions are the funnel for command-driven UI mutation (palette,
-        // menus, plugin commands, macros) — any of them can change what the
-        // overlay stack / chrome tree would derive, so spoil the
-        // per-generation UI memos.
-        self.bump_ui_gen();
+
+        // **An action is a write the description reads.** Most reach here
+        // through a key or a press, which mark the tree stale themselves
+        // when they finish; the ones that do not — a plugin command, a test
+        // driving the editor by actions, an async completion — change what
+        // the tree says (a prompt opens, a popup closes, focus moves) with
+        // no frame in between. The next input, and the next `get_key_context`,
+        // lay the tree out from the facts first (`shell_description_stale`).
+        self.shell_description_stale = true;
 
         // Record action to macro if recording
         self.record_macro_action(&action);
@@ -99,11 +106,21 @@ impl Editor {
             let buffer_id = self.active_buffer();
             if let Some(line) = self.cursor_line_in_active_buffer() {
                 if let Some(target) = self.line_target_at(buffer_id, line) {
-                    let source = self.active_split_id();
+                    let source = self.active_window().split_manager().active_split();
                     self.follow_line_target(target, source);
                     return Ok(());
                 }
             }
+        }
+
+        // **A page's window is not a buffer's viewport.** Scrolling a pane
+        // that shows a described page has to move the tree's own window;
+        // `Event::Scroll` would move the mirror's, which nothing draws. Every
+        // other action goes on to mean what it always meant — this is the one
+        // place a page reinterprets the editor's vocabulary, and it
+        // reinterprets two entries of it.
+        if self.page_takes_action(&action) {
+            return Ok(());
         }
 
         match action {
@@ -144,10 +161,27 @@ impl Editor {
                     self.init_file_open_state();
                 } else if self.check_save_conflict().is_some() {
                     // Check if file was modified externally since we opened/saved it
-                    self.start_prompt(
-                        t!("file.file_changed_prompt").to_string(),
-                        PromptType::ConfirmSaveConflict,
+                    let body = t!("file.file_changed_prompt").to_string();
+                    let confirm = Confirm::new(
+                        t!("dialog.title.file_changed").into_owned(),
+                        body.clone(),
+                        vec![
+                            Choice::new(
+                                t!("dialog.btn.overwrite").into_owned(),
+                                "o",
+                                Tone::Destructive,
+                            ),
+                            crate::app::confirm_dialog::cancel(),
+                        ],
+                    )
+                    .detail(
+                        self.active_state()
+                            .buffer
+                            .file_path()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default(),
                     );
+                    self.start_confirm_prompt(body, PromptType::ConfirmSaveConflict, confirm);
                 } else if let Err(e) = self.save() {
                     let msg = format!("{}", e);
                     self.active_window_mut().status_message =
@@ -177,20 +211,7 @@ impl Editor {
             }
             Action::SaveAll => {
                 let msg = match self.save_all() {
-                    Ok((saved, failed)) => {
-                        if failed > 0 {
-                            t!(
-                                "status.save_all_partial",
-                                saved = saved.to_string(),
-                                failed = failed.to_string()
-                            )
-                            .to_string()
-                        } else if saved == 0 {
-                            t!("status.save_all_none").to_string()
-                        } else {
-                            t!("status.save_all", count = saved.to_string()).to_string()
-                        }
-                    }
+                    Ok(outcome) => Self::save_all_message(&outcome),
                     Err(e) => t!("file.save_failed", error = &format!("{}", e)).to_string(),
                 };
                 self.active_window_mut().status_message = Some(msg);
@@ -200,6 +221,7 @@ impl Editor {
                 self.prefill_open_file_prompt();
                 self.init_file_open_state();
             }
+            Action::RecentFiles => self.start_recent_files_prompt(),
             Action::SwitchProject => {
                 self.start_prompt(
                     t!("file.switch_project_prompt").to_string(),
@@ -215,10 +237,7 @@ impl Editor {
                         PromptType::GotoLine,
                     );
                 } else {
-                    self.start_prompt(
-                        t!("goto.scan_confirm_prompt", yes = "y", no = "N").to_string(),
-                        PromptType::GotoLineScanConfirm,
-                    );
+                    self.start_goto_line_scan_confirm();
                 }
             }
             Action::ScanLineIndex => {
@@ -237,17 +256,29 @@ impl Editor {
             Action::Revert => {
                 // Check if buffer has unsaved changes - prompt for confirmation
                 if self.active_state().buffer.is_modified() {
-                    let revert_key = t!("prompt.key.revert").to_string();
-                    let cancel_key = t!("prompt.key.cancel").to_string();
-                    self.start_prompt(
-                        t!(
-                            "prompt.revert_confirm",
-                            revert_key = revert_key,
-                            cancel_key = cancel_key
-                        )
-                        .to_string(),
-                        PromptType::ConfirmRevert,
-                    );
+                    let body = t!("prompt.revert_confirm").to_string();
+                    let confirm = Confirm::new(
+                        t!("dialog.title.revert").into_owned(),
+                        body.clone(),
+                        vec![
+                            Choice::new(
+                                t!("dialog.btn.revert").into_owned(),
+                                t!("prompt.key.revert").into_owned(),
+                                Tone::Destructive,
+                            ),
+                            crate::app::confirm_dialog::cancel(),
+                        ],
+                    )
+                    .detail(
+                        self.active_state()
+                            .buffer
+                            .file_path()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default(),
+                    )
+                    // A destructive lead opens on the retreat.
+                    .selecting(1);
+                    self.start_confirm_prompt(body, PromptType::ConfirmRevert, confirm);
                 } else {
                     // No local changes, just revert
                     if let Err(e) = self.revert_file() {
@@ -259,6 +290,9 @@ impl Editor {
             }
             Action::ToggleAutoRevert => {
                 self.toggle_auto_revert();
+            }
+            Action::ReviewInterruptedSaves => {
+                self.review_interrupted_saves();
             }
             Action::OpenUpdateLog => {
                 self.show_self_update_output();
@@ -398,7 +432,7 @@ impl Editor {
                             .splits()
                             .and_then(|(_, vs)| vs.get(&split))
                             .is_some_and(|vs| {
-                                vs.cursors.iter().any(|(_, c)| {
+                                vs.buffer_tab_state().cursors.iter().any(|(_, c)| {
                                     c.selection_range().is_some() || c.has_block_selection()
                                 })
                             })
@@ -545,20 +579,11 @@ impl Editor {
             Action::ToggleUtilityDock => {
                 use crate::view::split::SplitRole;
                 if let Some(dock_leaf) = self
-                    .windows
-                    .get(&self.active_window)
-                    .and_then(|w| w.buffers.splits())
-                    .map(|(mgr, _)| mgr)
-                    .expect("active window must have a populated split layout")
+                    .active_window()
+                    .split_manager()
                     .find_leaf_by_role(SplitRole::UtilityDock)
                 {
-                    let active = self
-                        .windows
-                        .get(&self.active_window)
-                        .and_then(|w| w.buffers.splits())
-                        .map(|(mgr, _)| mgr)
-                        .expect("active window must have a populated split layout")
-                        .active_split();
+                    let active = self.active_window().split_manager().active_split();
                     if active == dock_leaf {
                         // Already focused — no editor-leaf history yet,
                         // so just cycle to the next leaf via the
@@ -566,10 +591,8 @@ impl Editor {
                         // proper "previous editor split" pointer.
                         self.next_split();
                     } else {
-                        self.windows
-                            .get_mut(&self.active_window)
-                            .and_then(|w| w.split_manager_mut())
-                            .expect("active window must have a populated split layout")
+                        self.active_window_mut()
+                            .split_manager_mut()
                             .set_active_split(dock_leaf);
                     }
                 } else {
@@ -616,56 +639,22 @@ impl Editor {
                 // message. See `Editor::config_mut` for the broader rule.
                 self.sync_windows_config();
 
-                // Update all viewports to reflect the new line wrap setting,
-                // respecting per-language overrides
-                let active_split = self
+                // Only this view's pin is dropped: the user asked for a global
+                // default on the view in front of them, which is no reason to
+                // un-pin work they did elsewhere. `effective_active_split` is a
+                // shown group's focused panel, not the pane showing it.
+                let active_split = self.effective_active_split();
+                if let Some(view_state) = self
                     .windows
-                    .get(&self.active_window)
-                    .and_then(|w| w.buffers.splits())
-                    .map(|(mgr, _)| mgr)
-                    .expect("active window must have a populated split layout")
-                    .active_split();
-                let leaf_ids: Vec<_> = self
-                    .windows
-                    .get(&self.active_window)
-                    .and_then(|w| w.buffers.splits())
-                    .map(|(_, vs)| vs)
-                    .expect("active window must have a populated split layout")
-                    .keys()
-                    .copied()
-                    .collect();
-                for leaf_id in leaf_ids {
-                    let buffer_id = self
-                        .split_manager_mut()
-                        .get_buffer_id(leaf_id.into())
-                        .unwrap_or(BufferId(0));
-                    let effective_wrap =
-                        self.active_window().resolve_line_wrap_for_buffer(buffer_id);
-                    let wrap_column = self
-                        .active_window()
-                        .resolve_wrap_column_for_buffer(buffer_id);
-                    if let Some(view_state) = self
-                        .windows
-                        .get_mut(&self.active_window)
-                        .and_then(|w| w.split_view_states_mut())
-                        .expect("active window must have a populated split layout")
-                        .get_mut(&leaf_id)
-                    {
-                        // The active split's own pin is dropped — the user is
-                        // expressing a global intent on the view in front of
-                        // them. Every other pinned split keeps its choice: a
-                        // global default must not silently un-pin work the
-                        // user did elsewhere (same rule as the highlight
-                        // toggles below).
-                        if leaf_id == active_split {
-                            view_state.line_wrap_override = None;
-                        }
-                        if view_state.line_wrap_override.is_none() {
-                            view_state.viewport.line_wrap_enabled = effective_wrap;
-                            view_state.viewport.wrap_indent = self.config.editor.wrap_indent;
-                            view_state.viewport.wrap_column = wrap_column;
-                        }
-                    }
+                    .get_mut(&self.active_window)
+                    .and_then(|w| w.buffers.split_view_states_mut())
+                    .and_then(|states| states.get_mut(&active_split))
+                {
+                    view_state.buffer_tab_state_mut().line_wrap_override = None;
+                }
+
+                for window in self.windows.values_mut() {
+                    window.resync_global_display_defaults();
                 }
 
                 // `editor.line_wrap` is an editor-wide default, so an
@@ -684,45 +673,26 @@ impl Editor {
             Action::ToggleCurrentLineHighlight => {
                 let new_value = !self.config.editor.highlight_current_line;
                 self.config_mut().editor.highlight_current_line = new_value;
-                let active_split = self
-                    .windows
-                    .get(&self.active_window)
-                    .and_then(|w| w.buffers.splits())
-                    .map(|(mgr, _)| mgr)
-                    .expect("active window must have a populated split layout")
-                    .active_split();
+                // The sweep below resolves against `Window::config()`, a separate
+                // `Arc<Config>` clone, so fan the new value out first or it
+                // writes the pre-toggle state straight back.
+                self.sync_windows_config();
 
-                // Update all splits
-                let leaf_ids: Vec<_> = self
+                // Only this view's pin is dropped, as in `ToggleLineWrap` above.
+                let active_split = self.effective_active_split();
+                if let Some(view_state) = self
                     .windows
-                    .get(&self.active_window)
-                    .and_then(|w| w.buffers.splits())
-                    .map(|(_, vs)| vs)
-                    .expect("active window must have a populated split layout")
-                    .keys()
-                    .copied()
-                    .collect();
-                for leaf_id in leaf_ids {
-                    if let Some(view_state) = self
-                        .windows
-                        .get_mut(&self.active_window)
-                        .and_then(|w| w.split_view_states_mut())
-                        .expect("active window must have a populated split layout")
-                        .get_mut(&leaf_id)
-                    {
-                        // The active split's own pin is dropped just below —
-                        // the user is expressing a global intent on the view in
-                        // front of them. Every other pinned buffer keeps its
-                        // choice; a global default must not silently un-pin
-                        // work the user did elsewhere.
-                        if leaf_id == active_split {
-                            view_state.highlight_current_line_override = None;
-                        }
-                        if view_state.highlight_current_line_override.is_none() {
-                            view_state.highlight_current_line =
-                                self.config.editor.highlight_current_line;
-                        }
-                    }
+                    .get_mut(&self.active_window)
+                    .and_then(|w| w.buffers.split_view_states_mut())
+                    .and_then(|states| states.get_mut(&active_split))
+                {
+                    view_state
+                        .buffer_tab_state_mut()
+                        .highlight_current_line_override = None;
+                }
+
+                for window in self.windows.values_mut() {
+                    window.resync_global_display_defaults();
                 }
 
                 self.persist_config_change(
@@ -810,21 +780,11 @@ impl Editor {
                 self.active_window_mut().handle_toggle_page_view();
             }
             Action::SetPageWidth => {
-                let active_split = self
-                    .windows
-                    .get(&self.active_window)
-                    .and_then(|w| w.buffers.splits())
-                    .map(|(mgr, _)| mgr)
-                    .expect("active window must have a populated split layout")
-                    .active_split();
                 let current = self
-                    .windows
-                    .get(&self.active_window)
-                    .and_then(|w| w.buffers.splits())
-                    .map(|(_, vs)| vs)
-                    .expect("active window must have a populated split layout")
-                    .get(&active_split)
-                    .and_then(|v| v.compose_width.map(|w| w.to_string()))
+                    .active_window()
+                    .focused_view()
+                    .compose_width
+                    .map(|w| w.to_string())
                     .unwrap_or_default();
                 self.start_prompt_with_initial_text(
                     "Page width (empty = viewport): ".to_string(),
@@ -902,6 +862,9 @@ impl Editor {
             Action::DumpConfig => {
                 self.dump_config();
             }
+            Action::DumpUiTree => {
+                self.dump_ui_tree();
+            }
             Action::RedrawScreen => {
                 self.request_full_redraw();
             }
@@ -946,10 +909,11 @@ impl Editor {
                     return Ok(());
                 }
                 // Use same flow as query-replace, just with confirm_each defaulting to false
+                let in_selection = self.selection_spans_lines();
                 self.start_search_prompt(
                     t!("file.replace_prompt").to_string(),
                     PromptType::ReplaceSearch,
-                    false,
+                    in_selection,
                 );
             }
             Action::QueryReplace => {
@@ -958,10 +922,11 @@ impl Editor {
                 }
                 // Enable confirm mode by default for query-replace
                 self.active_window_mut().search_confirm_each = true;
+                let in_selection = self.selection_spans_lines();
                 self.start_search_prompt(
                     "Query replace: ".to_string(),
                     PromptType::QueryReplaceSearch,
-                    false,
+                    in_selection,
                 );
             }
             Action::FindInSelection => {
@@ -997,42 +962,20 @@ impl Editor {
 
             // Tab scrolling (manual scroll - don't auto-adjust)
             Action::ScrollTabsLeft => {
-                let active_split_id = self
-                    .windows
-                    .get(&self.active_window)
-                    .and_then(|w| w.buffers.splits())
-                    .map(|(mgr, _)| mgr)
-                    .expect("active window must have a populated split layout")
-                    .active_split();
-                if let Some(view_state) = self
-                    .windows
-                    .get_mut(&self.active_window)
-                    .and_then(|w| w.split_view_states_mut())
-                    .expect("active window must have a populated split layout")
-                    .get_mut(&active_split_id)
-                {
-                    view_state.tab_scroll_offset = view_state.tab_scroll_offset.saturating_sub(5);
-                    self.set_status_message(t!("status.scrolled_tabs_left").to_string());
-                }
+                let active_split_id = self.active_window().split_manager().active_split();
+                // A message to the pane's strip, which is a window and
+                // clamps itself. The editor kept the offset and this arm
+                // added five to it.
+                self.pan_pane_tab_strip(active_split_id, -1);
+                self.set_status_message(t!("status.scrolled_tabs_left").to_string());
             }
             Action::ScrollTabsRight => {
-                let active_split_id = self
-                    .windows
-                    .get(&self.active_window)
-                    .and_then(|w| w.buffers.splits())
-                    .map(|(mgr, _)| mgr)
-                    .expect("active window must have a populated split layout")
-                    .active_split();
-                if let Some(view_state) = self
-                    .windows
-                    .get_mut(&self.active_window)
-                    .and_then(|w| w.split_view_states_mut())
-                    .expect("active window must have a populated split layout")
-                    .get_mut(&active_split_id)
-                {
-                    view_state.tab_scroll_offset = view_state.tab_scroll_offset.saturating_add(5);
-                    self.set_status_message(t!("status.scrolled_tabs_right").to_string());
-                }
+                let active_split_id = self.active_window().split_manager().active_split();
+                // A message to the pane's strip, which is a window and
+                // clamps itself. The editor kept the offset and this arm
+                // added five to it.
+                self.pan_pane_tab_strip(active_split_id, 1);
+                self.set_status_message(t!("status.scrolled_tabs_right").to_string());
             }
             Action::NavigateBack => self.navigate_back(),
             Action::NavigateForward => self.navigate_forward(),
@@ -1197,6 +1140,8 @@ impl Editor {
             Action::ResetBufferSettings => self.reset_buffer_settings(),
             Action::FocusFileExplorer => self.focus_file_explorer(),
             Action::FocusEditor => self.active_window_mut().focus_editor(),
+            Action::FocusNextSidebarSection => self.focus_next_sidebar_section(),
+            Action::FocusPrevSidebarSection => self.focus_prev_sidebar_section(),
             Action::ToggleDockFocus => {
                 // Bounce keyboard focus between the editor/explorer area and
                 // the orchestrator dock. `dock` is `Some` whenever the dock is
@@ -1266,13 +1211,7 @@ impl Editor {
                     self.apply_event_to_active_buffer(&batch);
 
                     // Ensure the primary cursor is visible after removing secondary cursors
-                    let active_split = self
-                        .windows
-                        .get(&self.active_window)
-                        .and_then(|w| w.buffers.splits())
-                        .map(|(mgr, _)| mgr)
-                        .expect("active window must have a populated split layout")
-                        .active_split();
+                    let active_split = self.effective_active_split();
                     let active_buffer = self.active_buffer();
                     self.active_window_mut()
                         .ensure_cursor_visible_for_split(active_buffer, active_split);
@@ -1332,7 +1271,20 @@ impl Editor {
                         return Ok(());
                     }
                 }
-                self.smart_home();
+                self.smart_home(false);
+            }
+            Action::SelectSmartHome => {
+                // Composite (diff) views have no smart variant of the plain
+                // selection either; they select to the line start.
+                let buffer_id = self.active_buffer();
+                if self.active_window().is_composite_buffer(buffer_id) {
+                    if let Some(_handled) =
+                        self.handle_composite_action(buffer_id, &Action::SelectSmartHome)
+                    {
+                        return Ok(());
+                    }
+                }
+                self.smart_home(true);
             }
             Action::ToggleComment => {
                 self.toggle_comment();
@@ -1489,9 +1441,8 @@ impl Editor {
                     if events.len() > 1 {
                         // Multi-cursor: use optimized bulk edit (O(n) instead of O(n²))
                         let description = "Delete backward".to_string();
-                        if let Some(bulk_edit) = self.apply_events_as_bulk_edit(events, description)
-                        {
-                            self.active_event_log_mut().append(bulk_edit);
+                        if let Some(applied) = self.apply_events_as_bulk_edit(events, description) {
+                            self.active_event_log_mut().append(applied);
                         }
                     } else {
                         for event in events {
@@ -1507,14 +1458,30 @@ impl Editor {
                 // Use non-blocking version to avoid deadlock with async plugin ops
                 #[cfg(feature = "plugins")]
                 {
+                    // A mode binding's handler reads which control has focus
+                    // (`getPanelFocusKey`); it must read the host's answer as
+                    // of this key, not the last full snapshot's.
+                    self.publish_panel_focus();
+                    // Likewise the rest of its state: a key handled earlier in
+                    // the same input batch (adding a cursor, moving the
+                    // selection) must be visible to `getAllCursors()` and the
+                    // like, or the handler acts on the frame before (#3666).
+                    // A no-op when nothing changed since the last rebuild.
+                    self.refresh_plugin_state_snapshot();
+                    // A macro replay step runs as an answerable call, so the
+                    // replay learns when the handler has settled.
+                    let request_id = self.macro_replay.as_ref().and_then(|r| r.dispatch_request);
                     let result = self.plugin_manager.read().unwrap().execute_action_async(
                         &action_name,
                         None,
-                        None,
+                        request_id,
                     );
                     if let Some(result) = result {
                         match result {
                             Ok(receiver) => {
+                                if let Some(replay) = self.macro_replay.as_mut() {
+                                    replay.dispatch_request = None;
+                                }
                                 // Store pending action for processing in main loop
                                 self.pending_plugin_actions
                                     .push((action_name.clone(), receiver));
@@ -1542,7 +1509,9 @@ impl Editor {
             }
             Action::LoadPluginFromBuffer => {
                 #[cfg(feature = "plugins")]
-                {
+                if let Some(path) = self.saved_plugin_file() {
+                    self.reload_plugin_file(&path);
+                } else {
                     let buffer_id = self.active_buffer();
                     let state = self.active_state();
                     let buffer = &state.buffer;
@@ -1711,11 +1680,28 @@ impl Editor {
                 }
             }
             Action::TerminalPaste => {
-                // Paste clipboard contents into terminal as a single batch
+                // Paste clipboard contents into terminal as a single batch.
+                // Same normalization and bracketing as the terminal route in
+                // `paste_text`: CRLF/CR → LF, then wrapped in the paste
+                // markers when the child asked for DECSET 2004.
                 if self.active_window().focused_terminal_live() {
-                    if let Some(text) = self.clipboard.paste() {
-                        self.active_window_mut()
-                            .send_terminal_input(text.as_bytes());
+                    let pass_key = self.config.terminal.pass_ctrl_v_without_text;
+                    match self
+                        .clipboard
+                        .paste_for_terminal(self.system_clipboard_probe, pass_key)
+                    {
+                        Some(text) => {
+                            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+                            self.active_window_mut().send_terminal_paste(&normalized);
+                        }
+                        // No text to paste: the key is the program's. An
+                        // agent CLI reads an image from the clipboard itself
+                        // when it gets Ctrl+V (#3129).
+                        None if pass_key => self.active_window_mut().send_terminal_key(
+                            crossterm::event::KeyCode::Char('v'),
+                            crossterm::event::KeyModifiers::CONTROL,
+                        ),
+                        None => {}
                     }
                 }
             }
@@ -1764,9 +1750,18 @@ impl Editor {
                     state.set_current_to_null();
                 }
             }
+            // The next *panel* — coarser than the ring's Tab, which steps
+            // control to control; a bound key for jumping between the tree,
+            // the body and the footer.
             Action::SettingsToggleFocus => {
+                use crate::view::settings::state::{FocusPanel, FocusTarget};
                 if let Some(ref mut state) = self.settings_state {
-                    state.toggle_focus();
+                    let next = match state.focus_panel() {
+                        FocusPanel::Categories => FocusTarget::Card(state.selected_item),
+                        FocusPanel::Settings => FocusTarget::Footer(0),
+                        FocusPanel::Footer => FocusTarget::Categories,
+                    };
+                    state.focus_on(next);
                 }
             }
             Action::SettingsActivate => {
@@ -1812,6 +1807,15 @@ impl Editor {
                         }
                         PromptResult::Done => {}
                     }
+                }
+            }
+            Action::PluginNextKey(ref chord) => {
+                // For macro playback: the key a plugin's `getNextKey` took.
+                if !self.deliver_next_key(crate::input::router::next_key_payload(chord)) {
+                    tracing::debug!(
+                        "plugin_next_key '{}': no plugin was waiting for a key",
+                        chord
+                    );
                 }
             }
             Action::PromptConfirmWithText(ref text) => {
@@ -2027,18 +2031,13 @@ impl Editor {
         use crate::view::split::SplitRole;
 
         if let Some(dock_leaf) = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
+            .active_window()
+            .split_manager()
             .find_leaf_by_role(SplitRole::UtilityDock)
         {
             // Existing dock — focus it and let the regular open_terminal path attach a new tab.
-            self.windows
-                .get_mut(&self.active_window)
-                .and_then(|w| w.split_manager_mut())
-                .expect("active window must have a populated split layout")
+            self.active_window_mut()
+                .split_manager_mut()
                 .set_active_split(dock_leaf);
             self.open_terminal();
             return Ok(());
@@ -2054,10 +2053,8 @@ impl Editor {
 
         // Split at the root so the dock spans the full width below any pre-existing side-by-side panes.
         let new_leaf = self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_manager_mut())
-            .expect("active window must have a populated split layout")
+            .active_window_mut()
+            .split_manager_mut()
             .split_root_positioned(SplitDirection::Horizontal, buffer_id, 0.7, false)
             .map_err(|e| {
                 self.set_status_message(format!("Failed to create dock for terminal: {}", e));
@@ -2073,41 +2070,39 @@ impl Editor {
         );
         // Terminal-dedicated splits never show line numbers or current-line highlight.
         // (Mirrors the plugin-terminal split setup in `create_plugin_terminal`.)
-        view_state.apply_config_defaults(crate::view::split::ViewConfigDefaults {
-            line_numbers: false,
-            highlight_current_line: false,
-            line_wrap: self.active_window().resolve_line_wrap_for_buffer(buffer_id),
-            wrap_indent: self.config.editor.wrap_indent,
-            wrap_column: self
-                .active_window()
-                .resolve_wrap_column_for_buffer(buffer_id),
-            rulers: self.config.editor.rulers.clone(),
-            scroll_offset: 0,
-        });
+        view_state.buffer_tab_state_mut().apply_config_defaults(
+            crate::view::split::ViewConfigDefaults {
+                line_numbers: false,
+                highlight_current_line: false,
+                line_wrap: self.active_window().resolve_line_wrap_for_buffer(buffer_id),
+                wrap_indent: self.config.editor.wrap_indent,
+                wrap_column: self
+                    .active_window()
+                    .resolve_wrap_column_for_buffer(buffer_id),
+                rulers: self.config.editor.rulers.clone(),
+                scroll_offset: 0,
+            },
+        );
         // Terminals don't wrap — keep escape sequences intact.
-        view_state.viewport.line_wrap_enabled = false;
+        view_state.buffer_tab_state_mut().viewport.line_wrap_enabled = false;
 
-        self.windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
-            .expect("active window must have a populated split layout")
+        self.active_window_mut()
+            .split_view_states_mut()
             .insert(new_leaf, view_state);
-        self.windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_manager_mut())
-            .expect("active window must have a populated split layout")
+        self.active_window_mut()
+            .split_manager_mut()
             .set_leaf_role(new_leaf, Some(SplitRole::UtilityDock));
-        self.windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_manager_mut())
-            .expect("active window must have a populated split layout")
+        self.active_window_mut()
+            .split_manager_mut()
             .set_active_split(new_leaf);
 
         // Mirror open_terminal's post-attach bookkeeping. The buffer was
         // created via `create_terminal_buffer_detached` (empty scrollback set),
         // so it is live in this split; focus the terminal pane.
         self.active_window_mut().key_context = crate::input::keybindings::KeyContext::Terminal;
-        self.active_window_mut().resize_visible_terminals();
+        // The dock leaf was just split off; size its PTY to the pane the
+        // grid gives it now, not the pane list of the last frame.
+        self.resize_visible_terminals();
 
         let exit_key = self
             .keybindings
@@ -2119,7 +2114,7 @@ impl Editor {
             )
             .unwrap_or_else(|| "Ctrl+Space".to_string());
         self.set_status_message(
-            rust_i18n::t!("terminal.opened", id = terminal_id.0, exit_key = exit_key).to_string(),
+            fresh_i18n::t!("terminal.opened", id = terminal_id.0, exit_key = exit_key).to_string(),
         );
         tracing::info!(
             "Opened terminal {:?} into new dock leaf {:?} (buffer {:?})",

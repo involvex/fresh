@@ -38,7 +38,7 @@
 //!
 //! ## Startup
 //!
-//! [`read_persisted_windows_env`] + [`read_persisted_plugin_state`]
+//! [`read_persisted_windows`] + [`read_persisted_plugin_state`]
 //! run from `editor_init` before the editor struct exists. The
 //! foreground window is the one whose `root` matches the launch cwd
 //! ([`pick_active_window_for_cwd`]) — authoritatively, regardless of
@@ -48,6 +48,7 @@
 //! The "warm" layout is intentionally not persisted across restarts —
 //! re-warming on first dive is fast enough.
 
+use fresh_editor_core::model::host_path::AsHostPath;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -96,6 +97,11 @@ pub(crate) struct PersistedWindow {
     /// even before the shell materializes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) stable_id: Option<String>,
+    /// When this workspace was last the foreground one, from the workspace
+    /// file's `last_focused_at` (Unix epoch milliseconds). `None` for files
+    /// written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_focused_at: Option<u64>,
 }
 
 fn is_local_authority_spec(spec: &crate::services::authority::SessionAuthoritySpec) -> bool {
@@ -135,6 +141,17 @@ fn default_version() -> u32 {
 
 const CURRENT_VERSION: u32 = 2;
 
+/// Which persisted workspaces a read takes in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WorkspaceScope {
+    /// Every workspace in the registry — what the Orchestrator lists.
+    All,
+    /// Only the workspaces rooted at the launch directory: what an ordinary
+    /// launch restores. Only files whose name says they belong to that root
+    /// are opened, so its cost does not grow with the registry.
+    LaunchDir,
+}
+
 /// Read the global `windows.json` and return the parsed
 /// envelope. Returns `None` when the file doesn't exist or
 /// fails to parse — those are not error cases at the editor
@@ -142,25 +159,24 @@ const CURRENT_VERSION: u32 = 2;
 /// state").
 ///
 /// Migrates v1 (per-cwd) files into the global store on first
-/// load and renames each to `.migrated.bak`. The `working_dir`
-/// argument is no longer used for the file location (it's
-/// global now); it's kept in the signature so the factory can
-/// later pass it to the orchestrator plugin as the
-/// "default project filter" hint without a second IO pass.
+/// load and renames each to `.migrated.bak`. `working_dir` is the
+/// directory [`WorkspaceScope::LaunchDir`] limits the read to; it
+/// plays no part in where the files live (that is global).
 ///
 /// Pure file IO + JSON parse. Used by the editor factory to
 /// decide how to build the initial windows map before any
 /// `Editor` instance exists.
-pub(crate) fn read_persisted_windows_env(
+pub(crate) fn read_persisted_windows(
     filesystem: &(dyn crate::model::filesystem::FileSystem + Send + Sync),
     data_dir: &Path,
-    _working_dir: &Path,
+    working_dir: &Path,
+    scope: WorkspaceScope,
 ) -> Option<PersistedWindows> {
     // Legacy v1 (per-cwd) → windows.json, if any survive. windows.json
     // is itself legacy now; the next step folds it into the per-dir
     // workspace files and retires it.
     let global_p = global_windows_path(data_dir);
-    if !filesystem.exists(&global_p) {
+    if !filesystem.exists(global_p.as_host()) {
         migrate_legacy_windows(filesystem, data_dir);
     }
     migrate_windows_json_into_workspaces(filesystem, data_dir);
@@ -173,7 +189,11 @@ pub(crate) fn read_persisted_windows_env(
     // co-tenant workspaces (a tab extracted into its own window over the same
     // project), so discovery yields one window per `stable_id`, not one per
     // directory. GC dead entries and build a window per survivor.
-    let windows = discover_sessions(filesystem, data_dir);
+    let only_root = match scope {
+        WorkspaceScope::All => None,
+        WorkspaceScope::LaunchDir => Some(working_dir),
+    };
+    let windows = discover_sessions(filesystem, data_dir, only_root);
     if windows.is_empty() {
         return None;
     }
@@ -216,14 +236,21 @@ fn basename_label(root: &Path) -> String {
 /// garbage-collect entries whose directory no longer exists, and return
 /// one `PersistedWindow` per survivor. Ids are assigned by sorted
 /// canonical root so they stay stable across runs for a stable dir set.
+///
+/// `only_root` limits the scan to the workspaces of one directory: files are
+/// picked by name (`<encoded-root>.json` / `<encoded-root>.<id>.json`, as
+/// `workspace::candidate_files_for_root` does) before any is read, and a
+/// name that merely shares the prefix is dropped once its `working_dir` is
+/// known.
 fn discover_sessions(
     filesystem: &(dyn crate::model::filesystem::FileSystem + Send + Sync),
     data_dir: &Path,
+    only_root: Option<&Path>,
 ) -> Vec<PersistedWindow> {
     type SessionState = HashMap<String, HashMap<String, serde_json::Value>>;
     let dir = workspaces_dir(data_dir);
     tracing::debug!(dir = %dir.display(), "discover_sessions: read_dir");
-    let entries = match filesystem.read_dir(&dir) {
+    let entries = match filesystem.read_dir(dir.as_host()) {
         Ok(e) => e,
         Err(_) => return Vec::new(),
     };
@@ -238,7 +265,13 @@ fn discover_sessions(
         authority_spec: crate::services::authority::SessionAuthoritySpec,
         stable_id: Option<String>,
         saved_at: u64,
+        last_focused_at: Option<u64>,
     }
+    let only_root = only_root.map(|root| {
+        let key = canonical_key(root);
+        let encoded = crate::workspace::encode_path_for_filename(&key);
+        (key, format!("{encoded}.json"), format!("{encoded}."))
+    });
     let mut found: Vec<Candidate> = Vec::new();
     for entry in entries {
         let p = &entry.path;
@@ -247,7 +280,11 @@ fn discover_sessions(
         if !entry.name.ends_with(".json") {
             continue;
         }
-        tracing::debug!(path = %p.display(), "discover_sessions: read_file");
+        if let Some((_, legacy_name, id_prefix)) = &only_root {
+            if entry.name != *legacy_name && !entry.name.starts_with(id_prefix.as_str()) {
+                continue;
+            }
+        }
         let Ok(bytes) = filesystem.read_file(p) else {
             continue;
         };
@@ -258,6 +295,11 @@ fn discover_sessions(
             continue;
         };
         let root = PathBuf::from(root);
+        if let Some((key, _, _)) = &only_root {
+            if canonical_key(&root) != *key {
+                continue;
+            }
+        }
         // The session's backend spec (how to reconnect on restore). Absent /
         // unparseable → `Local`, so a malformed entry degrades safely. Read
         // *before* the GC check: a remote session's `root` lives on the
@@ -282,7 +324,7 @@ fn discover_sessions(
         // after a restart. Whether the remote dir still exists is only knowable
         // after reconnecting, so we keep the entry and let restore decide.
         if !authority_spec.is_remote() {
-            match filesystem.is_dir(&root) {
+            match filesystem.is_dir(root.as_host()) {
                 Ok(true) => {}
                 Ok(false) => {
                     let _ = filesystem.remove_file(p).ok();
@@ -314,6 +356,7 @@ fn discover_sessions(
                 .and_then(|v| v.as_str())
                 .map(str::to_owned),
             saved_at: val.get("saved_at").and_then(|v| v.as_u64()).unwrap_or(0),
+            last_focused_at: val.get("last_focused_at").and_then(|v| v.as_u64()),
         });
     }
     // Session identity is the durable `stable_id`, not the directory: several
@@ -387,6 +430,7 @@ fn discover_sessions(
                 authority_spec: c.authority_spec,
                 plugin_state: c.plugin_state,
                 stable_id: c.stable_id,
+                last_focused_at: c.last_focused_at,
             }
         })
         .collect()
@@ -403,10 +447,10 @@ fn migrate_windows_json_into_workspaces(
     data_dir: &Path,
 ) {
     let global_p = global_windows_path(data_dir);
-    if !filesystem.exists(&global_p) {
+    if !filesystem.exists(global_p.as_host()) {
         return;
     }
-    let Ok(bytes) = filesystem.read_file(&global_p) else {
+    let Ok(bytes) = filesystem.read_file(global_p.as_host()) else {
         return;
     };
     let Ok(env) = serde_json::from_slice::<PersistedWindows>(&bytes) else {
@@ -414,10 +458,10 @@ fn migrate_windows_json_into_workspaces(
     };
     for w in &env.windows {
         let ws_path = workspace_file_for(data_dir, &w.root);
-        if !filesystem.exists(&ws_path) {
+        if !filesystem.exists(ws_path.as_host()) {
             continue;
         }
-        let Ok(wbytes) = filesystem.read_file(&ws_path) else {
+        let Ok(wbytes) = filesystem.read_file(ws_path.as_host()) else {
             continue;
         };
         let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(&wbytes) else {
@@ -434,14 +478,17 @@ fn migrate_windows_json_into_workspaces(
         }
         if let Ok(out) = serde_json::to_vec_pretty(&val) {
             // Best-effort backfill: on failure the workspace keeps its pre-migration content.
-            let _ = filesystem.write_file(&ws_path, &out).ok();
+            let _ = filesystem.write_file(ws_path.as_host(), &out).ok();
         }
     }
     // Retire windows.json (keep a .bak so a downgrade isn't one-way).
     let bak = global_p.with_extension("json.retired.bak");
-    if filesystem.rename(&global_p, &bak).is_err() {
+    if filesystem
+        .rename(global_p.as_host(), bak.as_host())
+        .is_err()
+    {
         // Best-effort: if delete also fails the file stays and migration reruns (idempotent).
-        let _ = filesystem.remove_file(&global_p).ok();
+        let _ = filesystem.remove_file(global_p.as_host()).ok();
     }
 }
 
@@ -468,7 +515,7 @@ fn migrate_session_workspaces_into_store(
     data_dir: &Path,
 ) {
     let legacy_dir = data_dir.join("session-workspaces");
-    let Ok(entries) = filesystem.read_dir(&legacy_dir) else {
+    let Ok(entries) = filesystem.read_dir(legacy_dir.as_host()) else {
         return;
     };
     let mut all_converted = true;
@@ -512,14 +559,14 @@ fn migrate_session_workspaces_into_store(
         ));
         // Never clobber a live workspace: the per-window store is authoritative
         // wherever both describe the same identity.
-        if filesystem.exists(&dest) {
+        if filesystem.exists(dest.as_host()) {
             continue;
         }
         let Ok(out) = serde_json::to_vec_pretty(&val) else {
             all_converted = false;
             continue;
         };
-        if filesystem.write_file(&dest, &out).is_err() {
+        if filesystem.write_file(dest.as_host(), &out).is_err() {
             all_converted = false;
             continue;
         }
@@ -536,10 +583,10 @@ fn migrate_session_workspaces_into_store(
     // one-way). A failure just leaves it for the next boot — the conversion
     // above skips anything already present, so rerunning is harmless.
     let bak = legacy_dir.with_extension("retired.bak");
-    if filesystem.exists(&bak) {
+    if filesystem.exists(bak.as_host()) {
         return;
     }
-    let _ = filesystem.rename(&legacy_dir, &bak).ok();
+    let _ = filesystem.rename(legacy_dir.as_host(), bak.as_host()).ok();
 }
 
 /// Pick which persisted session to bring up at boot, scoped to the
@@ -587,6 +634,39 @@ pub(crate) fn pick_active_window_for_cwd<'a>(
         .max_by_key(|w| w.id)
 }
 
+/// The directory of the workspace focused most recently, anywhere in the
+/// registry: where a bare `fresh` opens with `open_last_workspace` on. Only a
+/// local workspace whose directory still exists qualifies; `None` when there
+/// is none (a first run, or files that predate `last_focused_at`), and the
+/// launch stays in the current directory.
+///
+/// Reads the whole registry, so it is asked only when the setting is on.
+pub(crate) fn last_used_workspace_root(
+    filesystem: &(dyn crate::model::filesystem::FileSystem + Send + Sync),
+    data_dir: &Path,
+) -> Option<PathBuf> {
+    let env = read_persisted_windows(filesystem, data_dir, data_dir, WorkspaceScope::All)?;
+    env.windows
+        .into_iter()
+        .filter(|w| w.last_focused_at.is_some() && is_local_authority_spec(&w.authority_spec))
+        .filter(|w| w.root.is_dir())
+        .max_by_key(|w| w.last_focused_at)
+        .map(|w| w.root)
+}
+
+impl Editor {
+    /// See [`last_used_workspace_root`]. For the launch paths, which decide
+    /// the working directory before an editor exists.
+    pub fn last_used_workspace_root(
+        dir_context: &crate::config_io::DirectoryContext,
+    ) -> Option<PathBuf> {
+        last_used_workspace_root(
+            &crate::model::filesystem::StdFileSystem,
+            &dir_context.data_dir,
+        )
+    }
+}
+
 fn window_matches_cwd(w: &PersistedWindow, cwd: &Path) -> bool {
     paths_equal(&w.root, cwd)
 }
@@ -623,10 +703,10 @@ fn migrate_legacy_windows(
     data_dir: &Path,
 ) {
     let orch_root = data_dir.join("orchestrator");
-    if !filesystem.exists(&orch_root) {
+    if !filesystem.exists(orch_root.as_host()) {
         return;
     }
-    let entries = match filesystem.read_dir(&orch_root) {
+    let entries = match filesystem.read_dir(orch_root.as_host()) {
         Ok(es) => es,
         Err(_) => return,
     };
@@ -644,14 +724,16 @@ fn migrate_legacy_windows(
         // Only look at directories that look like slug-encoded
         // paths (i.e. not the `state/` plugin dir, which lives
         // alongside but isn't a per-cwd bucket).
-        let dir_name = match dir.file_name().and_then(|s| s.to_str()) {
+        let dir_name = match filesystem.at(&dir).file_name().and_then(|s| s.to_str()) {
             Some(n) => n.to_string(),
             None => continue,
         };
         if dir_name == "state" {
             continue;
         }
-        let legacy_p = dir.join("windows.json");
+        let legacy_p = filesystem
+            .at(&dir)
+            .join_name(std::ffi::OsStr::new("windows.json"));
         if !filesystem.exists(&legacy_p) {
             continue;
         }
@@ -663,8 +745,19 @@ fn migrate_legacy_windows(
             Ok(e) => e,
             Err(_) => continue,
         };
-        let project_path = crate::workspace::decode_filename_to_path(&dir_name)
-            .unwrap_or_else(|| PathBuf::from(dir_name.clone()));
+        // **A directory name that does not decode leaves `project_path`
+        // unset, rather than storing the filename as if it were one.**
+        //
+        // `decode_filename_to_path` declines a name the encoder had to fold to
+        // fit `NAME_MAX` — the head plus a digest is not a path, and the deep
+        // orchestrator roots this migration walks are exactly where folding
+        // happens. The old `unwrap_or_else` would have written
+        // `…deep-directory-six~18289b17dcb27c00` into every migrated window as
+        // a relative path naming nothing, and unlike a display fallback that
+        // value is *persisted*. Left unset, the window still migrates and
+        // whoever needs a project path resolves it the way it is resolved for
+        // any entry that never carried one.
+        let project_path = crate::workspace::decode_filename_to_path(&dir_name);
 
         let mut local_renum: HashMap<u64, u64> = HashMap::new();
         for mut w in env.windows.into_iter() {
@@ -672,7 +765,7 @@ fn migrate_legacy_windows(
             // the entry already carries one (a partial migration
             // re-running on the same data).
             if w.project_path.is_none() {
-                w.project_path = Some(project_path.clone());
+                w.project_path = project_path.clone();
             }
             if used_ids.contains(&w.id) {
                 let new_id = merged_next_id;
@@ -692,7 +785,7 @@ fn migrate_legacy_windows(
         // wins by virtue of being last.
         let active_id = local_renum.get(&env.active).copied().unwrap_or(env.active);
         merged_active = active_id;
-        legacy_to_rename.push(legacy_p);
+        legacy_to_rename.push((legacy_p).into_path_buf());
     }
 
     if merged_windows.is_empty() {
@@ -706,7 +799,7 @@ fn migrate_legacy_windows(
         windows: merged_windows,
     };
     let global_p = global_windows_path(data_dir);
-    if let Err(e) = filesystem.create_dir_all(&orch_root) {
+    if let Err(e) = filesystem.create_dir_all(orch_root.as_host()) {
         tracing::warn!("orchestrator migration: failed to create {orch_root:?}: {e}");
         return;
     }
@@ -717,13 +810,13 @@ fn migrate_legacy_windows(
             return;
         }
     };
-    if let Err(e) = filesystem.write_file(&global_p, &bytes) {
+    if let Err(e) = filesystem.write_file(global_p.as_host(), &bytes) {
         tracing::warn!("orchestrator migration: failed to write {global_p:?}: {e}");
         return;
     }
     for legacy_p in legacy_to_rename {
         let backup = legacy_p.with_extension("json.migrated.bak");
-        if let Err(e) = filesystem.rename(&legacy_p, &backup) {
+        if let Err(e) = filesystem.rename(legacy_p.as_host(), backup.as_host()) {
             tracing::warn!(
                 "orchestrator migration: failed to rename {legacy_p:?} → {backup:?}: {e}"
             );
@@ -739,7 +832,7 @@ fn migrate_legacy_windows(
 /// Read every `state/<plugin>.json` into a flat
 /// `plugin → key → value` map. Skips files with unsafe names,
 /// non-JSON extensions, parse errors, and empty maps. Same
-/// motivations as [`read_persisted_windows_env`] — used by the
+/// motivations as [`read_persisted_windows`] — used by the
 /// editor factory pre-construction.
 ///
 /// Reads from the global `<data>/orchestrator/state/` directory.
@@ -755,13 +848,13 @@ pub(crate) fn read_persisted_plugin_state(
 ) -> HashMap<String, HashMap<String, serde_json::Value>> {
     let mut out: HashMap<String, HashMap<String, serde_json::Value>> = HashMap::new();
     let state_dir = global_state_dir(data_dir);
-    if !filesystem.exists(&state_dir) {
+    if !filesystem.exists(state_dir.as_host()) {
         migrate_legacy_plugin_state(filesystem, data_dir);
     }
-    if !filesystem.exists(&state_dir) {
+    if !filesystem.exists(state_dir.as_host()) {
         return out;
     }
-    let entries = match filesystem.read_dir(&state_dir) {
+    let entries = match filesystem.read_dir(state_dir.as_host()) {
         Ok(es) => es,
         Err(e) => {
             tracing::warn!("orchestrator persistence: failed to read {state_dir:?}: {e}");
@@ -770,13 +863,13 @@ pub(crate) fn read_persisted_plugin_state(
     };
     for entry in entries {
         let path = entry.path;
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        let Some(stem) = filesystem.at(&path).file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
         if !plugin_name_is_safe(stem) {
             continue;
         }
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+        if filesystem.at(&path).extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
         match filesystem.read_file(&path) {
@@ -843,10 +936,10 @@ fn migrate_legacy_plugin_state(
     data_dir: &Path,
 ) {
     let orch_root = data_dir.join("orchestrator");
-    if !filesystem.exists(&orch_root) {
+    if !filesystem.exists(orch_root.as_host()) {
         return;
     }
-    let cwd_entries = match filesystem.read_dir(&orch_root) {
+    let cwd_entries = match filesystem.read_dir(orch_root.as_host()) {
         Ok(es) => es,
         Err(_) => return,
     };
@@ -857,14 +950,14 @@ fn migrate_legacy_plugin_state(
         if !filesystem.is_dir(&dir).unwrap_or(false) {
             continue;
         }
-        let dir_name = match dir.file_name().and_then(|s| s.to_str()) {
+        let dir_name = match filesystem.at(&dir).file_name().and_then(|s| s.to_str()) {
             Some(n) => n.to_string(),
             None => continue,
         };
         if dir_name == "state" {
             continue;
         }
-        let state_dir = dir.join("state");
+        let state_dir = filesystem.at(&dir).join_name(std::ffi::OsStr::new("state"));
         if !filesystem.exists(&state_dir) {
             continue;
         }
@@ -874,13 +967,13 @@ fn migrate_legacy_plugin_state(
         };
         for pe in plugin_entries {
             let p = pe.path;
-            let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+            let Some(stem) = filesystem.at(&p).file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
             if !plugin_name_is_safe(stem) {
                 continue;
             }
-            if p.extension().and_then(|e| e.to_str()) != Some("json") {
+            if filesystem.at(&p).extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
             let bytes = match filesystem.read_file(&p) {
@@ -895,14 +988,14 @@ fn migrate_legacy_plugin_state(
             for (k, v) in map {
                 slot.insert(k, v);
             }
-            legacy_to_rename.push(p);
+            legacy_to_rename.push((p).into_path_buf());
         }
     }
     if merged.is_empty() {
         return;
     }
     let target_state_dir = global_state_dir(data_dir);
-    if let Err(e) = filesystem.create_dir_all(&target_state_dir) {
+    if let Err(e) = filesystem.create_dir_all(target_state_dir.as_host()) {
         tracing::warn!("orchestrator migration: failed to create {target_state_dir:?}: {e}");
         return;
     }
@@ -915,13 +1008,13 @@ fn migrate_legacy_plugin_state(
                 continue;
             }
         };
-        if let Err(e) = filesystem.write_file(&path, &bytes) {
+        if let Err(e) = filesystem.write_file(path.as_host(), &bytes) {
             tracing::warn!("orchestrator migration: failed to write {path:?}: {e}");
         }
     }
     for legacy_p in legacy_to_rename {
         let backup = legacy_p.with_extension("json.migrated.bak");
-        if let Err(e) = filesystem.rename(&legacy_p, &backup) {
+        if let Err(e) = filesystem.rename(legacy_p.as_host(), backup.as_host()) {
             tracing::warn!(
                 "orchestrator migration: failed to rename {legacy_p:?} → {backup:?}: {e}"
             );
@@ -934,6 +1027,102 @@ fn migrate_legacy_plugin_state(
 }
 
 impl Editor {
+    /// Bring every persisted workspace into the editor, once. A launch starts
+    /// with only its own directory's workspaces (Orchestrator mode adds the
+    /// one it reopens, the last used anywhere); the rest of the registry is
+    /// read the first time something uses it — the
+    /// Orchestrator listing workspaces (`editor.loadWorkspaces()`), or a
+    /// window being created, which must see an existing workspace for its
+    /// root rather than mint a duplicate.
+    ///
+    /// Each newly found workspace becomes an inert shell, exactly as at boot,
+    /// under a fresh window id: ids carry no meaning across launches (boot
+    /// assigns them by sorted root), so continuing from `next_window_id`
+    /// never collides with a window the plugins already know.
+    pub fn ensure_all_workspaces_loaded(&mut self) {
+        if self.all_workspaces_loaded {
+            return;
+        }
+        self.all_workspaces_loaded = true;
+        let start = std::time::Instant::now();
+        let local = crate::model::filesystem::StdFileSystem;
+        let Some(mut env) = read_persisted_windows(
+            &local,
+            &self.dir_context.data_dir,
+            &self.working_dir().to_path_buf(),
+            WorkspaceScope::All,
+        ) else {
+            return;
+        };
+        // Already here: the launch directory's workspaces, and any window
+        // created since. Matched by durable identity; an id-less legacy file
+        // is the one a window at its root adopted.
+        let live_ids: std::collections::HashSet<String> = self
+            .windows
+            .values()
+            .map(|w| w.stable_id.clone())
+            .chain(
+                self.dormant_remote
+                    .values()
+                    .filter_map(|d| d.stable_id.clone()),
+            )
+            .collect();
+        let live_roots: std::collections::HashSet<PathBuf> = self
+            .windows
+            .values()
+            .map(|w| canonical_key(&w.root))
+            .collect();
+        env.windows.retain(|ps| match &ps.stable_id {
+            Some(id) => !live_ids.contains(id),
+            None => !live_roots.contains(&canonical_key(&ps.root)),
+        });
+        let mut next = self.next_window_id;
+        for ps in &mut env.windows {
+            ps.id = next;
+            next += 1;
+        }
+        env.next_id = next;
+        let added = env.windows.len();
+
+        let mut shell_resources = self.window_resources();
+        shell_resources.fs_manager = std::sync::Arc::new(crate::services::fs::FsManager::new(
+            std::sync::Arc::new(crate::model::filesystem::StdFileSystem),
+        ));
+        let (shells, dormant) = super::editor_init::build_persisted_window_shells(
+            Some(&env),
+            false,
+            self.active_window,
+            self.terminal_width,
+            self.terminal_height,
+            &self.dir_context,
+            &shell_resources,
+        );
+        self.next_window_id = self.next_window_id.max(next);
+        for (id, shell) in shells {
+            self.windows.insert(id, shell);
+            // Renderable before the first dive, as boot's shells are.
+            if let Some((buf, state, metadata, event_log, mgr, vs)) =
+                self.build_fresh_layout_if_needed(id)
+            {
+                if let Some(s) = self.windows.get_mut(&id) {
+                    s.buffers.set_splits((mgr, vs));
+                    s.buffers.insert(buf, state);
+                    s.buffer_metadata.insert(buf, metadata);
+                    s.event_logs.insert(buf, event_log);
+                }
+            }
+            self.materialize_pending.insert(id);
+        }
+        self.dormant_remote.extend(dormant);
+        self.adopt_existing_window_connections();
+        self.mark_plugin_snapshot_dirty();
+        tracing::info!(
+            added,
+            elapsed = ?start.elapsed(),
+            "loaded the rest of the workspace registry"
+        );
+    }
+
     /// Persist `sessions` + `plugin_global_state` to disk. Best-
     /// effort: filesystem errors are logged at WARN and swallowed
     /// so a transient permission glitch doesn't block quit.
@@ -995,7 +1184,11 @@ impl Editor {
         // directory (no per-cwd split), so two editor processes writing
         // the same plugin's state still need atomic-rename safety.
         let state_dir = global_state_dir(&data_dir);
-        if let Err(e) = self.authority().filesystem.create_dir_all(&state_dir) {
+        if let Err(e) = self
+            .authority()
+            .filesystem
+            .create_dir_all(state_dir.as_host())
+        {
             tracing::warn!("orchestrator persistence: failed to create {state_dir:?}: {e}");
             return;
         }
@@ -1003,7 +1196,7 @@ impl Editor {
         // → warn and start empty (the boot loader skips such files too).
         let path = global_plugin_state_path(&data_dir, plugin);
         let mut merged: HashMap<String, serde_json::Value> =
-            match self.authority().filesystem.read_file(&path) {
+            match self.authority().filesystem.read_file(path.as_host()) {
                 Ok(bytes) => match serde_json::from_slice(&bytes) {
                     Ok(map) => map,
                     Err(e) => {
@@ -1029,11 +1222,19 @@ impl Editor {
         match serde_json::to_vec_pretty(&merged) {
             Ok(bytes) => {
                 let tmp = path.with_extension("json.tmp");
-                if let Err(e) = self.authority().filesystem.write_file(&tmp, &bytes) {
+                if let Err(e) = self
+                    .authority()
+                    .filesystem
+                    .write_file(tmp.as_host(), &bytes)
+                {
                     tracing::warn!("orchestrator persistence: failed to write {tmp:?}: {e}");
                     return;
                 }
-                if let Err(e) = self.authority().filesystem.rename(&tmp, &path) {
+                if let Err(e) = self
+                    .authority()
+                    .filesystem
+                    .rename(tmp.as_host(), path.as_host())
+                {
                     tracing::warn!(
                         "orchestrator persistence: failed to rename {tmp:?} → {path:?}: {e}"
                     );
@@ -1127,6 +1328,7 @@ mod tests {
             authority_spec: Default::default(),
             plugin_state: HashMap::new(),
             stable_id: None,
+            last_focused_at: None,
         }
     }
 
@@ -1271,7 +1473,7 @@ mod tests {
         .unwrap();
 
         let fs = StdFileSystem;
-        let sessions = discover_sessions(&fs, data_dir);
+        let sessions = discover_sessions(&fs, data_dir, None);
 
         assert_eq!(sessions.len(), 1, "only the existing dir yields a session");
         assert_eq!(sessions[0].root, live_root);
@@ -1335,7 +1537,7 @@ mod tests {
         .unwrap();
 
         let fs = StdFileSystem;
-        let sessions = discover_sessions(&fs, data_dir);
+        let sessions = discover_sessions(&fs, data_dir, None);
 
         let remote = sessions
             .iter()
@@ -1394,6 +1596,7 @@ mod tests {
             window: true,
             label: Some("ssh-session".into()),
             command: None,
+            adopt_window: None,
         });
         std::fs::write(
             ws_dir.join("ssh.json"),
@@ -1407,7 +1610,7 @@ mod tests {
         .unwrap();
 
         let fs = StdFileSystem;
-        let sessions = discover_sessions(&fs, data_dir);
+        let sessions = discover_sessions(&fs, data_dir, None);
 
         let ssh = sessions
             .iter()

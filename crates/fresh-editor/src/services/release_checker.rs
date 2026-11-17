@@ -110,40 +110,6 @@ impl ReleaseCheckResult {
     }
 }
 
-/// Handle to a background update check (one-shot)
-///
-/// Use `try_get_result` to check if the result is ready without blocking.
-pub struct UpdateCheckHandle {
-    receiver: Receiver<Result<ReleaseCheckResult, String>>,
-    #[allow(dead_code)]
-    thread: JoinHandle<()>,
-}
-
-impl UpdateCheckHandle {
-    /// Try to get the result without blocking.
-    /// Returns Some(result) if the check completed, None if still running.
-    /// If still running, the background thread is abandoned (will be killed on process exit).
-    pub fn try_get_result(self) -> Option<Result<ReleaseCheckResult, String>> {
-        match self.receiver.try_recv() {
-            Ok(result) => {
-                tracing::debug!("Update check completed");
-                Some(result)
-            }
-            Err(TryRecvError::Empty) => {
-                // Still running - abandon the thread
-                tracing::debug!("Update check still running, abandoning");
-                drop(self.thread);
-                None
-            }
-            Err(TryRecvError::Disconnected) => {
-                // Thread panicked or exited without sending
-                tracing::debug!("Update check thread disconnected");
-                None
-            }
-        }
-    }
-}
-
 /// Handle to an update checker running in the background.
 ///
 /// Runs a single check at startup (if not already done today).
@@ -253,66 +219,6 @@ pub fn start_periodic_update_check_with_interval(
     start_periodic_update_check(releases_url, time_source, data_dir)
 }
 
-/// Start a background update check
-///
-/// Returns a handle that can be used to query the result later.
-/// The check runs in a background thread and won't block.
-/// Respects daily debouncing - if already checked today, no result will be sent.
-pub fn start_update_check(
-    releases_url: &str,
-    time_source: SharedTimeSource,
-    data_dir: PathBuf,
-) -> UpdateCheckHandle {
-    tracing::debug!("Starting background update check");
-    let url = releases_url.to_string();
-    let (tx, rx) = mpsc::channel();
-
-    let handle = thread::spawn(move || {
-        if let Some(unique_id) =
-            super::telemetry::should_run_daily_check(time_source.as_ref(), &data_dir)
-        {
-            super::telemetry::track_open(&unique_id);
-            let result = check_for_update(&url);
-            // Receiver may be dropped if handle is dropped before result arrives.
-            #[allow(clippy::let_underscore_must_use)]
-            let _ = tx.send(result);
-        }
-    });
-
-    UpdateCheckHandle {
-        receiver: rx,
-        thread: handle,
-    }
-}
-
-/// Fetches release information from the provided URL.
-///
-/// The HTTP/TLS transport lives in `services::http`; without the `http`
-/// feature that call returns an error and we surface it here unchanged.
-pub fn fetch_latest_version(url: &str) -> Result<String, String> {
-    tracing::debug!("Fetching latest version from {}", url);
-    let body = super::http::get_release_json(url)?;
-    let version = parse_version_from_json(&body)?;
-    tracing::debug!("Latest version: {}", version);
-    Ok(version)
-}
-
-/// Parse the version from a GitHub releases API body.
-///
-/// Thin wrapper over `fresh_update::feed::Release` kept because callers/tests
-/// use the `Result` shape.
-fn parse_version_from_json(json: &str) -> Result<String, String> {
-    Ok(fresh_update::feed::Release::parse(json)?
-        .version()
-        .to_string())
-}
-
-/// Compare two versions; `true` if `latest` is newer than `current`.
-/// Delegates to `fresh_update::version`.
-pub fn is_newer_version(current: &str, latest: &str) -> bool {
-    fresh_update::version::is_newer(current, latest)
-}
-
 /// Detect how this copy of `fresh` was installed.
 ///
 /// Delegates entirely to `fresh_update::resolve()` (override → receipt →
@@ -327,14 +233,52 @@ pub fn plan_for(prov: &Provenance) -> UpdatePlan {
     fresh_update::plan(prov)
 }
 
+/// Resolve the latest release, over the network.
+///
+/// With the `http` feature this goes through `fresh_update::fetch`, which is
+/// the same path `fresh --cmd update` takes: it sends a `GITHUB_TOKEN` from
+/// the environment if there is one, and when GitHub's API refuses because the
+/// address's hourly budget is spent it reads the version from the
+/// `releases/latest` redirect instead. Sharing that matters here — the daily
+/// check is *also* an API request, and a check that silently gave up on a
+/// rate limit is how the indicator goes quiet for an hour at a time.
+#[cfg(feature = "http")]
+fn fetch_release(releases_url: &str) -> Result<fresh_update::feed::Release, String> {
+    // From the environment, so both overrides are honoured: which route the
+    // check takes depends on the download base too — a mirror's own feed is
+    // authoritative for a mirror, and GitHub's redirect is not.
+    let mut endpoints = fresh_update::endpoint::Endpoints::from_env().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "ignoring an unusable release endpoint override");
+        fresh_update::endpoint::Endpoints::production()
+    });
+    if releases_url != endpoints.releases_url {
+        // A URL the policy refuses cannot reach here in a release build —
+        // `releases_url()` above already sanitised the env override — but a
+        // background check is not worth an error either way.
+        if let Err(e) = endpoints.set_releases_url(releases_url.to_string()) {
+            tracing::warn!(error = %e, "ignoring an unusable release endpoint; using the default");
+            endpoints = fresh_update::endpoint::Endpoints::production();
+        }
+    }
+    let transport = fresh_update::net::Transport::new(&endpoints);
+    Ok(fresh_update::fetch::latest(&transport, &endpoints, false)?.release)
+}
+
+/// Without the `http` feature there is no transport; `services::http` says so.
+#[cfg(not(feature = "http"))]
+fn fetch_release(releases_url: &str) -> Result<fresh_update::feed::Release, String> {
+    fresh_update::feed::Release::parse(&super::http::get_release_json(releases_url)?)
+}
+
 /// Check for a new release (blocking).
 ///
-/// Fetches the release feed here (HTTP lives in `services::http`) and hands the
-/// body to `fresh_update::check::evaluate`, which parses it, compares versions,
-/// and resolves provenance.
+/// Fetches the release feed and hands the result to
+/// `fresh_update::check::evaluate_release`, which compares versions and pairs
+/// them with this copy's provenance.
 pub fn check_for_update(releases_url: &str) -> Result<ReleaseCheckResult, String> {
-    let body = super::http::get_release_json(releases_url)?;
-    let check = fresh_update::check::evaluate(CURRENT_VERSION, &body)?;
+    let release = fetch_release(releases_url)?;
+    let check =
+        fresh_update::check::evaluate_release(CURRENT_VERSION, &release, fresh_update::resolve());
 
     tracing::debug!(
         current = CURRENT_VERSION,
@@ -356,55 +300,10 @@ pub fn check_for_update(releases_url: &str) -> Result<ReleaseCheckResult, String
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_is_newer_version() {
-        // (current, latest, expected_newer)
-        let cases = [
-            ("0.1.26", "1.0.0", true),        // major bump
-            ("0.1.26", "0.2.0", true),        // minor bump
-            ("0.1.26", "0.1.27", true),       // patch bump
-            ("0.1.26", "0.1.26", false),      // same
-            ("0.1.26", "0.1.25", false),      // older patch
-            ("0.2.0", "0.1.26", false),       // older minor
-            ("1.0.0", "0.1.26", false),       // older major
-            ("0.1.26-alpha", "0.1.27", true), // prerelease current
-            ("0.1.26", "0.1.27-beta", true),  // prerelease latest
-        ];
-        for (current, latest, expected) in cases {
-            assert_eq!(
-                is_newer_version(current, latest),
-                expected,
-                "is_newer_version({:?}, {:?})",
-                current,
-                latest
-            );
-        }
-    }
-
     // Install-method detection lives in `fresh_update::provenance` (see that
     // crate's tests). release_checker only delegates, so there is nothing to
     // test here — and nothing path-specific anywhere, since provenance is read
     // from what the installer recorded rather than inferred from the exe path.
-
-    #[test]
-    fn test_parse_version_from_json() {
-        // Various JSON formats should all parse correctly
-        let cases = [
-            (r#"{"tag_name": "v0.1.27"}"#, "0.1.27"),
-            (r#"{"tag_name": "0.1.27"}"#, "0.1.27"),
-            (
-                r#"{"tag_name": "v0.2.0", "name": "v0.2.0", "draft": false}"#,
-                "0.2.0",
-            ),
-        ];
-        for (json, expected) in cases {
-            assert_eq!(parse_version_from_json(json).unwrap(), expected);
-        }
-
-        // Verify mock version is detected as newer than current
-        let version = parse_version_from_json(r#"{"tag_name": "v99.0.0"}"#).unwrap();
-        assert!(is_newer_version(CURRENT_VERSION, &version));
-    }
 
     #[test]
     fn test_current_version_is_valid() {
@@ -414,10 +313,17 @@ mod tests {
         assert!(parts[1].parse::<u32>().is_ok());
     }
 
+    #[cfg(debug_assertions)]
     use std::sync::mpsc as std_mpsc;
 
     /// Test helper: start a local HTTP server that returns a mock release JSON
     /// Returns (stop_sender, url) - send to stop_sender to shut down the server
+    ///
+    /// The feed is plain http, which fresh-update's endpoint policy only
+    /// accepts under `debug_assertions` (or `insecure-endpoints`): a release
+    /// build ignores it and asks the real GitHub API instead. So this helper
+    /// and every test that uses it are debug-only.
+    #[cfg(debug_assertions)]
     fn start_mock_release_server(version: &str) -> (std_mpsc::Sender<()>, String) {
         let server = tiny_http::Server::http("127.0.0.1:0").expect("Failed to start test server");
         let port = server.server_addr().to_ip().unwrap().port();
@@ -461,6 +367,7 @@ mod tests {
         (stop_tx, url)
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn test_update_checker_detects_new_version() {
         let (stop_tx, url) = start_mock_release_server("99.0.0");
@@ -485,6 +392,7 @@ mod tests {
         stop_tx.send(()).ok();
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn test_update_checker_no_update_when_current() {
         let (stop_tx, url) = start_mock_release_server(CURRENT_VERSION);
@@ -510,6 +418,7 @@ mod tests {
         stop_tx.send(()).ok();
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn test_update_checker_api_before_result() {
         let (stop_tx, url) = start_mock_release_server("99.0.0");
@@ -564,6 +473,10 @@ mod tests {
     /// the background check that decides whether to show the indicator, and
     /// the update child the popup spawns, must agree on where releases come
     /// from. They share one env var so they cannot drift.
+    ///
+    /// Debug only: a release build refuses an http override (see
+    /// `start_mock_release_server`).
+    #[cfg(debug_assertions)]
     #[test]
     fn the_release_feed_override_is_shared_by_check_and_update() {
         // Not set: both fall back to the GitHub API.

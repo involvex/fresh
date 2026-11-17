@@ -11,7 +11,6 @@
 
 use crate::model::event::{BufferId, LeafId, SplitId};
 
-use super::chrome::in_rect;
 use super::Editor;
 
 /// Render a floating panel's spec, choosing the marker-gutter
@@ -26,73 +25,6 @@ use super::Editor;
 /// host state that changes with every mouse move, so it is applied
 /// around the render rather than carried in the spec; only bare icon
 /// buttons read it.
-impl Editor {
-    /// Render a buffer-mounted panel spec with the live theme + grammars
-    /// threaded in (so `markdown: true` Text widgets render through the
-    /// shared markdown engine). The read guard on the theme lives only
-    /// for the render call.
-    pub(super) fn render_panel_spec(
-        &self,
-        spec: &fresh_core::api::WidgetSpec,
-        prev: &std::collections::HashMap<String, crate::widgets::WidgetInstanceState>,
-        prev_focus_key: &str,
-        panel_width: u32,
-        avail_height: Option<u32>,
-    ) -> crate::widgets::RenderOutput {
-        let theme_guard = self.theme.read().unwrap();
-        crate::widgets::render_spec_with_options(
-            spec,
-            prev,
-            panel_width,
-            crate::widgets::RenderOptions {
-                prev_focus_key,
-                auto_focus_first: true,
-                markdown: Some(crate::widgets::MarkdownCtx {
-                    theme: &theme_guard,
-                    grammars: Some(self.grammar_registry.as_ref()),
-                }),
-                // Auto-size budget for `visible_rows: None` lists/trees:
-                // the viewport height of the split currently showing the
-                // panel's buffer (None when it isn't on screen — widgets
-                // then keep the legacy fallback until it is).
-                avail_height,
-                ..Default::default()
-            },
-        )
-    }
-}
-
-// Every parameter here is host state the spec doesn't carry (focus, hover,
-// theme, geometry); bundling them into a struct would only move the same
-// list one level out.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn render_floating_spec(
-    focus_marker: bool,
-    spec: &fresh_core::api::WidgetSpec,
-    prev: &std::collections::HashMap<String, crate::widgets::WidgetInstanceState>,
-    prev_focus_key: &str,
-    panel_width: u32,
-    avail_height: Option<u32>,
-    hover_key: &str,
-    hover_item_key: &str,
-    markdown: Option<crate::widgets::MarkdownCtx<'_>>,
-) -> crate::widgets::RenderOutput {
-    crate::widgets::render_spec_with_options(
-        spec,
-        prev,
-        panel_width,
-        crate::widgets::RenderOptions {
-            prev_focus_key,
-            hover_key,
-            hover_item_key,
-            marker_gutter: focus_marker,
-            auto_focus_first: true,
-            markdown,
-            avail_height,
-        },
-    )
-}
-
 /// Walk a `Tree`'s flat `nodes` and return the absolute indices of
 /// nodes that are currently visible — i.e. every ancestor is in
 /// `expanded`. Mirrors the renderer's filter so dispatcher and
@@ -103,26 +35,6 @@ pub(super) fn render_floating_spec(
 /// positionless wheel to pick which widget inside a panel absorbs
 /// the scroll. No kind matching here: the capability is the kind's
 /// declaration.
-/// Whether `spec` contains a `List`/`Tree` that omitted `visible_rows` —
-/// the widgets whose row window is the host's to size, and so the only
-/// ones a change of panel height can leave laid out wrongly.
-fn spec_has_auto_sized_list(spec: &fresh_core::api::WidgetSpec) -> bool {
-    use fresh_core::api::WidgetSpec;
-    if matches!(
-        spec,
-        WidgetSpec::List {
-            visible_rows: None,
-            ..
-        } | WidgetSpec::Tree {
-            visible_rows: None,
-            ..
-        }
-    ) {
-        return true;
-    }
-    spec.children().any(spec_has_auto_sized_list)
-}
-
 fn find_scrollable_widget_key(spec: &fresh_core::api::WidgetSpec) -> Option<String> {
     let meta = crate::widgets::kinds::behavior(spec).box_meta(spec);
     if meta.picker_scroll_target {
@@ -160,36 +72,85 @@ pub(super) fn translate_plugin_animation_kind(
 }
 
 impl Editor {
-    /// Process a resolved widget hit (from a TUI cell click, a floating
-    /// panel click, or a native-frontend click): move focus to the hit's
+    /// Process a resolved widget press (from a TUI cell click, a floating
+    /// panel click, or a plugin's own `WidgetAction`): move focus to the event's
     /// OWNING widget, run the owner kind's own pointer handler
     /// ([`crate::widgets::kinds::WidgetImpl::on_pointer`] — tree
     /// expansion, list/tree selection, dropdown open/commit, dual-list
     /// cursors all live with their kinds), apply the effects it
-    /// requested, and — unless the kind consumed the hit — fire the
-    /// recorded event tagged `via: "click"`. This is the single dispatch
+    /// requested, and — unless the kind consumed the press — fire the
+    /// event tagged `via: "click"`. This is the single dispatch
     /// path shared by every frontend, so a click delivers identical
     /// behaviour in all of them. No per-kind decision happens here.
+    ///
+    /// **`clicked_byte` is measured from the start of the widget's own
+    /// rendered row**, which is the space the `focus` event's
+    /// `valueInnerStart` breadcrumb is in. A described widget is its own node,
+    /// so the byte the library reports for a press on it is already that.
+    /// (The caller that resolved through the text projection's composed rows
+    /// and rebased by the matched area's `byte_start` is deleted with the
+    /// panel class it served; the space is the field's own on every path.)
+    ///
+    /// `None` when the press carries no byte at all — the web's by-index
+    /// route, and a keyboard activation.
+    /// **A double-click on a list or tree row activates it**, the way Enter
+    /// does: the first press selected the row (its `select`), the second
+    /// fires the widget's `activate` for the selection — opening a folder in
+    /// a file browser, choosing an entry in a picker, opening a workspace on
+    /// a board. Other widgets take a second press as another single one.
+    pub(crate) fn activate_on_double_click(
+        &mut self,
+        panel_key: &crate::widgets::PanelKey,
+        hit: &crate::widgets::WidgetEvent,
+    ) {
+        // A row's body, not its disclosure glyph or checkbox: those report
+        // `expand` / `toggle`, and a double click on them is two of those.
+        if hit.event_type != "select" {
+            return;
+        }
+        let owner = hit.owner().to_string();
+        let ev = self.widget_registry.get(panel_key).and_then(|p| {
+            let spec = crate::widgets::find_widget_by_key(&p.spec, &owner)?;
+            // A tree row opens on a double click as a list row does: the same
+            // `activate` Enter fires, on the row the first click selected.
+            match hit.widget_kind {
+                "list" => crate::widgets::kinds::list::activate_event(spec, &owner, p),
+                "tree" => crate::widgets::kinds::tree::activate_event(spec, &owner, p),
+                _ => None,
+            }
+        });
+        if let Some((event_type, payload)) = ev {
+            self.fire_widget_event(panel_key, owner, event_type, payload);
+        }
+    }
+
     pub(crate) fn deliver_widget_hit(
         &mut self,
         panel_key: &crate::widgets::PanelKey,
-        hit: &crate::widgets::HitArea,
+        hit: &crate::widgets::WidgetEvent,
         clicked_byte: Option<usize>,
     ) {
         use crate::widgets::kinds::{PointerDisposition, PointerFx};
         let owner = hit.owner().to_string();
-        // Click-to-focus: if the owning widget has a stable, tabbable
-        // key, move focus there before anything else so the next render
-        // reflects it. (A List row's owner is the List itself — a row
-        // click focuses the list, and arrows right after it keep moving
-        // the list's selection.)
+        // Click-to-focus: if the owning widget can hold focus, move focus
+        // there before anything else so the next render reflects it. (A List
+        // row's owner is the List itself — a row click focuses the list, and
+        // arrows right after it keep moving the list's selection.)
+        //
+        // **Asked of the spec, not of a recorded ring.** The registry no longer
+        // records a ring; the spec in hand is the only current answer. The
+        // question is a property of the widget under the pointer, so it is put
+        // to that widget — `kinds::focusable_key` is the same predicate the
+        // tree's ring admits by, so a click can never focus something Tab
+        // cannot reach, or fail to focus something it can.
         if !owner.is_empty() {
-            let is_tabbable = self
+            let focusable = self
                 .widget_registry
                 .get(panel_key)
-                .map(|p| p.tabbable.iter().any(|k| k == &owner))
-                .unwrap_or(false);
-            if is_tabbable {
+                .and_then(|p| crate::widgets::find_widget_by_key(&p.spec, &owner))
+                .and_then(crate::widgets::kinds::focusable_key)
+                .is_some();
+            if focusable {
                 self.set_panel_focus_and_notify(panel_key, owner.clone());
             }
             self.rerender_widget_panel(panel_key);
@@ -225,22 +186,16 @@ impl Editor {
         // (native by-index delivery passes `None`).
         if fx.place_caret {
             if let Some(byte) = clicked_byte {
-                if let Some(line) = hit.payload.get("mdLine").and_then(|v| v.as_u64()) {
-                    self.position_markdown_text_cursor_from_click(
-                        panel_key,
-                        &hit.widget_key,
-                        line as usize,
-                        byte.saturating_sub(hit.byte_start),
-                    );
-                } else {
-                    self.reposition_widget_text_cursor_from_click(
-                        panel_key,
-                        &hit.widget_key,
-                        byte,
-                        hit.byte_start,
-                        &hit.payload,
-                    );
-                }
+                // A markdown document's press does not come this way any
+                // more: the run answers a press with a byte of the document
+                // (`UiFact::WidgetProsePress`), and the arena row this
+                // branch resolved `mdLine` against is gone.
+                self.reposition_widget_text_cursor_from_click(
+                    panel_key,
+                    &hit.widget_key,
+                    byte,
+                    &hit.payload,
+                );
             }
         }
         // Apply the handler's effects — the same interpretation the key
@@ -274,365 +229,21 @@ impl Editor {
         }
     }
 
-    /// Native-frontend entry point: deliver the hit at `hit_index` in panel
-    /// `(plugin, panel_id)`'s recorded hit list — the same hits `widgets_view`
-    /// shipped to the frontend. Runs the shared `deliver_widget_hit` path.
-    pub fn deliver_widget_hit_by_index(&mut self, plugin: &str, panel_id: u64, hit_index: usize) {
-        let panel_key = crate::widgets::PanelKey::new(plugin, panel_id);
-        let hit = self
-            .widget_registry
-            .get(&panel_key)
-            .and_then(|p| p.hits.get(hit_index).cloned());
-        if let Some(hit) = hit {
-            // Native frontends deliver by index, without a per-cell click
-            // column, so there's no click-to-position payload to honour here.
-            self.deliver_widget_hit(&panel_key, &hit, None);
-        }
-    }
-
-    /// Native-frontend entry point, robust against hit-list drift: resolve
-    /// the clicked hit by IDENTITY — `widget_key` + `event_type`, preferring
-    /// exact `payload` equality — instead of by raw index. A raw index goes
-    /// stale the moment the plugin re-renders between the pushed frame and
-    /// the click; identity survives reordering by construction. `hit_index`
-    /// (the index the frontend rendered from) stays as the last-resort
-    /// tiebreaker for hits that carry no key.
-    ///
-    /// The recorded hit list is additionally a projection of the TUI's
-    /// *visible* rows — `collect_list` windows its hits to the cell
-    /// viewport's `[scroll, scroll+visible)` — while a native frontend
-    /// renders the whole list in its own scroll container. A click on a row
-    /// outside that window therefore matches NO recorded hit; for
-    /// `list`/`select` clicks the hit is then synthesized from the panel's
-    /// own spec (`synthesize_list_hit` rebuilds exactly the `HitArea` the
-    /// renderer would have emitted for that row — the item key comes from
-    /// the spec, never from frontend-supplied strings alone).
-    pub fn deliver_widget_hit_semantic(
-        &mut self,
-        plugin: &str,
-        panel_id: u64,
-        widget_key: &str,
-        event_type: &str,
-        payload: &serde_json::Value,
-        hit_index: Option<usize>,
-    ) {
-        let panel_key = crate::widgets::PanelKey::new(plugin, panel_id);
-        let hit = {
-            let Some(panel) = self.widget_registry.get(&panel_key) else {
-                return;
-            };
-            let identity = |strict: bool| {
-                panel
-                    .hits
-                    .iter()
-                    .find(|h| {
-                        h.event_type == event_type
-                            && h.widget_key == widget_key
-                            && (!strict || h.payload == *payload)
-                            // Never loose-match across rows: tree hits all
-                            // share the tree's spec key, so when both payloads
-                            // carry an `index` they must agree — otherwise a
-                            // click on an off-window row would deliver some
-                            // other row's recorded hit.
-                            && (strict
-                                || match (h.payload.get("index"), payload.get("index")) {
-                                    (Some(a), Some(b)) => a == b,
-                                    _ => true,
-                                })
-                    })
-                    .cloned()
-            };
-            // Exact match first; then key+event only (payload drift, e.g. a
-            // toggle whose `checked` flipped — the CURRENT hit is the right
-            // one to deliver, exactly as a TUI click would use it). The
-            // loose tier requires a non-empty key so keyless hits can't
-            // cross-match. Then the raw-index tiebreaker, then the
-            // off-window list synthesis.
-            identity(true)
-                .or_else(|| {
-                    if widget_key.is_empty() {
-                        None
-                    } else {
-                        identity(false)
-                    }
-                })
-                .or_else(|| hit_index.and_then(|i| panel.hits.get(i).cloned()))
-                .or_else(|| Self::synthesize_list_hit(panel, event_type, payload))
-                .or_else(|| Self::synthesize_tree_hit(panel, widget_key, event_type, payload))
-                .or_else(|| Self::synthesize_control_hit(panel, widget_key, event_type, payload))
-        };
-        if let Some(hit) = hit {
-            self.deliver_widget_hit(&panel_key, &hit, None);
-        }
-    }
-
-    /// Copy the right-click screen cell (`col`/`row`) from a frontend
-    /// `context` payload into the synthesized one, clamped to `u16` like a
-    /// real terminal cell. The plugin uses it to anchor its popup; absent
-    /// or malformed coordinates are simply omitted (the plugin falls back
-    /// to a default anchor).
-    fn copy_context_anchor_cell(from: &serde_json::Value, into: &mut serde_json::Value) {
-        if let Some(obj) = into.as_object_mut() {
-            for cell in ["col", "row"] {
-                if let Some(v) = from.get(cell).and_then(|v| v.as_u64()) {
-                    obj.insert(cell.to_string(), serde_json::json!(v.min(u16::MAX as u64)));
-                }
-            }
-        }
-    }
-
-    /// Rebuild the `HitArea` that `collect_list` would have emitted for a
-    /// list row that is outside the TUI's scroll window (so no hit was
-    /// recorded), from the panel's own spec: the payload's `list_key` must
-    /// name a `List` in the spec and `index` must be in bounds; the item key
-    /// is read from the spec's `item_keys`. Returns `None` for anything
-    /// that isn't a valid in-bounds list `select` or right-click `context`
-    /// (which is never recorded as a hit — the TUI synthesizes it from a
-    /// right-click as well).
-    fn synthesize_list_hit(
-        panel: &crate::widgets::WidgetPanelState,
-        event_type: &str,
-        payload: &serde_json::Value,
-    ) -> Option<crate::widgets::HitArea> {
-        if event_type != "select" && event_type != "context" {
-            return None;
-        }
-        let list_key = payload.get("list_key")?.as_str()?;
-        let index = payload.get("index")?.as_i64()?;
-        let spec = crate::widgets::find_widget_by_key(&panel.spec, list_key)?;
-        let fresh_core::api::WidgetSpec::List {
-            items,
-            item_specs,
-            item_keys,
-            ..
-        } = spec
-        else {
-            return None;
-        };
-        let total = if item_specs.is_empty() {
-            items.len()
-        } else {
-            item_specs.len()
-        };
-        if index < 0 || index as usize >= total {
-            return None;
-        }
-        let item_key = item_keys.get(index as usize).cloned().unwrap_or_default();
-        let mut row_payload = serde_json::json!({
-            "index": index,
-            "key": item_key,
-            "list_key": list_key,
-        });
-        let event_type = if event_type == "context" {
-            Self::copy_context_anchor_cell(payload, &mut row_payload);
-            "context"
-        } else {
-            "select"
-        };
-        Some(crate::widgets::HitArea {
-            row_target: true,
-            context_click: true,
-            overlay: false,
-            widget_key: item_key.clone(),
-            widget_kind: "list",
-            buffer_row: 0,
-            byte_start: 0,
-            byte_end: 0,
-            payload: row_payload,
-            event_type,
-            owner_key: Some(list_key.to_string()),
-        })
-    }
-
-    /// Rebuild the `HitArea` `render_widget_tree` would have emitted for a
-    /// tree row outside the TUI's scroll window (so no hit was recorded),
-    /// from the panel's own spec: `widget_key` must name a `Tree`, the
-    /// payload's `index` must be in bounds, and the row's item key comes
-    /// from the spec's `item_keys`. Covers the row-body `select`, the
-    /// disclosure `expand`, the checkbox `toggle`, and the right-click
-    /// `context` events (the natively-scrolled web frontend can click any
-    /// row, not just the TUI's visible window; no `context` hit is ever
-    /// recorded — the TUI synthesizes those from a right-click too).
-    fn synthesize_tree_hit(
-        panel: &crate::widgets::WidgetPanelState,
-        widget_key: &str,
-        event_type: &str,
-        payload: &serde_json::Value,
-    ) -> Option<crate::widgets::HitArea> {
-        if !matches!(event_type, "select" | "expand" | "toggle" | "context")
-            || widget_key.is_empty()
-        {
-            return None;
-        }
-        let index = payload.get("index")?.as_i64()?;
-        let spec = crate::widgets::find_widget_by_key(&panel.spec, widget_key)?;
-        let fresh_core::api::WidgetSpec::Tree {
-            nodes, item_keys, ..
-        } = spec
-        else {
-            return None;
-        };
-        if index < 0 || index as usize >= nodes.len() {
-            return None;
-        }
-        let item_key = item_keys.get(index as usize).cloned().unwrap_or_default();
-        let (event_type, payload) = match event_type {
-            "expand" => (
-                "expand",
-                serde_json::json!({
-                    "index": index,
-                    "key": item_key,
-                    "expanded": payload.get("expanded").and_then(|v| v.as_bool()).unwrap_or(true),
-                }),
-            ),
-            // Right-click: same shape the TUI's context path fires —
-            // the row identity plus the click cell the plugin anchors
-            // its popup at (see `handle_floating_widget_context_click`).
-            "context" => {
-                let mut p = serde_json::json!({ "index": index, "key": item_key });
-                Self::copy_context_anchor_cell(payload, &mut p);
-                ("context", p)
-            }
-            // Checkbox click: same shape the renderer's checkbox hit
-            // carries — `checked` is the NEW value, derived from the
-            // spec (the plugin's pushed truth), never from the frontend.
-            // Only nodes that actually bear a checkbox (checked is
-            // Some) get one, mirroring the renderer.
-            "toggle" => {
-                let current = nodes.get(index as usize).and_then(|n| n.checked)?;
-                (
-                    "toggle",
-                    serde_json::json!({
-                        "index": index,
-                        "key": item_key,
-                        "checked": !current,
-                    }),
-                )
-            }
-            _ => (
-                "select",
-                serde_json::json!({ "index": index, "key": item_key }),
-            ),
-        };
-        Some(crate::widgets::HitArea {
-            row_target: true,
-            context_click: true,
-            overlay: false,
-            widget_key: widget_key.to_string(),
-            widget_kind: "tree",
-            buffer_row: 0,
-            byte_start: 0,
-            byte_end: 0,
-            payload,
-            event_type,
-            owner_key: None,
-        })
-    }
-
-    /// Rebuild the `HitArea` the renderer would have emitted for a keyed
-    /// control widget that recorded no hit — because the TUI clipped it (a
-    /// native frontend grows a floating panel to fit its content) or
-    /// because the frontend renders states the TUI's hit window didn't
-    /// (e.g. a dropdown's option rows). State comes from the panel's own
-    /// spec: a disabled Button synthesizes nothing (the renderer records no
-    /// hit for it either), a Toggle's `checked` and a Dropdown's option
-    /// bounds are read from the spec, never trusted from the frontend.
-    fn synthesize_control_hit(
-        panel: &crate::widgets::WidgetPanelState,
-        widget_key: &str,
-        event_type: &str,
-        payload: &serde_json::Value,
-    ) -> Option<crate::widgets::HitArea> {
-        if widget_key.is_empty() {
-            return None;
-        }
-        let spec = crate::widgets::find_widget_by_key(&panel.spec, widget_key)?;
-        use fresh_core::api::WidgetSpec as W;
-        let (widget_kind, event_type, payload): (_, &'static str, _) = match (spec, event_type) {
-            (W::Button { disabled, .. }, "activate") if !disabled => {
-                ("button", "activate", serde_json::json!({}))
-            }
-            (W::Toggle { checked, .. }, "toggle") => (
-                "toggle",
-                "toggle",
-                serde_json::json!({ "checked": !checked }),
-            ),
-            (W::Text { .. }, "focus") => ("text", "focus", serde_json::json!({})),
-            (W::Number { .. }, "number_value") => ("number", "number_value", serde_json::json!({})),
-            (W::Dropdown { .. }, "dropdown_toggle") => {
-                ("dropdown", "dropdown_toggle", serde_json::json!({}))
-            }
-            (W::Dropdown { options, .. }, "dropdown_select") => {
-                let index = payload.get("index")?.as_i64()?;
-                if index < 0 || index as usize >= options.len() {
-                    return None;
-                }
-                (
-                    "dropdown",
-                    "dropdown_select",
-                    serde_json::json!({ "index": index }),
-                )
-            }
-            (W::DualList { options, .. }, "dual_focus") => {
-                let column = payload.get("column")?.as_str()?;
-                if column != "available" && column != "included" {
-                    return None;
-                }
-                let index = payload.get("index")?.as_i64()?;
-                // Loose bound: either column's row count can never exceed
-                // the full option universe; the click handler clamps to the
-                // live column length itself.
-                if index < 0 || index as usize >= options.len().max(1) {
-                    return None;
-                }
-                (
-                    "dual_list",
-                    "dual_focus",
-                    serde_json::json!({ "column": column, "index": index }),
-                )
-            }
-            _ => return None,
-        };
-        Some(crate::widgets::HitArea {
-            row_target: false,
-            context_click: false,
-            overlay: false,
-            widget_key: widget_key.to_string(),
-            widget_kind,
-            buffer_row: 0,
-            byte_start: 0,
-            byte_end: 0,
-            payload,
-            event_type,
-            owner_key: None,
-        })
-    }
-
-    /// Native-frontend entry point: place a text widget's caret at a flat
-    /// byte offset into its value. A browser input positions its caret
-    /// natively on click (it owns the font metrics), then reports the
-    /// position here so the host `TextEdit` — the single source of truth —
-    /// follows. `set_cursor_from_flat` clamps, snaps to a grapheme
-    /// boundary, and clears any selection (matching a plain GUI click).
-    pub fn set_widget_text_cursor(
-        &mut self,
-        plugin: &str,
-        panel_id: u64,
-        widget_key: &str,
-        byte: usize,
-    ) {
-        let panel_key = crate::widgets::PanelKey::new(plugin, panel_id);
-        let Some(panel) = self.widget_registry.get_mut(&panel_key) else {
-            return;
-        };
-        let Some(crate::widgets::WidgetInstanceState::Text { editor: te, .. }) =
-            panel.instance_states.get_mut(widget_key)
-        else {
-            return;
-        };
-        te.set_cursor_from_flat(byte);
-        self.rerender_widget_panel(&panel_key);
-    }
+    // **The three native-frontend entry points are deleted with the web's
+    // plugin panels.** `deliver_widget_hit_by_index`, `deliver_widget_hit_
+    // semantic` (with `synthesize_list_hit` / `synthesize_tree_hit` /
+    // `synthesize_control_hit` behind it) and `set_widget_text_cursor` all
+    // resolved an interaction the *browser* had laid out: an index or an
+    // identity into `WidgetPanelState::hits`, or a byte the browser measured.
+    // The scene stopped shipping a plugin panel to the browser, so nothing
+    // can send one back, and `hits` stopped having a described-panel reader
+    // with them. See `docs/internal/retained-mode-ui.md` "The web".
+    //
+    // The synthesizers are the loss worth naming: they were the derivation of
+    // `HitArea`'s identity half from `(spec, instance state)` — the shape §4.1
+    // of the end-state doc wants everything to use — and they are the only
+    // written instance of it. Bringing the web back should re-derive from the
+    // display list rather than restore them.
 
     /// Deliver a `widget_event` hook to the plugin owning `panel_key` —
     /// and to that plugin only. Panel ids are plugin-local, so the event
@@ -644,368 +255,326 @@ impl Editor {
         event_type: String,
         payload: serde_json::Value,
     ) {
-        let pm = self.plugin_manager.read().unwrap();
-        if !pm.has_hook_handlers("widget_event") {
+        if !self
+            .plugin_manager
+            .read()
+            .unwrap()
+            .has_hook_handlers("widget_event")
+        {
             return;
         }
-        pm.run_hook_for_plugin(
+        self.publish_panel_focus();
+        let focus_key = self
+            .widget_registry
+            .focus_key(panel_key)
+            .map(str::to_string)
+            .unwrap_or_default();
+        self.plugin_manager.read().unwrap().run_hook_for_plugin(
             &panel_key.plugin,
             "widget_event",
             fresh_core::hooks::HookArgs::WidgetEvent {
+                window_id: self.active_window.0,
                 panel_id: panel_key.id,
                 widget_key,
                 event_type,
                 payload,
+                focus_key,
             },
         );
     }
 
-    /// Apply a `RenderOutput`'s focus-cursor position to the panel
-    /// buffer + every split rendering it. When a `TextInput` is
-    /// focused, the dispatcher flips `show_cursors=true` and moves
-    /// the primary cursor to the right byte. When no TextInput is
-    /// focused, the cursor is hidden (`show_cursors=false`) — the
-    /// focused widget's own bg overlay shows where focus is.
-    ///
-    /// Must be called *after* `set_virtual_buffer_content` so the
-    /// buffer's text matches the row/byte coordinates the renderer
-    /// produced.
-    pub(super) fn apply_widget_focus_cursor(
-        &mut self,
-        buffer_id: BufferId,
-        entries: &[fresh_core::text_property::TextPropertyEntry],
-        focus_cursor: Option<crate::widgets::FocusCursor>,
-    ) {
-        // A widget panel is laid out to the panel's exact width and clipped
-        // there, so its view has nothing to scroll sideways to. Pin it
-        // before anything else: the focus cursor below can sit at the end
-        // of a row that reaches the right edge, and cursor-following would
-        // otherwise drag the whole panel — header included — left by a
-        // column or two.
-        self.pin_widget_panel_horizontal_scroll(buffer_id);
-
-        // If the plugin has taken explicit control of this buffer's cursor
-        // (via `setBufferShowCursors`), the widget runtime must not touch
-        // its visibility or position — the plugin owns it. This lets a
-        // widget-panel pane be cursor-driven (e.g. git log's commit list)
-        // without each repaint clearing the cursor.
-        let locked = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.get(&buffer_id))
-            .map(|s| s.cursor_visibility_locked)
-            .unwrap_or(false);
-        if locked {
+    /// Close the focused field's suggestion list, if it has one up — a press
+    /// landed outside it. The kind decides what closing means (and queues
+    /// `completion_dismiss`); this applies it.
+    pub(crate) fn dismiss_focused_completions(&mut self, panel_key: &crate::widgets::PanelKey) {
+        let Some(focus_key) = self
+            .widget_registry
+            .focus_key(panel_key)
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let mut fx = crate::widgets::kinds::KeyFx::default();
+        let closed = match self.widget_registry.get_mut(panel_key) {
+            Some(panel) => {
+                crate::widgets::kinds::text::dismiss_completion_list(&focus_key, panel, &mut fx)
+            }
+            None => return,
+        };
+        if !closed {
             return;
         }
-
-        let absolute_byte = focus_cursor.map(|fc| {
-            let row = fc.buffer_row as usize;
-            let prefix: usize = entries.iter().take(row).map(|e| e.text.len()).sum();
-            prefix + fc.byte_in_row as usize
-        });
-
-        if let Some(state) = self
-            .windows
-            .get_mut(&self.active_window)
-            .map(|w| &mut w.buffers)
-            .expect("active window present")
-            .get_mut(&buffer_id)
-        {
-            state.show_cursors = absolute_byte.is_some();
-        }
-
-        if let Some(byte) = absolute_byte {
-            for vs in self
-                .windows
-                .get_mut(&self.active_window)
-                .and_then(|w| w.split_view_states_mut())
-                .expect("active window must have a populated split layout")
-                .values_mut()
-            {
-                if vs.buffer_state(buffer_id).is_some() {
-                    let cursor = vs.cursors.primary_mut();
-                    cursor.position = byte;
-                }
-            }
+        self.rerender_widget_panel(panel_key);
+        for (event_type, payload) in fx.events {
+            self.fire_widget_event(panel_key, focus_key.clone(), event_type, payload);
         }
     }
 
-    /// Mark every view of `buffer_id` as non-horizontally-scrollable.
+    /// Publish every mounted panel's focus fact to the plugins' state
+    /// snapshot, where `editor.getPanelFocusKey` reads it.
     ///
-    /// Called on each widget-panel repaint rather than once at mount:
-    /// a panel that is hidden and shown again gets a fresh
-    /// `SplitViewState`, and the flag has to land on that one too.
-    fn pin_widget_panel_horizontal_scroll(&mut self, buffer_id: BufferId) {
-        for vs in self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
-            .expect("active window must have a populated split layout")
-            .values_mut()
+    /// Cheap and targeted rather than a full snapshot refresh, because it
+    /// runs ahead of every `widget_event` and every plugin action: those are
+    /// the moments plugin code runs in answer to the user, and what it reads
+    /// about focus then must be what the host decided a moment ago.
+    pub(crate) fn publish_panel_focus(&self) {
+        #[cfg(feature = "plugins")]
         {
-            if vs.buffer_state(buffer_id).is_none() {
-                continue;
-            }
-            if vs.active_buffer == buffer_id {
-                vs.viewport.horizontal_scroll_enabled = false;
-                vs.viewport.left_column = 0;
-            }
-            if let Some(bs) = vs.keyed_states.get_mut(&buffer_id) {
-                bs.viewport.horizontal_scroll_enabled = false;
-                bs.viewport.left_column = 0;
+            let Some(handle) = self.plugin_manager.read().unwrap().state_snapshot_handle() else {
+                return;
+            };
+            let Ok(mut snapshot) = handle.write() else {
+                return;
+            };
+            snapshot.panel_focus.clear();
+            for (key, focus) in self.widget_registry.focus_keys() {
+                snapshot
+                    .panel_focus
+                    .entry(key.plugin.clone())
+                    .or_default()
+                    .insert(key.id, focus.to_string());
             }
         }
     }
 
-    /// Best-effort width for a buffer's containing split. Returns
-    /// the most recent `SplitViewState::viewport.width` for any
-    /// split rendering this buffer; falls back to terminal width
-    /// when the buffer hasn't been rendered yet (e.g. mid-mount).
-    /// Subtracts 2 columns to account for gutter/scrollbar/border
-    /// padding the renderer adds — leaving the right edge clear
-    /// instead of pushing content into the chrome. This is what
-    /// flex `Spacer`s inside `Row` use to size their fill.
-    pub(super) fn widget_panel_width(&self, buffer_id: BufferId) -> u32 {
-        let raw = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
-            .values()
-            .find(|vs| vs.buffer_state(buffer_id).is_some() && vs.viewport.width > 0)
-            .map(|vs| vs.viewport.width as u32)
-            .unwrap_or_else(|| self.terminal_width.max(1) as u32);
-        // Reserve 2 cols for gutter/scrollbar/border. Saturate to
-        // avoid 0 width on tiny panels.
-        raw.saturating_sub(2).max(10)
+    /// The described page in the pane that holds the keyboard, if there is
+    /// one.
+    pub(crate) fn active_page_panel(&self) -> Option<crate::widgets::PanelKey> {
+        let buffer = self.active_buffer();
+        self.widget_registry
+            .panels_for_buffer(buffer)
+            .into_iter()
+            .find(|k| self.widget_registry.get(k).is_some_and(|p| p.page))
     }
 
-    /// Height sibling of [`Self::widget_panel_width`]: the viewport
-    /// height of a split currently rendering this buffer, or `None`
-    /// when the buffer isn't on screen (auto-sized widgets then keep
-    /// the legacy fallback until it is). No padding is subtracted —
-    /// the viewport height is already the buffer's usable rows.
-    pub(super) fn widget_panel_height(&self, buffer_id: BufferId) -> Option<u32> {
-        // Prefer the rect the last draw actually gave this panel. The
-        // split view-state's viewport is a seed the layout pass computes,
-        // and for a buffer-group panel it can only be a guess: the group's
-        // inner tree is stashed out of the main split tree, so
-        // `apply_layout` finds no rect for those leaves and falls back to
-        // the whole editor height. Sizing a list to that overshoots the
-        // panel and clips its last rows.
-        if let Some(painted) = self.painted_panel_height(buffer_id) {
-            return Some(painted);
+    /// **The page follows the caret.** Run after every event that could have
+    /// moved it — an arrow key, a page key, a click on the text, and equally
+    /// an edit, which moves the caret without being a `MoveCursor`.
+    ///
+    /// This is the whole of a page's navigation, and it is why the page binds
+    /// nothing. The mirror buffer under a described pane is a real buffer with
+    /// a real cursor, so every motion the editor already has — the arrows,
+    /// `Home`/`End`, `Ctrl+Home`/`Ctrl+End`, the page keys, word motions, vi
+    /// operators, and whatever the user rebound them to — moves it for free.
+    /// The page's job is to *read* where that caret ended up: bring its row
+    /// into the window, draw the caret there, and point the keyboard at
+    /// whatever control the row carries.
+    ///
+    /// The caret is read off the buffer rather than out of the event. Those
+    /// differ — an edit has no new-position field at all, a `Batch` can nest
+    /// another whose last move is the one that counts, and a position can be
+    /// clamped on the way in — and every one of those differences was a hole
+    /// while the page matched on key names instead.
+    pub(super) fn page_follows_caret(&mut self) {
+        let Some(key) = self.active_page_panel() else {
+            return;
+        };
+        let follows = self
+            .widget_registry
+            .get(&key)
+            .is_some_and(|p| p.focus_follows_cursor);
+        let position = self.active_window().active_cursors().primary().position;
+        let st = self.active_state();
+        let row = st.buffer.get_line_number(position);
+        // **A display column, not a byte one.** The page's spans come off the
+        // laid-out tree, so the reader's column has to be in the same units
+        // the tree is in — and the rows carrying controls are exactly the
+        // rows drawn in box glyphs, where three bytes are one column. The
+        // mirror is where the two meet, so the conversion belongs here and in
+        // `mirror_page_reader_into_buffer`, which does it the other way.
+        let col = st
+            .buffer
+            .line_start_offset(row)
+            .map(|start| {
+                display_col_of(
+                    &Self::page_line(&st.buffer, row),
+                    position.saturating_sub(start),
+                )
+            })
+            .unwrap_or(0);
+        let at = (row as u32, col);
+        if self.page_reading.get(&key) == Some(&at) {
+            return;
         }
+        // **A page with no reader still follows one.** `focusFollowsCursor`
+        // decides whether the caret is *drawn* and whether focus is seated on
+        // its row; the window follows the caret either way, because a page
+        // whose text scrolled away from the cursor it reports in the status
+        // bar is a page that has lost its place.
+        if follows {
+            self.page_reading.insert(key.clone(), at);
+        }
+        if let Some(anchor) = self.page_anchors.get(&key) {
+            anchor.reveal(at.0);
+        }
+        self.shell_description_stale = true;
+        if follows {
+            self.sync_widget_focus_to_reading_row(&key);
+        }
+    }
+
+    /// An editor action a page answers for itself, applied to its window.
+    ///
+    /// **The page does not re-bind anything.** Its keys are the editor's —
+    /// resolved once, by the one resolver, against the user's own keymap —
+    /// and this is the short list of *actions* whose subject is the window
+    /// rather than a buffer's cursor. Everything else the editor still does:
+    /// a page mounted in a pane switches tabs, opens the palette and quits
+    /// with the same keys as any other pane, because nothing here claims
+    /// them.
+    ///
+    /// Returns whether the action was the page's.
+    pub(crate) fn page_takes_action(&mut self, action: &crate::input::keybindings::Action) -> bool {
+        use crate::input::keybindings::Action;
+        // **A page key moves the window by a page too**, so the caret keeps
+        // its place on screen — which is what paging *is* in every other
+        // buffer, and the one thing a minimal reveal cannot do: revealed
+        // alone, a caret a page further down lands on the window's last row,
+        // and the page after that reads as one row of movement.
+        //
+        // The caret's own move stays the editor's, so a page key is not
+        // consumed here: the window goes first and the action follows it.
+        enum Step {
+            Rows(i32),
+            Pages(i32),
+        }
+        let (step, consumed) = match action {
+            Action::ScrollUp => (Step::Rows(-1), true),
+            Action::ScrollDown => (Step::Rows(1), true),
+            Action::MovePageUp | Action::SelectPageUp => (Step::Pages(-1), false),
+            Action::MovePageDown | Action::SelectPageDown => (Step::Pages(1), false),
+            _ => return false,
+        };
+        let Some(key) = self.active_page_panel() else {
+            return false;
+        };
+        let Some(anchor) = self.page_anchors.get(&key) else {
+            return false;
+        };
+        match step {
+            Step::Rows(n) => anchor.scroll_by(n),
+            Step::Pages(n) => anchor.scroll_by_pages(n),
+        }
+        self.shell_description_stale = true;
+        consumed
+    }
+
+    /// The column a composed buffer is painted into, or `None` when it is
+    /// not composing.
+    ///
+    /// The narrow half of [`Self::widget_panel_width`]'s reading, on its own
+    /// because a described panel needs the number the *pane* is flanked by
+    /// rather than the number its rows are laid out to. Read from this
+    /// buffer's state and not through the split's deref, for the reason
+    /// argued there: `SplitViewState` answers for whichever buffer is active
+    /// in the split, which is the neighbouring tab whenever this panel is
+    /// behind one.
+    pub(crate) fn buffer_compose_width(&self, buffer_id: BufferId) -> Option<u16> {
         self.windows
             .get(&self.active_window)
             .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .and_then(|vs| {
-                vs.values()
-                    .find(|vs| vs.buffer_state(buffer_id).is_some() && vs.viewport.height > 0)
-                    .map(|vs| vs.viewport.height as u32)
+            .map(|(_, vs)| vs)?
+            .values()
+            .find(|vs| {
+                vs.buffer_state(buffer_id).is_some() && vs.buffer_tab_state().viewport.width > 0
             })
+            .and_then(|vs| vs.buffer_state(buffer_id))
+            .and_then(|b| b.compose_width)
     }
 
-    /// Height of the content rect the last draw gave `buffer_id`, or
-    /// `None` when it wasn't painted into a split at all (hidden panel,
-    /// a group slot pointing at some other buffer).
-    fn painted_panel_height(&self, buffer_id: BufferId) -> Option<u32> {
-        self.active_layout()
-            .split_areas
-            .iter()
-            .find(|(_, id, _, _, _, _)| *id == buffer_id)
-            .map(|(_, _, content_rect, _, _, _)| content_rect.height as u32)
-            .filter(|h| *h > 0)
-    }
-
-    /// Buffer-mounted widget panels whose split no longer matches the row
-    /// budget their auto-sized (`visible_rows: None`) lists and trees were
-    /// windowed to — a resize, a divider drag, a panel becoming visible.
+    /// Forget every panel mounted into `buffer_id`, because that buffer is
+    /// being closed.
     ///
-    /// Deliberately narrow, because the repaint it drives happens mid-draw:
+    /// **The registry is the editor's and the buffer is the window's, and
+    /// nothing else joined those two lifetimes.** A panel whose buffer went
+    /// away — the tab's `×`, `Ctrl+W`, closing the workspace's last file —
+    /// stayed mounted, so every later sweep over the registry kept trying to
+    /// paint it: a resize re-renders *all* of them, and each attempt wrote
+    /// its rows into a buffer that no longer exists. That is the
+    /// `rerender_widget_panel(welcome_screen:1) failed: Buffer not found`
+    /// that appeared in the log on every terminal resize after the welcome
+    /// page's tab was closed.
     ///
-    /// * only panels currently painted into a split (a panel whose buffer
-    ///   has been swapped out of its group's slot has no geometry to be
-    ///   stale against, and must not be rewritten underneath the plugin);
-    /// * only panels that actually *have* an auto-sized list or tree —
-    ///   a spec that pins every `visible_rows` lays out the same at any
-    ///   height, so repainting it would be work with no visible effect;
-    /// * and the comparison is against the height the panel was last
-    ///   *rendered* against, not the previous frame's viewport, so a panel
-    ///   is repainted once per size change rather than once per frame.
-    pub(super) fn widget_panels_with_stale_height(&self) -> Vec<crate::widgets::PanelKey> {
-        self.widget_registry
-            .panel_keys()
-            .into_iter()
-            .filter(|key| {
-                let Some((buffer_id, spec)) = self.widget_registry.buffer_and_spec_ref(key) else {
-                    return false;
-                };
-                // Floating and dock panels size themselves to their own
-                // frame (`floating_panel_inner_height`) and are re-rendered
-                // by the paths that move them; only the split-mounted ones
-                // take their budget from a split.
-                if Self::slot_for_panel_buffer(buffer_id).is_some() {
-                    return false;
-                }
-                if !spec_has_auto_sized_list(spec) {
-                    return false;
-                }
-                let Some(painted) = self.painted_panel_height(buffer_id) else {
-                    return false;
-                };
-                self.widget_panel_render_heights.get(key) != Some(&painted)
-            })
-            .collect()
-    }
-
-    /// Record the row budget `panel_key` was just rendered against. Called
-    /// from every path that renders a buffer-mounted panel, so
-    /// [`Self::widget_panels_with_stale_height`] can tell a panel that has
-    /// seen the current geometry from one that has not.
-    pub(super) fn record_widget_panel_render_height(
-        &mut self,
-        panel_key: &crate::widgets::PanelKey,
-        avail_height: Option<u32>,
-    ) {
-        match avail_height {
-            Some(h) => {
-                self.widget_panel_render_heights
-                    .insert(panel_key.clone(), h);
-            }
-            None => {
-                self.widget_panel_render_heights.remove(panel_key);
-            }
+    /// The plugin learns of the close from the `buffer_closed` hook and drops
+    /// its own handle; this is the host's half of the same teardown, and it
+    /// mirrors what `handle_unmount_widget_panel` does when the plugin
+    /// unmounts a panel itself.
+    pub(crate) fn drop_widget_panels_for_buffer(&mut self, buffer_id: BufferId) {
+        for panel_key in self.widget_registry.panels_for_buffer(buffer_id) {
+            self.page_anchors.remove(&panel_key);
+            self.pane_mirrors.remove(&panel_key);
+            self.prose_reveal.borrow_mut().remove(&panel_key);
+            self.widget_registry.unmount(&panel_key);
+            // The description names the panels, so losing one changes it.
+            self.shell_description_stale = true;
+            tracing::debug!(
+                "Dropped widget panel {} with its buffer {:?}",
+                panel_key,
+                buffer_id
+            );
         }
     }
 
-    /// Re-render an existing widget panel after an in-host state
-    /// change (focus advance, scroll move, etc.) without the plugin
-    /// re-emitting the spec. Reads the panel's current spec from
-    /// the registry, runs `render_spec` against the (possibly
-    /// updated) prev state / focus key, writes the result back.
+    /// Re-resolve an existing widget panel after an in-host state change
+    /// (focus advance, selection move, etc.) without the plugin re-emitting
+    /// the spec. Reads the panel's current spec from the registry, resolves
+    /// it against the (possibly updated) state / focus key, and writes the
+    /// result back — the three walks of [`Self::resolve_described_panel`],
+    /// and nothing else: the tree lays every mounted panel out, so there is
+    /// no text projection to refresh here.
     pub(super) fn rerender_widget_panel(&mut self, panel_key: &crate::widgets::PanelKey) {
-        // The spec already lives in the registry — mutations (e.g.
-        // `append_tree_nodes_in_spec`) edit it in place. Borrow it for
-        // render, then write back only the side-effects (hits, instance
-        // states, focus key, tabbable). The previous shape cloned the
-        // whole spec out, rendered, then moved it back — for a Tree
-        // with 5 000 nodes that's a multi-MB deep clone per IPC, which
-        // dominates the host's per-mutation cost during a streaming
-        // search.
-        let rendered_height: Option<u32>;
-        let (buffer_id, _is_floating, panel_width, out_pieces) = {
-            let (buffer_id, spec) = match self.widget_registry.buffer_and_spec_ref(panel_key) {
-                Some(s) => s,
-                None => return,
-            };
-            let prev = self
-                .widget_registry
-                .instance_states(panel_key)
-                .cloned()
-                .unwrap_or_default();
-            let prev_focus = self
-                .widget_registry
-                .focus_key(panel_key)
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            let panel_slot = Self::slot_for_panel_buffer(buffer_id);
-            let is_floating = panel_slot.is_some();
-            let panel_width = if let Some(slot) = panel_slot {
-                self.floating_panel_inner_width(slot)
-            } else {
-                self.widget_panel_width(buffer_id)
-            };
-            // Floating panels that opted into the focus-marker gutter
-            // (the Orchestrator New Session form) must re-render
-            // through the same marker renderer on every host-driven
-            // refresh — otherwise a Tab / focus advance would repaint
-            // the panel without the gutter and the layout would jump.
-            let focus_marker = panel_slot
-                .and_then(|slot| self.panel(slot))
-                .map(|f| f.focus_marker)
-                .unwrap_or(false);
-            // This is also the path a hover change re-renders through, so
-            // the panel's tracked hover key has to reach the renderer here
-            // — otherwise entering a `×` would repaint it unhighlighted.
-            let hover_key = panel_slot
-                .and_then(|slot| self.panel(slot))
-                .map(|f| f.hovered_widget_key.clone())
-                .unwrap_or_default();
-            let hover_item_key = panel_slot
-                .and_then(|slot| self.panel(slot))
-                .map(|f| f.hovered_item_key.clone())
-                .unwrap_or_default();
-            // Row budget for auto-sized lists/trees: the floating
-            // panel's inner height when this is a floating/dock slot,
-            // else the split viewport height of the panel's buffer.
-            let avail_height = match panel_slot {
-                Some(slot) => self.floating_panel_inner_height(slot),
-                None => self.widget_panel_height(buffer_id),
-            };
-            rendered_height = avail_height;
-            let theme_guard = self.theme.read().unwrap();
-            let out = render_floating_spec(
-                focus_marker,
-                spec,
-                &prev,
-                &prev_focus,
-                panel_width,
-                avail_height,
-                &hover_key,
-                &hover_item_key,
-                Some(crate::widgets::MarkdownCtx {
-                    theme: &theme_guard,
-                    grammars: Some(self.grammar_registry.as_ref()),
-                }),
-            );
-            (buffer_id, is_floating, panel_width, out)
+        // Whatever this re-resolves is read by the description; the tree
+        // catches up on the next frame, and a key before it lays one out.
+        self.shell_description_stale = true;
+        self.resolve_described_panel(panel_key);
+    }
+    /// Re-resolve a **described** panel, and report that the collector did
+    /// not need to run.
+    ///
+    /// **The text projection has no reader for such a panel, so it is not
+    /// produced.** Its rows are the tree's nodes, its hit areas are those
+    /// nodes' own presses, its wheel is its viewports' (the box arena that
+    /// answered one is deleted), and its painted windows are superseded by the viewport's
+    /// (`Editor::widget_viewport` asks the tree first). What is left is
+    /// [`crate::widgets::resolve_panel`]'s three: the state carry, the focus
+    /// clamp, and the ring — none of which needs a row, a width or a height.
+    ///
+    /// An anchored floating panel used to be an exception here: its width was
+    /// the mirror's widest row, because a rule inside its interior was text of
+    /// a computed length and set the width it had been asked about under
+    /// `Auto`. A rule is a ground the backend tiles now (`fresh_ui::Node::rule`),
+    /// so the box measures its content like every other described box and
+    /// the anchored panel needs nothing from the collector.
+    ///
+    /// Returns `false` for a panel that is not mounted.
+    fn resolve_described_panel(&mut self, panel_key: &crate::widgets::PanelKey) -> bool {
+        if !self.panel_is_the_trees(panel_key) {
+            return false;
+        }
+        let Some(state) = self.widget_registry.get(panel_key) else {
+            return false;
         };
-        let _ = panel_width;
-        self.record_widget_panel_render_height(panel_key, rendered_height);
-        let panel_slot = Self::slot_for_panel_buffer(buffer_id);
-        let focus_cursor = out_pieces.focus_cursor;
-        let entries = out_pieces.entries;
-        let embeds = out_pieces.embeds;
-        let overlays = out_pieces.overlays;
-        let panel_boxes = out_pieces.boxes.clone();
-        let popup = out_pieces.popup;
+        let ink = self.markdown_ink();
+        let out = crate::widgets::resolve_panel(
+            &state.spec,
+            &state.instance_states,
+            &state.focus_key,
+            // The panel's own policy, not a literal: this is the fourth
+            // path that can re-resolve focus, and it is the one the
+            // migration routes described panels through. Seeding here
+            // discarded `autoFocusFirst: false` on every repaint of
+            // exactly the panels the tree has already taken over.
+            state.auto_focus_first,
+            Some(ink.ctx()),
+        );
         if self
             .widget_registry
-            .update_side_effects(
-                panel_key,
-                out_pieces.hits,
-                out_pieces.instance_states,
-                out_pieces.focus_key,
-                out_pieces.tabbable,
-                out_pieces.effective_rows,
-                out_pieces.boxes,
-            )
+            .update_side_effects(panel_key, out.instance_states, out.focus_key)
             .is_none()
         {
-            tracing::warn!("rerender_widget_panel({}) lost panel mid-call", panel_key);
-            return;
+            tracing::warn!("resolve_described_panel({}) lost panel mid-call", panel_key);
         }
-        if let Some(slot) = panel_slot {
-            if let Some(fwp) = self.panel_mut(slot) {
-                if &fwp.panel_key == panel_key {
-                    fwp.entries = entries;
-                    fwp.focus_cursor = focus_cursor;
-                    fwp.embeds = embeds;
-                    fwp.overlays = overlays;
-                    fwp.boxes = panel_boxes;
-                    fwp.popup = popup;
-                }
-            }
-            return;
-        }
-        if let Err(e) = self.set_virtual_buffer_content(buffer_id, entries.clone()) {
-            tracing::error!("rerender_widget_panel({}) failed: {}", panel_key, e);
-        }
-        self.apply_widget_focus_cursor(buffer_id, &entries, focus_cursor);
+        true
     }
 
     pub(super) fn handle_widget_command(
@@ -1028,24 +597,250 @@ impl Editor {
                 self.handle_widget_text_key(panel_key, &key);
             }
             WidgetAction::TextInputChar { text } => {
-                self.handle_widget_text_char(panel_key, &text);
+                let _ = self.handle_widget_text_char(panel_key, &text);
             }
-            WidgetAction::Key { key } => {
-                self.handle_widget_key(panel_key, &key);
+            WidgetAction::Key { key } => match crate::input::keybindings::parse_key_seq(&key) {
+                Some(seq) => self.handle_widget_key(panel_key, &seq),
+                None => tracing::debug!(
+                    target: "fresh::widgets",
+                    %key,
+                    "widget key did not parse; dropped"
+                ),
+            },
+        }
+    }
+
+    /// **The window a widget's key and wheel handlers act inside.**
+    ///
+    /// One resolver, host-side, because "how big is this widget's window"
+    /// is not something a kind can answer: it is a fact about a *layout*.
+    ///
+    /// **The tree first**, through [`Self::described_widget_viewport`] — the
+    /// widget is a node the reconciler placed, and the viewport under it
+    /// published its window during that layout.
+    ///
+    /// **Then the spec**, for the frame between a mount and the first layout,
+    /// where nothing has laid this widget out at all.
+    ///
+    /// **The division to items happens here, once.** Every branch reports
+    /// both numbers, so no seam downstream has to divide a row count by an
+    /// item height — which is exactly the arithmetic that paged a card
+    /// list past its own end (§6h) because one of two copies had it and
+    /// the other did not.
+    pub(crate) fn widget_viewport(
+        &self,
+        panel_key: &crate::widgets::PanelKey,
+        widget: &fresh_core::api::WidgetSpec,
+        widget_key: &str,
+    ) -> crate::widgets::kinds::Viewport {
+        self.described_widget_viewport(panel_key, widget_key)
+            .unwrap_or_else(|| crate::widgets::kinds::Viewport::from_spec(widget))
+    }
+
+    /// The window the *tree* gave this widget, for a panel the tree describes.
+    ///
+    /// **The question is put to the tree, and it either has the element or it
+    /// does not.** Same shape as `advance_panel_focus_in_tree`'s
+    /// `has_focus_within`: nothing here asks the runtime "is this panel
+    /// described" or "does this spec have a described interior" and then
+    /// trusts the answer — a second authority for a fact the tree holds is
+    /// §6g's defect class, and it has shipped three times. The lookup *is* the
+    /// test: a widget the tree laid out has a keyed element with a viewport
+    /// under it, and a widget it did not has neither.
+    ///
+    /// **Scoped to this panel's own subtree**, because a key is unique only
+    /// where its owner says it is ([`fresh_ui::Ui::find_by_key_in`] says so in
+    /// as many words). The dock, the floating panel and every pane can each
+    /// hold a described panel in the same frame, and two plugins may both key
+    /// a list `"items"`; a frame-wide lookup would hand one panel's window to
+    /// another's handler.
+    ///
+    /// `None` for a cell-scrolling viewport, by
+    /// [`fresh_ui::Ui::item_window`]'s design — a `Tree` drawn as bordered
+    /// cards scrolls line by line, so its window is not in items and
+    /// answering with its height in rows would be the units conflated (§6i).
+    /// Such a widget falls through to the spec.
+    fn described_widget_viewport(
+        &self,
+        panel_key: &crate::widgets::PanelKey,
+        widget_key: &str,
+    ) -> Option<crate::widgets::kinds::Viewport> {
+        if widget_key.is_empty() {
+            return None;
+        }
+        let ui = self.shell_ui.as_ref()?;
+        let root = self.panel_subtree_root(ui, panel_key)?;
+        // **Only the vertical.** For an item-scrolling viewport the window
+        // rectangle is mixed-unit — `y`/`h` count items, `w` counts cells —
+        // so `h` is the item count and there is nothing across to read.
+        // `cells` is the same window's height in the unit a `Tree`'s offset
+        // moves in, which is why it comes back beside it rather than being
+        // multiplied out of a band the host cannot see.
+        let (window, cells) = ui.item_window_in(root, &fresh_ui::Key::Str(widget_key.into()))?;
+        Some(crate::widgets::kinds::Viewport {
+            items: (window.h as u32).max(1),
+            rows: cells as u32,
+            // `w` counts cells on both kinds of window — it is the one part
+            // of an item-scrolling rectangle that is not in items — so it is
+            // the width a sideways pan is measured against.
+            cols: window.w as u32,
+        })
+    }
+
+    /// The element a described panel's widgets are laid out under, per
+    /// surface — the root every by-key lookup into that panel is scoped to.
+    ///
+    /// Three surfaces, three roots, and the pane's is per-leaf for the same
+    /// reason `splits::content_key`'s own doc gives: a grid puts several
+    /// interiors in one tree, and an unscoped name finds whichever came
+    /// first. `panel::interior_key` cannot serve a pane — it maps every
+    /// `Slot::Pane` to one number.
+    ///
+    /// `None` when the surface has no described interior in this frame, which
+    /// is the same answer as "the tree did not lay this panel out".
+    pub(super) fn panel_subtree_root(
+        &self,
+        ui: &fresh_ui::Ui<crate::view::shell::msg::UiMsg>,
+        panel_key: &crate::widgets::PanelKey,
+    ) -> Option<fresh_ui::ElementId> {
+        use crate::view::shell::widgets::Slot;
+        match self.slot_of_panel(panel_key) {
+            Some(super::PanelSlot::Dock) => {
+                ui.find_by_key(&crate::view::shell::panel::interior_key(Slot::Dock))
+            }
+            Some(super::PanelSlot::Floating) => {
+                ui.find_by_key(&crate::view::shell::panel::interior_key(Slot::Floating))
+            }
+            Some(super::PanelSlot::Sidebar(i)) => {
+                ui.find_by_key(&crate::view::shell::panel::interior_key(Slot::Sidebar(i)))
+            }
+            None => {
+                let buffer = self.widget_registry.get(panel_key)?.buffer_id?;
+                let leaf = self
+                    .window_buffer_panes()
+                    .into_iter()
+                    .find(|(_, b)| *b == buffer)
+                    .map(|(leaf, _)| leaf)?;
+                ui.find_by_key(&crate::view::shell::splits::content_key(leaf))
             }
         }
     }
 
-    fn handle_widget_key(&mut self, panel_key: &crate::widgets::PanelKey, key: &str) {
-        // Smart key dispatch — route to the right specialized
-        // handler based on focused widget kind. See WidgetAction::Key
-        // doc for the dispatch table.
+    /// `Up`, `Down`, `Home` and `End` — with or without `S-` — over a markdown
+    /// document, resolved to a byte of the document from the rows the tree
+    /// wrapped it into (`Ui::text_rows_in`, then `cell_of` and `byte_of`),
+    /// and applied as a caret move the kind never sees. Returns whether the
+    /// key was one of those over such a widget.
+    ///
+    /// This is what the shadow editor over the reflowed rows existed to do:
+    /// give a key handler with no width something to count rows in. The
+    /// rows are layout's now, so the handler that has the tree does the
+    /// counting, and the document's state holds the document.
+    fn prose_vertical_key(
+        &mut self,
+        panel_key: &crate::widgets::PanelKey,
+        widget: &fresh_core::api::WidgetSpec,
+        widget_key: &str,
+        key: &crate::input::keybindings::KeySeq,
+    ) -> bool {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        use fresh_ui::render::prim::{byte_of, cell_of};
+        if !matches!(widget, fresh_core::api::WidgetSpec::Text { markdown: true, rows, .. } if *rows > 1)
+        {
+            return false;
+        }
+        // One press, and `Shift` is the only modifier a row move reads: it
+        // extends the selection. A chord is somebody else's.
+        let Some(press) = key.single() else {
+            return false;
+        };
+        let extend = if press.mods().is_empty() {
+            false
+        } else if press.mods() == KeyModifiers::SHIFT {
+            true
+        } else {
+            return false;
+        };
+        let base = press.code();
+        if !matches!(
+            base,
+            KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End
+        ) {
+            return false;
+        }
+        let byte = match self
+            .widget_registry
+            .get(panel_key)
+            .and_then(|p| p.instance_states.get(widget_key))
+        {
+            Some(crate::widgets::WidgetInstanceState::Text { editor, .. }) => {
+                editor.flat_cursor_byte()
+            }
+            _ => return false,
+        };
+        let Some(mut ui) = self.shell_ui.take() else {
+            return false;
+        };
+        let rows = self.panel_subtree_root(&ui, panel_key).and_then(|root| {
+            ui.text_rows_in(
+                root,
+                &crate::view::shell::widgets::prose_run_key(widget_key),
+            )
+        });
+        self.shell_ui = Some(ui);
+        let Some((whole, rows)) = rows else {
+            return false;
+        };
+        if rows.is_empty() {
+            return true;
+        }
+        let (row, col) = cell_of(&rows, &whole, byte);
+        let last = rows.len() - 1;
+        let target = match base {
+            KeyCode::Home => rows[row].src.start,
+            KeyCode::End => rows[row].src.end,
+            KeyCode::Up if row == 0 => 0,
+            KeyCode::Up => {
+                byte_of(&rows, &whole, row - 1, col as i32).unwrap_or(rows[row - 1].src.end)
+            }
+            KeyCode::Down if row == last => whole.len(),
+            _ => byte_of(&rows, &whole, row + 1, col as i32).unwrap_or(rows[row + 1].src.end),
+        };
+        self.move_prose_caret(panel_key, widget_key, target, extend);
+        true
+    }
+
+    fn handle_widget_key(
+        &mut self,
+        panel_key: &crate::widgets::PanelKey,
+        key: &crate::input::keybindings::KeySeq,
+    ) {
+        // Smart key dispatch: the focused control first, then the panel's
+        // own defaults for what it passes.
+        if self.widget_control_key(panel_key, key)
+            != crate::widgets::kinds::KeyDisposition::Consumed
+        {
+            self.widget_panel_default_key(panel_key, key);
+        }
+    }
+
+    /// **The focused control's turn at a key** — the kind's own
+    /// `WidgetImpl::on_key`, with its effects applied, and nothing of the
+    /// panel's. Its answer decides whether the panel's mode and the panel's
+    /// defaults get the key after it (`Pass` / `PassAfter`) or not
+    /// (`Consumed`); see `Editor::dispatch_widget_panel_key`.
+    pub(super) fn widget_control_key(
+        &mut self,
+        panel_key: &crate::widgets::PanelKey,
+        key: &crate::input::keybindings::KeySeq,
+    ) -> crate::widgets::kinds::KeyDisposition {
+        use crate::widgets::kinds::KeyDisposition;
         let panel = match self.widget_registry.get(panel_key) {
             Some(p) => p,
-            None => return,
+            None => return KeyDisposition::Consumed,
         };
         let focus_key = panel.focus_key.clone();
-        // Kind-owned key handling (widget-framework-v2-review.md §4.3):
+        // Kind-owned key handling (`docs/internal/retained-mode-ui.md` "Where each surface lives"):
         // the focused widget's impl claims keys its own open popup
         // needs — Text's completion list, Dropdown's option list —
         // and passes everything else through. The popup short-circuit
@@ -1056,11 +851,21 @@ impl Editor {
         if !focus_key.is_empty() {
             let widget = crate::widgets::find_widget_by_key(&panel.spec, &focus_key).cloned();
             if let Some(widget) = widget {
+                // **A rendered-row move over a markdown document is the
+                // host's.** `Up`/`Down`/`Home`/`End` there mean the rows the
+                // wrap produced, and the kind has neither the width nor the
+                // tree; the host reads the rows layout shaped and hands the
+                // kind a byte. Everything else on that surface stays the
+                // kind's and stays logical.
+                if self.prose_vertical_key(panel_key, &widget, &focus_key, key) {
+                    return KeyDisposition::Consumed;
+                }
                 let mut fx = crate::widgets::kinds::KeyFx::default();
+                let viewport = self.widget_viewport(panel_key, &widget, &focus_key);
                 let disposition = match self.widget_registry.get_mut(panel_key) {
                     Some(panel_mut) => crate::widgets::kinds::behavior(&widget)
-                        .on_key(&widget, &focus_key, panel_mut, key, &mut fx),
-                    None => return,
+                        .on_key(&widget, &focus_key, panel_mut, viewport, key, &mut fx),
+                    None => return KeyDisposition::Consumed,
                 };
                 if fx.flash_scrollbar {
                     // Keyboard nav in the dock: flash its overlay
@@ -1082,53 +887,61 @@ impl Editor {
                 if let Some(delta) = fx.focus_advance {
                     self.handle_widget_focus_advance(panel_key, delta);
                 }
-                if disposition == crate::widgets::kinds::KeyDisposition::Consumed {
-                    return;
-                }
+                return disposition;
             }
         }
-        // Re-fetch the focused widget for the main dispatch: the
-        // kind-owned handler above ran `&mut self` (it may have closed
-        // a popup), so we can't hold a borrow from before it. The spec
-        // is unchanged by a dismiss, so this resolves to the same
-        // widget.
+        KeyDisposition::Pass
+    }
+
+    /// **The panel's own defaults for a key its focused control passed** —
+    /// Tab walking the ring, picker-style arrows, Enter on a single-line
+    /// field. Runs after the control and after the panel's mode.
+    pub(super) fn widget_panel_default_key(
+        &mut self,
+        panel_key: &crate::widgets::PanelKey,
+        key: &crate::input::keybindings::KeySeq,
+    ) {
         let panel = match self.widget_registry.get(panel_key) {
             Some(p) => p,
             None => return,
         };
+        let focus_key = panel.focus_key.clone();
         let widget = if focus_key.is_empty() {
             None
         } else {
             crate::widgets::find_widget_by_key(&panel.spec, &focus_key)
+        }
+        .cloned();
+        let widget = widget.as_ref();
+        use crossterm::event::KeyCode;
+        let Some(key) = key.single().filter(|k| k.mods().is_empty()) else {
+            return;
         };
-        match key {
-            "Tab" => self.handle_widget_focus_advance(panel_key, 1),
-            "Shift+Tab" => self.handle_widget_focus_advance(panel_key, -1),
-            "Up" | "Down" => {
-                let delta = if key == "Up" { -1 } else { 1 };
-                // Picker-style nav, capability-declared: the focused
-                // kind says whether panel arrows should walk the focus
-                // ring instead (`arrows_advance_focus` — Button/Toggle,
-                // no vertical axis of their own), and the panel's
-                // picker target says how an arrow reaches it
-                // (`picker_nav`: List peeks, Tree takes focus). No
-                // kind matching here — the capabilities are the kinds'
-                // declarations.
-                let arrows_advance = widget
-                    .map(|w| crate::widgets::kinds::behavior(w).arrows_advance_focus())
-                    .unwrap_or(false);
+        match key.code() {
+            KeyCode::Tab => self.handle_widget_focus_advance(panel_key, 1),
+            KeyCode::BackTab => self.handle_widget_focus_advance(panel_key, -1),
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
+                // **An arrow nothing used moves focus by where things are**
+                // (`docs/internal/widget-controls-own-interaction.md` R4): the
+                // focused control and the panel's mode have both passed it, so
+                // it goes to the nearest control on screen in its direction —
+                // the traversal policy the panel's interior declares
+                // (`fresh_ui::Directional`), not the next stop in Tab order,
+                // which in a two-column menu or a form's footer is the wrong
+                // one. Tab stays reading order under the same policy.
+                //
+                // The one exception is the typed-filter panel: ↑/↓ from its
+                // single-line filter field reach the panel's picker (a List
+                // moves its selection while the field keeps typing; a Tree
+                // takes focus), capability-declared by the picker's kind.
+                let vertical = matches!(key.code(), KeyCode::Up | KeyCode::Down);
+                let from_field = matches!(widget, Some(fresh_core::api::WidgetSpec::Text { .. }));
                 let scrollable = self
                     .widget_registry
                     .get(panel_key)
                     .and_then(|p| find_scrollable_widget_key(&p.spec));
-                if scrollable.is_none() && arrows_advance {
-                    // Button-only popups (the dock's right-click
-                    // context menu, confirm panes): arrows walk
-                    // the controls like Tab / Shift+Tab, matching
-                    // every other menu in the dock.
-                    self.handle_widget_focus_advance(panel_key, delta);
-                }
-                if let Some(target_key) = scrollable {
+                if let Some(target_key) = scrollable.filter(|_| vertical && from_field) {
+                    let delta = if key.code() == KeyCode::Up { -1 } else { 1 };
                     let nav = self
                         .widget_registry
                         .get(panel_key)
@@ -1138,6 +951,7 @@ impl Editor {
                     match nav {
                         crate::widgets::kinds::PickerNav::Peek => {
                             self.handle_widget_select_move_for_key(panel_key, &target_key, delta);
+                            return;
                         }
                         crate::widgets::kinds::PickerNav::TakeFocus => {
                             // set_panel_focus_and_notify seeds the
@@ -1145,13 +959,21 @@ impl Editor {
                             // row (the kind's on_focus_change).
                             self.set_panel_focus_and_notify(panel_key, target_key.clone());
                             self.rerender_widget_panel(panel_key);
+                            return;
                         }
                         crate::widgets::kinds::PickerNav::Skip => {}
                     }
                 }
+                let dir = match key.code() {
+                    KeyCode::Up => fresh_ui::FocusDir::Up,
+                    KeyCode::Down => fresh_ui::FocusDir::Down,
+                    KeyCode::Left => fresh_ui::FocusDir::Left,
+                    _ => fresh_ui::FocusDir::Right,
+                };
+                self.move_panel_focus(panel_key, dir, 1);
             }
-            "Enter" => match widget {
-                Some(fresh_core::api::WidgetSpec::Text { .. }) => {
+            KeyCode::Enter => {
+                if let Some(fresh_core::api::WidgetSpec::Text { .. }) = widget {
                     // Multi-line Enter (newline, or markdown
                     // activate) is kind-owned in on_key; what
                     // reaches here is a single-line field.
@@ -1173,40 +995,422 @@ impl Editor {
                         self.handle_widget_focus_advance(panel_key, 1);
                     }
                 }
-                _ => {}
-            },
+            }
             _ => {} // unrecognised key — quietly ignore
         }
     }
 
+    /// Move this panel's focus by `delta` tab stops.
+    ///
+    /// **Two rings, and which one is authoritative is the tree's answer, not
+    /// a count taken from the runtime.** Every host-driven focus move arrives
+    /// here — the plugin's `WidgetAction::FocusAdvance`, a kind's
+    /// `KeyFx::focus_advance` (Enter committing a field), the smart-key
+    /// `Tab` / `Shift+Tab` a plugin's `defineMode` binding produces, and the
+    /// arrows on a button-only popup — so this is the one place the choice
+    /// can be made once.
+    ///
+    /// Since S2 a described panel's Tab is the *tree's*: the keyboard layer
+    /// names the interior as its focus scope, the fallback declines Tab, and
+    /// `default_for_intent` runs `Ui::move_focus`. The box arena's ring below
+    /// still exists because a panel with no described interior — an empty
+    /// dock, or one the adapter's scope has nothing focusable in — keeps the
+    /// key sink and has no tree ring at all. Advancing on the arena while the
+    /// tree holds focus writes the registry's key without moving the tree's
+    /// focus, and the next Tab then starts from the widget the user has
+    /// already left: two rings, disagreeing.
+    ///
+    /// So the tree is asked whether it is holding this panel's focus —
+    /// `has_focus_within(interior_key(slot))`, which is a fact only the tree
+    /// has — and if it is, the move is *its* `move_focus` and the registry's
+    /// key follows through the `WidgetFocus` mirror. Deliberately not a
+    /// "does this panel have focus targets" question put to the runtime: that
+    /// is the two-sources-for-one-fact shape that shipped once already
+    /// (`c89d25f`), and the runtime cannot know whether the tree's focus is
+    /// where its ring would start.
     fn handle_widget_focus_advance(&mut self, panel_key: &crate::widgets::PanelKey, delta: i32) {
-        let panel = match self.widget_registry.get(panel_key) {
-            Some(p) => p,
-            None => return,
+        let dir = match delta < 0 {
+            true => fresh_ui::FocusDir::Prev,
+            false => fresh_ui::FocusDir::Next,
         };
-        // The ring comes from the layout-box tree, scoped to the
-        // nearest focus-trap ancestor of the focused box (a modal /
-        // Component subtree contains Tab cycling; without traps this
-        // is the whole panel's document order). Panels mounted without
-        // a box tree (tests, legacy paths) fall back to the stored
-        // flat ring.
-        let ring = {
-            let scoped =
-                crate::widgets::layout_box::focus_ring_scoped(&panel.boxes, &panel.focus_key);
-            if scoped.is_empty() {
-                panel.tabbable.clone()
-            } else {
-                scoped
-            }
-        };
-        if ring.is_empty() {
+        self.move_panel_focus(panel_key, dir, delta.unsigned_abs());
+    }
+
+    /// Move this panel's focus `steps` stops in `dir` — Tab's ring for
+    /// Next/Prev, the arrows' directions for the rest. Which stop a direction
+    /// reaches is the traversal policy the panel's interior declares
+    /// (`fresh_ui::Directional`: by where things are laid out), answered by
+    /// the tree on either path below — its own `move_focus` when it holds the
+    /// panel's focus, `next_in` over the same registrations when it does not.
+    fn move_panel_focus(
+        &mut self,
+        panel_key: &crate::widgets::PanelKey,
+        dir: fresh_ui::FocusDir,
+        steps: u32,
+    ) {
+        // The ring is read off the tree, so the tree has to carry the panel
+        // as it is now — a mount or a spec update since the last frame is
+        // laid out first. See `Editor::shell_description_stale`.
+        self.lay_out_shell_if_stale();
+        if self.advance_panel_focus_in_tree(panel_key, dir, steps) {
             return;
         }
-        let cur_idx = ring.iter().position(|k| k == &panel.focus_key).unwrap_or(0) as i32;
-        let n = ring.len() as i32;
-        let new_idx = ((cur_idx + delta) % n + n) % n;
-        let new_key = ring[new_idx as usize].clone();
+        // **The tree does not hold this panel's focus** — a mounted but
+        // unfocused panel, or a pane-mounted one whose keyboard is the
+        // buffer's — so the panel's focus *fact* advances instead, along the
+        // ring the tree would walk if it did (`Ui::next_in`). One order and
+        // one source: the same registrations, in the same policy's order, as
+        // the Tab above. Confined to the nearest focus scope around the
+        // focused widget, which is what a `Component`'s trap declares.
+        let Some(slot) = self.described_slot_of_panel(panel_key) else {
+            return;
+        };
+        let focus_key = self
+            .widget_registry
+            .focus_key(panel_key)
+            .map(str::to_string)
+            .unwrap_or_default();
+        let follows_reader = self
+            .widget_registry
+            .get(panel_key)
+            .is_some_and(|p| p.page && p.focus_follows_cursor);
+        let Some(ui) = self.shell_ui.as_ref() else {
+            return;
+        };
+        let Some(interior) = ui.find_by_key(&crate::view::shell::panel::interior_key(slot)) else {
+            return;
+        };
+        let from = (!focus_key.is_empty())
+            .then(|| ui.find_by_key(&crate::view::shell::widgets::widget_focus_key(&focus_key)))
+            .flatten()
+            .filter(|f| ui.contains(interior, *f));
+        let root = from
+            .and_then(|f| ui.enclosing_focus_scope(f))
+            .filter(|s| ui.contains(interior, *s))
+            .unwrap_or(interior);
+        // "Nothing focused" sits *outside* the ring: the first Tab lands on
+        // the first widget and the first Shift+Tab on the last, which is what
+        // `next_in` answers for a `from` it does not find.
+        //
+        // **Except on a page whose focus follows its reader**, where nothing
+        // focused is not the panel at rest — it is the reader on prose, which
+        // on a page that is mostly prose is most rows. Starting at the ring's
+        // end there would send every Tab from below the fold to the top of the
+        // document: read down to the third level, press Tab, and you are back
+        // on the startup switch. So the ring is seeded from where the reader
+        // is, and Tab goes on from there.
+        let seed = match from.is_none() && follows_reader {
+            true => self.page_ring_seed(
+                panel_key,
+                matches!(
+                    dir,
+                    fresh_ui::FocusDir::Next | fresh_ui::FocusDir::Down | fresh_ui::FocusDir::Right
+                ),
+            ),
+            false => None,
+        };
+        let from = seed
+            .as_deref()
+            .and_then(|k| ui.find_by_key(&crate::view::shell::widgets::widget_focus_key(k)))
+            .filter(|f| ui.contains(interior, *f))
+            .or(from);
+        let mut cur = from;
+        for _ in 0..steps {
+            match ui.next_in(root, cur, dir) {
+                Some(n) => cur = Some(n),
+                None => break,
+            }
+        }
+        let Some(new) = cur.filter(|c| Some(*c) != from) else {
+            return;
+        };
+        let Some(new_key) = ui
+            .key_of(new)
+            .as_ref()
+            .and_then(crate::view::shell::widgets::widget_key_of)
+            .map(str::to_string)
+        else {
+            return;
+        };
         self.set_panel_focus_and_notify(panel_key, new_key);
+        self.rerender_widget_panel(panel_key);
+    }
+
+    /// The slot whose described interior this panel is, pane-mounted panels
+    /// included — `slot_of_panel` answers only the three slots with a
+    /// keyboard layer.
+    fn described_slot_of_panel(
+        &self,
+        panel_key: &crate::widgets::PanelKey,
+    ) -> Option<crate::view::shell::widgets::Slot> {
+        use crate::view::shell::widgets::Slot;
+        match self.slot_of_panel(panel_key) {
+            Some(super::PanelSlot::Dock) => return Some(Slot::Dock),
+            Some(super::PanelSlot::Floating) => return Some(Slot::Floating),
+            Some(super::PanelSlot::Sidebar(i)) => return Some(Slot::Sidebar(i)),
+            None => {}
+        }
+        let buffer = self.widget_registry.get(panel_key)?.buffer_id?;
+        self.window_buffer_panes()
+            .into_iter()
+            .find(|(_, b)| *b == buffer)
+            .map(|(leaf, _)| Slot::Pane(leaf))
+    }
+
+    /// Ask the tree to move this panel's focus along its own ring, and report
+    /// whether it was the one to answer.
+    ///
+    /// **The question is `has_focus_within`, and it is put to the tree.**
+    /// A panel is on the tree's ring when its keyboard layer named an
+    /// interior as its focus scope *and* focus is currently inside it — which
+    /// is one lookup and one containment test, both answered from the focus
+    /// tree that would do the moving. Anything the host could compute instead
+    /// (does this spec have tabbable widgets, is this panel `focused`) is a
+    /// second source for a fact the tree already holds, and would be wrong in
+    /// exactly the cases that matter: a scope with nothing focusable in it
+    /// keeps the sink, and a panel that is not the focused surface has the
+    /// tree's focus somewhere else entirely.
+    ///
+    /// `true` includes **the tree declining to move**: a scope holding one
+    /// focusable answers every direction with the element focus is already
+    /// on, and `Ui::move_focus` reports that as no move (its own doc says
+    /// why — returning `true` there would claim the key). Falling through to
+    /// the arena there is precisely the disagreement this exists to prevent:
+    /// it would write a focus key the tree's focus is not on, and the user's
+    /// next Tab would start from the widget they had already left.
+    ///
+    /// `false` means there is no tree ring for this panel — no described
+    /// interior, nothing in it to focus, a pane-mounted panel, or the panel
+    /// is not where focus is — and the box arena is the only ring there is.
+    ///
+    /// `panel::Interior::has_focus_targets` is *not* this question: it is a
+    /// build input, deciding whether the description declares a scope at all,
+    /// which has to be answered before the tree exists. It used to be a count
+    /// the runtime recorded, which made it a second authority that could go
+    /// stale against the spec; it is now the same predicate the tree applies
+    /// to the same spec (`widgets::any_on_the_ring`), so it cannot disagree
+    /// with the ring it is predicting. Where it is still *incomplete* — a
+    /// focusable reachable only inside a card or a shut pop-over — the failure
+    /// stays graceful in both directions: the scope is either not declared
+    /// (the panel keeps its sink, as before) or declared with nothing in it,
+    /// and the test below then answers `false` and this falls through to the
+    /// arena rather than to a focus move nobody can see.
+    ///
+    /// **What this does not fix, stated rather than implied.** A panel that
+    /// is mounted but not focused still advances on the arena, so its
+    /// registry key (which is what the description paints the focus marker
+    /// from) can name a widget the tree's focus is not on. It is settled the
+    /// next time focus *enters* the panel, and correctly: the description
+    /// marks the registry's focused widget `autofocus`
+    /// (`view::shell::widgets::on_the_ring`), so `apply_autofocus` lands the
+    /// tree where the marker already is rather than on the scope's first
+    /// control — which is the seeding this paragraph used to say was missing,
+    /// said as a description rather than as a second writer of the tree's
+    /// focus.
+    ///
+    /// The other moment — a focus move made while the panel is *already*
+    /// focused — is the description's too: the mark moves with the registry's
+    /// key, and `fresh_ui` re-settles focus onto a mark that moved. No host
+    /// call places focus in the tree.
+    fn advance_panel_focus_in_tree(
+        &mut self,
+        panel_key: &crate::widgets::PanelKey,
+        dir: fresh_ui::FocusDir,
+        steps: u32,
+    ) -> bool {
+        use crate::view::shell::msg::{UiFact, UiMsg};
+        use crate::view::shell::widgets::Slot;
+        let slot = match self.slot_of_panel(panel_key) {
+            Some(super::PanelSlot::Dock) => Slot::Dock,
+            Some(super::PanelSlot::Floating) => Slot::Floating,
+            Some(super::PanelSlot::Sidebar(i)) => Slot::Sidebar(i),
+            // A pane-mounted panel has no keyboard layer, so it names no
+            // scope; its keys arrive by the buffer's route and the arena is
+            // its ring.
+            None => return false,
+        };
+        let Some(mut ui) = self.shell_ui.take() else {
+            return false;
+        };
+        let holds = ui
+            .find_by_key(&crate::view::shell::panel::interior_key(slot))
+            .is_some_and(|el| ui.has_focus_within(el));
+        if !holds {
+            self.shell_ui = Some(ui);
+            return false;
+        }
+        // **Take whatever is pending first, and drop it, so what follows is
+        // unambiguously this move's.** `Ui::pending_messages` is where
+        // framework-initiated activity leaves its facts — what
+        // `apply_autofocus` settled on a frame since the last input, and any
+        // `request_focus` this dispatch has already made. The editor's own
+        // drain is `Editor::apply_settled_shell_messages`, at the head of
+        // every `shell_dispatch`; this path can run between two of those, so
+        // there can be something here.
+        //
+        // Dropping it rather than applying it is safe *because of what these
+        // facts are*: every one of them names where this tree's focus is, and
+        // the move below is about to name that again and write the registry
+        // from it. A superseded answer is not worth the re-entrancy of
+        // applying messages in the middle of one. Anything else that ever
+        // lands in this queue would have to be reconsidered here.
+        let _superseded = ui.take_messages();
+        // **←/→ out of a tree's row land level with it** (R4, below the
+        // control): where the arrow came from is the row the cursor was on,
+        // not the whole tree, so it is read before the move.
+        let lateral = matches!(dir, fresh_ui::FocusDir::Left | fresh_ui::FocusDir::Right);
+        let from_key = self
+            .widget_registry
+            .focus_key(panel_key)
+            .map(str::to_string)
+            .unwrap_or_default();
+        let origin = lateral
+            .then(|| self.tree_cursor_row(&ui, panel_key, &from_key))
+            .flatten();
+        // `steps` is a count of stops — a zero stays put — so the tree is
+        // stepped exactly that many times. `WidgetAction::FocusAdvance`'s own
+        // doc only defines ±1, and nothing bundled sends more.
+        for _ in 0..steps {
+            if !ui.move_focus(dir) {
+                break;
+            }
+        }
+        let msgs = ui.take_messages();
+        self.shell_ui = Some(ui);
+        // **One landing, one `focus` event.** Each step raises a
+        // `UiFact::WidgetFocus`, and applying them all would tell the plugin
+        // about tab stops it was never told about when the arena did this —
+        // and would run each intermediate kind's `on_focus_change`. Only the
+        // last names where focus ended up; the rest are the walk.
+        let last_focus = msgs
+            .iter()
+            .rposition(|m| matches!(m, UiMsg::Ui(UiFact::WidgetFocus { .. })));
+        let msgs: Vec<UiMsg> = msgs
+            .into_iter()
+            .enumerate()
+            .filter(|(i, m)| {
+                !matches!(m, UiMsg::Ui(UiFact::WidgetFocus { .. })) || Some(*i) == last_focus
+            })
+            .map(|(_, m)| m)
+            .collect();
+        // Default `EventFacts`: they describe the pointer event a message was
+        // produced *by*, and there isn't one — the host asked for this move.
+        // Nothing on this path reads them (`WidgetFocus`'s applier does not),
+        // and inventing a cell would be worse than saying there was none.
+        self.apply_shell_messages(msgs, Default::default());
+        if let Some(origin) = origin {
+            self.land_tree_level(panel_key, &from_key, origin);
+        }
+        true
+    }
+
+    /// The rows the selected row of tree `key` covers on screen, as
+    /// `(top, bottom)`: `None` when `key` is not a tree, nothing is selected,
+    /// or the row is not laid out.
+    fn tree_cursor_row(
+        &self,
+        ui: &fresh_ui::Ui<crate::view::shell::msg::UiMsg>,
+        panel_key: &crate::widgets::PanelKey,
+        key: &str,
+    ) -> Option<(i32, i32)> {
+        let panel = self.widget_registry.get(panel_key)?;
+        let spec = crate::widgets::find_widget_by_key(&panel.spec, key)?;
+        let fresh_core::api::WidgetSpec::Tree { item_keys, .. } = spec else {
+            return None;
+        };
+        let sel = crate::widgets::kinds::tree::resolve(spec, key, &panel.instance_states).selected;
+        let item = item_keys.get(usize::try_from(sel).ok()?)?;
+        let tree = ui.find_by_key_in(
+            self.panel_subtree_root(ui, panel_key)?,
+            &crate::view::shell::widgets::widget_focus_key(key),
+        )?;
+        let row = ui.find_by_key_in(tree, &fresh_ui::Key::Str(item.clone().into()))?;
+        let r = ui.rect(row);
+        (r.h > 0).then_some((r.y, r.y + r.h as i32))
+    }
+
+    /// After ←/→ moved focus from tree `from_key` into another tree, put the
+    /// new tree's cursor on its row nearest `origin` — the rows the cursor
+    /// left — rather than wherever that tree's cursor last was, or its first
+    /// row: across a board's columns the arrow goes to the card beside the
+    /// one you were on. The plugin hears it as a `select`, as from a key.
+    fn land_tree_level(
+        &mut self,
+        panel_key: &crate::widgets::PanelKey,
+        from_key: &str,
+        origin: (i32, i32),
+    ) {
+        let Some(to_key) = self
+            .widget_registry
+            .focus_key(panel_key)
+            .map(str::to_string)
+            .filter(|k| k != from_key)
+        else {
+            return;
+        };
+        let Some(item_keys) = self
+            .widget_registry
+            .get(panel_key)
+            .and_then(|p| crate::widgets::find_widget_by_key(&p.spec, &to_key))
+            .and_then(|w| match w {
+                fresh_core::api::WidgetSpec::Tree { item_keys, .. } => Some(item_keys.to_vec()),
+                _ => None,
+            })
+        else {
+            return;
+        };
+        let best = {
+            let Some(ui) = self.shell_ui.as_ref() else {
+                return;
+            };
+            let Some(tree) = self.panel_subtree_root(ui, panel_key).and_then(|root| {
+                ui.find_by_key_in(
+                    root,
+                    &crate::view::shell::widgets::widget_focus_key(&to_key),
+                )
+            }) else {
+                return;
+            };
+            let view = ui.rect(tree);
+            let (view_top, view_bottom) = (view.y, view.y + view.h as i32);
+            // Twice each coordinate, so the midpoint stays an integer.
+            let mid = origin.0 + origin.1;
+            item_keys
+                .iter()
+                .enumerate()
+                .filter_map(|(i, k)| {
+                    let row = ui.find_by_key_in(tree, &fresh_ui::Key::Str(k.clone().into()))?;
+                    let r = ui.rect(row);
+                    let (top, bottom) = (r.y, r.y + r.h as i32);
+                    // Only the rows on screen: a windowed list may lay out a
+                    // row or two past its edges.
+                    if r.h == 0 || bottom <= view_top || top >= view_bottom {
+                        return None;
+                    }
+                    let gap = if mid < 2 * top {
+                        2 * top - mid
+                    } else if mid >= 2 * bottom {
+                        mid - 2 * bottom + 1
+                    } else {
+                        0
+                    };
+                    Some((gap, i))
+                })
+                .min()
+                .map(|(_, i)| i)
+        };
+        let Some(index) = best else {
+            return;
+        };
+        if let Some(panel) = self.widget_registry.get_mut(panel_key) {
+            panel.set_selected_index(&to_key, index as i32);
+        }
+        self.fire_widget_event(
+            panel_key,
+            to_key,
+            "select".to_string(),
+            serde_json::json!({ "index": index, "key": item_keys[index] }),
+        );
         self.rerender_widget_panel(panel_key);
     }
 
@@ -1246,7 +1450,15 @@ impl Editor {
             "set_panel_focus_and_notify: firing `focus` widget_event"
         );
         self.widget_registry
-            .set_focus_key(panel_key, new_key.clone());
+            .decide_focus(panel_key, new_key.clone());
+        // **The fact is written; the tree follows it on the next frame.** The
+        // description marks the registry's focused widget `autofocus`
+        // (`view::shell::widgets::on_the_ring`), and `fresh_ui` re-settles
+        // focus whenever that mark moves — on the frame that carries it,
+        // including a frame that builds the widget for the first time. No
+        // host-side call places focus in the tree, so there is nothing to
+        // hold back or replay when the element is not there yet.
+        self.shell_description_stale = true;
         // Offer the transition to the kinds: the widget losing focus
         // and the one gaining it each get their `on_focus_change`
         // hook (Tree keeps its selected-row highlight coherent with
@@ -1255,10 +1467,656 @@ impl Editor {
         self.notify_widget_focus_change(panel_key, &old_key, &new_key);
         self.fire_widget_event(
             panel_key,
-            new_key,
+            new_key.clone(),
             "focus".to_string(),
             serde_json::json!({ "previous": old_key }),
         );
+        // **Last, and this is re-entrant on purpose.** On a
+        // `focusFollowsCursor` panel the caret is half of what focus is,
+        // so it comes along — and moving it re-resolves focus from where
+        // it landed, which can disagree with the widget we just focused
+        // (`anchor_of_widget` answers a widget's top-left cell;
+        // `focus_target_at` answers the nearest control to a column, and
+        // on a row with several controls those are not inverses). So:
+        //
+        //     set_panel_focus_and_notify
+        //       └ seat_cursor_on_focused_widget
+        //           └ seat_buffer_cursor
+        //               └ sync_widget_focus_to_cursor
+        //                   └ set_panel_focus_and_notify   (at most once)
+        //
+        // It terminates because the inner call's guard compares against
+        // the reading row the outer one just wrote, and the second-level
+        // entry then finds focus and the reader already agreeing.
+        // `seat_focus_depth` makes that an assertion rather than a hope.
+        //
+        // Placing it *after* the event is the whole reason this is the
+        // last statement: with the seat in the middle, a disagreeing
+        // resolve fired the inner (final) `focus` event before the outer
+        // (already superseded) one, and every plugin mirroring focus from
+        // these events — `welcome_screen.ts` does — was left holding the
+        // stale key.
+        self.seat_focus_depth += 1;
+        debug_assert!(
+            self.seat_focus_depth <= 2,
+            "focus/reader sync recursed past its one re-entry: focus and the reading \
+             row disagree after a seat, which means `page_anchor_of_widget` and \
+             `page_focus_target_at` are not settling on the same widget"
+        );
+        self.seat_reading_row_on_focused_widget(panel_key, &new_key);
+        self.seat_focus_depth -= 1;
+    }
+
+    /// The page's viewport element, from the anchor bound to it.
+    ///
+    /// The anchor **is** the host's handle on that window (§3.5), so it is
+    /// also the only name the host has for the element: the description keys
+    /// the widgets inside the page, not the viewport around them.
+    pub(super) fn page_viewport(
+        &self,
+        panel_key: &crate::widgets::PanelKey,
+    ) -> Option<fresh_ui::ElementId> {
+        self.page_anchors.get(panel_key)?.target()
+    }
+
+    /// Every region a focusable widget of this page occupies, as
+    /// `(content row, rows, first column, columns, key)`.
+    ///
+    /// **Content coordinates, not screen ones.** A child's laid-out rectangle
+    /// has the window's offset already taken off it, so putting the offset
+    /// back is what turns "where it is on screen" into "where it is in the
+    /// page" — which is the space a reading row is in, and the space the
+    /// anchor's `reveal` counts.
+    ///
+    /// **A widget's region is every node carrying its key, not just the one
+    /// that takes focus.** A card several rows tall is a Tab stop once and a
+    /// place to be many times: the welcome screen's door cards emit a node per
+    /// row, all under the card's key, with `focusable` on the row that names
+    /// the action. Reading only the focusable node would make the card a
+    /// one-row region, so moving down inside it would leave it and take the
+    /// Enter the reader aimed at it with them.
+    fn page_widget_spans(
+        &self,
+        panel_key: &crate::widgets::PanelKey,
+    ) -> Vec<(u32, u16, u16, u16, String)> {
+        let Some(slot) = self.described_slot_of_panel(panel_key) else {
+            return Vec::new();
+        };
+        let (Some(ui), Some(vp)) = (self.shell_ui.as_ref(), self.page_viewport(panel_key)) else {
+            return Vec::new();
+        };
+        let Some(interior) = ui.find_by_key(&crate::view::shell::panel::interior_key(slot)) else {
+            return Vec::new();
+        };
+        let ring_key_of = |el| {
+            ui.key_of(el)
+                .as_ref()
+                .and_then(crate::view::shell::widgets::widget_key_of)
+                .map(str::to_string)
+        };
+        // The region's nodes are in the *node* namespace, the ring's wrappers
+        // in the focus one; a widget is both.
+        let key_of = |el| {
+            ui.key_of(el)
+                .as_ref()
+                .and_then(crate::view::shell::widgets::widget_key_of_any)
+                .map(str::to_string)
+        };
+        // Only what Tab can reach is a place to be: prose is where "nothing
+        // focused" comes from, and a node that cannot take focus must not
+        // silently become the answer for its row.
+        let tabbable: std::collections::HashSet<String> = ui
+            .traversal_order(interior)
+            .into_iter()
+            .filter_map(ring_key_of)
+            .collect();
+        let origin = ui.rect_of(vp);
+        let (scroll, _) = ui.scroll(vp);
+        let mut out = Vec::new();
+        let mut stack = vec![interior];
+        while let Some(el) = stack.pop() {
+            stack.extend(ui.children(el));
+            let Some(key) = key_of(el).filter(|k| tabbable.contains(k)) else {
+                continue;
+            };
+            let r = ui.rect_of(el);
+            if r.h == 0 || r.w == 0 {
+                continue;
+            }
+            let row = (r.y - origin.y + scroll.y).max(0) as u32;
+            let col = (r.x - origin.x + scroll.x).max(0) as u16;
+            out.push((row, r.h, col, r.w, key));
+        }
+        out
+    }
+
+    /// The mirror buffer's line `row`, without its newline.
+    fn page_line(buffer: &crate::model::buffer::Buffer, row: usize) -> String {
+        buffer
+            .get_line(row)
+            .map(|b| {
+                String::from_utf8_lossy(&b)
+                    .trim_end_matches('\n')
+                    .to_string()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Does a span running `[start, start + width)` cover `col`?
+    ///
+    /// A zero-width span covers nothing, which is what a zero-width node is:
+    /// a marker, not a place.
+    fn column_covers(start: u16, width: u16, col: u16) -> bool {
+        col >= start && col < start.saturating_add(width)
+    }
+
+    /// The widget in `panel_key` that a reader at `(row, col)` is on, or `""`
+    /// for none.
+    ///
+    /// **A focus region is the control's own rectangle: the reader has to be
+    /// standing on it, in both axes.** The rule was once "the row is the
+    /// region; the column decides which control on it", with no distance cap —
+    /// so on a row carrying one control that control was the answer for every
+    /// column of the row, and a reader walking down the page's left margin lit
+    /// up, and armed Enter on, a button forty columns away that they were
+    /// plainly not pointing at. Reaching a control now means going to it.
+    ///
+    /// **Which is why the reading column is a display column** (see
+    /// [`Self::page_follows_caret`]): the spans come off the laid-out tree, so
+    /// a byte column would put the reader two columns right of where they are
+    /// on any row whose frame is drawn in box glyphs — exactly the rows the
+    /// controls are in.
+    ///
+    /// Nested spans are decided innermost-first (narrowest, ties leftmost): a
+    /// card's own key covers every row it occupies, and a control inside it is
+    /// the more specific answer for the cells it covers.
+    ///
+    /// An empty string is an answer, not the absence of one: a reader on a row
+    /// with no control at all means *nothing* is focused, and a caller that
+    /// read it as "leave focus alone" would keep the last Tab's target armed
+    /// under an Enter aimed at prose.
+    ///
+    /// **A card several rows tall is one region because it is one node.** The
+    /// welcome screen's door cards are keyed once and placed once, so their
+    /// rectangle covers every row they occupy and a reader anywhere in the card
+    /// is on the card. That fell out of the tree rather than having to be
+    /// arranged: the projection this replaced had a hit per *row*, and being a
+    /// region at all depended on those rows sharing a key.
+    fn page_focus_target_at(
+        &self,
+        panel_key: &crate::widgets::PanelKey,
+        row: u32,
+        col: u16,
+    ) -> String {
+        let mut best: Option<(u16, u16, String)> = None;
+        for (top, rows, start, width, key) in self.page_widget_spans(panel_key) {
+            if row < top || row >= top + rows.max(1) as u32 {
+                continue;
+            }
+            if !Self::column_covers(start, width, col) {
+                continue;
+            }
+            if best
+                .as_ref()
+                .is_none_or(|(bw, bs, _)| width < *bw || (width == *bw && start < *bs))
+            {
+                best = Some((width, start, key));
+            }
+        }
+        best.map(|(_, _, k)| k).unwrap_or_default()
+    }
+
+    /// Where the reader goes when this widget takes focus: the first cell of
+    /// the node that *takes* the focus, which is not the top of its region.
+    ///
+    /// **The two differ for a card, and each is right for its own question.**
+    /// A card's region is every row it occupies, because a reader anywhere in
+    /// it is on it; the row it is *seated* on is the one naming the action,
+    /// because that is the line the card is about — its frame's top edge is
+    /// not somewhere to be. `focusable` marks that row, so the ring's own
+    /// element answers this and the region answers the other.
+    fn page_anchor_of_widget(
+        &self,
+        panel_key: &crate::widgets::PanelKey,
+        key: &str,
+    ) -> Option<(u32, u16)> {
+        let slot = self.described_slot_of_panel(panel_key)?;
+        let ui = self.shell_ui.as_ref()?;
+        let vp = self.page_viewport(panel_key)?;
+        let interior = ui.find_by_key(&crate::view::shell::panel::interior_key(slot))?;
+        let origin = ui.rect_of(vp);
+        let (scroll, _) = ui.scroll(vp);
+        // Every node carrying the key, and then the *innermost* of them: a
+        // card is a frame around rows that carry its key too, and the frame's
+        // top edge is a border rather than a line to be on.
+        let mut mine = Vec::new();
+        let mut stack = vec![interior];
+        while let Some(el) = stack.pop() {
+            stack.extend(ui.children(el));
+            if ui
+                .key_of(el)
+                .as_ref()
+                .and_then(crate::view::shell::widgets::widget_key_of_any)
+                == Some(key)
+            {
+                mine.push(el);
+            }
+        }
+        mine.iter()
+            .filter(|el| !mine.iter().any(|o| o != *el && ui.contains(**el, *o)))
+            .map(|el| {
+                let r = ui.rect_of(*el);
+                (
+                    (r.y - origin.y + scroll.y).max(0) as u32,
+                    (r.x - origin.x + scroll.x).max(0) as u16,
+                )
+            })
+            .min()
+    }
+
+    /// Move the reader onto the region of the widget that just took focus, on
+    /// a page that asked for `focusFollowsCursor`.
+    ///
+    /// The guard is not "is the reader already on that row" but "does the
+    /// reader's row already resolve to this widget", which is the same question
+    /// the other direction asks — and it has to be, because a card several rows
+    /// tall anchors at its top. Arriving at its last row from below focuses the
+    /// card; seating the reader on the card's *top* row would then throw them
+    /// back over everything they just walked past, and the next Up would do it
+    /// again.
+    ///
+    /// Clearing focus never moves the reader. "Nothing is focused" is what a
+    /// reader on prose means; there is no row to go to.
+    pub(super) fn seat_reading_row_on_focused_widget(
+        &mut self,
+        panel_key: &crate::widgets::PanelKey,
+        new_key: &str,
+    ) {
+        if new_key.is_empty() {
+            return;
+        }
+        if !self
+            .widget_registry
+            .get(panel_key)
+            .is_some_and(|p| p.focus_follows_cursor)
+        {
+            return;
+        }
+        // The spans are read off the tree, so the tree has to carry the panel
+        // as it is now.
+        self.lay_out_shell_if_stale();
+        if let Some((row, col)) = self.page_reading.get(panel_key).copied() {
+            if self.page_focus_target_at(panel_key, row, col) == new_key {
+                return;
+            }
+        }
+        let Some(at) = self.page_anchor_of_widget(panel_key, new_key) else {
+            return;
+        };
+        self.move_page_reader_to(panel_key, at);
+    }
+
+    /// Where a Tab ring should start when nothing is focused and the reader is
+    /// where they are: the first focusable at or after that point in the ring's
+    /// own order (`forward`), or the last at or before it. Wraps.
+    ///
+    /// The order is the tree's traversal order, and so is the geometry, so
+    /// "before the reader" is asked and answered in one place.
+    fn page_ring_seed(
+        &self,
+        panel_key: &crate::widgets::PanelKey,
+        forward: bool,
+    ) -> Option<String> {
+        let at = self.page_reading.get(panel_key).copied()?;
+        // One entry per widget, at its own first cell: the ring has one stop
+        // per widget however many nodes carry its key.
+        let mut anchors: std::collections::HashMap<String, (u32, u16)> =
+            std::collections::HashMap::new();
+        for (row, _, col, _, key) in self.page_widget_spans(panel_key) {
+            let at = anchors.entry(key).or_insert((row, col));
+            *at = (*at).min((row, col));
+        }
+        let mut ordered: Vec<((u32, u16), String)> =
+            anchors.into_iter().map(|(k, at)| (at, k)).collect();
+        ordered.sort();
+        let found = match forward {
+            true => ordered
+                .iter()
+                .find(|(p, _)| *p >= at)
+                .or_else(|| ordered.first()),
+            false => ordered
+                .iter()
+                .rev()
+                .find(|(p, _)| *p <= at)
+                .or_else(|| ordered.last()),
+        };
+        found.map(|(_, k)| k.clone())
+    }
+
+    /// A press on `pane` at screen `(x, y)` moves that pane's page reader, if
+    /// it has one and the press landed inside its window — and arms the
+    /// selection sweep the press may turn out to have started.
+    ///
+    /// Screen coordinates in, content coordinates out ([`Self::page_point_at`])
+    /// — the same conversion `page_widget_spans` does, in the other direction.
+    pub(super) fn press_moved_the_page_reader(&mut self, pane: LeafId, x: u16, y: u16) {
+        let Some(panel_key) = self.page_panel_of_pane(pane) else {
+            return;
+        };
+        let Some(at) = self.page_point_at(&panel_key, x, y, false) else {
+            return;
+        };
+        self.move_page_reader_to(&panel_key, at);
+        self.sync_widget_focus_to_reading_row(&panel_key);
+        // **The press is also a selection's anchor.** The page's text is the
+        // mirror's, and a reader who wants to quote a paragraph of it sweeps
+        // the pointer across it exactly as they would over a file. The caret
+        // this press just seated is collapsed, so the anchor is where it is;
+        // every move of the pointer under the same capture extends from here
+        // (`drag_moved_the_page_selection`), and the release leaves the
+        // selection standing for Copy.
+        self.active_window_mut().mouse_state.drag = Some(
+            crate::app::types::PointerDrag::Selection(crate::app::types::SelectionDrag {
+                pane,
+                anchor: None,
+                word_end: None,
+            }),
+        );
+    }
+
+    /// The page panel a pane holds, if it holds one whose focus follows its
+    /// reader.
+    fn page_panel_of_pane(&self, pane: LeafId) -> Option<crate::widgets::PanelKey> {
+        self.widget_registry
+            .panel_keys()
+            .into_iter()
+            .find(|k| {
+                self.described_slot_of_panel(k)
+                    == Some(crate::view::shell::widgets::Slot::Pane(pane))
+            })
+            .filter(|k| {
+                self.widget_registry
+                    .get(k)
+                    .is_some_and(|p| p.page && p.focus_follows_cursor)
+            })
+    }
+
+    /// Screen `(x, y)` as a point in the page's own content, or `None` when
+    /// the point is outside its window — unless `clamp`, which pins it to the
+    /// nearest cell inside instead, because a drag that leaves the window is
+    /// still a drag to the end of what it crossed.
+    fn page_point_at(
+        &self,
+        panel_key: &crate::widgets::PanelKey,
+        x: u16,
+        y: u16,
+        clamp: bool,
+    ) -> Option<(u32, u16)> {
+        let (ui, vp) = (self.shell_ui.as_ref()?, self.page_viewport(panel_key)?);
+        let window = ui.rect_of(vp);
+        let (scroll, _) = ui.scroll(vp);
+        let (x, y) = (x as i32, y as i32);
+        let inside = x >= window.x && x < window.right() && y >= window.y && y < window.bottom();
+        if !inside && !clamp {
+            return None;
+        }
+        let x = x.clamp(window.x, window.right().saturating_sub(1).max(window.x));
+        let y = y.clamp(window.y, window.bottom().saturating_sub(1).max(window.y));
+        Some((
+            (y - window.y + scroll.y).max(0) as u32,
+            (x - window.x + scroll.x).max(0) as u16,
+        ))
+    }
+
+    /// A move of the pointer the page's press captured: the selection grows
+    /// to wherever it is now.
+    ///
+    /// Returns whether this pane is a page at all — a pane that is not takes
+    /// its drag through the buffer's own path, which needs a screen-to-byte
+    /// projection a described pane does not have.
+    pub(super) fn drag_moved_the_page_selection(&mut self, pane: LeafId, x: u16, y: u16) -> bool {
+        let Some(panel_key) = self.page_panel_of_pane(pane) else {
+            return false;
+        };
+        if self
+            .active_window()
+            .mouse_state
+            .selection_in(pane)
+            .is_none()
+        {
+            return true;
+        }
+        let Some(at) = self.page_point_at(&panel_key, x, y, true) else {
+            return true;
+        };
+        // Deliberately not `sync_widget_focus_to_reading_row`: a sweep across
+        // the page is a statement about its text, and arming every control it
+        // crosses under Enter is not part of it.
+        self.move_page_reader(&panel_key, at, true);
+        true
+    }
+
+    /// The mirror buffer's selection as bands of display columns, one per
+    /// content row — what the description washes over the page.
+    ///
+    /// Read off whichever split carries the buffer, the active one first: the
+    /// selection is a cursor's, cursors are per split, and a page shown in
+    /// two panes is one buffer with two of them.
+    pub(super) fn page_selection_bands(&self, buffer_id: BufferId) -> Vec<(u32, u16, u16)> {
+        /// A whole-page selection is thousands of rows and a handful of them
+        /// are on screen; the cap is a guard against a pathological
+        /// description, not a limit anyone can reach by selecting.
+        const MAX_BANDS: usize = 8192;
+        let window = self.windows.get(&self.active_window);
+        let Some(state) = window.and_then(|w| w.buffers.get(&buffer_id)) else {
+            return Vec::new();
+        };
+        let Some((_, view_states)) = window.and_then(|w| w.buffers.splits()) else {
+            return Vec::new();
+        };
+        let active = self.effective_active_split();
+        let mut leaves = self.splits_showing_buffer(buffer_id);
+        leaves.sort_by_key(|l| *l != active);
+        let Some(vs) = leaves.first().and_then(|l| view_states.get(l)) else {
+            return Vec::new();
+        };
+        let mut ranges = vs.buffer_tab_state().cursors.selections();
+        ranges.sort_by_key(|r| r.start);
+        let mut bands = Vec::new();
+        for range in ranges {
+            let first = state.buffer.get_line_number(range.start);
+            let last = state.buffer.get_line_number(range.end);
+            for row in first..=last {
+                if bands.len() >= MAX_BANDS {
+                    return bands;
+                }
+                let Some(start) = state.buffer.line_start_offset(row) else {
+                    break;
+                };
+                let line = Self::page_line(&state.buffer, row);
+                let from = match row == first {
+                    true => display_col_of(&line, range.start.saturating_sub(start)),
+                    false => 0,
+                };
+                // A row inside the selection is selected past its own text,
+                // by the one column that stands for the line break it took —
+                // the same shape the buffer painter gives a multi-line
+                // selection.
+                let to = match row == last {
+                    true => display_col_of(&line, range.end.saturating_sub(start)),
+                    false => display_col_of(&line, line.len()).saturating_add(1),
+                };
+                if to > from {
+                    bands.push((row as u32, from, to));
+                }
+            }
+        }
+        bands
+    }
+
+    /// Put the reader at `(row, col)` and bring that row into the window.
+    ///
+    /// The reveal is minimal, which is what following is: a Tab between two
+    /// controls of one card must not move the page under them.
+    fn move_page_reader_to(&mut self, panel_key: &crate::widgets::PanelKey, at: (u32, u16)) {
+        self.move_page_reader(panel_key, at, false);
+    }
+
+    /// The same, saying whether the caret it seats takes the selection with
+    /// it: a drag over the page is one gesture from its press, so every move
+    /// of it extends from where the press left the anchor.
+    fn move_page_reader(
+        &mut self,
+        panel_key: &crate::widgets::PanelKey,
+        at: (u32, u16),
+        extend: bool,
+    ) {
+        self.page_reading.insert(panel_key.clone(), at);
+        if let Some(anchor) = self.page_anchors.get(panel_key) {
+            anchor.reveal(at.0);
+        }
+        self.mirror_page_reader_into_buffer(panel_key, at, extend);
+        self.shell_description_stale = true;
+    }
+
+    /// Put the mirror buffer's cursor on the row the reader is on.
+    ///
+    /// **The mirror is where a reading position is *reported* from**, and it
+    /// goes on being that: the status bar's `Ln`/`Col`, a plugin's
+    /// `cursor_moved`, and a click's line are all read off the buffer under a
+    /// described panel. What changed is the direction — the buffer's cursor
+    /// used to be the reading position and now follows it — which is what
+    /// breaks the loop the page had: nothing resolves focus from the mirror any
+    /// more, so a cursor that arrives here cannot come back round as a focus
+    /// move.
+    ///
+    /// The pane shows the tree rather than the mirror, so this scrolls nothing.
+    fn mirror_page_reader_into_buffer(
+        &mut self,
+        panel_key: &crate::widgets::PanelKey,
+        (row, col): (u32, u16),
+        extend: bool,
+    ) {
+        let Some(buffer_id) = self
+            .widget_registry
+            .get(panel_key)
+            .and_then(|p| p.buffer_id)
+        else {
+            return;
+        };
+        let Some(offset) = self.active_window().buffers.get(&buffer_id).and_then(|st| {
+            let start = st.buffer.line_start_offset(row as usize)?;
+            let end = match st.buffer.line_start_offset(row as usize + 1) {
+                // Less the newline that begins the next row.
+                Some(next) => next.saturating_sub(1),
+                None => st.buffer.len(),
+            };
+            let line = Self::page_line(&st.buffer, row as usize);
+            Some((start + byte_at_display_col(&line, col)).min(end))
+        }) else {
+            return;
+        };
+        self.seat_buffer_cursor_selecting(buffer_id, offset, extend);
+    }
+
+    /// The other direction: the reader has landed somewhere on a
+    /// `focusFollowsCursor` page, so focus goes to whatever focusable widget is
+    /// on that row — or to nothing, when the row carries none.
+    ///
+    /// Clearing is the half that matters most. Without it a movement key leaves
+    /// the last Tab's target armed under Enter, three cards up and off screen:
+    /// the reader is looking at one thing and the keyboard is pointed at
+    /// another.
+    fn sync_widget_focus_to_reading_row(&mut self, panel_key: &crate::widgets::PanelKey) {
+        let Some((row, col)) = self.page_reading.get(panel_key).copied() else {
+            return;
+        };
+        let next = self.page_focus_target_at(panel_key, row, col);
+        if self.widget_registry.focus_key(panel_key) == Some(next.as_str()) {
+            return;
+        }
+        self.set_panel_focus_and_notify(panel_key, next);
+        // The focus marker is painted by the render, so the panel has to
+        // repaint for the move to be visible at all.
+        self.rerender_widget_panel(panel_key);
+    }
+
+    /// Every split currently showing `buffer_id`, the leaves of grouped
+    /// subtrees included.
+    ///
+    /// A grouped subtree's leaves are not in `splits_for_buffer` — the
+    /// group host owns the outer leaf — so a panel buffer shown inside
+    /// one would keep a stale caret without this.
+    pub(super) fn splits_showing_buffer(&self, buffer_id: BufferId) -> Vec<LeafId> {
+        let (manager, view_states) = self.active_window().splits();
+        // A pane whose buffer *tab* is `buffer_id` but which shows a group
+        // does not show it: `splits_for_buffer` reads the tree, which only
+        // knows tabs, so the view state decides.
+        let mut splits: Vec<LeafId> = manager
+            .splits_for_buffer(buffer_id)
+            .into_iter()
+            .filter(|leaf| {
+                view_states
+                    .get(leaf)
+                    .is_none_or(|vs| vs.shown_buffer() == Some(buffer_id))
+            })
+            .collect();
+        for node in self.active_window().grouped_subtrees.values() {
+            if let crate::view::split::SplitNode::Grouped { layout, .. } = node {
+                for inner_leaf in layout.leaf_split_ids() {
+                    if view_states
+                        .get(&inner_leaf)
+                        .is_some_and(|vs| vs.shown_buffer() == Some(buffer_id))
+                        && !splits.contains(&inner_leaf)
+                    {
+                        splits.push(inner_leaf);
+                    }
+                }
+            }
+        }
+        splits
+    }
+
+    /// Put `buffer_id`'s caret at `position` in every split showing it.
+    ///
+    /// The editor writes a caret through two routes — the event pipeline
+    /// (`Editor::apply_event`, which every user-visible move travels:
+    /// arrows, page keys, a click, Goto Line, back/forward, a search
+    /// hit) and this one, for the host and plugins seating it directly.
+    /// Both end in `sync_widget_focus_to_cursor`, so a
+    /// `focusFollowsCursor` panel cannot be reached by a caret move that
+    /// leaves its focus behind.
+    ///
+    /// That is an invariant, not an observation, and it only holds while
+    /// **every** direct write goes through here — including the ones that
+    /// look like initialisation. `CreateVirtualBufferWithContent`'s
+    /// `initialCursorLine` and the display-buffer path both used to call
+    /// `set_buffer_cursor_in_splits` themselves, into buffers that can
+    /// perfectly well carry a focus-following panel; they call this now.
+    #[cfg(feature = "plugins")]
+    pub(super) fn seat_buffer_cursor(&mut self, buffer_id: BufferId, position: usize) {
+        self.seat_buffer_cursor_selecting(buffer_id, position, false);
+    }
+
+    /// The same, saying whether the caret drags a selection behind it. Only
+    /// the page's pointer sweep passes `true`: every other seat here is a
+    /// placement, and a placement collapses.
+    pub(super) fn seat_buffer_cursor_selecting(
+        &mut self,
+        buffer_id: BufferId,
+        position: usize,
+        extend: bool,
+    ) {
+        let splits = self.splits_showing_buffer(buffer_id);
+        if splits.is_empty() {
+            tracing::warn!("No splits found for buffer {:?}", buffer_id);
+        }
+        if self.active_window().buffers.get(&buffer_id).is_none() {
+            tracing::warn!("Buffer {:?} not found for a caret move", buffer_id);
+            return;
+        }
+        self.active_window_mut()
+            .set_buffer_cursor_in_splits_selecting(buffer_id, position, &splits, extend);
     }
 
     /// Offer a panel-focus transition to the kinds: the widget losing
@@ -1438,80 +2296,94 @@ impl Editor {
         false
     }
 
-    /// Mouse-wheel scroll over a widget panel buffer. With `pos` —
-    /// the pointer's panel-relative (row, display column) — the wheel
-    /// scrolls the `List`/`Tree` whose rendered region contains the
-    /// pointer, so two side-by-side lists (the code tour's Steps rail
-    /// and prose column) each answer to the wheel hovering over them.
-    /// Without a position, or when the pointer sits on panel chrome
-    /// outside every list, it falls back to the first `Tree`/`List`
-    /// in the spec (the pre-position behaviour). Sets the widget's
-    /// `user_scrolled` flag so the renderer's auto-scroll doesn't
-    /// snap the offset back to the selection. No focus change,
-    /// no `widget_event` fires — wheel is viewport navigation, not
-    /// selection.
+    /// Scroll one *named* widget's own window by a wheel notch.
     ///
-    /// Returns `true` if any panel consumed the scroll.
-    pub(super) fn handle_widget_panel_wheel_at(
+    /// **The same `on_wheel`, reached by name instead of by rectangle.**
+    /// The runtime used to find the widget by hit-testing the text
+    /// projection's box arena, which a described panel has no layout for; the
+    /// tree hit-tests its own nodes and says which widget the notch landed on,
+    /// and this is the other end of that. Nothing else differs: the kind
+    /// decides what a notch means and whether it took it, and a widget that
+    /// moved gets the panel re-rendered.
+    ///
+    /// Returns `true` when the widget consumed the notch. Today the only
+    /// caller is a `Text`'s open completion list — see
+    /// [`UiFact::WidgetWheel`](crate::view::shell::msg::UiFact::WidgetWheel)
+    /// for why that is the one window in a described panel the tree cannot
+    /// own.
+    pub(crate) fn wheel_widget_by_key(
         &mut self,
-        buffer_id: crate::model::event::BufferId,
-        pos: Option<(u32, u32)>,
+        panel_key: &crate::widgets::PanelKey,
+        widget_key: &str,
         delta: i32,
     ) -> bool {
-        let panels = self.widget_registry.panels_for_buffer(buffer_id);
-        let mut consumed = false;
-        for panel_key in panels {
-            // Hit-tested routing: the deepest box under the pointer,
-            // then bubbling outward — each scrollable ancestor gets the
-            // delta until one consumes it (scroll chaining). A widget
-            // already at its bound returns false from `on_wheel`, so a
-            // List/Tree that shows everything (e.g. Git Log, which sets
-            // visible_rows == total and scrolls via its enclosing pane)
-            // lets the wheel keep bubbling instead of going dead. With
-            // no position, or a pointer on chrome outside every box,
-            // fall back to the first scrollable widget in the spec (the
-            // pre-position behaviour).
-            let (spec, mut candidates) = match self.widget_registry.get(&panel_key) {
-                Some(p) => {
-                    let along_path: Vec<String> = pos
-                        .map(|(row, col)| {
-                            crate::widgets::layout_box::hit_path(&p.boxes, row, col)
-                                .into_iter()
-                                .rev()
-                                .filter(|&i| p.boxes[i].scrollable)
-                                .filter_map(|i| p.boxes[i].key.clone())
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    (p.spec.clone(), along_path)
-                }
-                None => continue,
-            };
-            if candidates.is_empty() {
-                if let Some(k) = find_scrollable_widget_key(&spec) {
-                    candidates.push(k);
-                }
-            }
-            for widget_key in candidates {
-                let Some(widget) = crate::widgets::find_widget_by_key(&spec, &widget_key) else {
-                    continue;
-                };
-                let Some(panel) = self.widget_registry.get_mut(&panel_key) else {
-                    break;
-                };
-                if crate::widgets::kinds::behavior(widget).on_wheel(
-                    widget,
-                    &widget_key,
-                    panel,
-                    delta,
-                ) {
-                    self.rerender_widget_panel(&panel_key);
-                    consumed = true;
-                    break;
-                }
-            }
+        if widget_key.is_empty() {
+            return false;
         }
-        consumed
+        let Some(spec) = self.widget_registry.get(panel_key).map(|p| p.spec.clone()) else {
+            return false;
+        };
+        let Some(widget) = crate::widgets::find_widget_by_key(&spec, widget_key) else {
+            return false;
+        };
+        let viewport = self.widget_viewport(panel_key, widget, widget_key);
+        let Some(panel) = self.widget_registry.get_mut(panel_key) else {
+            return false;
+        };
+        if !crate::widgets::kinds::behavior(widget)
+            .on_wheel(widget, widget_key, panel, viewport, delta)
+        {
+            return false;
+        }
+        self.rerender_widget_panel(panel_key);
+        true
+    }
+
+    /// Pan the keyed widget sideways by `delta` display columns.
+    ///
+    /// The runtime's counterpart to [`Self::wheel_widget_by_key`], and it does
+    /// not go through a kind: a pan moves the panel's own fold rather than a
+    /// window a kind resolves, so there is nothing for a `Tree` or a `List` to
+    /// decide. What each kind decides is whether it *honours* the fold, which
+    /// it does at paint time by threading it into `render_tree_row` — and
+    /// [`pan_bounds`] answers that same question from the spec, so a notch over
+    /// a kind that cannot show a pan falls through instead of being swallowed.
+    ///
+    /// [`pan_bounds`]: crate::widgets::render::pan_bounds
+    pub(crate) fn pan_widget_by_key(
+        &mut self,
+        panel_key: &crate::widgets::PanelKey,
+        widget_key: &str,
+        delta: i32,
+    ) -> bool {
+        if widget_key.is_empty() {
+            return false;
+        }
+        let Some(spec) = self.widget_registry.get(panel_key).map(|p| p.spec.clone()) else {
+            return false;
+        };
+        let Some(widget) = crate::widgets::find_widget_by_key(&spec, widget_key) else {
+            return false;
+        };
+        let viewport = self.widget_viewport(panel_key, widget, widget_key);
+        let bounds = crate::widgets::render::pan_bounds(widget, viewport.cols, None);
+        let Some(panel) = self.widget_registry.get_mut(panel_key) else {
+            return false;
+        };
+        if !panel.pan_h(widget_key, Some(delta), bounds) {
+            return false;
+        }
+        self.rerender_widget_panel(panel_key);
+        true
+    }
+
+    /// **Does the tree describe this panel's interior** — and it does for
+    /// every mounted panel. The dock, the floating modal, a sidebar section
+    /// and a pane all describe what is mounted in them; the pane-mounted class
+    /// that rode the buffer's scroll and kept the text projection is gone
+    /// (design §3.5). What is left to ask is whether the panel is mounted.
+    pub(crate) fn panel_is_the_trees(&self, panel_key: &crate::widgets::PanelKey) -> bool {
+        self.widget_registry.get(panel_key).is_some()
     }
 
     /// Fire `widget_event { event_type: "activate" }` for the focused
@@ -1557,10 +2429,54 @@ impl Editor {
         if panel.focus_key.is_empty() {
             return false;
         }
+        // A read-only or markdown `Text` is somewhere you *read*, not
+        // somewhere you type — and this predicate now decides whether a
+        // printable key reaches the mode's bindings at all, so calling a
+        // rendered document "focused text input" would divert every
+        // character into a field that discards it.
         matches!(
             crate::widgets::find_widget_by_key(&panel.spec, &panel.focus_key),
-            Some(fresh_core::api::WidgetSpec::Text { .. })
+            Some(fresh_core::api::WidgetSpec::Text {
+                read_only: false,
+                markdown: false,
+                ..
+            })
         )
+    }
+
+    /// The keymap a panel's keys resolve against once its focused control
+    /// has passed them: the plugin mode its interior names.
+    ///
+    /// Per slot, because a mode reaches a panel two ways. A dock or a
+    /// floating panel names the mode it mounted with, and one mounted
+    /// without a mode has no keymap: the window's editor mode and the
+    /// editor-wide input mode (vi's) belong to the buffer, so a panel that
+    /// borrowed them would hand its arrows and Esc to whichever plugin owns
+    /// them. A pane's
+    /// panel resolves against its buffer's mode (`setBufferMode`). A sidebar
+    /// section takes its keys through `widget_event` and never through a
+    /// mode, so it has none. Read by the description (the capture leg's
+    /// shortcuts) and by `dispatch_widget_panel_key` (everything else) — one
+    /// answer for both.
+    pub(crate) fn panel_keymap(
+        &self,
+        panel_key: &crate::widgets::PanelKey,
+    ) -> Option<crate::view::shell::panel::Keymap> {
+        let mode = match self.slot_of_panel(panel_key) {
+            Some(slot @ (super::PanelSlot::Dock | super::PanelSlot::Floating)) => {
+                self.panel(slot)?.mode.clone()?
+            }
+            Some(super::PanelSlot::Sidebar(_)) => return None,
+            None => {
+                let buffer = self.widget_registry.get(panel_key)?.buffer_id?;
+                self.buffer_mode(buffer)?.to_string()
+            }
+        };
+        Some(crate::view::shell::panel::Keymap {
+            mode,
+            resolver: self.keybindings.clone(),
+            chord: self.active_window().chord_state.clone(),
+        })
     }
 
     /// Read the currently-selected text from the focused `Text`
@@ -1579,7 +2495,13 @@ impl Editor {
         if self.widget_registry.get(panel_key).is_none() {
             return false;
         }
-        self.handle_widget_key(panel_key, "C-a");
+        self.handle_widget_key(
+            panel_key,
+            &crate::input::keybindings::KeySeq::one(crate::input::keybindings::Key::new(
+                crossterm::event::KeyCode::Char('a'),
+                crossterm::event::KeyModifiers::CONTROL,
+            )),
+        );
         true
     }
 
@@ -1591,7 +2513,13 @@ impl Editor {
         if self.widget_registry.get(panel_key).is_none() {
             return false;
         }
-        self.handle_widget_key(panel_key, "C-c");
+        self.handle_widget_key(
+            panel_key,
+            &crate::input::keybindings::KeySeq::one(crate::input::keybindings::Key::new(
+                crossterm::event::KeyCode::Char('c'),
+                crossterm::event::KeyModifiers::CONTROL,
+            )),
+        );
         true
     }
 
@@ -1602,7 +2530,13 @@ impl Editor {
         if self.widget_registry.get(panel_key).is_none() {
             return false;
         }
-        self.handle_widget_key(panel_key, "C-x");
+        self.handle_widget_key(
+            panel_key,
+            &crate::input::keybindings::KeySeq::one(crate::input::keybindings::Key::new(
+                crossterm::event::KeyCode::Char('x'),
+                crossterm::event::KeyModifiers::CONTROL,
+            )),
+        );
         true
     }
 
@@ -1675,36 +2609,38 @@ impl Editor {
     }
 
     /// Reposition a just-focused Text widget's cursor to the byte under
-    /// a mouse click (#2573). `entry_byte` is the click's byte offset
-    /// within the rendered row (as resolved by `hit_test`); `payload` is
-    /// the `focus` HitArea payload, which carries the value-layout
-    /// breadcrumbs the renderer stamped on it (`valueInnerStart` and the
-    /// truncation fields). Maps the row byte back to a value byte, moves
-    /// the cursor, and fires `change` so a plugin mirroring the cursor
-    /// position (e.g. Search & Replace) stays in sync.
+    /// a mouse click (#2573). `byte_in_field` is the click's byte offset
+    /// within *the field's own* rendered row; `payload` is the `focus`
+    /// event's payload, which carries the value-layout breadcrumbs the
+    /// renderer stamped on it (`valueInnerStart` and the truncation
+    /// fields). Maps that byte back to a value byte, moves the cursor, and
+    /// fires `change` so a plugin mirroring the cursor position (e.g. Search
+    /// & Replace) stays in sync.
     ///
-    /// A no-op for hits without the layout payload (older render paths,
+    /// **One coordinate space, and the caller puts the click in it.**
+    /// `valueInnerStart` is relative to the field's own rendered text
+    /// (gutter + label + `[`), and the pass that composes two fields onto one
+    /// line (Search + Replace) shifts the `HitArea`'s byte range without
+    /// shifting the payload — so a caller resolving through the text
+    /// projection's rows subtracts the matched hit's `byte_start` before
+    /// calling. This used to take that offset as a parameter and subtract it
+    /// here, which meant the described path, whose byte is field-relative
+    /// already, had to add it on first.
+    ///
+    /// A no-op for events without the layout payload (older render paths,
     /// non-text widgets) or when the clicked widget isn't the focused
     /// one — the caller is expected to focus it first.
     pub(super) fn reposition_widget_text_cursor_from_click(
         &mut self,
         panel_key: &crate::widgets::PanelKey,
         widget_key: &str,
-        entry_byte: usize,
-        hit_byte_start: usize,
+        byte_in_field: usize,
         payload: &serde_json::Value,
     ) {
-        // `valueInnerStart` is relative to the *field's own* rendered
-        // text (gutter + label + `[`). Fields can be composed
-        // horizontally into a shared row (Search + Replace live on one
-        // line), so `hit_byte_start` — the field's offset within that
-        // composed row — rebases both the click and the value origin
-        // into the same coordinate space.
         let inner_start = match payload.get("valueInnerStart").and_then(|v| v.as_u64()) {
             Some(v) => v as usize,
             None => return,
         };
-        let offset_in_field = entry_byte.saturating_sub(hit_byte_start);
         // The cursor op below targets the panel's *focused* widget; guard
         // that focus already landed on the clicked field so a stray call
         // can't move an unrelated field's cursor.
@@ -1730,10 +2666,11 @@ impl Editor {
             .unwrap_or(0) as usize;
 
         // Translate the click's field byte → value byte (shared with the
-        // Settings UI via `crate::widgets`). `offset_in_field` already
-        // rebased the click by `hit_byte_start`, so pass `byte_start = 0`.
+        // Settings UI via `crate::widgets`). The click is already field-
+        // relative, so there is no row offset left to take off: `byte_start`
+        // is 0.
         let value_byte = crate::widgets::row_byte_to_value_byte(
-            offset_in_field,
+            byte_in_field,
             0,
             inner_start,
             dropped,
@@ -1742,106 +2679,6 @@ impl Editor {
         );
 
         self.with_focused_text_editor(panel_key, |editor| editor.set_cursor_from_flat(value_byte));
-    }
-
-    /// Flat byte offset of `(line, byte_in_line)` within `value`,
-    /// clamping the line into range and the byte onto a char boundary
-    /// of that line. Newlines count one byte each, matching
-    /// [`TextEdit::flat_cursor_byte`](crate::primitives::text_edit::TextEdit).
-    fn markdown_line_byte_to_flat(value: &str, line: usize, byte_in_line: usize) -> usize {
-        let mut flat = 0usize;
-        for (i, l) in value.split('\n').enumerate() {
-            if i == line {
-                let mut b = byte_in_line.min(l.len());
-                while b > 0 && !l.is_char_boundary(b) {
-                    b -= 1;
-                }
-                return flat + b;
-            }
-            flat += l.len() + 1;
-        }
-        value.len()
-    }
-
-    /// A press on a markdown document row: focus already moved (the
-    /// caller's tabbable path), so place the caret at the clicked byte
-    /// of rendered line `line`, re-arm keep-caret-visible, and arm
-    /// drag-to-select anchored at the press.
-    pub(super) fn position_markdown_text_cursor_from_click(
-        &mut self,
-        panel_key: &crate::widgets::PanelKey,
-        widget_key: &str,
-        line: usize,
-        byte_in_line: usize,
-    ) {
-        let is_focused = self
-            .widget_registry
-            .get(panel_key)
-            .map(|p| p.focus_key == widget_key)
-            .unwrap_or(false);
-        if !is_focused {
-            return;
-        }
-        let Some(flat) = ({
-            let panel = self.widget_registry.get(panel_key);
-            panel.and_then(|p| match p.instance_states.get(widget_key) {
-                Some(crate::widgets::WidgetInstanceState::Text { editor, .. }) => Some(
-                    Self::markdown_line_byte_to_flat(&editor.value(), line, byte_in_line),
-                ),
-                _ => None,
-            })
-        }) else {
-            return;
-        };
-        self.clear_focused_text_user_scrolled(panel_key);
-        let moved = self.with_focused_text_editor(panel_key, |editor| {
-            editor.set_cursor_from_flat(flat);
-        });
-        // A click that lands on the caret's own cell still dismisses an
-        // existing selection: `set_cursor_from_flat` cleared the anchor,
-        // but `with_focused_text_editor` saw no cursor/value change, so
-        // repaint explicitly.
-        if !moved {
-            self.rerender_widget_panel(panel_key);
-        }
-        self.widget_text_drag = Some(super::WidgetTextDrag {
-            panel: panel_key.clone(),
-            widget: widget_key.to_string(),
-            anchor_flat: flat,
-        });
-    }
-
-    /// Extend the drag selection of an armed widget-text drag to
-    /// `(line, byte_in_line)`: caret moves there, anchor stays at the
-    /// press position. Selection-only — no `change` event fires.
-    pub(super) fn extend_widget_text_selection_to(
-        &mut self,
-        drag: &super::WidgetTextDrag,
-        line: usize,
-        byte_in_line: usize,
-    ) {
-        let Some(panel) = self.widget_registry.get_mut(&drag.panel) else {
-            return;
-        };
-        let Some(crate::widgets::WidgetInstanceState::Text { editor, .. }) =
-            panel.instance_states.get_mut(&drag.widget)
-        else {
-            return;
-        };
-        let value = editor.value();
-        let head = Self::markdown_line_byte_to_flat(&value, line, byte_in_line);
-        // Anchor (row, col) from its flat offset: park the cursor there
-        // momentarily to reuse the flat→(row, col) clamping, then move
-        // the cursor to the head and re-attach the anchor.
-        editor.set_cursor_from_flat(drag.anchor_flat);
-        let anchor_rc = (editor.cursor_row, editor.cursor_col);
-        editor.set_cursor_from_flat(head);
-        editor.selection_anchor = if head != drag.anchor_flat {
-            Some(anchor_rc)
-        } else {
-            None
-        };
-        self.rerender_widget_panel(&drag.panel);
     }
 
     /// Apply a non-printable editing key to the focused text widget —
@@ -1854,8 +2691,12 @@ impl Editor {
             Some(p) if !p.focus_key.is_empty() => p.focus_key.clone(),
             _ => return,
         };
+        let Some(press) = crate::input::keybindings::parse_key_press(key) else {
+            tracing::debug!(target: "fresh::widgets", %key, "text input key did not parse; dropped");
+            return;
+        };
         self.with_kind_mutation(panel_key, &focus_key, |spec, wkey, panel, fx| {
-            crate::widgets::kinds::text::text_key(spec, wkey, panel, key, fx);
+            crate::widgets::kinds::text::text_key(spec, wkey, panel, press, fx);
         });
     }
 
@@ -1875,72 +2716,84 @@ impl Editor {
         }
     }
 
-    /// Clear the focused Text widget's `user_scrolled` flag (re-arming
-    /// keep-caret-visible). Returns true when the flag was set.
-    fn clear_focused_text_user_scrolled(&mut self, panel_key: &crate::widgets::PanelKey) -> bool {
-        let Some(panel) = self.widget_registry.get_mut(panel_key) else {
-            return false;
-        };
-        let focus_key = panel.focus_key.clone();
-        if focus_key.is_empty() {
-            return false;
-        }
-        crate::widgets::kinds::text::clear_user_scrolled(&focus_key, panel)
-    }
-
     /// Insert printable / IME-committed text at the focused text
     /// widget's cursor. Same path for single-line and multi-line —
     /// `TextEdit::insert_str` strips `\n` automatically when the
     /// editor was constructed single-line. `text` may be a single
     /// codepoint, a grapheme cluster, or a multi-codepoint IME
     /// commit; `insert_str` handles each identically.
+    /// Typed text goes to the focused widget's kind (`WidgetImpl::on_text`):
+    /// a field inserts it, a number cell reads its digits, and a kind with
+    /// nothing to type into passes — the same dispatch a named key gets.
     pub(super) fn handle_widget_text_char(
         &mut self,
         panel_key: &crate::widgets::PanelKey,
         text: &str,
-    ) {
-        if text.is_empty() || self.focused_text_mode(panel_key).1 {
-            return;
+    ) -> crate::widgets::kinds::KeyDisposition {
+        use crate::widgets::kinds::KeyDisposition;
+        if text.is_empty() {
+            return KeyDisposition::Pass;
         }
-        let text = text.to_string();
-        self.with_focused_text_editor(panel_key, move |editor| {
-            editor.insert_str(&text);
-        });
+        let Some(panel) = self.widget_registry.get(panel_key) else {
+            return KeyDisposition::Pass;
+        };
+        let focus_key = panel.focus_key.clone();
+        let Some(widget) = crate::widgets::find_widget_by_key(&panel.spec, &focus_key).cloned()
+        else {
+            return KeyDisposition::Pass;
+        };
+        let mut fx = crate::widgets::kinds::KeyFx::default();
+        let disposition = match self.widget_registry.get_mut(panel_key) {
+            Some(panel_mut) => crate::widgets::kinds::behavior(&widget)
+                .on_text(&widget, &focus_key, panel_mut, text, &mut fx),
+            None => return KeyDisposition::Pass,
+        };
+        if disposition != KeyDisposition::Pass {
+            self.rerender_widget_panel(panel_key);
+        }
+        for (event_type, payload) in fx.events {
+            self.fire_widget_event(panel_key, focus_key.clone(), event_type, payload);
+        }
+        disposition
     }
 
-    /// Inner-rect column budget for a floating panel render — the
-    /// terminal width × `width_pct`, minus 2 cols for the frame
-    /// border. Mirrors the `widget_panel_width` reservation; never
-    /// goes below 10 cols so flex spacers don't collapse to zero on
-    /// narrow terminals.
-    pub(super) fn floating_panel_inner_width(&self, slot: super::PanelSlot) -> u32 {
-        // A left-dock panel wraps its content to the dock's fixed
-        // column width rather than a percentage of the terminal.
-        if let Some(super::PanelPlacement::LeftDock { width_cols }) =
-            self.panel(slot).map(|f| f.placement)
-        {
-            return (width_cols as u32).saturating_sub(2).max(10);
-        }
-        let term_w = self.terminal_width.max(1) as u32;
-        let pct = self
-            .panel(slot)
-            .map(|f| f.width_pct.clamp(1, 100) as u32)
-            .unwrap_or(80);
-        let w = (term_w * pct) / 100;
-        w.saturating_sub(2).max(10)
-    }
-
-    /// Height sibling of [`Self::floating_panel_inner_width`]: the row
-    /// budget auto-sized (`visible_rows: None`) lists/trees inside this
-    /// panel size themselves to. A left dock spans the terminal height;
-    /// a centered modal takes its `height_pct` share. 2 rows are
-    /// reserved for the panel frame, mirroring the width helper's
-    /// 2-column reservation.
+    /// The row budget auto-sized (`visible_rows: None`) lists/trees inside
+    /// this panel size themselves to. A left dock spans the terminal height;
+    /// a centered modal takes its `height_pct` share.
+    ///
+    /// **Two rows come off, and only one arm has a frame to justify them.**
+    /// For the centred and anchored panel the reservation is the box's own
+    /// border, and the number is not in competition with layout: the box is
+    /// `Sizing::Auto` (`view::shell::panel::layer_for`), so the budget
+    /// decides the content's height and `Auto` measures around it — one
+    /// authority with the layout following, not two answers.
+    ///
+    /// The dock is the arm where that argument does not hold. Its rectangle is
+    /// the full terminal height (`Editor::compute_dock_split`) and its column
+    /// has no border — the divider is a *column*, which the column's own
+    /// description accounts for separately (`view::shell::dock`) — so nothing in
+    /// the dock's geometry spends these two rows. What does spend them is the
+    /// orchestrator's own layout: it pads below its tree so its hint bar lands
+    /// on the column's last two rows. That makes the number a plugin's
+    /// convention wearing a frame's name, and the honest replacement is the
+    /// one `splits::panel_content` already uses for a pane — take the budget
+    /// from `LayoutInfo::constraints.max_h` inside `dock::column`'s existing
+    /// `layout_reader`, which is the height the column really has. It is not
+    /// done here because the two are not equal and the difference is the dock
+    /// e2e suite's to adjudicate, not a reader's.
     pub(super) fn floating_panel_inner_height(&self, slot: super::PanelSlot) -> Option<u32> {
         let term_h = (self.terminal_height.max(1)) as u32;
+        // A section's budget is the body rows the last frame resolved it
+        // to: its height is the column's to decide, not a share of the
+        // terminal's.
+        if let super::PanelSlot::Sidebar(i) = slot {
+            let sec = self.sidebar_sections.get(i)?;
+            sec.panel.as_ref()?;
+            return Some((sec.resolved as u32).max(1));
+        }
         let panel = self.panel(slot)?;
         let h = match panel.placement {
-            super::PanelPlacement::LeftDock { .. } => term_h,
+            super::PanelPlacement::LeftDock => term_h,
             _ => {
                 let pct = panel.height_pct.clamp(1, 100) as u32;
                 (term_h * pct) / 100
@@ -1970,9 +2823,20 @@ impl Editor {
         let Some(panel_key) = self.panel(slot).map(|f| f.panel_key.clone()) else {
             return;
         };
+        if slot == super::PanelSlot::Dock {
+            self.dock_passed_key_pending = false;
+        }
         if let Some(f) = self.panel_mut(slot) {
             f.focused = true;
         }
+        // Refocused on purpose, and the plugin is told so below: whatever a
+        // layer over the dock had covered is moot.
+        if slot == super::PanelSlot::Dock {
+            self.dock_covered = false;
+        }
+        // The panel's keyboard is a fact the description reads (its keys
+        // layer, its marks), so the tree is stale until it is rebuilt.
+        self.shell_description_stale = true;
         let widget_key = self
             .widget_registry
             .get(&panel_key)
@@ -2000,12 +2864,53 @@ impl Editor {
     /// Shared by the Esc handler, the editor-click handler, and the
     /// `FloatingPanelControl{op:"blur"}` command.
     pub(super) fn blur_floating_panel(&mut self, slot: super::PanelSlot) {
+        self.blur_floating_panel_with(slot, serde_json::json!({}));
+    }
+
+    /// [`Self::blur_floating_panel`] for a key the panel gave up the keyboard
+    /// to pass on (an unhandled chord such as Ctrl+P). The `blur` says so
+    /// (`passed_on: true`), so the plugin can tell a panel left to run a
+    /// command — whose result may hand the keyboard back to it — from one the
+    /// user left (#3136).
+    pub(super) fn blur_floating_panel_passing_key(&mut self, slot: super::PanelSlot) {
+        self.blur_floating_panel_with(slot, serde_json::json!({ "passed_on": true }));
+        if slot == super::PanelSlot::Dock {
+            self.dock_passed_key_pending = true;
+        }
+    }
+
+    /// The command a key passed on from the dock ran is over once a later
+    /// key arrives with no prompt open (a palette the key opened has closed,
+    /// confirmed or not): tell the dock it was left, with a plain `blur`, so
+    /// that the plugin stops counting it as still holding the keyboard. A
+    /// picker the command floated over the dock has already noted that the
+    /// dock had it.
+    pub(super) fn end_dock_passed_key(&mut self) {
+        if !self.dock_passed_key_pending || self.active_window().prompt.is_some() {
+            return;
+        }
+        self.dock_passed_key_pending = false;
+        if self.dock.as_ref().is_some_and(|d| !d.focused) {
+            self.blur_floating_panel(super::PanelSlot::Dock);
+        }
+    }
+
+    fn blur_floating_panel_with(&mut self, slot: super::PanelSlot, payload: serde_json::Value) {
         let Some(panel_key) = self.panel(slot).map(|f| f.panel_key.clone()) else {
             return;
         };
         if let Some(f) = self.panel_mut(slot) {
             f.focused = false;
         }
+        // Blurred on purpose, and the plugin is told so below; a cover a
+        // layer over the dock had put on it is over with the layer's keyboard.
+        if slot == super::PanelSlot::Dock {
+            self.dock_covered = false;
+        }
+        // The blur is a focus write: the description marks the pane behind
+        // the panel now, and the tree must say so before the next key is
+        // routed over it (`Editor::get_key_context`).
+        self.shell_description_stale = true;
         tracing::debug!(
             target: "fresh::dock",
             panel = %panel_key,
@@ -2017,12 +2922,7 @@ impl Editor {
             .get(&panel_key)
             .map(|p| p.focus_key.clone())
             .unwrap_or_default();
-        self.fire_widget_event(
-            &panel_key,
-            widget_key,
-            "blur".to_string(),
-            serde_json::json!({}),
-        );
+        self.fire_widget_event(&panel_key, widget_key, "blur".to_string(), payload);
     }
 
     /// Handle CloseSplit command
@@ -2030,18 +2930,14 @@ impl Editor {
         // Plugin sends arbitrary SplitId — convert to LeafId at the boundary
         let leaf_id = LeafId(split_id);
         match self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_manager_mut())
-            .expect("active window must have a populated split layout")
+            .active_window_mut()
+            .split_manager_mut()
             .close_split(leaf_id)
         {
             Ok(()) => {
                 // Clean up the view state for the closed split
-                self.windows
-                    .get_mut(&self.active_window)
-                    .and_then(|w| w.split_view_states_mut())
-                    .expect("active window must have a populated split layout")
+                self.active_window_mut()
+                    .split_view_states_mut()
                     .remove(&leaf_id);
                 // Drop the closed split from every terminal's scrollback set.
                 self.active_window_mut()
@@ -2266,8 +3162,8 @@ impl Editor {
 
     // ==================== Project Grep ====================
 
-    /// Retry deferred virtual-buffer animations now that split_areas has
-    /// been recomputed. Called from render() after layout but before
+    /// Retry deferred virtual-buffer animations now that the frame's
+    /// layout has placed the panes. Called from render() after layout but before
     /// animations.apply_all so the first frame of the effect lands in
     /// the same render pass.
     pub(crate) fn drain_pending_vb_animations(&mut self) {
@@ -2299,387 +3195,22 @@ impl Editor {
         &self,
         buffer_id: BufferId,
     ) -> Option<ratatui::layout::Rect> {
-        self.active_layout()
-            .split_areas
-            .iter()
-            .find(|(_, bid, _, _, _, _)| *bid == buffer_id)
-            .map(|(_, _, content_rect, _, _, _)| *content_rect)
+        self.pane_content_rect_for_buffer(buffer_id)
     }
 }
 
-/// Where a screen cell lands inside a floating widget panel. See
-/// [`Editor::probe_floating_widget`].
-struct FloatingWidgetProbe {
-    /// 0-indexed row within the panel's rendered entries.
-    brow: u32,
-    /// UTF-8 byte offset within that row's text (the overlay's text when
-    /// an overlay covers the row).
-    bcol: usize,
-    /// The widget under the cell, or `None` for a cell on no widget.
-    hit: Option<crate::widgets::HitArea>,
-}
-
-/// Panel pointer machinery shared by every mounted floating panel
-/// (the dock and the centered modal): probe/hover resolution, list
-/// scrollbar press/drag, dropdown pop-over clicks, wheel routing, and
-/// dismissal. Behavior owned by the panel runtime (moved from
-/// mouse_input.rs).
+/// Panel pointer machinery shared by every mounted floating panel (the dock
+/// and the centered modal): the text drag and dismissal.
+///
+/// **What is no longer here.** The cell→widget probe, the list scrollbar's
+/// press and drag, the dropdown pop-over's click and the wheel all resolved a
+/// screen cell against rectangles the interior painter or the text projection
+/// had recorded. Every mounted panel is described now: its widgets are nodes
+/// that answer their own presses, its lists are viewports whose wheel the
+/// library chains into and whose bar captures the pointer itself. What
+/// survives here is what a *node* cannot answer: a drag through text inside a
+/// widget, and closing the panel.
 impl Editor {
-    /// Hit-test a click against the floating widget panel. Clicks
-    /// inside the panel's inner rect resolve to a widget row/byte
-    /// and fire `widget_event` via the same path
-    /// Forward a vertical-wheel scroll to the active floating
-    /// widget panel — same plumbing the orchestrator's
-    /// embedded-widget panels use, but the floating panel
-    /// doesn't show up in `split_at_position` so it needs its
-    /// own dispatch entry point. Returns `true` when the panel
-    /// is active AND the mouse is inside its inner rect (so the
-    /// caller knows the wheel was consumed and shouldn't fall
-    /// through to buffer scrolling).
-    pub(super) fn handle_floating_widget_panel_wheel(
-        &mut self,
-        slot: super::PanelSlot,
-        col: u16,
-        row: u16,
-        delta: i32,
-    ) -> bool {
-        let inner = match self.panel(slot) {
-            Some(fwp) => match fwp.last_inner_rect {
-                Some(rect) => rect,
-                None => return false,
-            },
-            None => return false,
-        };
-        if col < inner.x || col >= inner.x + inner.width {
-            return false;
-        }
-        if row < inner.y || row >= inner.y + inner.height {
-            return false;
-        }
-        // Panel-relative pointer position, so the wheel scrolls the
-        // List/Tree under it rather than the first one in the spec.
-        // Floating panels paint their entries from row 0 at `inner`,
-        // so the translation is a plain offset.
-        let pos = (u32::from(row - inner.y), u32::from(col - inner.x));
-        let scrolled = self.handle_widget_panel_wheel_at(slot.buffer_id(), Some(pos), delta);
-        // The non-modal dock must swallow the wheel whenever the pointer
-        // is over it, even when the list is too short to scroll — the
-        // scroll must never leak through to the active window beneath.
-        let is_dock = matches!(
-            self.panel(slot).map(|f| f.placement),
-            Some(super::PanelPlacement::LeftDock { .. })
-        );
-        scrolled || is_dock
-    }
-
-    /// Route a vertical wheel to a widget panel mounted into an editor
-    /// split (Settings, Search & Replace, the code-tour dock). Resolves
-    /// the split under the pointer, translates the screen position into
-    /// the panel's (buffer row, display column), and hands it to
-    /// [`handle_widget_panel_wheel_at`](Self::handle_widget_panel_wheel_at)
-    /// so the wheel scrolls the list the pointer is actually over —
-    /// not the first list in the spec. Returns `true` when a panel
-    /// consumed the scroll.
-    pub(super) fn handle_split_widget_panel_wheel(
-        &mut self,
-        col: u16,
-        row: u16,
-        delta: i32,
-    ) -> bool {
-        let Some((split_id, buffer_id)) = self.active_window().split_at_position(col, row) else {
-            return false;
-        };
-        if self.widget_registry.panels_for_buffer(buffer_id).is_empty() {
-            return false;
-        }
-        let content_rect = self
-            .active_layout()
-            .split_areas
-            .iter()
-            .find(|(sid, ..)| *sid == split_id)
-            .map(|(_, _, rect, ..)| *rect);
-        let pos = content_rect.and_then(|rect| {
-            if !in_rect(col, row, rect) {
-                return None;
-            }
-            // Buffer row = viewport top line + rows below the content
-            // origin. Panels render one entry per line (no soft wrap)
-            // and are normally pinned to the top, but honour a scrolled
-            // viewport all the same.
-            let top_byte = self
-                .windows
-                .get(&self.active_window)
-                .and_then(|w| w.buffers.splits())
-                .map(|(_, vs)| vs)
-                .and_then(|vs| vs.get(&split_id))
-                .map(|vs| vs.viewport.top_byte())
-                .unwrap_or(0);
-            let top_line = self
-                .buffers()
-                .get(&buffer_id)
-                .map(|s| s.buffer.get_line_number(top_byte))
-                .unwrap_or(0);
-            let gutter = self
-                .buffers()
-                .get(&buffer_id)
-                .map(|s| s.margins.left_total_width() as u16)
-                .unwrap_or(0);
-            let panel_row = u32::from(row - rect.y).saturating_add(top_line as u32);
-            let panel_col = u32::from(col.saturating_sub(rect.x).saturating_sub(gutter));
-            Some((panel_row, panel_col))
-        });
-        self.handle_widget_panel_wheel_at(buffer_id, pos, delta)
-    }
-
-    /// Extend an armed widget-text drag selection to the pointer.
-    ///
-    /// Translates the screen position into the document's (rendered
-    /// line, byte-in-line) through the widget's recorded scroll region
-    /// — the same geometry wheel routing hit-tests — then hands the
-    /// caret move to the runtime. Rows above/below the region clamp to
-    /// its edges so a drag that overshoots keeps selecting.
-    pub(super) fn handle_widget_text_selection_drag(&mut self, col: u16, row: u16) {
-        use crate::primitives::display_width::grapheme_byte_at_visual_column;
-        let Some(drag) = self.widget_text_drag.clone() else {
-            return;
-        };
-        let Some(panel) = self.widget_registry.get(&drag.panel) else {
-            return;
-        };
-        let buffer_id = panel.buffer_id;
-        let Some(region) = panel
-            .boxes
-            .iter()
-            .find(|b| b.scroll.is_some() && b.key.as_deref() == Some(drag.widget.as_str()))
-            .cloned()
-        else {
-            return;
-        };
-        let Some(rect) = self
-            .active_layout()
-            .split_areas
-            .iter()
-            .find(|(_, bid, ..)| *bid == buffer_id)
-            .map(|(_, _, rect, ..)| *rect)
-        else {
-            return;
-        };
-        let (top_line, gutter) = self
-            .buffers()
-            .get(&buffer_id)
-            .map(|s| (0usize, s.margins.left_total_width() as u16))
-            .unwrap_or((0, 0));
-        // Buffer row under the pointer, clamped into the region's row
-        // band (dragging past either edge selects to the visible edge).
-        let Some(sc) = region.scroll else { return };
-        let brow = top_line + usize::from(row.max(rect.y) - rect.y);
-        let rel_row = brow
-            .saturating_sub(region.row as usize)
-            .min(region.height.saturating_sub(1) as usize);
-        let line = (sc.offset + rel_row).min(sc.total.saturating_sub(1));
-        // Byte within the rendered line, from the pointer's display
-        // column within the widget's region.
-        let widget_col = usize::from(col.saturating_sub(rect.x).saturating_sub(gutter))
-            .saturating_sub(region.col as usize);
-        let line_text = self
-            .widget_registry
-            .get(&drag.panel)
-            .and_then(|p| match p.instance_states.get(&drag.widget) {
-                Some(crate::widgets::WidgetInstanceState::Text { editor, .. }) => Some(
-                    editor
-                        .value()
-                        .split('\n')
-                        .nth(line)
-                        .unwrap_or_default()
-                        .to_string(),
-                ),
-                _ => None,
-            })
-            .unwrap_or_default();
-        let byte_in_line = grapheme_byte_at_visual_column(&line_text, widget_col);
-        self.extend_widget_text_selection_to(&drag, line, byte_in_line);
-    }
-
-    /// Try to start a floating-panel list scrollbar drag. Returns
-    /// true if the press landed on a scrollbar track (so the caller
-    /// skips row hit-testing — the bar overlaps the list's rightmost
-    /// column). Reuses the canonical `ScrollbarMouse`/`ScrollbarState`.
-    fn try_widget_scrollbar_press(&mut self, slot: super::PanelSlot, col: u16, row: u16) -> bool {
-        use crate::view::ui::scrollbar::ScrollbarState;
-        let (panel_key, tracks) = match self.panel(slot) {
-            Some(fwp) => (fwp.panel_key.clone(), fwp.scrollbar_tracks.clone()),
-            None => return false,
-        };
-        for t in &tracks {
-            let state = ScrollbarState::new(t.total, t.visible, t.scroll);
-            let pressed = self
-                .panel_mut(slot)
-                .and_then(|fwp| fwp.scrollbar_mouse.press(state, t.rect, col, row));
-            if let Some(new_offset) = pressed {
-                if let Some(fwp) = self.panel_mut(slot) {
-                    fwp.scrollbar_drag_key = Some(t.list_key.clone());
-                }
-                self.apply_widget_scroll(&panel_key, &t.list_key, new_offset, t.visible);
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Continue an in-flight floating-panel scrollbar drag. Returns
-    /// true if a drag is active (the press captured a `list_key`).
-    pub(super) fn try_widget_scrollbar_drag(&mut self, slot: super::PanelSlot, row: u16) -> bool {
-        use crate::view::ui::scrollbar::ScrollbarState;
-        let (panel_key, key) = match self.panel(slot) {
-            Some(fwp) => match &fwp.scrollbar_drag_key {
-                Some(k) => (fwp.panel_key.clone(), k.clone()),
-                None => return false,
-            },
-            None => return false,
-        };
-        // The track geometry for the dragged list (its rect may have
-        // shifted if the panel re-rendered between events).
-        let track = self.panel(slot).and_then(|fwp| {
-            fwp.scrollbar_tracks
-                .iter()
-                .find(|t| t.list_key == key)
-                .cloned()
-        });
-        let Some(t) = track else {
-            return false;
-        };
-        let state = ScrollbarState::new(t.total, t.visible, t.scroll);
-        let new_offset = self
-            .panel_mut(slot)
-            .and_then(|fwp| fwp.scrollbar_mouse.drag(state, t.rect, row));
-        if let Some(off) = new_offset {
-            self.apply_widget_scroll(&panel_key, &key, off, t.visible);
-        }
-        true
-    }
-
-    /// Try to start a drag on a scrollbar painted over a *buffer-mounted*
-    /// widget panel (the review-diff sidebar, Search & Replace). Returns
-    /// true when the press landed on a track, so the caller skips the
-    /// click it would otherwise have delivered to the panel underneath.
-    ///
-    /// The floating-panel twin is [`Self::try_widget_scrollbar_press`];
-    /// the difference is only where the tracks live (on the editor here,
-    /// on the panel struct there).
-    pub(super) fn try_split_widget_scrollbar_press(&mut self, col: u16, row: u16) -> bool {
-        use crate::view::ui::scrollbar::ScrollbarState;
-        // Only tracks belonging to a keyed List/Tree: those are the ones
-        // `apply_widget_scroll` can move. A press claimed for anything else
-        // (a keyless box, an overflowing multi-line Text) would scroll
-        // nothing while still swallowing the click the panel underneath
-        // was owed.
-        let Some((panel_key, track)) = self
-            .split_widget_scrollbar_tracks
-            .iter()
-            .find(|(panel_key, t)| {
-                crate::view::ui::point_in_rect(t.rect, col, row)
-                    && self
-                        .widget_registry
-                        .buffer_and_spec_ref(panel_key)
-                        .is_some_and(|(_, spec)| {
-                            crate::widgets::find_widget_by_key(spec, &t.list_key).is_some_and(|w| {
-                                matches!(
-                                    w,
-                                    fresh_core::api::WidgetSpec::List { .. }
-                                        | fresh_core::api::WidgetSpec::Tree { .. }
-                                )
-                            })
-                        })
-            })
-            .map(|(p, t)| (p.clone(), t.clone()))
-        else {
-            return false;
-        };
-        let state = ScrollbarState::new(track.total, track.visible, track.scroll);
-        let Some(new_offset) = self
-            .split_widget_scrollbar_mouse
-            .press(state, track.rect, col, row)
-        else {
-            return false;
-        };
-        self.split_widget_scrollbar_drag = Some((panel_key.clone(), track.list_key.clone()));
-        self.apply_widget_scroll(&panel_key, &track.list_key, new_offset, track.visible);
-        true
-    }
-
-    /// Continue an in-flight buffer-mounted scrollbar drag. Returns true
-    /// while one is active.
-    pub(super) fn try_split_widget_scrollbar_drag(&mut self, row: u16) -> bool {
-        use crate::view::ui::scrollbar::ScrollbarState;
-        let Some((panel_key, list_key)) = self.split_widget_scrollbar_drag.clone() else {
-            return false;
-        };
-        // Re-read the track: the panel re-renders as it scrolls, so its
-        // recorded geometry is the one from the latest draw.
-        let Some(track) = self
-            .split_widget_scrollbar_tracks
-            .iter()
-            .find(|(p, t)| *p == panel_key && t.list_key == list_key)
-            .map(|(_, t)| t.clone())
-        else {
-            return true;
-        };
-        let state = ScrollbarState::new(track.total, track.visible, track.scroll);
-        if let Some(off) = self
-            .split_widget_scrollbar_mouse
-            .drag(state, track.rect, row)
-        {
-            self.apply_widget_scroll(&panel_key, &list_key, off, track.visible);
-        }
-        true
-    }
-
-    /// End any in-flight buffer-mounted scrollbar drag.
-    pub(super) fn release_split_widget_scrollbar(&mut self) {
-        self.split_widget_scrollbar_mouse.release();
-        self.split_widget_scrollbar_drag = None;
-    }
-
-    /// End any in-flight floating-panel scrollbar drag.
-    pub(super) fn release_widget_scrollbar(&mut self) {
-        for fwp in [self.dock.as_mut(), self.floating_widget_panel.as_mut()]
-            .into_iter()
-            .flatten()
-        {
-            fwp.scrollbar_mouse.release();
-            fwp.scrollbar_drag_key = None;
-        }
-    }
-
-    /// Apply a host-driven scroll to a panel list (scrollbar press /
-    /// drag): update the registry's instance state, re-render, and —
-    /// when the list has a live selection that moved into the new
-    /// window — notify the plugin so its own selection mirror +
-    /// preview stay in sync with the thumb.
-    fn apply_widget_scroll(
-        &mut self,
-        panel_key: &crate::widgets::PanelKey,
-        list_key: &str,
-        new_offset: usize,
-        visible: usize,
-    ) {
-        let moved_sel = self.widget_registry.set_list_scroll(
-            panel_key,
-            list_key,
-            new_offset as u32,
-            visible as u32,
-        );
-        self.rerender_widget_panel(panel_key);
-        if let Some(sel) = moved_sel {
-            self.fire_widget_event(
-                panel_key,
-                list_key.to_string(),
-                "select".to_string(),
-                serde_json::json!({ "index": sel as i64 }),
-            );
-        }
-    }
-
     /// Right-click hit-test against a floating widget panel. Resolves the
     /// cell under the cursor to a widget and — only when it lands on a
     /// `list` row — fires a `widget_event` with `event_type: "context"`
@@ -2688,9 +3219,19 @@ impl Editor {
     /// right-clicked row. Returns `true` when a context event fired (so the
     /// caller swallows the click). Clicks on non-list widgets, padding, or
     /// outside the inner rect return `false`.
-    pub(super) fn handle_floating_widget_context_click(
+    /// Raise a widget's context menu from a hit the caller already has.
+    ///
+    /// **The half that was never the probe's.** Deciding *which* widget a
+    /// right press belongs to is geometry; deciding what a right press on it
+    /// means is not. The panel answers the first itself — its widgets are
+    /// nodes with rectangles — and hands the hit here. There is no other
+    /// producer left: the runtime's own right-press probe over the box arena
+    /// went in 2.4 and the left-press one in S7, so this is the whole of the
+    /// second half rather than the shared end of two paths.
+    pub(super) fn fire_widget_context(
         &mut self,
         slot: super::PanelSlot,
+        hit: &crate::widgets::WidgetEvent,
         col: u16,
         row: u16,
     ) -> bool {
@@ -2698,23 +3239,12 @@ impl Editor {
             Some(fwp) => fwp.panel_key.clone(),
             None => return false,
         };
-        // One probe for every pointer gesture on a panel — the same
-        // geometry, surface decision (base vs covering popup), and
-        // row-aware resolution the left-click and hover paths use.
-        // This path used to duplicate the geometry inline WITHOUT the
-        // overlay check, so a right-click went through an open popup
-        // to the rows it covered.
-        let probe = match self.probe_floating_widget(slot, col, row) {
-            Some(p) => p,
-            None => return false,
-        };
-        // Keep only hits whose kind declared the context-click
-        // capability (List/Tree rows): a right-click raises a menu for
-        // a session row, not for a button or empty padding.
-        let (mut payload, key, _kind) = match probe.hit.filter(|hit| hit.context_click) {
-            Some(hit) => (hit.payload.clone(), hit.widget_key.clone(), hit.widget_kind),
-            None => return false,
-        };
+        // A right-click raises a menu for a session row, not for a button or
+        // empty padding: only kinds that declared the capability answer.
+        if !hit.context_click {
+            return false;
+        }
+        let mut payload = hit.payload.clone();
         // Carry the screen cell so the plugin can anchor its popup at the
         // click (the list `select` payload only has the row index).
         if let Some(obj) = payload.as_object_mut() {
@@ -2729,40 +3259,15 @@ impl Editor {
         {
             return false;
         }
-        self.fire_widget_event(&panel_key, key, "context".to_string(), payload);
+        self.fire_widget_event(
+            &panel_key,
+            hit.widget_key.clone(),
+            "context".to_string(),
+            payload,
+        );
         true
     }
 
-    /// True when the centered (`Floating`) slot currently holds an
-    /// anchored context-menu popup rather than a centered modal.
-    pub(super) fn floating_panel_is_anchored(&self) -> bool {
-        matches!(
-            self.floating_widget_panel.as_ref().map(|f| f.placement),
-            Some(super::PanelPlacement::Anchored { .. })
-        )
-    }
-
-    /// True when `(col, row)` falls within the panel's drawn box — the
-    /// last-rendered inner rect grown by its 1-cell border. False when the
-    /// panel or its rect is absent.
-    pub(super) fn point_in_floating_panel(
-        &self,
-        slot: super::PanelSlot,
-        col: u16,
-        row: u16,
-    ) -> bool {
-        let Some(inner) = self.panel(slot).and_then(|f| f.last_inner_rect) else {
-            return false;
-        };
-        let x0 = inner.x.saturating_sub(1);
-        let y0 = inner.y.saturating_sub(1);
-        // inner.{x,y} + {width,height} already lands on the far border cell.
-        col >= x0 && col <= inner.x + inner.width && row >= y0 && row <= inner.y + inner.height
-    }
-
-    /// Unmount the floating panel and fire a `cancel` widget_event so the
-    /// owning plugin clears its state — the click-outside analogue of the
-    /// Esc dismissal in `dispatch_floating_widget_key`.
     pub(super) fn dismiss_floating_panel_with_cancel(&mut self, slot: super::PanelSlot) {
         let panel_key = match self.panel(slot) {
             Some(f) => f.panel_key.clone(),
@@ -2779,261 +3284,2054 @@ impl Editor {
             "cancel".to_string(),
             serde_json::json!({}),
         );
-        *self.panel_opt_mut(slot) = None;
+        if let Some(o) = self.panel_opt_mut(slot) {
+            *o = None;
+        }
         let _ = self.widget_registry.unmount(&panel_key);
     }
 
-    /// `handle_editor_click` uses; clicks outside the rect are
-    /// swallowed without dismissing the panel.
-    /// Resolve a click against the open dropdown pop-over's screen rects
-    /// (recorded by the last draw). A click on an option row delivers the
-    /// same `dropdown_select` hit a TUI cell click on the old inline list
-    /// would; a click elsewhere inside the box (border) is swallowed so it
-    /// neither selects nor dismisses the modal. Returns true when the click
-    /// was inside the pop-over box (and thus consumed).
-    fn try_panel_popup_click(&mut self, slot: super::PanelSlot, col: u16, row: u16) -> bool {
-        let (panel_key, key, hits, popup_rect) = match self.panel(slot) {
-            Some(f) => (
-                f.panel_key.clone(),
-                f.popup.as_ref().map(|d| d.widget_key.clone()),
-                f.popup_hits.clone(),
-                f.popup_rect,
-            ),
-            None => return false,
-        };
-        let popup_rect = match popup_rect {
-            Some(r) => r,
-            None => return false,
-        };
-        let key = match key {
-            Some(k) if !k.is_empty() => k,
-            _ => return false,
-        };
-        // Option row → select that index (fires `change`) and close.
-        if let Some(hit) = hits.iter().find(|h| in_rect(col, row, h.rect)) {
-            let ha = crate::widgets::HitArea {
-                overlay: false,
-                row_target: false,
-                context_click: false,
-                widget_key: key,
-                widget_kind: "dropdown",
-                buffer_row: 0,
-                byte_start: 0,
-                byte_end: 0,
-                payload: serde_json::json!({ "index": hit.index }),
-                event_type: "dropdown_select",
-                owner_key: None,
-            };
-            self.deliver_widget_hit(&panel_key, &ha, None);
-            return true;
-        }
-        // Inside the box but not on a row (its border): consume so the
-        // modal isn't dismissed and the list stays open.
-        in_rect(col, row, popup_rect)
-    }
-
-    /// Resolve a screen cell against a mounted floating panel: the
-    /// panel-local row and byte column it maps to, plus the widget hit
-    /// there (`None` when the cell is over no widget).
+    /// **The tree's focus entered or left a panel's interior** — for the dock,
+    /// the one panel another layer opens over while it keeps its keyboard.
     ///
-    /// Returns `None` when the panel isn't mounted, hasn't been drawn yet,
-    /// or the cell is outside its inner rect — i.e. "not this panel's cell"
-    /// as distinct from "this panel's cell, no widget on it".
-    ///
-    /// Shared by the click path and the hover tracker so the two can never
-    /// disagree about what the pointer is on. They did once for left- vs
-    /// right-click (byte-exact vs row-wide resolution), and compact dock
-    /// rows silently swallowed clicks past their label for it.
-    fn probe_floating_widget(
-        &self,
-        slot: super::PanelSlot,
-        col: u16,
-        row: u16,
-    ) -> Option<FloatingWidgetProbe> {
-        let inner = self.panel(slot)?.last_inner_rect?;
-        if col < inner.x || col >= inner.x + inner.width {
-            return None;
-        }
-        if row < inner.y || row >= inner.y + inner.height {
-            return None;
-        }
-        let brow = (row - inner.y) as u32;
-        let local_screen_col = (col - inner.x) as usize;
-        // Which surface is the pointer on? The panel's layout-box tree
-        // answers: a z>0 box — an Overlay-promoted subtree (the dock's
-        // "New Task… ▾" / "Move to Folder…" dropdowns) or the Text
-        // completion popup — covers the base rows beneath it. This used
-        // to be re-derived by scanning the painted overlay rows; the
-        // box tree is the same fact, stated structurally.
-        // Resolve the boxes through the slot's own panel key — never a
-        // `panels_for_buffer(..).first()` pick, whose HashMap order is
-        // arbitrary and could name a different panel than the one whose
-        // overlays/entries the text lookup below reads.
-        let slot_panel_key = self.panel(slot)?.panel_key.clone();
-        let on_overlay = self.widget_registry.get(&slot_panel_key).is_some_and(|p| {
-            // The covering surface is named by `pointer_opaque` on
-            // the hit path — the popup boxes (overlay promotion,
-            // completion list) carry it. z alone is not enough: a
-            // future non-opaque cover (a pass-through tooltip)
-            // must NOT capture the pointer.
-            crate::widgets::layout_box::hit_path(&p.boxes, brow, local_screen_col as u32)
-                .iter()
-                .any(|&i| p.boxes[i].pointer_opaque && p.boxes[i].z > 0)
-        });
-        // The column maps to a byte offset through the text of the
-        // surface the pointer is on — a covered row is DRAWN from the
-        // overlay's text, and the overlay's hit areas were measured
-        // against it. Mapping through the row underneath yields a byte
-        // offset in a different string, which is why the dropdown
-        // options were once unclickable.
-        let panel = self.panel(slot)?;
-        let row_text = if on_overlay {
-            panel
-                .overlays
-                .iter()
-                .find(|o| o.buffer_row == brow)
-                .map(|o| o.entry.text.as_str())?
-        } else {
-            panel.entries.get(brow as usize).map(|e| e.text.as_str())?
-        };
-        let bcol = crate::primitives::display_width::grapheme_byte_at_visual_column(
-            row_text,
-            local_screen_col,
-        );
-        // Row-aware resolution on the base surface (a click past a
-        // compact row's text still lands on the row); opaque popup
-        // semantics on the overlay surface (only its own hits are
-        // reachable, misses swallowed) — both inside
-        // `hit_test_row_aware`, keyed by the surface parameter.
-        let hit = self.widget_registry.hit_test_row_aware(
-            slot.buffer_id(),
-            brow,
-            bcol as u32,
-            on_overlay,
-        );
-        Some(FloatingWidgetProbe {
-            brow,
-            bcol,
-            hit: hit.map(|(_, h)| h.clone()),
-        })
-    }
-
-    /// Track which widget the pointer is over, per mounted panel, and
-    /// re-render a panel whose hovered widget changed.
-    ///
-    /// Purely host state: the tracked key feeds `RenderContext::hover_key`,
-    /// which the renderer compares against each widget's own key. A hover
-    /// therefore costs a hit-test and — only when the pointer crosses a
-    /// widget boundary — one spec re-render. Nothing crosses the plugin
-    /// bridge, so panels pay nothing for pointer movement over them.
-    ///
-    /// The re-render is needed because the draw pass paints the panel's
-    /// cached entries; a highlight change has to go back through the
-    /// renderer to appear.
-    ///
-    /// `pointer_owner` names the slot the pointer is actually addressing,
-    /// for callers that already know: a centered modal captures the mouse
-    /// channel outright, and the dock it covers must not keep (or gain) a
-    /// highlight from a pointer that is really over the modal. `None` —
-    /// the normal, non-modal pipeline — leaves every mounted panel
-    /// reachable.
-    pub(super) fn update_widget_hover(
+    /// A focused dock stays focused under a centred panel (its layer is
+    /// covered, not dropped), so the move out and back in is the tree's alone
+    /// and the owning plugin hears it the way it always heard a dock losing
+    /// and regaining the keyboard: a `blur`, then a `focus` marked
+    /// `previous: "(re-focus)"`. A dock that is not focused was blurred on
+    /// purpose, and that path told the plugin already.
+    pub(super) fn panel_keyboard_changed(
         &mut self,
-        col: u16,
-        row: u16,
-        pointer_owner: Option<super::PanelSlot>,
-    ) -> bool {
-        let mut changed = false;
-        for slot in [super::PanelSlot::Dock, super::PanelSlot::Floating] {
-            // A slot the pointer isn't addressing resolves to "nothing
-            // hovered", which also *clears* whatever it had highlighted.
-            // The hovered *row* travels beside the hovered widget: a
-            // list/tree hit carries its item key in the payload, and every
-            // row of one tree shares the tree's own `widget_key`, so
-            // without it the renderer could only light the whole list.
-            let (now, now_item) = if pointer_owner.is_none_or(|owner| owner == slot) {
-                self.probe_floating_widget(slot, col, row)
-                    .and_then(|p| p.hit)
-                    .map(|h| {
-                        let item = h
-                            .payload
-                            .get("key")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        (h.widget_key, item)
-                    })
-                    .unwrap_or_default()
-            } else {
-                (String::new(), String::new())
-            };
-            let panel_key = match self.panel(slot) {
-                Some(fwp) if fwp.hovered_widget_key != now || fwp.hovered_item_key != now_item => {
-                    fwp.panel_key.clone()
-                }
-                _ => continue,
-            };
-            if let Some(fwp) = self.panel_mut(slot) {
-                fwp.hovered_widget_key = now;
-                fwp.hovered_item_key = now_item;
-            }
-            self.rerender_widget_panel(&panel_key);
-            changed = true;
-        }
-        changed
-    }
-
-    pub(super) fn handle_floating_widget_click(
-        &mut self,
-        slot: super::PanelSlot,
-        col: u16,
-        row: u16,
+        slot: crate::view::shell::widgets::Slot,
+        held: bool,
     ) {
-        // An open dropdown's option list floats as a screen-level pop-over
-        // that extends PAST the panel/modal border, so a click on one of
-        // its option rows lands outside the panel's inner rect and would be
-        // dropped by the gate below. Resolve it first, against the screen
-        // rects recorded at draw time.
-        if self.try_panel_popup_click(slot, col, row) {
+        if slot != crate::view::shell::widgets::Slot::Dock {
             return;
         }
-        // Scrollbar press wins over row hit-testing (the bar overlaps
-        // the list's rightmost column).
-        if self.try_widget_scrollbar_press(slot, col, row) {
+        let Some(dock) = self.dock.as_ref() else {
+            return;
+        };
+        if !dock.focused {
+            self.dock_covered = false;
             return;
         }
-        let panel_key = match self.panel(slot) {
-            Some(fwp) => fwp.panel_key.clone(),
-            None => return,
-        };
-        let probe = match self.probe_floating_widget(slot, col, row) {
-            Some(p) => p,
-            None => return,
-        };
-        let (brow, bcol) = (probe.brow, probe.bcol);
-        let Some(hit) = probe.hit else {
-            tracing::debug!(
-                target: "fresh::dock",
-                ?slot, col, row, brow, bcol,
-                "handle_floating_widget_click: hit_test found no widget"
-            );
-            return;
-        };
-        tracing::debug!(
-            target: "fresh::dock",
-            hit_key = %hit.widget_key,
-            hit_kind = hit.widget_kind,
-            hit_event = %hit.event_type,
-            "handle_floating_widget_click: hit"
+        let panel_key = dock.panel_key.clone();
+        let widget_key = self
+            .widget_registry
+            .focus_key(&panel_key)
+            .map(str::to_string)
+            .unwrap_or_default();
+        match (held, self.dock_covered) {
+            (false, false) => {
+                self.dock_covered = true;
+                self.fire_widget_event(
+                    &panel_key,
+                    widget_key,
+                    "blur".to_string(),
+                    serde_json::json!({ "covered": true }),
+                );
+            }
+            (true, true) => {
+                self.dock_covered = false;
+                self.fire_widget_event(
+                    &panel_key,
+                    widget_key,
+                    "focus".to_string(),
+                    serde_json::json!({ "previous": "(re-focus)" }),
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The display column a byte offset sits at within `line`.
+///
+/// The page's rows are text and its spans are cells, and these two are where
+/// the one becomes the other. A byte column is what a buffer cursor is; a
+/// display column is what the tree laid out, what a press lands on, and what
+/// a selection is washed across.
+fn display_col_of(line: &str, byte: usize) -> u16 {
+    use unicode_width::UnicodeWidthChar;
+    let mut cols = 0usize;
+    for (at, ch) in line.char_indices() {
+        if at >= byte {
+            break;
+        }
+        cols += ch.width().unwrap_or(0);
+    }
+    cols.min(u16::MAX as usize) as u16
+}
+
+/// The byte offset at display column `col` of `line` — the start of the
+/// character covering that cell, and the line's length past its end.
+pub(super) fn byte_at_display_col(line: &str, col: u16) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    let mut cols = 0usize;
+    for (at, ch) in line.char_indices() {
+        if cols >= col as usize {
+            return at;
+        }
+        cols += ch.width().unwrap_or(0);
+    }
+    line.len()
+}
+
+impl crate::app::window::Window {
+    /// Mark every view of `buffer_id` as non-horizontally-scrollable.
+    ///
+    /// Called on each widget-panel repaint rather than once at mount:
+    /// a panel that is hidden and shown again gets a fresh
+    /// `SplitViewState`, and the flag has to land on that one too.
+    pub(super) fn pin_widget_panel_horizontal_scroll(&mut self, buffer_id: BufferId) {
+        for vs in self.split_view_states_mut().values_mut() {
+            if let Some(bs) = vs.buffer_state_mut(buffer_id) {
+                bs.viewport.horizontal_scroll_enabled = false;
+                bs.viewport.left_column = 0;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Editor;
+    use crate::config::Config;
+    use crate::config_io::DirectoryContext;
+    use fresh_core::api::WidgetSpec;
+    use fresh_editor_core::model::host_path::{AsHostPath, PathStyle};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn make_editor() -> (Editor, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_context = DirectoryContext::for_testing(temp_dir.path());
+        let fs: Arc<dyn crate::model::filesystem::FileSystem + Send + Sync> =
+            Arc::new(crate::model::filesystem::StdFileSystem);
+        let mut editor = Editor::new(
+            Config::default(),
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+            fs,
+        )
+        .unwrap();
+        // Pin the dock to the 30 columns `frame_the_shell` hands the tree.
+        editor.set_dock_width_cols(30);
+        (editor, temp_dir)
+    }
+
+    fn dock_panel(panel_key: crate::widgets::PanelKey) -> crate::app::FloatingWidgetState {
+        crate::app::FloatingWidgetState {
+            panel_key,
+            width_pct: 30,
+            height_pct: 100,
+            placement: crate::app::PanelPlacement::LeftDock,
+            focused: true,
+            mode: None,
+            scrollbar_zone_hovered: false,
+            scrollbar_flash_until: None,
+            fullscreen: false,
+            fill: false,
+            focus_marker: false,
+            label_align: Default::default(),
+            title: None,
+            closable: false,
+            hovered_widget_key: String::new(),
+            hovered_item_key: String::new(),
+            hovered_popup_row: String::new(),
+        }
+    }
+
+    /// One frame of the shell's tree, without a terminal.
+    ///
+    /// **`Editor::lay_out_shell_tree`, not a re-spelling of it.** This used to
+    /// repeat the take/frame/put-back sequence `render` performs, which meant
+    /// a step deleted from `render` was still taken here and the tests went on
+    /// passing — including the one guarding #3137, whose whole subject is a
+    /// call `render` makes after the frame. Calling the same function is what
+    /// makes that test able to fail.
+    fn frame_the_shell(editor: &mut Editor) {
+        use ratatui::layout::Rect;
+        let dock = Rect::new(0, 0, 30, 24);
+        let chrome = Rect::new(30, 0, 50, 24);
+        let shell = editor.shell_frame((Some(dock), chrome));
+        editor.lay_out_shell_tree(shell, fresh_ui::Size::new(80, 24));
+    }
+
+    fn button(key: &str) -> WidgetSpec {
+        WidgetSpec::Button {
+            label: key.into(),
+            focused: false,
+            intent: Default::default(),
+            key: Some(key.into()),
+            disabled: false,
+            focusable: true,
+            bare: false,
+            full_width: false,
+            hover_style: None,
+            style: None,
+        }
+    }
+
+    fn list_of(n: usize) -> WidgetSpec {
+        WidgetSpec::List {
+            items: (0..n)
+                .map(|i| fresh_core::text_property::TextPropertyEntry::text(format!("row {i}")))
+                .collect::<Vec<_>>()
+                .into(),
+            item_specs: Vec::new().into(),
+            item_keys: (0..n).map(|i| format!("k{i}")).collect::<Vec<_>>().into(),
+            selected_index: 0,
+            visible_rows: Some(4),
+            focusable: true,
+            type_ahead: false,
+            key: Some("lst".into()),
+        }
+    }
+
+    /// A list the plugin left the host to size — the `visible_rows: None`
+    /// branch, which is the only one where the collector and the tree can
+    /// disagree (an explicit count wins unconditionally in both).
+    fn auto_list(n: usize) -> WidgetSpec {
+        match list_of(n) {
+            WidgetSpec::List {
+                items,
+                item_specs,
+                item_keys,
+                selected_index,
+                focusable,
+                type_ahead,
+                key,
+                ..
+            } => WidgetSpec::List {
+                items,
+                item_specs,
+                item_keys,
+                selected_index,
+                visible_rows: None,
+                focusable,
+                type_ahead,
+                key,
+            },
+            other => other,
+        }
+    }
+
+    fn mount_list_panel(
+        editor: &mut Editor,
+        panel_key: &crate::widgets::PanelKey,
+        buffer_id: crate::model::event::BufferId,
+    ) {
+        let spec = list_of(40);
+        let out = crate::widgets::resolve_panel(&spec, &Default::default(), "", true, None);
+        editor.widget_registry.mount(
+            panel_key.clone(),
+            buffer_id,
+            spec,
+            out.instance_states,
+            out.focus_key,
+            true,
+            false,
+            false,
         );
-        // The shared pointer dispatch — identical to a buffer-cell or
-        // native-frontend click: focus the hit's owner, run the kind's
-        // own `on_pointer`, place a text caret from the clicked byte
-        // column (`bcol`), fire the recorded event unless consumed.
-        // This TUI-native path used to hand-copy a subset of that
-        // ladder and drifted (no list-selection sync, no dual-list
-        // cursor move); delegating is what keeps the three frontends
-        // behaving identically.
-        self.deliver_widget_hit(&panel_key, &hit, Some(bcol));
+    }
+
+    /// **The one window in a described panel the runtime still owns, reached
+    /// by name.**
+    ///
+    /// The arena stands down for a described panel and that is right for every
+    /// scrolling surface but this one: a `Text`'s candidate list is windowed
+    /// by `completion_popup` out of `completion_scroll_offset`, which the
+    /// plugin's `SetCompletions` writes and no viewport can hold. So the tree
+    /// hit-tests the float it placed and says which widget the notch was on,
+    /// and this is the end that moves it — the same `on_wheel` the arena would
+    /// have called, reached by a key instead of by a rectangle.
+    #[test]
+    fn a_named_widget_takes_a_wheel_the_arena_would_have_declined() {
+        let (mut editor, _t) = make_editor();
+        let panel_key = crate::widgets::PanelKey::new("test-plugin", 1);
+        let buffer = crate::app::PanelSlot::Dock.buffer_id();
+        let spec = WidgetSpec::Text {
+            value: "he".into(),
+            cursor_byte: 2,
+            focused: true,
+            label: String::new(),
+            placeholder: None,
+            rows: 1,
+            field_width: 20,
+            max_visible_chars: 0,
+            full_width: false,
+            completions: Vec::new(),
+            completions_visible_rows: 3,
+            min_rows: 0,
+            max_rows: 0,
+            block_caret: false,
+            sel_start: -1,
+            sel_end: -1,
+            label_width: 0,
+            read_only: false,
+            markdown: false,
+            combo: false,
+            key: Some("field".into()),
+        };
+        let out = crate::widgets::resolve_panel(&spec, &Default::default(), "field", true, None);
+        editor.widget_registry.mount(
+            panel_key.clone(),
+            buffer,
+            spec.clone(),
+            out.instance_states,
+            out.focus_key,
+            true,
+            false,
+            false,
+        );
+        editor.dock = Some(dock_panel(panel_key.clone()));
+        // Candidates never come from the spec — the plugin pushes them — so
+        // this is the state a `SetCompletions` leaves behind, seeded the way
+        // that applier seeds it on a field nobody has typed in.
+        let panel = editor
+            .widget_registry
+            .get_mut(&panel_key)
+            .expect("the panel");
+        crate::widgets::kinds::text::ensure_text_state(&spec, "field", panel);
+        match panel.instance_states.get_mut("field") {
+            Some(crate::widgets::WidgetInstanceState::Text { completions, .. }) => {
+                *completions = (0..9).map(|i| format!("cand{i}").into()).collect();
+            }
+            other => panic!("a text instance state, got {other:?}"),
+        }
+
+        assert!(
+            editor.wheel_widget_by_key(&panel_key, "field", 3),
+            "the field takes the notch its open list is under"
+        );
+        let scroll = match editor
+            .widget_registry
+            .get(&panel_key)
+            .and_then(|p| p.instance_states.get("field"))
+        {
+            Some(crate::widgets::WidgetInstanceState::Text {
+                completion_scroll_offset,
+                completion_navigated,
+                ..
+            }) => {
+                assert!(
+                    *completion_navigated,
+                    "scrolling is stepping into the list: Enter now accepts a row"
+                );
+                *completion_scroll_offset
+            }
+            other => panic!("a text instance state, got {other:?}"),
+        };
+        assert_eq!(scroll, 3, "three rows, the notch the caller was handed");
+
+        // A key that names nothing is not an error and moves nothing — the
+        // tree can outlive a spec the plugin has already replaced.
+        assert!(!editor.wheel_widget_by_key(&panel_key, "gone", 3));
+        assert!(!editor.wheel_widget_by_key(&panel_key, "", 3));
+    }
+
+    /// **Where the tree has no ring, the arena is still the one that works.**
+    ///
+    /// **Blurring a panel moves the tree's focus out of it, and the key
+    /// context follows.** The focus fact has one writer, and the tree is its
+    /// projection: while the dock holds the keyboard, its focused widget is
+    /// marked and the focus chain reads as `Dock`; when the host blurs it
+    /// (`blur_floating_panel`, the dive), the dock stops marking, the active
+    /// pane's content is the mark, and the next key is routed over a tree
+    /// that says so — `get_key_context` reads `Normal`, so a typed character
+    /// reaches the buffer and `Ctrl+P` opens the editor's palette. Before
+    /// this, focus stayed on the blurred dock's widget (it was still there,
+    /// still focusable) and every key after a dive resolved in the `Dock`
+    /// context and died.
+    #[test]
+    fn blurring_a_panel_moves_the_trees_focus_to_the_pane_behind_it() {
+        use crate::input::keybindings::KeyContext;
+        let (mut editor, _t) = make_editor();
+        let panel_key = crate::widgets::PanelKey::new("test-plugin", 1);
+        mount_list_panel(
+            &mut editor,
+            &panel_key,
+            crate::app::PanelSlot::Dock.buffer_id(),
+        );
+        editor.dock = Some(dock_panel(panel_key.clone()));
+        frame_the_shell(&mut editor);
+        assert_eq!(editor.get_key_context(), KeyContext::Dock);
+        let focused = editor
+            .shell_ui
+            .as_ref()
+            .and_then(|ui| ui.focused())
+            .and_then(|e| editor.shell_ui.as_ref().unwrap().key_of(e));
+        assert_eq!(
+            focused,
+            Some(crate::view::shell::widgets::widget_focus_key("lst")),
+            "the dock's focused widget holds the tree's focus"
+        );
+
+        editor.blur_floating_panel(crate::app::PanelSlot::Dock);
+        assert!(
+            editor.shell_description_stale,
+            "a focus write marks the tree stale"
+        );
+        // The context is read off a tree laid out after the write.
+        assert_eq!(editor.get_key_context(), KeyContext::Normal);
+        let focused = editor
+            .shell_ui
+            .as_ref()
+            .and_then(|ui| ui.focused())
+            .and_then(|e| editor.shell_ui.as_ref().unwrap().key_of(e));
+        let active = editor
+            .active_window()
+            .buffers
+            .splits()
+            .map(|(m, _)| m.active_split())
+            .expect("a pane");
+        assert_eq!(
+            focused,
+            Some(crate::view::shell::splits::content_key(active)),
+            "the active pane's content is where focus rests"
+        );
+        assert!(editor.editor_base_owns_keyboard());
+
+        // And a frame that changes nothing leaves it there.
+        frame_the_shell(&mut editor);
+        let focused = editor
+            .shell_ui
+            .as_ref()
+            .and_then(|ui| ui.focused())
+            .and_then(|e| editor.shell_ui.as_ref().unwrap().key_of(e));
+        assert_eq!(
+            focused,
+            Some(crate::view::shell::splits::content_key(active))
+        );
+    }
+
+    /// **A workspace created from a modal over the dock keeps the keyboard.**
+    ///
+    /// A centred panel mounting over a focused dock blurs it, and when the
+    /// panel closes the host hands the keyboard back to the dock widget that
+    /// opened it (R2) — a Cancel is back where it started. A submit that
+    /// goes somewhere else says so: the Orchestrator's New-Workspace form
+    /// closes and then blurs the dock (`showDockUnfocused`) so the workspace
+    /// it just created takes the keys. Plugin commands run in order, so that
+    /// blur lands after the give-back and wins. (The bug this guards: every
+    /// key after the submit resolved in the `Dock` context and died, so a
+    /// file opened in the new workspace never took the keyboard.)
+    ///
+    /// Gated on `plugins`: it mounts and unmounts the modal through the
+    /// plugin command path (`handle_plugin_command`), which only exists
+    /// when the plugin runtime is compiled in.
+    #[cfg(feature = "plugins")]
+    #[test]
+    fn a_modal_that_blurred_the_dock_leaves_the_keyboard_with_the_editor() {
+        use crate::input::keybindings::KeyContext;
+        let (mut editor, _t) = make_editor();
+        let dock_key = crate::widgets::PanelKey::new("test-plugin", 1);
+        mount_list_panel(
+            &mut editor,
+            &dock_key,
+            crate::app::PanelSlot::Dock.buffer_id(),
+        );
+        editor.dock = Some(dock_panel(dock_key.clone()));
+        frame_the_shell(&mut editor);
+        assert_eq!(editor.get_key_context(), KeyContext::Dock);
+
+        // The form: a centred modal, which blurs the dock as it mounts.
+        editor
+            .handle_plugin_command(fresh_core::api::PluginCommand::MountFloatingWidget {
+                plugin: "test-plugin".to_string(),
+                panel_id: 2,
+                spec: list_of(3),
+                width_pct: 60,
+                height_pct: 60,
+                as_dock: false,
+                focus_marker: false,
+                label_align: Default::default(),
+                title: None,
+                closable: false,
+                start_blurred: false,
+                mode: None,
+            })
+            .unwrap();
+        frame_the_shell(&mut editor);
+        assert!(
+            !editor.is_dock_focused(),
+            "mounting a centred modal takes the keyboard from the dock"
+        );
+
+        // Submitting it closes the form — the host gives the dock its
+        // keyboard back — and then blurs the dock, as the plugin does when
+        // it moves into the workspace it made.
+        editor
+            .handle_plugin_command(fresh_core::api::PluginCommand::UnmountFloatingWidget {
+                plugin: "test-plugin".to_string(),
+                panel_id: 2,
+            })
+            .unwrap();
+        editor
+            .handle_plugin_command(fresh_core::api::PluginCommand::FloatingPanelControl {
+                plugin: "test-plugin".to_string(),
+                panel_id: 1,
+                op: "blur".to_string(),
+                arg: 0.0,
+            })
+            .unwrap();
+        frame_the_shell(&mut editor);
+        assert!(!editor.is_dock_focused(), "the dock is blurred");
+        assert_eq!(
+            editor.get_key_context(),
+            KeyContext::Normal,
+            "the keyboard is the editor's, not the blurred dock's"
+        );
+    }
+
+    /// **A panel the tree does not hold advances along the tree's ring
+    /// anyway.** A mounted but unfocused panel has no keyboard layer, so
+    /// `Ui::move_focus` is not the move — but its interior is described, its
+    /// wrappers are registered, and `Ui::next_in` walks them in the same
+    /// order Tab would. The panel's focus *fact* advances along that ring;
+    /// there is no second ring walked over the spec.
+    #[test]
+    fn a_panel_the_tree_does_not_hold_advances_along_the_trees_ring() {
+        let (mut editor, _t) = make_editor();
+        let panel_key = crate::widgets::PanelKey::new("test-plugin", 1);
+        let spec = WidgetSpec::Col {
+            children: vec![button("one"), button("two")],
+            key: None,
+        };
+        let out = crate::widgets::resolve_panel(&spec, &Default::default(), "", true, None);
+        assert_eq!(
+            out.tabbable,
+            vec!["one".to_string(), "two".to_string()],
+            "the arena's ring, from the same `box_meta` the tree's is built from"
+        );
+        editor.widget_registry.mount(
+            panel_key.clone(),
+            crate::app::PanelSlot::Dock.buffer_id(),
+            spec,
+            out.instance_states,
+            out.focus_key,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(
+            editor.widget_registry.focus_key(&panel_key),
+            Some("one"),
+            "the render clamps focus onto the first tabbable"
+        );
+        // In the dock's slot, unfocused: the tree describes the interior
+        // and its ring, and does not hold the panel's focus.
+        let mut dock = dock_panel(panel_key.clone());
+        dock.focused = false;
+        editor.dock = Some(dock);
+        frame_the_shell(&mut editor);
+
+        editor.handle_widget_focus_advance(&panel_key, 1);
+        assert_eq!(
+            editor.widget_registry.focus_key(&panel_key),
+            Some("two"),
+            "the fact advanced along the tree's ring"
+        );
+        editor.handle_widget_focus_advance(&panel_key, -1);
+        assert_eq!(
+            editor.widget_registry.focus_key(&panel_key),
+            Some("one"),
+            "and back"
+        );
+    }
+
+    /// **And where the tree does hold it, the tree is the one that moves.**
+    ///
+    /// The same panel, mounted in the dock slot and given a frame, so the
+    /// keyboard layer names its interior and focus settles on a widget inside
+    /// it. A plugin's `FocusAdvance` now moves *the tree's* focus and the
+    /// registry's key follows as the mirror it is meant to be — where before,
+    /// the arena wrote the key and the tree's focus stayed where it was, so
+    /// the user's next Tab started from the widget they had already left.
+    #[test]
+    fn a_panel_the_tree_holds_advances_on_the_trees_ring() {
+        let (mut editor, _t) = make_editor();
+        let panel_key = crate::widgets::PanelKey::new("test-plugin", 1);
+        let spec = WidgetSpec::Col {
+            children: vec![button("one"), button("two")],
+            key: None,
+        };
+        let out = crate::widgets::resolve_panel(&spec, &Default::default(), "", true, None);
+        editor.widget_registry.mount(
+            panel_key.clone(),
+            crate::app::PanelSlot::Dock.buffer_id(),
+            spec,
+            out.instance_states,
+            out.focus_key,
+            true,
+            false,
+            false,
+        );
+        editor.dock = Some(dock_panel(panel_key.clone()));
+        frame_the_shell(&mut editor);
+
+        let scope =
+            crate::view::shell::panel::interior_key(crate::view::shell::widgets::Slot::Dock);
+        let ui = editor.shell_ui.as_ref().expect("the tree");
+        let el = ui
+            .find_by_key(&scope)
+            .expect("the interior names the scope");
+        assert!(ui.has_focus_within(el), "and the frame settled focus in it");
+        let before = ui.focused();
+
+        editor.handle_widget_focus_advance(&panel_key, 1);
+
+        let ui = editor.shell_ui.as_ref().expect("the tree");
+        assert_ne!(ui.focused(), before, "the tree's focus is what moved");
+        assert_eq!(
+            editor.widget_registry.focus_key(&panel_key),
+            Some("two"),
+            "and the registry's key mirrors it"
+        );
+    }
+
+    /// **A described panel's window is the tree's, and the spec answers only
+    /// when there is no tree.**
+    ///
+    /// The collector and the reconciler used to resolve the same auto-sized
+    /// list two different ways — the collector took the panel's row budget
+    /// and subtracted what its fill pass measured the siblings to
+    /// occupy, the tree gives the node its `.flex(1)` share of what layout
+    /// actually had — and until S5 the handlers were driven by the first even
+    /// on a surface the second had drawn. The paint's record is gone; what is
+    /// left to check is that the tree's window is the one read, and that the
+    /// spec's legacy fallback is what answers before a layout exists.
+    #[test]
+    fn a_described_panels_window_is_the_trees_not_the_specs() {
+        let (mut editor, _t) = make_editor();
+        let panel_key = crate::widgets::PanelKey::new("test-plugin", 1);
+        let spec = WidgetSpec::Col {
+            children: vec![button("hdr"), auto_list(40)],
+            key: None,
+        };
+        let out = crate::widgets::resolve_panel(&spec, &Default::default(), "", true, None);
+        editor.widget_registry.mount(
+            panel_key.clone(),
+            crate::app::PanelSlot::Dock.buffer_id(),
+            spec.clone(),
+            out.instance_states,
+            out.focus_key,
+            true,
+            false,
+            false,
+        );
+        editor.dock = Some(dock_panel(panel_key.clone()));
+        frame_the_shell(&mut editor);
+
+        let widget = crate::widgets::find_widget_by_key(&spec, "lst")
+            .cloned()
+            .expect("the list is in the spec");
+
+        let vp = editor.widget_viewport(&panel_key, &widget, "lst");
+        let tree = editor
+            .shell_ui
+            .as_ref()
+            .expect("the tree")
+            .item_window_in(
+                editor
+                    .shell_ui
+                    .as_ref()
+                    .unwrap()
+                    .find_by_key(&crate::view::shell::panel::interior_key(
+                        crate::view::shell::widgets::Slot::Dock,
+                    ))
+                    .expect("the dock's interior"),
+                &fresh_ui::Key::Str("lst".into()),
+            )
+            .expect("the list's own viewport published its window");
+        assert_eq!(
+            (vp.items, vp.rows),
+            (tree.0.h as u32, tree.1 as u32),
+            "the window is the one the reconciler laid out"
+        );
+        let legacy = fresh_core::api::LEGACY_VISIBLE_ROWS_FALLBACK;
+        assert_ne!(
+            vp.items, legacy,
+            "and not the spec's fallback: got {}",
+            vp.items
+        );
+
+        // The same panel with no tree: nothing has laid the list out, and
+        // the spec's fallback is the only answer there is.
+        editor.shell_ui = None;
+        let vp = editor.widget_viewport(&panel_key, &widget, "lst");
+        assert_eq!((vp.items, vp.rows), (legacy, legacy), "the spec's window");
+    }
+
+    // ---- the markdown document view -----------------------------------
+
+    /// A markdown document as the prose column of a dock panel: long enough
+    /// to wrap into several rows at the dock's width.
+    fn prose_spec(key: Option<&str>) -> WidgetSpec {
+        WidgetSpec::Text {
+            value: "The quick brown fox jumps over the lazy dog while the five boxing \
+                    wizards jump quickly and vexed nymphs blow jugs of fun at dusk."
+                .into(),
+            cursor_byte: -1,
+            focused: false,
+            label: String::new(),
+            placeholder: None,
+            rows: 4,
+            field_width: 0,
+            max_visible_chars: 0,
+            full_width: false,
+            completions: Vec::new(),
+            completions_visible_rows: 0,
+            min_rows: 0,
+            max_rows: 0,
+            block_caret: false,
+            sel_start: -1,
+            sel_end: -1,
+            label_width: 0,
+            read_only: true,
+            markdown: true,
+            combo: false,
+            key: key.map(str::to_string),
+        }
+    }
+
+    /// A key as the router hands one over, spelled the way a binding is
+    /// (`crate::keys`'s syntax: `S-Down` is Shift and the arrow).
+    fn keyseq(s: &str) -> crate::input::keybindings::KeySeq {
+        crate::input::keybindings::KeySeq::parse(s, None).expect("a key spelling")
+    }
+
+    /// Mount a prose panel in the dock **with no collector output at all** —
+    /// the state the description needs is seeded by `resolve_panel`, not by
+    /// a render — and lay the frame out once.
+    fn mount_prose_panel(editor: &mut Editor, key: &crate::widgets::PanelKey, spec: WidgetSpec) {
+        let focus = match &spec {
+            WidgetSpec::Text { key: Some(k), .. } => k.clone(),
+            _ => String::new(),
+        };
+        editor.widget_registry.mount(
+            key.clone(),
+            crate::app::PanelSlot::Dock.buffer_id(),
+            spec,
+            Default::default(),
+            focus,
+            true,
+            false,
+            false,
+        );
+        editor.dock = Some(dock_panel(key.clone()));
+        editor.rerender_widget_panel(key);
+        frame_the_shell(editor);
+    }
+
+    fn prose_rows(
+        editor: &mut Editor,
+        key: &crate::widgets::PanelKey,
+    ) -> (String, Vec<fresh_ui::render::prim::Row>) {
+        let mut ui = editor.shell_ui.take().expect("a laid-out tree");
+        let out = editor.panel_subtree_root(&ui, key).and_then(|root| {
+            ui.text_rows_in(root, &crate::view::shell::widgets::prose_run_key("prose"))
+        });
+        editor.shell_ui = Some(ui);
+        out.expect("the prose run's rows")
+    }
+
+    fn prose_editor(
+        editor: &Editor,
+        key: &crate::widgets::PanelKey,
+    ) -> crate::primitives::text_edit::TextEdit {
+        prose_editor_of(editor, key, "prose")
+    }
+
+    fn prose_editor_of(
+        editor: &Editor,
+        key: &crate::widgets::PanelKey,
+        widget: &str,
+    ) -> crate::primitives::text_edit::TextEdit {
+        match editor
+            .widget_registry
+            .get(key)
+            .and_then(|p| p.instance_states.get(widget))
+        {
+            Some(crate::widgets::WidgetInstanceState::Text { editor, .. }) => editor.clone(),
+            other => panic!("expected the prose's Text state, got {other:?}"),
+        }
+    }
+
+    fn prose_rect(editor: &Editor) -> ratatui::layout::Rect {
+        let ui = editor.shell_ui.as_ref().expect("a laid-out tree");
+        crate::view::shell::rect_of(
+            ui,
+            &crate::view::shell::widgets::prose_run_key("prose"),
+            ratatui::layout::Rect::new(0, 0, 80, 24),
+        )
+        .expect("the prose run has a rectangle")
+    }
+
+    /// **The document's state holds the document.** No renderer ran; the
+    /// `TextEdit` the caret and Copy address is the rendered document — one
+    /// string, the same bytes at every width — and the tree wrapped it.
+    #[test]
+    fn a_markdown_documents_state_holds_the_document_not_its_reflow() {
+        let (mut editor, _t) = make_editor();
+        let key = crate::widgets::PanelKey::new("tour", 1);
+        mount_prose_panel(&mut editor, &key, prose_spec(Some("prose")));
+        let ink = editor.markdown_ink();
+        let doc = crate::widgets::kinds::text::markdown_document(
+            match prose_spec(None) {
+                WidgetSpec::Text { value, .. } => value,
+                _ => unreachable!(),
+            }
+            .as_str(),
+            Some(ink.ctx()),
+        )
+        .text;
+        assert_eq!(
+            prose_editor(&editor, &key).value(),
+            doc.trim_end_matches('\n'),
+            "the state is the document — no newline the wrap put there"
+        );
+        let (whole, rows) = prose_rows(&mut editor, &key);
+        assert_eq!(
+            whole,
+            prose_editor(&editor, &key).value(),
+            "and the run shows that string"
+        );
+        assert!(
+            rows.len() >= 3,
+            "wrapped into rows at the dock's width: {}",
+            rows.len()
+        );
+    }
+
+    /// **A growing text box pages by the height layout gave it.** The box
+    /// states two rows and grows to eight with its text; PageDown moved the
+    /// caret by the spec's `rows - 1`, one line, where the box showed eight.
+    #[test]
+    fn a_growing_text_box_pages_by_its_laid_out_height() {
+        let (mut editor, _t) = make_editor();
+        let key = crate::widgets::PanelKey::new("notes", 1);
+        let value = (0..30)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let spec = WidgetSpec::Text {
+            value,
+            cursor_byte: 0,
+            focused: true,
+            label: String::new(),
+            placeholder: None,
+            rows: 2,
+            field_width: 0,
+            max_visible_chars: 0,
+            full_width: false,
+            completions: Vec::new(),
+            completions_visible_rows: 0,
+            min_rows: 2,
+            max_rows: 8,
+            block_caret: false,
+            sel_start: -1,
+            sel_end: -1,
+            label_width: 0,
+            read_only: false,
+            markdown: false,
+            combo: false,
+            key: Some("notes".into()),
+        };
+        mount_prose_panel(&mut editor, &key, spec);
+        let line = |editor: &Editor| {
+            let e = prose_editor_of(editor, &key, "notes");
+            e.value()[..e.flat_cursor_byte()].matches('\n').count()
+        };
+
+        editor.handle_widget_key(&key, &keyseq("PageDown"));
+        assert_eq!(line(&editor), 7, "a page is the eight rows shown, less one");
+        frame_the_shell(&mut editor);
+        editor.handle_widget_key(&key, &keyseq("PageUp"));
+        assert_eq!(line(&editor), 0);
+    }
+
+    /// **`Up`/`Down`/`Home`/`End` move by rendered row, resolved host-side.**
+    /// The kind never sees them: the host reads the rows the tree shaped and
+    /// puts the caret on the byte one row down at the same column.
+    #[test]
+    fn keys_over_a_markdown_document_move_by_the_rows_the_wrap_made() {
+        use fresh_ui::render::prim::byte_of;
+        let (mut editor, _t) = make_editor();
+        let key = crate::widgets::PanelKey::new("tour", 1);
+        mount_prose_panel(&mut editor, &key, prose_spec(Some("prose")));
+        let (whole, rows) = prose_rows(&mut editor, &key);
+        assert_eq!(prose_editor(&editor, &key).flat_cursor_byte(), 0);
+
+        editor.handle_widget_key(&key, &keyseq("Down"));
+        let one_down = byte_of(&rows, &whole, 1, 0).expect("row 1 col 0");
+        assert_eq!(
+            prose_editor(&editor, &key).flat_cursor_byte(),
+            one_down,
+            "Down: one rendered row"
+        );
+        assert!(one_down > 0 && one_down < whole.len());
+
+        editor.handle_widget_key(&key, &keyseq("End"));
+        assert_eq!(
+            prose_editor(&editor, &key).flat_cursor_byte(),
+            rows[1].src.end,
+            "End: the row's last byte"
+        );
+        editor.handle_widget_key(&key, &keyseq("Home"));
+        assert_eq!(
+            prose_editor(&editor, &key).flat_cursor_byte(),
+            rows[1].src.start,
+            "Home: the row's first byte"
+        );
+
+        editor.handle_widget_key(&key, &keyseq("S-Down"));
+        let two_down = byte_of(&rows, &whole, 2, 0).expect("row 2 col 0");
+        let e = prose_editor(&editor, &key);
+        assert_eq!(e.flat_cursor_byte(), two_down);
+        assert_eq!(
+            e.selection_flat_range(),
+            Some((rows[1].src.start, two_down)),
+            "S-Down extends from the anchor"
+        );
+
+        editor.handle_widget_key(&key, &keyseq("Up"));
+        editor.handle_widget_key(&key, &keyseq("Up"));
+        let e = prose_editor(&editor, &key);
+        assert_eq!(
+            e.flat_cursor_byte(),
+            0,
+            "two rows up from row 2 is the start"
+        );
+        assert_eq!(
+            e.selection_flat_range(),
+            None,
+            "a plain move drops the selection"
+        );
+    }
+
+    /// **A press places the caret by the byte under the pointer, and the drag
+    /// is the run's own capture.** No arena, no line number: `Event::text_byte`
+    /// from the rows layout shaped, and the release ends it.
+    #[test]
+    fn a_press_on_the_prose_places_the_caret_by_byte_and_a_drag_selects() {
+        use fresh_ui::render::prim::byte_of;
+        use fresh_ui::{Input, Mods, MouseButton, Point};
+        let (mut editor, _t) = make_editor();
+        let key = crate::widgets::PanelKey::new("tour", 1);
+        mount_prose_panel(&mut editor, &key, prose_spec(Some("prose")));
+        let (whole, rows) = prose_rows(&mut editor, &key);
+        let r = prose_rect(&editor);
+
+        editor.shell_dispatch(Input::press(
+            Point::new(r.x as i32, r.y as i32 + 1),
+            MouseButton::Left,
+            Mods::NONE,
+        ));
+        assert_eq!(
+            prose_editor(&editor, &key).flat_cursor_byte(),
+            rows[1].src.start,
+            "a press on row 1's first cell"
+        );
+        assert!(editor.prose_drag.is_some(), "the press is live");
+
+        editor.shell_dispatch(Input::Move {
+            pos: Point::new(r.x as i32 + 3, r.y as i32 + 2),
+            mods: Mods::NONE,
+        });
+        let to = byte_of(&rows, &whole, 2, 3).expect("row 2 col 3");
+        assert_eq!(
+            prose_editor(&editor, &key).selection_flat_range(),
+            Some((rows[1].src.start, to)),
+            "the drag extends the selection to the byte under the pointer"
+        );
+
+        // Off the run is one of its two ends, and which one is where the
+        // pointer went: dragging up past the first row selects *back* to the
+        // start. Reading "no byte" as the document's end alone turned that
+        // into a forward selection to the far end of the text.
+        editor.shell_dispatch(Input::Move {
+            pos: Point::new(r.x as i32 + 3, r.y as i32 - 2),
+            mods: Mods::NONE,
+        });
+        assert_eq!(
+            prose_editor(&editor, &key).selection_flat_range(),
+            Some((0, rows[1].src.start)),
+            "a drag above the run reaches the start, not the end"
+        );
+        editor.shell_dispatch(Input::Move {
+            pos: Point::new(r.x as i32 + 3, r.y as i32 + 2),
+            mods: Mods::NONE,
+        });
+
+        editor.shell_dispatch(Input::release(
+            Point::new(r.x as i32 + 3, r.y as i32 + 2),
+            MouseButton::Left,
+            Mods::NONE,
+        ));
+        assert!(editor.prose_drag.is_none(), "the release ends it");
+        assert_eq!(
+            prose_editor(&editor, &key).selection_flat_range(),
+            Some((rows[1].src.start, to)),
+            "and the selection stands"
+        );
+    }
+
+    /// **A widget in a *pane-mounted* panel can be focused.**
+    ///
+    /// The code tour mounts its prose in a pane, and the fact that focuses a
+    /// widget resolved its panel through a slot match that had every slot but
+    /// that one — so the focus never moved there: no caret was painted (the
+    /// markdown arm gates on it) and every key handler that asks what is
+    /// focused declined, including the rendered-row moves. It asks the one
+    /// resolver now, the same one the press itself uses.
+    #[test]
+    fn a_focus_fact_from_a_pane_reaches_its_panel() {
+        let (mut editor, _t) = make_editor();
+        let key = crate::widgets::PanelKey::new("tour", 1);
+        // Mounted on the buffer a pane is showing, which is what makes this
+        // panel the pane's rather than a slot's.
+        let buffer = editor.active_buffer();
+        editor.widget_registry.mount(
+            key.clone(),
+            buffer,
+            prose_spec(Some("prose")),
+            Default::default(),
+            String::new(),
+            true,
+            false,
+            false,
+        );
+        let slot = editor
+            .described_slot_of_panel(&key)
+            .expect("the pane's slot");
+        assert!(
+            matches!(slot, crate::view::shell::widgets::Slot::Pane(_)),
+            "the panel is the pane's: {slot:?}"
+        );
+        editor.apply_shell_messages(
+            vec![crate::view::shell::msg::UiMsg::Ui(
+                crate::view::shell::msg::UiFact::WidgetFocus {
+                    slot,
+                    widget: "prose".into(),
+                },
+            )],
+            Default::default(),
+        );
+        assert_eq!(
+            editor.widget_registry.focus_key(&key),
+            Some("prose"),
+            "the focus landed on the widget the fact named"
+        );
+    }
+
+    /// **A caret placed by byte lands on the row the wrap put it on, after a
+    /// width change.** The caret is a byte of the document; which row that is
+    /// changes with the width, and the tree — not a second wrap — answers.
+    #[test]
+    fn the_caret_lands_on_the_row_the_wrap_put_it_on_after_a_width_change() {
+        use fresh_ui::render::prim::cell_of;
+        let (mut editor, _t) = make_editor();
+        let key = crate::widgets::PanelKey::new("tour", 1);
+        mount_prose_panel(&mut editor, &key, prose_spec(Some("prose")));
+        let (whole, narrow) = prose_rows(&mut editor, &key);
+        assert!(narrow.len() >= 4);
+        let byte = narrow[2].src.start + 2;
+        editor.move_prose_caret(&key, "prose", byte, false);
+        frame_the_shell(&mut editor);
+        assert_eq!(
+            cell_of(&narrow, &whole, byte).0,
+            2,
+            "on row 2 at the narrow width"
+        );
+
+        // Widen the dock: the same bytes wrap into fewer rows.
+        editor.set_dock_width_cols(60);
+        editor.shell_description_stale = true;
+        let dock = ratatui::layout::Rect::new(0, 0, 60, 24);
+        let chrome = ratatui::layout::Rect::new(60, 0, 20, 24);
+        let shell = editor.shell_frame((Some(dock), chrome));
+        editor.lay_out_shell_tree(shell, fresh_ui::Size::new(80, 24));
+
+        let (whole2, wide) = prose_rows(&mut editor, &key);
+        assert_eq!(whole2, whole, "the same string");
+        assert!(
+            wide.len() < narrow.len(),
+            "fewer rows: {} < {}",
+            wide.len(),
+            narrow.len()
+        );
+        let row = cell_of(&wide, &whole2, byte).0;
+        assert!(row < 2, "the byte moved up to row {row}");
+
+        // And the caret is painted there: a one-byte wash on that row, inside
+        // the run's rectangle.
+        let r = prose_rect(&editor);
+        let ui = editor.shell_ui.as_ref().unwrap();
+        let washes: Vec<_> = ui
+            .spec()
+            .items
+            .iter()
+            .filter(|i| matches!(i.draw, fresh_ui::Draw::Wash))
+            .filter(|i| i.rect.x >= r.x as i32 && i.rect.x < (r.x + r.width) as i32)
+            .map(|i| i.rect.y - r.y as i32)
+            .collect();
+        assert_eq!(
+            washes,
+            vec![row as i32],
+            "the caret wash is on the wrap's row"
+        );
+    }
+
+    /// **A keyless document is a wrapped run and nothing else** — the welcome
+    /// screen's code sample: no state to seed, no caret, no gesture, and a key
+    /// aimed at the panel has nothing to move.
+    #[test]
+    fn a_keyless_markdown_document_is_a_wrapped_run_and_nothing_else() {
+        let (mut editor, _t) = make_editor();
+        let key = crate::widgets::PanelKey::new("welcome", 1);
+        mount_prose_panel(&mut editor, &key, prose_spec(None));
+        let panel = editor.widget_registry.get(&key).expect("the panel");
+        assert!(
+            panel.instance_states.is_empty(),
+            "nothing to seed without a key"
+        );
+        let ui = editor.shell_ui.as_ref().unwrap();
+        assert!(ui
+            .find_by_key(&crate::view::shell::widgets::prose_run_key("prose"))
+            .is_none());
+        editor.handle_widget_key(&key, &keyseq("Down"));
+        assert!(editor
+            .widget_registry
+            .get(&key)
+            .unwrap()
+            .instance_states
+            .is_empty());
+    }
+
+    #[test]
+    fn a_described_panel_resolves_instead_of_rendering() {
+        let (mut editor, _t) = make_editor();
+        let described = crate::widgets::PanelKey::new("test-plugin", 1);
+        let plain = crate::widgets::PanelKey::new("test-plugin", 2);
+        let plain_buffer = crate::model::event::BufferId(9_999);
+        mount_list_panel(
+            &mut editor,
+            &described,
+            crate::app::PanelSlot::Dock.buffer_id(),
+        );
+        mount_list_panel(&mut editor, &plain, plain_buffer);
+        editor.dock = Some(dock_panel(described.clone()));
+        // A selection the plugin's spec does not carry — the state a
+        // re-render must not lose.
+        editor
+            .widget_registry
+            .get_mut(&described)
+            .expect("the panel")
+            .instance_states
+            .insert(
+                "lst".to_string(),
+                crate::widgets::WidgetInstanceState::List { selected_index: 7 },
+            );
+
+        editor.rerender_widget_panel(&described);
+
+        let panel = editor.widget_registry.get(&described).expect("the panel");
+        assert_eq!(panel.focus_key, "lst", "the focus clamp still ran");
+        assert!(
+            matches!(
+                panel.instance_states.get("lst"),
+                Some(crate::widgets::WidgetInstanceState::List { selected_index: 7 })
+            ),
+            "and the state was carried, not re-seeded from the spec"
+        );
+
+        // The same panel outside a slot is a pane's, and a pane's panel is
+        // described too — there is no mounted panel the tree does not lay
+        // out, so no re-render runs the collector.
+        editor.rerender_widget_panel(&plain);
+        let panel = editor.widget_registry.get(&plain).expect("the panel");
+        assert_eq!(
+            panel.focus_key, "lst",
+            "a pane-mounted panel is the tree's as well"
+        );
+    }
+
+    /// **A panel dies with the buffer it paints into.**
+    ///
+    /// Closing the tab is the reader's move, not the plugin's, and nothing
+    /// joined the editor-level registry to the window's buffer map: the panel
+    /// stayed mounted over a buffer that had been freed, and every later
+    /// sweep over the registry — a resize re-renders every panel key — failed
+    /// against it with `Buffer not found`, once per resize, for the rest of
+    /// the session.
+    #[test]
+    fn closing_a_buffer_unmounts_the_panels_mounted_into_it() {
+        let (mut editor, _t) = make_editor();
+        let panel_key = crate::widgets::PanelKey::new("welcome_screen", 1);
+        let buffer = editor.active_buffer();
+        mount_list_panel(&mut editor, &panel_key, buffer);
+        assert!(
+            editor.widget_registry.get(&panel_key).is_some(),
+            "mounted to begin with"
+        );
+
+        editor
+            .close_buffer(buffer)
+            .expect("an unmodified buffer closes");
+
+        assert!(
+            editor.widget_registry.get(&panel_key).is_none(),
+            "the panel went with its buffer"
+        );
+    }
+
+    /// **A widget nothing has laid out falls back to the spec, and a `Tree`
+    /// divides.**
+    ///
+    /// The frame between a mount and the first layout: no element, no paint.
+    /// A row budget is not an item count for a tree of bordered cards — the
+    /// dock's card view is four rows a node — and reporting one as the other
+    /// pages it four times too far on the first key after a mount.
+    #[test]
+    fn an_unlaid_out_widget_takes_the_specs_window_in_the_specs_own_units() {
+        use crate::widgets::kinds::Viewport;
+        let cards = WidgetSpec::Tree {
+            nodes: Vec::new().into(),
+            item_keys: Vec::new().into(),
+            selected_index: 0,
+            visible_rows: Some(12),
+            key: Some("t".into()),
+            expanded_keys: Vec::new(),
+            checkable: false,
+            indent_cols: 2,
+            item_height: 2,
+            card_borders: true,
+            toggle_on_click: false,
+            columns: Vec::new(),
+        };
+        assert_eq!(
+            Viewport::from_spec(&cards),
+            Viewport {
+                rows: 12,
+                items: 3,
+                cols: 0,
+            },
+            "twelve rows of four-row cards is three cards"
+        );
+        let lines = match cards.clone() {
+            WidgetSpec::Tree {
+                nodes,
+                item_keys,
+                selected_index,
+                visible_rows,
+                key,
+                expanded_keys,
+                checkable,
+                indent_cols,
+                ..
+            } => WidgetSpec::Tree {
+                nodes,
+                item_keys,
+                selected_index,
+                visible_rows,
+                key,
+                expanded_keys,
+                checkable,
+                indent_cols,
+                item_height: 1,
+                card_borders: false,
+                toggle_on_click: false,
+                columns: Vec::new(),
+            },
+            other => other,
+        };
+        assert_eq!(
+            Viewport::from_spec(&lines),
+            Viewport {
+                rows: 12,
+                items: 12,
+                cols: 0,
+            },
+            "and a single-line tree's rows are its nodes"
+        );
+    }
+
+    /// **The mirror's other direction: a focus the host decides moves the
+    /// tree's.**
+    ///
+    /// Not every focus move is a traversal. A plugin's `setFocusKey`, the
+    /// dock's `/` landing on its filter, a kind's own focus effect — all of
+    /// them write the registry through `set_panel_focus_and_notify`, and
+    /// `apply_autofocus` cannot settle any of them, because it leaves focus
+    /// alone once it is inside the scope. Left there, the panel painted its
+    /// marker on the widget the registry named while the next Tab moved from
+    /// the one the tree still held: the dock's create dropdown closed back
+    /// onto the session list and three Tabs from it landed one stop past the
+    /// section header they were aimed at.
+    #[test]
+    fn a_focus_the_host_decides_moves_the_trees_focus_too() {
+        let (mut editor, _t) = make_editor();
+        let panel_key = crate::widgets::PanelKey::new("test-plugin", 1);
+        let spec = WidgetSpec::Col {
+            children: vec![button("one"), button("two")],
+            key: None,
+        };
+        let out = crate::widgets::resolve_panel(&spec, &Default::default(), "", true, None);
+        editor.widget_registry.mount(
+            panel_key.clone(),
+            crate::app::PanelSlot::Dock.buffer_id(),
+            spec,
+            out.instance_states,
+            out.focus_key,
+            true,
+            false,
+            false,
+        );
+        editor.dock = Some(dock_panel(panel_key.clone()));
+        frame_the_shell(&mut editor);
+
+        let ui = editor.shell_ui.as_ref().expect("the tree");
+        let one = ui.find_by_key(&crate::view::shell::widgets::widget_focus_key("one"));
+        assert_eq!(ui.focused(), one, "the frame settled on the first widget");
+
+        editor.set_panel_focus_and_notify(&panel_key, "two".to_string());
+        assert!(
+            editor.shell_description_stale,
+            "a decision the tree has not seen makes the description stale"
+        );
+        frame_the_shell(&mut editor);
+
+        let ui = editor.shell_ui.as_ref().expect("the tree");
+        assert_eq!(
+            ui.focused(),
+            ui.find_by_key(&crate::view::shell::widgets::widget_focus_key("two")),
+            "the frame carried the host's write, so the next Tab starts here"
+        );
+        assert!(!editor.shell_description_stale, "and the frame cleared it");
+    }
+
+    /// **The tree's own move stands until a decision says otherwise.**
+    ///
+    /// A Tab moves the tree's focus; the registry learns of it through the
+    /// `WidgetFocus` echo at the next drain, and until then the description
+    /// still marks the widget focus *left*. That stale mark is not a
+    /// decision — it has not moved — so the frame that carries it changes
+    /// nothing. This is what separates "the mark moved" from "the mark
+    /// disagrees with focus", and it is the property the library's fourth
+    /// autofocus case is built on.
+    #[test]
+    fn the_trees_own_move_is_not_undone_by_a_stale_mark() {
+        let (mut editor, _t) = make_editor();
+        let panel_key = crate::widgets::PanelKey::new("test-plugin", 1);
+        let spec = WidgetSpec::Col {
+            children: vec![button("one"), button("two")],
+            key: None,
+        };
+        let out = crate::widgets::resolve_panel(&spec, &Default::default(), "", true, None);
+        editor.widget_registry.mount(
+            panel_key.clone(),
+            crate::app::PanelSlot::Dock.buffer_id(),
+            spec,
+            out.instance_states,
+            out.focus_key,
+            true,
+            false,
+            false,
+        );
+        editor.dock = Some(dock_panel(panel_key.clone()));
+        frame_the_shell(&mut editor);
+
+        // The ring moves on its own, and the echo is deliberately not
+        // drained: the registry still says "one".
+        let ui = editor.shell_ui.as_mut().expect("the tree");
+        assert!(ui.move_focus(fresh_ui::FocusDir::Next));
+        let two = ui.find_by_key(&crate::view::shell::widgets::widget_focus_key("two"));
+        assert_eq!(ui.focused(), two);
+        let _undrained = ui.take_messages();
+        assert_eq!(editor.widget_registry.focus_key(&panel_key), Some("one"));
+
+        frame_the_shell(&mut editor);
+        let ui = editor.shell_ui.as_ref().expect("the tree");
+        assert_eq!(
+            ui.focused(),
+            two,
+            "a mark that has not moved does not pull focus back"
+        );
+    }
+
+    /// **A decision on a panel the tree is not focused in lands when the
+    /// panel is entered.** The registry's key is the only record of where
+    /// focus will land; the tree cannot write a fact about a subtree it is
+    /// not in, and does not try.
+    #[test]
+    fn a_decision_on_an_unfocused_panel_lands_when_it_is_entered() {
+        let (mut editor, _t) = make_editor();
+        let panel_key = crate::widgets::PanelKey::new("test-plugin", 1);
+        let spec = WidgetSpec::Col {
+            children: vec![button("one"), button("two")],
+            key: None,
+        };
+        let out = crate::widgets::resolve_panel(&spec, &Default::default(), "", true, None);
+        editor.widget_registry.mount(
+            panel_key.clone(),
+            crate::app::PanelSlot::Dock.buffer_id(),
+            spec,
+            out.instance_states,
+            out.focus_key,
+            true,
+            false,
+            false,
+        );
+        let mut dock = dock_panel(panel_key.clone());
+        dock.focused = false;
+        editor.dock = Some(dock);
+        frame_the_shell(&mut editor);
+
+        editor.set_panel_focus_and_notify(&panel_key, "two".to_string());
+        frame_the_shell(&mut editor);
+        assert_eq!(editor.widget_registry.focus_key(&panel_key), Some("two"));
+
+        editor.dock.as_mut().expect("the dock").focused = true;
+        frame_the_shell(&mut editor);
+        let ui = editor.shell_ui.as_ref().expect("the tree");
+        assert_eq!(
+            ui.focused(),
+            ui.find_by_key(&crate::view::shell::widgets::widget_focus_key("two")),
+            "entering the panel lands on the fact, not on the first control"
+        );
+    }
+
+    /// **`autoFocusFirst: false` with nothing focused is a resting state the
+    /// tree's entry landing must not overwrite.** The description marks
+    /// nothing, so the tree rests on the scope's own element and the
+    /// `WidgetFocus` echo has nothing to say.
+    #[test]
+    fn an_empty_focus_the_panel_asked_for_is_not_reseeded_by_entry() {
+        let (mut editor, _t) = make_editor();
+        let panel_key = crate::widgets::PanelKey::new("test-plugin", 1);
+        let spec = WidgetSpec::Col {
+            children: vec![button("one"), button("two")],
+            key: None,
+        };
+        let out = crate::widgets::resolve_panel(&spec, &Default::default(), "", false, None);
+        assert_eq!(out.focus_key, "", "nothing seeded");
+        editor.widget_registry.mount(
+            panel_key.clone(),
+            crate::app::PanelSlot::Dock.buffer_id(),
+            spec,
+            out.instance_states,
+            out.focus_key,
+            false,
+            false,
+            false,
+        );
+        editor.dock = Some(dock_panel(panel_key.clone()));
+        frame_the_shell(&mut editor);
+        editor.apply_settled_shell_messages();
+        assert_eq!(
+            editor.widget_registry.focus_key(&panel_key),
+            Some(""),
+            "the tree's landing did not name a widget the panel did not"
+        );
+    }
+
+    /// **Two decisions in one batch resolve the second from the first.** A
+    /// host focus write and a Tab with no frame between them: the Tab must
+    /// move from where the write put focus, not from where the tree last
+    /// saw it. `shell_dispatch` lays the tree out before routing when the
+    /// description is stale, which is the rule that keeps this true.
+    #[test]
+    fn a_tab_in_the_same_batch_as_a_focus_write_moves_from_the_written_focus() {
+        let (mut editor, _t) = make_editor();
+        let panel_key = crate::widgets::PanelKey::new("test-plugin", 1);
+        let spec = WidgetSpec::Col {
+            children: vec![button("one"), button("two"), button("three")],
+            key: None,
+        };
+        let out = crate::widgets::resolve_panel(&spec, &Default::default(), "", true, None);
+        editor.widget_registry.mount(
+            panel_key.clone(),
+            crate::app::PanelSlot::Dock.buffer_id(),
+            spec,
+            out.instance_states,
+            out.focus_key,
+            true,
+            false,
+            false,
+        );
+        editor.dock = Some(dock_panel(panel_key.clone()));
+        frame_the_shell(&mut editor);
+        editor.apply_settled_shell_messages();
+
+        editor.set_panel_focus_and_notify(&panel_key, "two".to_string());
+        // The tree hands a panel's Tab to the runtime (the focused control
+        // answers it first), which reads the key the entry point recorded —
+        // `handle_key` sets it before it dispatches.
+        editor.shell_key_event = Some(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Tab,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let tab = fresh_ui::Input::Key(fresh_ui::KeyPress::new(fresh_ui::KeyCode::Tab));
+        editor.shell_dispatch(tab);
+        assert_eq!(
+            editor.widget_registry.focus_key(&panel_key),
+            Some("three"),
+            "the Tab started from the written focus"
+        );
+        let ui = editor.shell_ui.as_ref().expect("the tree");
+        assert_eq!(
+            ui.focused(),
+            ui.find_by_key(&crate::view::shell::widgets::widget_focus_key("three"))
+        );
+    }
+
+    /// **A focus onto a widget the spec has only just grown (#3137).**
+    ///
+    /// The dock's "Move to Folder…" dropdown is two plugin writes: a spec
+    /// carrying the option rows, then `setFocusKey` onto the first of them.
+    /// Both are applied before the frame that describes either, so the
+    /// imperative half of the focus mirror asked the tree for an element the
+    /// tree could not have yet and quietly did nothing. The tree kept the
+    /// focus the dropdown was supposed to take, and its `FocusGained` fact
+    /// then wrote *that* back over the registry — so ↓ was routed to the
+    /// session list underneath, which dismissed the popup, moved the
+    /// selection and live-switched the workspace.
+    ///
+    /// The description carries the move; the frame that builds the element
+    /// is the frame that lands on it, and nothing is held or replayed.
+    #[test]
+    fn a_focus_onto_a_widget_the_next_frame_builds_lands_on_that_frame() {
+        let (mut editor, _t) = make_editor();
+        let panel_key = crate::widgets::PanelKey::new("test-plugin", 1);
+        // Rendering a spec into the registry exactly as mount/update do.
+        let render = |spec: &WidgetSpec, prev_focus: &str| {
+            crate::widgets::resolve_panel(spec, &Default::default(), prev_focus, true, None)
+        };
+        // The dock before the dropdown: a list, and nothing else to focus.
+        let closed = WidgetSpec::Col {
+            children: vec![button("sessions")],
+            key: None,
+        };
+        let out = render(&closed, "");
+        editor.widget_registry.mount(
+            panel_key.clone(),
+            crate::app::PanelSlot::Dock.buffer_id(),
+            closed,
+            out.instance_states,
+            out.focus_key,
+            true,
+            false,
+            false,
+        );
+        editor.dock = Some(dock_panel(panel_key.clone()));
+        frame_the_shell(&mut editor);
+        let ui = editor.shell_ui.as_ref().expect("the tree");
+        assert_eq!(
+            ui.focused(),
+            ui.find_by_key(&crate::view::shell::widgets::widget_focus_key("sessions")),
+            "the frame settled on the list, which is all there was"
+        );
+
+        // The dropdown opens: the spec grows an option row, and the plugin
+        // hands it the keyboard. Both land before the next frame.
+        let open = WidgetSpec::Col {
+            children: vec![
+                button("sessions"),
+                WidgetSpec::Overlay {
+                    child: Box::new(WidgetSpec::Col {
+                        children: vec![button("menu-pick:move:root")],
+                        key: None,
+                    }),
+                    key: Some("move-menu".into()),
+                },
+            ],
+            key: None,
+        };
+        let out = render(&open, "sessions");
+        editor
+            .widget_registry
+            .update(&panel_key, open, out.instance_states, out.focus_key)
+            .expect("the panel is mounted");
+        editor.set_panel_focus_and_notify(&panel_key, "menu-pick:move:root".to_string());
+
+        // The tree cannot carry it yet — the option row is not in the frame
+        // that is currently built. Nothing is held: the description marks
+        // the row, and the frame that builds it is the one that lands there.
+        assert!(editor.shell_description_stale);
+
+        frame_the_shell(&mut editor);
+
+        let ui = editor.shell_ui.as_ref().expect("the tree");
+        assert_eq!(
+            ui.focused(),
+            ui.find_by_key(&crate::view::shell::widgets::widget_focus_key(
+                "menu-pick:move:root"
+            )),
+            "the dropdown owns the keyboard, so ↑/↓ drive it and not the list"
+        );
+    }
+
+    /// **A panel closing over a focused dock gives the keyboard back to the
+    /// dock widget that opened it — by the tree's own rule.**
+    ///
+    /// The dock keeps its keyboard layer while a centred panel is up; the
+    /// panel's layer is above it, so the tree's focus moves into the panel and
+    /// the dock is told it is covered (a `blur`). When the panel goes, the
+    /// dock's layer is the keyboard's again and the tree settles on the widget
+    /// the dock's description marks — the one that had focus. Nothing on the
+    /// editor remembers an opener.
+    #[cfg(feature = "plugins")]
+    #[test]
+    fn closing_a_panel_over_the_dock_returns_focus_to_the_widget_that_opened_it() {
+        let (mut editor, _t) = make_editor();
+        let dock_key = crate::widgets::PanelKey::new("test-plugin", 1);
+        let spec = WidgetSpec::Col {
+            children: vec![button("list"), button("menu")],
+            key: None,
+        };
+        let out = crate::widgets::resolve_panel(&spec, &Default::default(), "", true, None);
+        editor.widget_registry.mount(
+            dock_key.clone(),
+            crate::app::PanelSlot::Dock.buffer_id(),
+            spec,
+            out.instance_states,
+            out.focus_key,
+            true,
+            false,
+            false,
+        );
+        editor.dock = Some(dock_panel(dock_key.clone()));
+        editor.set_panel_focus_and_notify(&dock_key, "menu".to_string());
+        frame_the_shell(&mut editor);
+        editor.apply_settled_shell_messages();
+        let menu = |e: &Editor| {
+            let ui = e.shell_ui.as_ref().expect("the tree");
+            (
+                ui.focused(),
+                ui.find_by_key(&crate::view::shell::widgets::widget_focus_key("menu")),
+            )
+        };
+        let (at, want) = menu(&editor);
+        assert_eq!(at, want, "the Menu button has the keyboard");
+
+        editor
+            .handle_plugin_command(fresh_core::api::PluginCommand::MountFloatingWidget {
+                plugin: "test-plugin".to_string(),
+                panel_id: 2,
+                spec: list_of(3),
+                width_pct: 60,
+                height_pct: 60,
+                as_dock: false,
+                focus_marker: false,
+                label_align: Default::default(),
+                title: None,
+                closable: false,
+                start_blurred: false,
+                mode: None,
+            })
+            .unwrap();
+        frame_the_shell(&mut editor);
+        editor.apply_settled_shell_messages();
+        assert!(
+            editor.dock.as_ref().is_some_and(|d| d.focused),
+            "the dock keeps its layer under the panel"
+        );
+        assert!(!editor.is_dock_focused(), "the panel has the keyboard");
+        assert!(editor.dock_covered, "and the dock was told it is covered");
+
+        editor
+            .handle_plugin_command(fresh_core::api::PluginCommand::UnmountFloatingWidget {
+                plugin: "test-plugin".to_string(),
+                panel_id: 2,
+            })
+            .unwrap();
+        frame_the_shell(&mut editor);
+        editor.apply_settled_shell_messages();
+        let (at, want) = menu(&editor);
+        assert_eq!(
+            at, want,
+            "focus is back on the widget that opened the panel"
+        );
+        assert!(editor.is_dock_focused());
+        assert!(
+            !editor.dock_covered,
+            "and the dock was told it has the keyboard back"
+        );
+        assert_eq!(editor.widget_registry.focus_key(&dock_key), Some("menu"));
+    }
+
+    /// The items `Arc` of the `List` keyed `lst` in a spec.
+    #[cfg(feature = "plugins")]
+    fn list_items(spec: &WidgetSpec) -> Arc<Vec<fresh_core::text_property::TextPropertyEntry>> {
+        match crate::widgets::find_widget_by_key(spec, "lst") {
+            Some(WidgetSpec::List { items, .. }) => items.clone(),
+            _ => panic!("no list"),
+        }
+    }
+
+    /// **A frame describes a panel from a handle on its storage, never a
+    /// copy of it.**
+    ///
+    /// `panel_interior` used to deep-clone the panel's whole spec on every
+    /// frame, and the `List` arm cloned every item again for its row builder,
+    /// so a still panel cost O(items) twice per frame before one row was on
+    /// screen. Now two frames with nothing changed describe the *same*
+    /// allocation, the drawn list holds the owner's items rather than a copy,
+    /// and a mutation — which edits copy-on-write — is what produces a new
+    /// one. (The mutation is a plugin's, so the test needs the feature.)
+    #[cfg(feature = "plugins")]
+    #[test]
+    fn a_still_panel_is_described_from_its_storage_not_a_copy() {
+        let (mut editor, _t) = make_editor();
+        let panel_key = crate::widgets::PanelKey::new("test-plugin", 1);
+        mount_list_panel(
+            &mut editor,
+            &panel_key,
+            crate::app::PanelSlot::Dock.buffer_id(),
+        );
+        editor.dock = Some(dock_panel(panel_key.clone()));
+
+        frame_the_shell(&mut editor);
+        let first = editor
+            .panel_interior(crate::app::PanelSlot::Dock)
+            .expect("the dock's interior")
+            .spec;
+        frame_the_shell(&mut editor);
+        let second = editor
+            .panel_interior(crate::app::PanelSlot::Dock)
+            .expect("the dock's interior")
+            .spec;
+        assert!(
+            std::rc::Rc::ptr_eq(&first, &second),
+            "two frames with no mutation describe the same spec allocation"
+        );
+        assert!(
+            std::rc::Rc::ptr_eq(
+                &first,
+                &editor.widget_registry.get(&panel_key).unwrap().spec
+            ),
+            "and it is the registry's own, not a copy of it"
+        );
+        let items = list_items(&second);
+        // The registry's spec, the two interiors above and the laid-out
+        // tree's row builder: the list's rows are read out of the owner's
+        // collection, not a clone of it.
+        drop((first, second));
+        assert!(
+            Arc::strong_count(&items) >= 3,
+            "the drawn list holds the owner's items (count {})",
+            Arc::strong_count(&items)
+        );
+
+        // A mutation is what makes a new allocation, and only for what it
+        // touched's path: the old handle keeps the old rows.
+        let before = editor.widget_registry.get(&panel_key).unwrap().spec.clone();
+        editor.handle_widget_mutate(
+            &panel_key,
+            fresh_core::api::WidgetMutation::SetItems {
+                widget_key: "lst".into(),
+                items: vec![fresh_core::text_property::TextPropertyEntry::text("only")],
+                item_keys: vec!["only".into()],
+            },
+        );
+        let after = editor.widget_registry.get(&panel_key).unwrap().spec.clone();
+        assert!(
+            !std::rc::Rc::ptr_eq(&before, &after),
+            "a mutation under a held handle writes a new spec"
+        );
+        assert_eq!(
+            list_items(&before).len(),
+            40,
+            "the held frame's rows are untouched"
+        );
+        assert_eq!(list_items(&after).len(), 1);
+        frame_the_shell(&mut editor);
+        let third = editor
+            .panel_interior(crate::app::PanelSlot::Dock)
+            .unwrap()
+            .spec;
+        assert!(
+            std::rc::Rc::ptr_eq(&third, &after),
+            "and the next frame describes it"
+        );
+    }
+
+    /// A tree of `groups` folders, each holding `per` leaves, keyed `tr`.
+    /// Its only user reads debug-only counters, so it is gated the same way.
+    #[cfg(all(feature = "plugins", debug_assertions))]
+    fn big_tree(groups: usize, per: usize, cards: bool) -> WidgetSpec {
+        let node = |t: String, depth: u32, has_children: bool| fresh_core::api::TreeNode {
+            text: fresh_core::text_property::TextPropertyEntry::text(t),
+            depth,
+            has_children,
+            flush: false,
+            draggable: false,
+            checked: None,
+            extra_lines: Vec::new(),
+            window_anchor: None,
+            cells: Vec::new(),
+            action: None,
+        };
+        let mut nodes = Vec::new();
+        let mut keys = Vec::new();
+        for g in 0..groups {
+            nodes.push(node(format!("group {g}"), 0, true));
+            keys.push(format!("g{g}"));
+            for l in 0..per {
+                nodes.push(node(format!("leaf {g}.{l}"), 1, false));
+                keys.push(format!("g{g}/l{l}"));
+            }
+        }
+        WidgetSpec::Tree {
+            nodes: nodes.into(),
+            item_keys: keys.into(),
+            selected_index: 0,
+            visible_rows: None,
+            key: Some("tr".into()),
+            // Every group open: a thousand visible nodes, a window of rows.
+            expanded_keys: (0..groups).map(|g| format!("g{g}")).collect(),
+            checkable: false,
+            indent_cols: 2,
+            item_height: 1,
+            card_borders: cards,
+            toggle_on_click: false,
+            columns: Vec::new(),
+        }
+    }
+
+    /// **A still plugin collection costs nothing per frame.**
+    ///
+    /// The drawn tree walked every node (`collect_visible_tree_indices`) and
+    /// rebuilt every row in its window on every frame, and a list rebuilt its
+    /// window, whether or not anything had changed. Now the projection is
+    /// the owner's, kept until the collections or the expansion change, and
+    /// each subtree is built under a memo on everything it reads — so a
+    /// frame with nothing new walks nothing and builds no row, a selection
+    /// move rebuilds the window but not the projection, and an expansion
+    /// change is what walks the tree again.
+    #[cfg(all(feature = "plugins", debug_assertions))]
+    #[test]
+    fn a_still_collection_is_projected_and_built_once() {
+        use crate::view::shell::widgets::collection_stats;
+        use fresh_core::api::WidgetMutation;
+        for (what, spec) in [
+            ("a plain tree", big_tree(100, 9, false)),
+            ("a card tree", big_tree(100, 9, true)),
+            ("a list", list_of(1000)),
+        ] {
+            let (mut editor, _t) = make_editor();
+            let panel_key = crate::widgets::PanelKey::new("test-plugin", 1);
+            let out = crate::widgets::resolve_panel(&spec, &Default::default(), "", true, None);
+            editor.widget_registry.mount(
+                panel_key.clone(),
+                crate::app::PanelSlot::Dock.buffer_id(),
+                spec.clone(),
+                out.instance_states,
+                out.focus_key,
+                true,
+                false,
+                false,
+            );
+            editor.dock = Some(dock_panel(panel_key.clone()));
+            let is_tree = matches!(spec, WidgetSpec::Tree { .. });
+            let widget = if is_tree { "tr" } else { "lst" };
+
+            collection_stats::take();
+            frame_the_shell(&mut editor);
+            let first = collection_stats::take();
+            frame_the_shell(&mut editor);
+            frame_the_shell(&mut editor);
+            let still = collection_stats::take();
+            eprintln!("{what}: first frame {first:?}, two still frames {still:?}");
+            assert_eq!(
+                first.projections,
+                u32::from(is_tree),
+                "{what}: one walk to start"
+            );
+            assert!(first.rows > 0, "{what}: the first frame builds its window");
+            // A card tree too: it is windowed in cells over its projection,
+            // and builds the blocks that overlap the window.
+            assert!(
+                first.rows < 200,
+                "{what}: a window's worth of rows, not the collection ({})",
+                first.rows
+            );
+            assert_eq!(
+                still,
+                collection_stats::Counts::default(),
+                "{what}: two still frames walk nothing and build no row"
+            );
+
+            // The selection moves: the window's rows are built again (their
+            // state changed), the projection is not.
+            editor.handle_widget_mutate(
+                &panel_key,
+                WidgetMutation::SetSelectedIndex {
+                    widget_key: widget.into(),
+                    index: 3,
+                },
+            );
+            frame_the_shell(&mut editor);
+            let moved = collection_stats::take();
+            eprintln!("{what}: after a selection move {moved:?}");
+            assert_eq!(
+                moved.projections, 0,
+                "{what}: a selection is not an expansion"
+            );
+            assert!(moved.rows > 0, "{what}: the moved selection is redrawn");
+
+            if is_tree {
+                // Folding a group is an expansion change: one walk.
+                editor.handle_widget_mutate(
+                    &panel_key,
+                    WidgetMutation::SetExpandedKeys {
+                        widget_key: "tr".into(),
+                        keys: vec!["g1".into()],
+                    },
+                );
+                frame_the_shell(&mut editor);
+                let folded = collection_stats::take();
+                eprintln!("{what}: after an expansion change {folded:?}");
+                assert_eq!(folded.projections, 1, "{what}: the expansion changed");
+                frame_the_shell(&mut editor);
+                assert_eq!(
+                    collection_stats::take(),
+                    collection_stats::Counts::default(),
+                    "{what}: and is still again after"
+                );
+            }
+        }
+    }
+
+    /// A palette of `n` commands, with the one at `long_at` named far
+    /// longer than the rest.
+    fn palette(n: usize, long_at: usize) -> crate::view::prompt::Prompt {
+        use crate::input::commands::Suggestion;
+        let suggestions = (0..n)
+            .map(|i| {
+                let name = match i == long_at {
+                    true => format!("command {i} {}", "with a very long name ".repeat(3)),
+                    false => format!("command {i}"),
+                };
+                Suggestion::new(format!("cmd{i}"), name).with_keybinding(Some("Ctrl+K".into()))
+            })
+            .collect();
+        crate::view::prompt::Prompt::with_suggestions(
+            "Command: ".into(),
+            crate::view::prompt::PromptType::QuickOpen,
+            suggestions,
+        )
+    }
+
+    /// **A thousand-command palette converts the rows it shows, not the
+    /// list.** The description used to map every suggestion into a
+    /// `SuggestionRow` on every frame; now it holds the prompt's own list and
+    /// the list's layout reader converts the rows in its window.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_long_palette_converts_only_its_window() {
+        use crate::view::shell::prompt::stats;
+        let (mut editor, _t) = make_editor();
+        editor.active_window_mut().prompt = Some(palette(1000, usize::MAX));
+        stats::take();
+        frame_the_shell(&mut editor);
+        let first = stats::take();
+        frame_the_shell(&mut editor);
+        let next = stats::take();
+        eprintln!("palette of 1000: {first} rows converted, then {next}");
+        assert!(first > 0, "the window's rows are converted");
+        assert!(
+            first <= 30 && next <= 30,
+            "a window's worth, not the list: {first}, then {next}"
+        );
+    }
+
+    /// **The name column is as wide as the longest name on screen *this*
+    /// frame.** It was measured over the window the previous layout had
+    /// settled, read back off the tree — so on the frame the selection jumped
+    /// to a long name, the column was still sized for the rows it left.
+    #[test]
+    fn the_name_column_fits_the_rows_on_screen_in_the_same_frame() {
+        let (mut editor, _t) = make_editor();
+        editor.active_window_mut().prompt = Some(palette(1000, 500));
+        frame_the_shell(&mut editor);
+        let name_width = |editor: &Editor, i: usize| {
+            let ui = editor.shell_ui.as_ref().expect("a laid-out shell");
+            let id = ui
+                .find_by_key(&crate::view::shell::prompt::name_key(&format!("cmd{i}")))
+                .unwrap_or_else(|| panic!("row {i}'s name is on screen"));
+            ui.rect_of(id).w
+        };
+        let short = name_width(&editor, 0);
+
+        // Jump to the long name: the list reveals it in this frame's layout,
+        // and its column is measured over the rows that layout shows.
+        editor
+            .active_window_mut()
+            .prompt
+            .as_mut()
+            .unwrap()
+            .select_suggestion(Some(500));
+        frame_the_shell(&mut editor);
+        let long = name_width(&editor, 500);
+        // Wider than the short rows' column, on the frame the long name
+        // arrived — how much wider is the row's to decide (the description
+        // yields first), but a column sized from the rows the window left
+        // would still be the short rows' width.
+        assert!(
+            long > short,
+            "the long name's column grows on the frame it arrives ({long}, the short rows had \
+             {short})"
+        );
+    }
+
+    /// **A thousand-entry directory formats the entries it shows, not the
+    /// directory.** The description used to format every entry's size and
+    /// date and the list then copied the lot (`rows.to_vec()`); now the list
+    /// holds the model's listing and formats the rows in its window.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_large_directory_formats_only_its_window() {
+        use crate::model::filesystem::{DirEntry, EntryType};
+        use crate::view::shell::file_browser::stats;
+        let (mut editor, t) = make_editor();
+        let fs: Arc<dyn crate::model::filesystem::FileSystem + Send + Sync> =
+            Arc::new(crate::model::filesystem::StdFileSystem);
+        let dir = t.path().to_path_buf();
+        let mut state = crate::app::file_open::FileOpenState::new(dir.clone(), false, fs);
+        state.set_entries(
+            (0..1000)
+                .map(|i| {
+                    DirEntry::new(
+                        dir.as_path()
+                            .as_host()
+                            .under(PathStyle::host())
+                            .join_name(std::ffi::OsStr::new(&format!("f{i:04}.txt"))),
+                        format!("f{i:04}.txt"),
+                        EntryType::File,
+                    )
+                })
+                .collect(),
+        );
+        let w = editor.active_window_mut();
+        w.file_open_state = Some(state);
+        w.prompt = Some(crate::view::prompt::Prompt::new(
+            "Open: ".into(),
+            crate::view::prompt::PromptType::OpenFile,
+        ));
+        stats::take();
+        frame_the_shell(&mut editor);
+        let first = stats::take();
+        frame_the_shell(&mut editor);
+        let next = stats::take();
+        eprintln!("directory of 1000: {first} entries formatted, then {next}");
+        assert!(first > 0, "the window's entries are formatted");
+        assert!(
+            first <= 40 && next <= 40,
+            "a window's worth, not the directory: {first}, then {next}"
+        );
     }
 }

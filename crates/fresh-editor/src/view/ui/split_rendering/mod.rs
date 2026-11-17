@@ -17,10 +17,20 @@ mod char_style;
 mod folding;
 pub(crate) use folding::fold_skip_set;
 mod gutter;
-mod layout;
+pub mod instrument;
+pub(crate) mod layout;
 mod orchestration;
 
+// The grid's paint, one phase at a time. `render_content` above runs all
+// three for a caller that hands it a whole rectangle; the shell folds a
+// display list and calls them one `Host` at a time instead, so that a pane's
+// rectangle is the one layout gave it.
+pub(crate) use orchestration::reconcile::pane_text_width;
 pub(crate) use orchestration::render_buffer::wrap_index_geometry_for;
+pub(crate) use orchestration::{
+    content_pass, paint_leaf, prepare_content, reconcile_panes, ContentPass, FrameFacts,
+    PaneContent, Stores,
+};
 mod post_pass;
 pub(crate) mod scrollbar;
 #[cfg(test)]
@@ -30,24 +40,20 @@ mod style;
 pub(crate) mod transforms;
 pub(crate) mod view_data;
 
-use crate::app::types::ViewLineMapping;
-use crate::app::BufferMetadata;
 use crate::config::IndentationGuideMode;
 use crate::model::buffer::Buffer;
-use crate::model::event::{BufferId, EventLog, LeafId, SplitDirection};
+use crate::model::event::{BufferId, EventLog};
 use crate::primitives::ansi_background::AnsiBackground;
 use crate::state::EditorState;
 use crate::view::bracket_highlight_overlay::BracketHighlightSettings;
-use crate::view::split::SplitManager;
 use ratatui::layout::Rect;
-use std::collections::HashMap;
 
 /// Maximum line width before forced wrapping is applied, even when line wrapping is disabled.
 /// This prevents memory exhaustion when opening files with extremely long lines (e.g., 10MB
 /// single-line JSON files). Lines exceeding this width are wrapped into multiple visual lines,
 /// each bounded to this width. 10,000 columns is far wider than any monitor while keeping
 /// memory usage reasonable (~80KB per ViewLine instead of hundreds of MB).
-const MAX_SAFE_LINE_WIDTH: usize = 10_000;
+pub(crate) const MAX_SAFE_LINE_WIDTH: usize = 10_000;
 
 /// Immutable editor render settings for one frame.
 ///
@@ -87,6 +93,7 @@ impl<'a> EditorRenderConfig<'a> {
         editor: &'a crate::config::EditorConfig,
         background_fade: f32,
         software_cursor_only: bool,
+        linux_console: bool,
     ) -> Self {
         Self {
             large_file_threshold_bytes: editor.large_file_threshold_bytes,
@@ -101,7 +108,10 @@ impl<'a> EditorRenderConfig<'a> {
             show_tilde: editor.show_tilde,
             highlight_current_column: editor.highlight_current_column,
             indentation_guide: editor.indentation_guide,
-            indentation_guide_glyph: &editor.indentation_guide_glyph,
+            indentation_guide_glyph: console_safe_guide_glyph(
+                &editor.indentation_guide_glyph,
+                linux_console,
+            ),
             rainbow_indentation: editor.rainbow_indentation,
             bracket_highlight: BracketHighlightSettings::from_config(editor),
             hide_current_line_on_selection: editor.hide_current_line_on_selection,
@@ -111,11 +121,23 @@ impl<'a> EditorRenderConfig<'a> {
     }
 }
 
+/// The indentation guide glyph to draw. The default, `▏`, is a block element
+/// the Linux console's fonts do not have — the console shows it as `#` — so
+/// there the default is drawn as `│`, which every console font has. A glyph
+/// the user chose is drawn as chosen.
+fn console_safe_guide_glyph(glyph: &str, linux_console: bool) -> &str {
+    if linux_console && glyph == crate::config::default_indentation_guide_glyph() {
+        "│"
+    } else {
+        glyph
+    }
+}
+
 /// "How to render" — the appearance/policy inputs that are identical for
 /// every split in a frame: the theme, the ANSI backdrop, and the editor
 /// render config. Built once at the top of the render pass and threaded by
 /// reference through the whole painter chain (`render_content` →
-/// `render_buffer_in_split` → …), so each layer forwards one `RenderStyle`
+/// `content_pass` → `paint_leaf` → …), so each layer forwards one `RenderStyle`
 /// instead of re-listing ~16 style parameters. Distinct from per-split state
 /// and the draw target, which vary or are mutated.
 //
@@ -135,126 +157,6 @@ pub struct RenderStyle<'a> {
 pub struct SplitRenderer;
 
 impl SplitRenderer {
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::type_complexity)]
-    pub fn render_content(
-        buf: &mut ratatui::buffer::Buffer,
-        area: Rect,
-        split_manager: &SplitManager,
-        buffers: &mut HashMap<BufferId, EditorState>,
-        buffer_metadata: &HashMap<BufferId, BufferMetadata>,
-        preview_buffer: Option<BufferId>,
-        event_logs: &mut HashMap<BufferId, EventLog>,
-        composite_buffers: &mut HashMap<BufferId, crate::model::composite_buffer::CompositeBuffer>,
-        composite_view_states: &mut HashMap<
-            (LeafId, BufferId),
-            crate::view::composite_view::CompositeViewState,
-        >,
-        style: RenderStyle<'_>,
-        lsp_waiting: bool,
-        split_view_states: Option<&mut HashMap<LeafId, crate::view::split::SplitViewState>>,
-        grouped_subtrees: &HashMap<LeafId, crate::view::split::SplitNode>,
-        hide_cursor: bool,
-        hovered_tab: Option<(crate::view::split::TabTarget, LeafId, bool)>,
-        hovered_close_split: Option<LeafId>,
-        hovered_maximize_split: Option<LeafId>,
-        is_maximized: bool,
-        tab_bar_visible: bool,
-        session_mode: bool,
-        scrollback_view_splits: &std::collections::HashSet<LeafId>,
-        cell_theme_map: &mut Vec<crate::app::types::CellThemeInfo>,
-        screen_width: u16,
-        pending_hardware_cursor: &mut Option<(u16, u16)>,
-        // Forwarded to the tab-bar renderer: when false the tab bar lays out but
-        // paints no cells (web renders tabs natively); panes always draw.
-        draw_tab_bar: bool,
-    ) -> (
-        Vec<(LeafId, BufferId, Rect, Rect, usize, usize)>,
-        HashMap<LeafId, crate::view::ui::tabs::TabLayout>,
-        Vec<(LeafId, u16, u16, u16)>,
-        Vec<(LeafId, u16, u16, u16)>,
-        HashMap<LeafId, Vec<ViewLineMapping>>,
-        Vec<(LeafId, BufferId, Rect, usize, usize, usize)>,
-        Vec<(
-            crate::model::event::ContainerId,
-            SplitDirection,
-            u16,
-            u16,
-            u16,
-        )>,
-    ) {
-        orchestration::render_content(
-            buf,
-            area,
-            split_manager,
-            buffers,
-            buffer_metadata,
-            preview_buffer,
-            event_logs,
-            composite_buffers,
-            composite_view_states,
-            style,
-            lsp_waiting,
-            split_view_states,
-            grouped_subtrees,
-            hide_cursor,
-            hovered_tab,
-            hovered_close_split,
-            hovered_maximize_split,
-            is_maximized,
-            tab_bar_visible,
-            session_mode,
-            scrollback_view_splits,
-            cell_theme_map,
-            screen_width,
-            pending_hardware_cursor,
-            draw_tab_bar,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn compute_content_layout(
-        area: Rect,
-        split_manager: &SplitManager,
-        buffers: &mut HashMap<BufferId, EditorState>,
-        split_view_states: &mut HashMap<LeafId, crate::view::split::SplitViewState>,
-        theme: &crate::view::theme::Theme,
-        lsp_waiting: bool,
-        estimated_line_length: usize,
-        highlight_context_bytes: usize,
-        relative_line_numbers: bool,
-        use_terminal_bg: bool,
-        session_mode: bool,
-        software_cursor_only: bool,
-        tab_bar_visible: bool,
-        show_vertical_scrollbar: bool,
-        show_horizontal_scrollbar: bool,
-        diagnostics_inline_text: bool,
-        show_tilde: bool,
-        bracket_highlight: BracketHighlightSettings,
-    ) -> HashMap<LeafId, Vec<ViewLineMapping>> {
-        orchestration::compute_content_layout(
-            area,
-            split_manager,
-            buffers,
-            split_view_states,
-            theme,
-            lsp_waiting,
-            estimated_line_length,
-            highlight_context_bytes,
-            relative_line_numbers,
-            use_terminal_bg,
-            session_mode,
-            software_cursor_only,
-            tab_bar_visible,
-            show_vertical_scrollbar,
-            show_horizontal_scrollbar,
-            diagnostics_inline_text,
-            show_tilde,
-            bracket_highlight,
-        )
-    }
-
     /// Render a single buffer into an arbitrary screen rect.
     ///
     /// Public façade over the per-leaf renderer for callers that
@@ -295,34 +197,87 @@ impl SplitRenderer {
         // - lsp_waiting = false (preview never owns LSP requests)
         // - pending_hardware_cursor: the preview must not move the
         //   terminal's hardware cursor away from the prompt input.
-        let mut sink: Option<(u16, u16)> = None;
-        orchestration::render_buffer_in_split(
-            buf,
+        // The leaf is outside the split tree, so the frame's pre-paint
+        // reconcile never saw it: place it here, immediately before its
+        // text pass. Only the formatter's half — this pane never ran the
+        // byte-oriented sync, and does not now.
+        state
+            .margins
+            .set_gutter_separator(style.theme.chrome.gutter_separator);
+        viewport.gutter_separator = style.theme.chrome.gutter_separator;
+        orchestration::reconcile::place_pane(
+            state,
+            viewport,
+            cursors,
+            folds,
+            &view_mode,
+            compose_width,
+            show_line_numbers,
+            area,
+        );
+        let crate::view::ui::EditorRenderConfig {
+            estimated_line_length,
+            highlight_context_bytes,
+            relative_line_numbers,
+            use_terminal_bg,
+            software_cursor_only,
+            diagnostics_inline_text,
+            indentation_guide,
+            indentation_guide_glyph,
+            rainbow_indentation,
+            bracket_highlight,
+            background_fade,
+            ..
+        } = style.cfg;
+        let mut layout = orchestration::compute_buffer_layout(
             state,
             cursors,
             viewport,
             folds,
-            event_log,
             area,
             /* is_active */ false,
-            style,
+            style.theme,
             /* lsp_waiting */ false,
             view_mode,
             compose_width,
-            compose_column_guides,
-            buffer_id,
-            /* hide_cursor */ true,
+            estimated_line_length,
+            highlight_context_bytes,
+            relative_line_numbers,
+            use_terminal_bg,
             session_mode,
-            rulers,
+            software_cursor_only,
             show_line_numbers,
             highlight_current_line,
             true, // preview leaves have no per-split fold pin
+            diagnostics_inline_text,
             show_tilde,
-            highlight_current_column,
-            cell_theme_map,
-            screen_width,
-            &mut sink,
-        )
+            indentation_guide,
+            indentation_guide_glyph,
+            rainbow_indentation,
+            bracket_highlight,
+            Some((cell_theme_map, screen_width)),
+        );
+        let _ = (event_log, highlight_current_column, buffer_id);
+        let rows = std::mem::take(&mut layout.view_line_mappings);
+        let left_column = layout.left_column;
+        // A preview leaf is never the active pane: it shows no caret, and
+        // no caret column is highlighted.
+        orchestration::draw_buffer_in_split(
+            buf,
+            layout,
+            area,
+            style.theme,
+            style.ansi_background,
+            background_fade,
+            software_cursor_only,
+            rulers,
+            compose_column_guides,
+            false,
+            None,
+        );
+        // No horizontal bar here, so no clamp and no width to clamp to.
+        orchestration::reconcile::settle_pane(state, viewport, left_column, false, 0);
+        rows
     }
 
     /// Public wrapper for building base tokens - used by render.rs for the
@@ -531,6 +486,7 @@ mod tests {
         let mut dummy_theme_map = Vec::new();
         let output = render_view_lines(LineRenderInput {
             state: &state,
+            margin: &state.margins.left_config,
             theme: &theme,
             view_lines: &view_data.lines,
             view_anchor,
@@ -550,6 +506,7 @@ mod tests {
             show_line_numbers: true, // Tests show line numbers
             byte_offset_mode: false, // Tests use exact line numbers
             show_tilde: true,
+            effective_editor_bg: theme.editor_bg,
             highlight_current_line: true,
             indentation_guide,
             indentation_guide_glyph: &indentation_guide_glyph,
@@ -642,6 +599,7 @@ mod tests {
         let mut dummy_theme_map = Vec::new();
         render_view_lines(LineRenderInput {
             state: &state,
+            margin: &state.margins.left_config,
             theme: &theme,
             view_lines: &view_data.lines,
             view_anchor,
@@ -661,6 +619,7 @@ mod tests {
             show_line_numbers: true,
             byte_offset_mode: false,
             show_tilde: true,
+            effective_editor_bg: theme.editor_bg,
             highlight_current_line: true,
             indentation_guide: IndentationGuideMode::All,
             indentation_guide_glyph: &glyph,
@@ -1007,8 +966,12 @@ mod tests {
         let (output, _, _, _) =
             render_output_for_with_indentation_guide("\tchild\n\t\tgrand\n", 0, 0);
 
-        assert_eq!(rendered_line_text(&output, 0), "▏   child");
-        assert_eq!(rendered_line_text(&output, 1), "▏   ▏   grand");
+        // The guide keeps the tab stop and the tab's marker takes the next
+        // column of the expansion. This used to read `▏   child`: the guide
+        // simply overwrote the marker, and with guides on there was then no
+        // way to tell a tab indent from a space indent (issue #3079).
+        assert_eq!(rendered_line_text(&output, 0), "▏→  child");
+        assert_eq!(rendered_line_text(&output, 1), "▏→  ▏→  grand");
     }
 
     #[test]
@@ -1143,10 +1106,12 @@ mod tests {
             IndentationGuideMode::Active,
         );
 
-        // Tab cells that are not replaced by the active guide retain the
-        // existing leading-tab whitespace indicator.
+        // Tab cells the active guide does not claim keep their marker where
+        // it is; the one it does claim hands the marker the next column of
+        // the expansion rather than swallowing it (issue #3079) — this line
+        // used to read `→   ▏   grand`.
         assert_eq!(rendered_line_text(&output, 0), "→   child");
-        assert_eq!(rendered_line_text(&output, 1), "→   ▏   grand");
+        assert_eq!(rendered_line_text(&output, 1), "→   ▏→  grand");
     }
 
     #[test]
@@ -3303,6 +3268,7 @@ mod tests {
 
         render_view_lines(LineRenderInput {
             state: &state,
+            margin: &state.margins.left_config,
             theme: &theme,
             view_lines: &view_data.lines,
             view_anchor,
@@ -3322,6 +3288,7 @@ mod tests {
             show_line_numbers: false,
             byte_offset_mode: false,
             show_tilde: true,
+            effective_editor_bg: theme.editor_bg,
             highlight_current_line,
             indentation_guide: IndentationGuideMode::None,
             indentation_guide_glyph: "▏",

@@ -1,7 +1,5 @@
 // Integration tests - testing how modules work together
 
-mod common;
-
 use fresh::model::filesystem::StdFileSystem;
 use fresh::{
     model::cursor::Cursors,
@@ -34,7 +32,7 @@ fn test_buffer_cursor_adjustment_on_insert() {
         &mut cursors,
         &Event::Insert {
             position: 0,
-            text: "hello world".to_string(),
+            text: "hello world".to_string().into(),
             cursor_id: original_primary,
         },
     );
@@ -64,7 +62,7 @@ fn test_buffer_cursor_adjustment_on_insert() {
         &mut cursors,
         &Event::Insert {
             position: 0,
-            text: "INSERTED ".to_string(),
+            text: "INSERTED ".to_string().into(),
             cursor_id: original_primary, // Using original cursor, not the new primary
         },
     );
@@ -104,7 +102,7 @@ fn test_buffer_cursor_adjustment_on_delete() {
         &mut cursors,
         &Event::Insert {
             position: 0,
-            text: "hello beautiful world".to_string(),
+            text: "hello beautiful world".to_string().into(),
             cursor_id,
         },
     );
@@ -125,7 +123,7 @@ fn test_buffer_cursor_adjustment_on_delete() {
         &mut cursors,
         &Event::Delete {
             range: 6..16,
-            deleted_text: "beautiful ".to_string(),
+            deleted_text: "beautiful ".to_string().into(),
             cursor_id,
         },
     );
@@ -156,7 +154,7 @@ fn test_state_eventlog_undo_redo() {
     // Perform a series of edits - each insert at the END of the buffer
     let event1 = Event::Insert {
         position: 0,
-        text: "a".to_string(),
+        text: "a".to_string().into(),
         cursor_id,
     };
     log.append(event1.clone());
@@ -164,7 +162,7 @@ fn test_state_eventlog_undo_redo() {
 
     let event2 = Event::Insert {
         position: state.buffer.len(),
-        text: "b".to_string(),
+        text: "b".to_string().into(),
         cursor_id,
     };
     log.append(event2.clone());
@@ -172,7 +170,7 @@ fn test_state_eventlog_undo_redo() {
 
     let event3 = Event::Insert {
         position: state.buffer.len(),
-        text: "c".to_string(),
+        text: "c".to_string().into(),
         cursor_id,
     };
     log.append(event3.clone());
@@ -220,7 +218,7 @@ fn test_undo_redo_cursor_positions() {
         let pos = state.buffer.len();
         let event = Event::Insert {
             position: pos,
-            text: ch.to_string(),
+            text: ch.to_string().into(),
             cursor_id,
         };
         log.append(event.clone());
@@ -271,7 +269,7 @@ fn test_viewport_tracks_cursor_through_edits() {
     for i in 0..20 {
         let event = Event::Insert {
             position: state.buffer.len(),
-            text: format!("Line {i}\n"),
+            text: format!("Line {i}\n").into(),
             cursor_id,
         };
         state.apply(&mut cursors, &event);
@@ -305,7 +303,7 @@ fn test_multi_cursor_normalization() {
         &mut cursors,
         &Event::Insert {
             position: 0,
-            text: "hello world".to_string(),
+            text: "hello world".to_string().into(),
             cursor_id,
         },
     );
@@ -357,7 +355,7 @@ fn test_cursor_within_buffer_bounds() {
         &mut cursors,
         &Event::Insert {
             position: 0,
-            text: "line1\nline2\nline3\nline4\nline5\n".to_string(),
+            text: "line1\nline2\nline3\nline4\nline5\n".to_string().into(),
             cursor_id,
         },
     );
@@ -402,7 +400,7 @@ fn test_overlay_events() {
         &mut cursors,
         &Event::Insert {
             position: 0,
-            text: "hello world".to_string(),
+            text: "hello world".to_string().into(),
             cursor_id: CursorId(0),
         },
     );
@@ -500,19 +498,19 @@ fn test_popup_events() {
         transient: false,
         content: PopupContentData::List {
             items: vec![
-                PopupListItemData {
+                PopupListItemData { id: "t501".into(),
                     text: "Item 1".to_string(),
                     detail: Some("First item".to_string()),
                     icon: Some("📄".to_string()),
                     data: None,
                 },
-                PopupListItemData {
+                PopupListItemData { id: "t507".into(),
                     text: "Item 2".to_string(),
                     detail: Some("Second item".to_string()),
                     icon: Some("📄".to_string()),
                     data: None,
                 },
-                PopupListItemData {
+                PopupListItemData { id: "t513".into(),
                     text: "Item 3".to_string(),
                     detail: Some("Third item".to_string()),
                     icon: Some("📄".to_string()),
@@ -577,7 +575,7 @@ fn test_overlay_undo_redo() {
     // Insert text and add overlay
     let event1 = Event::Insert {
         position: 0,
-        text: "hello".to_string(),
+        text: "hello".to_string().into(),
         cursor_id: CursorId(0),
     };
     log.append(event1.clone());
@@ -709,7 +707,7 @@ fn test_overlay_priority_layering() {
         &mut cursors,
         &Event::Insert {
             position: 0,
-            text: "hello world".to_string(),
+            text: "hello world".to_string().into(),
             cursor_id: CursorId(0),
         },
     );
@@ -768,7 +766,7 @@ fn test_overlay_priority_layering() {
 /// E2E test: Verify diagnostic overlays are visually rendered with correct colors
 #[test]
 fn test_diagnostic_overlay_visual_rendering() {
-    use common::harness::EditorTestHarness;
+    use crate::common::harness::EditorTestHarness;
     use fresh::model::event::{OverlayFace, UnderlineStyle};
     use ratatui::style::{Color, Modifier};
 
@@ -852,7 +850,7 @@ mod event_inverse_tests {
     fn test_insert_inverse() {
         let event = Event::Insert {
             position: 10,
-            text: "hello".to_string(),
+            text: "hello".to_string().into(),
             cursor_id: CursorId(0),
         };
 
@@ -876,7 +874,7 @@ mod event_inverse_tests {
     fn test_delete_inverse() {
         let event = Event::Delete {
             range: 5..10,
-            deleted_text: "world".to_string(),
+            deleted_text: "world".to_string().into(),
             cursor_id: CursorId(1),
         };
 
@@ -1025,14 +1023,6 @@ mod event_inverse_tests {
     }
 
     #[test]
-    fn test_set_viewport_no_inverse() {
-        let event = Event::SetViewport { top_line: 10 };
-
-        // SetViewport doesn't have inverse because we don't store the old top_line
-        assert!(event.inverse().is_none());
-    }
-
-    #[test]
     fn test_change_mode_no_inverse() {
         let event = Event::ChangeMode {
             mode: "insert".to_string(),
@@ -1048,17 +1038,17 @@ mod event_inverse_tests {
             events: vec![
                 Event::Insert {
                     position: 0,
-                    text: "a".to_string(),
+                    text: "a".to_string().into(),
                     cursor_id: CursorId(0),
                 },
                 Event::Insert {
                     position: 1,
-                    text: "b".to_string(),
+                    text: "b".to_string().into(),
                     cursor_id: CursorId(0),
                 },
                 Event::Insert {
                     position: 2,
-                    text: "c".to_string(),
+                    text: "c".to_string().into(),
                     cursor_id: CursorId(0),
                 },
             ],
@@ -1115,10 +1105,12 @@ mod event_inverse_tests {
             events: vec![
                 Event::Insert {
                     position: 0,
-                    text: "a".to_string(),
+                    text: "a".to_string().into(),
                     cursor_id: CursorId(0),
                 },
-                Event::SetViewport { top_line: 10 }, // Not invertible
+                Event::ChangeMode {
+                    mode: "insert".to_string(),
+                }, // Not invertible
             ],
             description: "Mixed batch".to_string(),
         };
@@ -1133,12 +1125,12 @@ mod event_inverse_tests {
             events: vec![
                 Event::Insert {
                     position: 0,
-                    text: "x".to_string(),
+                    text: "x".to_string().into(),
                     cursor_id: CursorId(0),
                 },
                 Event::Insert {
                     position: 1,
-                    text: "y".to_string(),
+                    text: "y".to_string().into(),
                     cursor_id: CursorId(0),
                 },
             ],
@@ -1149,13 +1141,13 @@ mod event_inverse_tests {
             events: vec![
                 Event::Insert {
                     position: 0,
-                    text: "a".to_string(),
+                    text: "a".to_string().into(),
                     cursor_id: CursorId(0),
                 },
                 inner_batch,
                 Event::Insert {
                     position: 3,
-                    text: "z".to_string(),
+                    text: "z".to_string().into(),
                     cursor_id: CursorId(0),
                 },
             ],
@@ -1194,7 +1186,7 @@ mod event_inverse_tests {
     fn test_double_inverse_equals_original() {
         let original = Event::Insert {
             position: 5,
-            text: "test".to_string(),
+            text: "test".to_string().into(),
             cursor_id: CursorId(0),
         };
 
@@ -1263,8 +1255,8 @@ mod event_inverse_tests {
 /// so line 1 is correct, line 2 is off by 1, line 3 is off by 2, etc.
 #[test]
 fn test_crlf_syntax_highlighting_offset() {
-    use common::fixtures::TestFixture;
-    use common::harness::EditorTestHarness;
+    use crate::common::fixtures::TestFixture;
+    use crate::common::harness::EditorTestHarness;
     use ratatui::style::Color;
 
     // Create a Rust file with CRLF line endings.
@@ -1290,7 +1282,7 @@ fn test_crlf_syntax_highlighting_offset() {
     let mut harness = EditorTestHarness::create(
         80,
         24,
-        common::harness::HarnessOptions::new().with_full_grammar_registry(),
+        crate::common::harness::HarnessOptions::new().with_full_grammar_registry(),
     )
     .unwrap();
     harness.open_file(&fixture.path).unwrap();

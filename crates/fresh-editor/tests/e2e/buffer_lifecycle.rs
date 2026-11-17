@@ -33,8 +33,8 @@ fn test_save_unnamed_buffer_shows_save_as_prompt() {
 /// save/discard/cancel close confirmation is up.
 ///
 /// Alt+W is `close_tab` in the normal context. When closing a *modified*
-/// buffer it raises the (s)ave/(d)iscard/(C)ancel prompt — at which point a
-/// second Alt+W used to leak into the search-options toggle (the binding lived
+/// buffer it raises the Save/Discard/Cancel confirmation dialog — at which
+/// point a second Alt+W used to leak into the search-options toggle (the binding lived
 /// in the broad `prompt` context). The toggles now live in the narrower
 /// `searchPrompt` context, active only for find/replace prompts, so Alt+W is
 /// inert here and the close prompt stays put.
@@ -53,7 +53,7 @@ fn test_alt_w_does_not_toggle_whole_word_in_close_prompt() {
         .send_key(KeyCode::Char('w'), KeyModifiers::ALT)
         .unwrap();
     harness.render().unwrap();
-    harness.assert_screen_contains("(d)iscard");
+    harness.assert_screen_contains("Discard");
 
     // A second Alt+W must be inert here — not flip whole-word match mode.
     harness
@@ -62,7 +62,7 @@ fn test_alt_w_does_not_toggle_whole_word_in_close_prompt() {
     harness.render().unwrap();
     harness.assert_screen_not_contains("Whole word");
     // The close confirmation is still the active prompt.
-    harness.assert_screen_contains("(d)iscard");
+    harness.assert_screen_contains("Discard");
 }
 
 /// Counterpart to the regression above: inside an actual search prompt Alt+W
@@ -152,9 +152,6 @@ fn test_quit_with_confirmation_discard() {
     harness
         .send_key(KeyCode::Char('d'), KeyModifiers::NONE)
         .unwrap();
-    harness
-        .send_key(KeyCode::Enter, KeyModifiers::NONE)
-        .unwrap();
     harness.render().unwrap();
 
     // Editor should quit
@@ -185,8 +182,8 @@ fn test_quit_prompt_offers_discard_when_hot_exit_enabled() {
 
     // The prompt must list both the discard ("d") and recoverable-quit ("q")
     // options; previously only the latter appeared in hot_exit mode.
-    harness.assert_screen_contains("(d)iscard and quit");
-    harness.assert_screen_contains("(q)uit (recoverable)");
+    harness.assert_screen_contains("Discard and Quit");
+    harness.assert_screen_contains("Quit (recoverable)");
 }
 
 /// Issue #1839: pressing the discard key in the hot_exit quit prompt must
@@ -212,9 +209,6 @@ fn test_quit_with_discard_key_works_with_hot_exit() {
 
     harness
         .send_key(KeyCode::Char('d'), KeyModifiers::NONE)
-        .unwrap();
-    harness
-        .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
     harness.render().unwrap();
 
@@ -244,9 +238,6 @@ fn test_quit_save_chains_save_as_for_unnamed_buffer() {
     harness.render().unwrap();
     harness
         .send_key(KeyCode::Char('s'), KeyModifiers::NONE)
-        .unwrap();
-    harness
-        .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
     harness.render().unwrap();
 
@@ -296,9 +287,6 @@ fn test_quit_save_chains_save_as_for_multiple_unnamed_buffers() {
     harness.render().unwrap();
     harness
         .send_key(KeyCode::Char('s'), KeyModifiers::NONE)
-        .unwrap();
-    harness
-        .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
     harness.render().unwrap();
 
@@ -360,9 +348,6 @@ fn test_quit_save_chain_cancel_aborts_quit() {
     harness
         .send_key(KeyCode::Char('s'), KeyModifiers::NONE)
         .unwrap();
-    harness
-        .send_key(KeyCode::Enter, KeyModifiers::NONE)
-        .unwrap();
     harness.render().unwrap();
     harness.assert_screen_contains("Save as:");
 
@@ -396,9 +381,6 @@ fn test_quit_with_confirmation_cancel() {
     // Cancel with 'c' and Enter (or any non-'d' key, default is cancel)
     harness
         .send_key(KeyCode::Char('c'), KeyModifiers::NONE)
-        .unwrap();
-    harness
-        .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
     harness.render().unwrap();
 
@@ -597,6 +579,130 @@ fn test_click_tab_close_button() {
     assert_eq!(tabs_after, 1, "Should have 1 tab after close");
 }
 
+/// Middle-clicking a tab's name closes that tab (issue #3284).
+#[test]
+fn test_middle_click_tab_name_closes_tab() {
+    use crate::common::harness::layout;
+
+    let mut harness = EditorTestHarness::new(100, 24).unwrap();
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let file1_path = temp_dir.path().join("first.txt");
+    let file2_path = temp_dir.path().join("to_close.txt");
+    std::fs::write(&file1_path, "First file content").unwrap();
+    std::fs::write(&file2_path, "UNIQUE_CONTENT_TO_CLOSE").unwrap();
+
+    harness.open_file(&file1_path).unwrap();
+    harness.render().unwrap();
+    harness.open_file(&file2_path).unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("UNIQUE_CONTENT_TO_CLOSE");
+
+    let tab_row = harness.get_screen_row(layout::TAB_BAR_ROW);
+    assert_eq!(
+        tab_row.matches('×').count(),
+        2,
+        "two tabs before: {tab_row}"
+    );
+    let name_col = tab_row
+        .find("to_close.txt")
+        .map(|byte| tab_row[..byte].chars().count())
+        .expect("to_close.txt tab should be on the tab bar");
+
+    // Middle-click the middle of the tab's name, away from its `×`.
+    harness
+        .mouse_middle_click((name_col + 3) as u16, layout::TAB_BAR_ROW as u16)
+        .unwrap();
+
+    harness.assert_screen_not_contains("UNIQUE_CONTENT_TO_CLOSE");
+    harness.assert_screen_contains("First file content");
+    let tab_row_after = harness.get_screen_row(layout::TAB_BAR_ROW);
+    assert!(
+        !tab_row_after.contains("to_close.txt"),
+        "the middle-clicked tab should be gone: {tab_row_after}"
+    );
+    assert_eq!(
+        tab_row_after.matches('×').count(),
+        1,
+        "one tab after: {tab_row_after}"
+    );
+}
+
+/// Middle-clicking a tab's `×` closes it too, rather than doing nothing.
+#[test]
+fn test_middle_click_tab_close_button_closes_tab() {
+    use crate::common::harness::layout;
+
+    let mut harness = EditorTestHarness::new(100, 24).unwrap();
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let file1_path = temp_dir.path().join("first.txt");
+    let file2_path = temp_dir.path().join("to_close.txt");
+    std::fs::write(&file1_path, "First file content").unwrap();
+    std::fs::write(&file2_path, "UNIQUE_CONTENT_TO_CLOSE").unwrap();
+
+    harness.open_file(&file1_path).unwrap();
+    harness.render().unwrap();
+    harness.open_file(&file2_path).unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("UNIQUE_CONTENT_TO_CLOSE");
+
+    // The `×` after the to_close.txt tab's name, as a screen column.
+    let tab_row = harness.get_screen_row(layout::TAB_BAR_ROW);
+    let name_byte = tab_row
+        .find("to_close.txt")
+        .expect("to_close.txt tab should be on the tab bar");
+    let close_byte = name_byte
+        + tab_row[name_byte..]
+            .find('×')
+            .expect("the tab should have a close button");
+    let close_col = tab_row[..close_byte].chars().count();
+
+    harness
+        .mouse_middle_click(close_col as u16, layout::TAB_BAR_ROW as u16)
+        .unwrap();
+
+    harness.assert_screen_not_contains("UNIQUE_CONTENT_TO_CLOSE");
+    let tab_row_after = harness.get_screen_row(layout::TAB_BAR_ROW);
+    assert!(
+        !tab_row_after.contains("to_close.txt"),
+        "the tab whose close button was middle-clicked should be gone: {tab_row_after}"
+    );
+}
+
+/// Middle-clicking a modified tab's name asks before closing, as the `×` does.
+#[test]
+fn test_middle_click_modified_tab_name_prompts() {
+    use crate::common::harness::layout;
+
+    let mut harness = EditorTestHarness::new(100, 24).unwrap();
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("dirty.txt");
+    std::fs::write(&file_path, "saved text").unwrap();
+    harness.open_file(&file_path).unwrap();
+    harness.type_text("UNSAVED_EDIT").unwrap();
+    harness.render().unwrap();
+
+    let tab_row = harness.get_screen_row(layout::TAB_BAR_ROW);
+    let name_col = tab_row
+        .find("dirty.txt")
+        .map(|byte| tab_row[..byte].chars().count())
+        .expect("dirty.txt tab should be on the tab bar");
+    harness
+        .mouse_middle_click((name_col + 2) as u16, layout::TAB_BAR_ROW as u16)
+        .unwrap();
+
+    harness.assert_screen_contains("Unsaved Changes");
+    // The prompt is pending: the buffer and its edit are still there.
+    harness.assert_screen_contains("UNSAVED_EDIT");
+    assert_eq!(
+        std::fs::read_to_string(&file_path).unwrap(),
+        "saved text",
+        "nothing should be saved by the prompt appearing"
+    );
+}
+
 /// Test clicking X on modified buffer shows confirmation prompt
 #[test]
 fn test_click_tab_close_button_modified_buffer() {
@@ -635,7 +741,7 @@ fn test_click_tab_close_button_modified_buffer() {
             harness.render().unwrap();
 
             // Should show confirmation prompt for modified buffer
-            harness.assert_screen_contains("modified. (s)ave, (d)iscard, (C)ancel");
+            harness.assert_screen_contains("Unsaved Changes");
         } else {
             panic!("Could not find × close button after * in tab bar");
         }
@@ -675,14 +781,11 @@ fn test_click_tab_close_modified_discard() {
             harness.render().unwrap();
 
             // Should show prompt
-            harness.assert_screen_contains("modified. (s)ave, (d)iscard, (C)ancel");
+            harness.assert_screen_contains("Unsaved Changes");
 
             // Press 'd' to discard and Enter to confirm
             harness
                 .send_key(KeyCode::Char('d'), KeyModifiers::NONE)
-                .unwrap();
-            harness
-                .send_key(KeyCode::Enter, KeyModifiers::NONE)
                 .unwrap();
             harness.render().unwrap();
 
@@ -727,14 +830,11 @@ fn test_click_tab_close_modified_cancel() {
             harness.render().unwrap();
 
             // Should show prompt
-            harness.assert_screen_contains("modified. (s)ave, (d)iscard, (C)ancel");
+            harness.assert_screen_contains("Unsaved Changes");
 
             // Press 'c' to cancel and Enter to confirm
             harness
                 .send_key(KeyCode::Char('c'), KeyModifiers::NONE)
-                .unwrap();
-            harness
-                .send_key(KeyCode::Enter, KeyModifiers::NONE)
                 .unwrap();
             harness.render().unwrap();
 
@@ -790,8 +890,11 @@ fn test_next_buffer_skips_hidden_buffers() {
         show_cursors: true,
         editing_disabled: true,
         hidden_from_tabs: true, // <-- This makes it hidden
+        background: false,
+        highlight_current_line: None,
         initial_cursor_line: None,
         indentation_guide: None,
+        scrollable: None,
         request_id: None,
     };
     harness
@@ -1068,4 +1171,222 @@ fn test_close_last_buffer_blank_workspace_when_both_disabled() {
         "Expected no `[No Name]` tab. Tab bar:\n{}",
         tab_bar
     );
+}
+
+/// Editor with `left.txt` active in the left pane (beside an unnamed buffer
+/// holding `left_draft`, when given) and a vertical split whose right pane's
+/// only tab is the modified buffer `open_right_tab` opens there, which is
+/// active. Returns the project root.
+fn split_with_sole_modified_tab(
+    harness: &mut EditorTestHarness,
+    left_draft: Option<&str>,
+    open_right_tab: impl FnOnce(&mut EditorTestHarness),
+) -> std::path::PathBuf {
+    let root = harness.project_dir().unwrap();
+    let left = root.join("left.txt");
+    std::fs::write(&left, "left content").unwrap();
+    harness.open_file(&left).unwrap();
+    if let Some(draft) = left_draft {
+        type_in_new_buffer(harness, draft);
+        harness.open_file(&left).unwrap();
+    }
+
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.type_text("split vert").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    open_right_tab(harness);
+    // The new pane starts with `left.txt` too: drop it from this pane only,
+    // so the modified buffer is the pane's sole tab.
+    harness
+        .send_key(KeyCode::PageUp, KeyModifiers::CONTROL)
+        .unwrap();
+    harness
+        .send_key(KeyCode::Char('w'), KeyModifiers::ALT)
+        .unwrap();
+    harness.render().unwrap();
+    assert!(
+        split_layout_shown(harness),
+        "setup must leave two panes:\n{}",
+        harness.screen_to_string()
+    );
+    root
+}
+
+fn type_in_new_buffer(harness: &mut EditorTestHarness, text: &str) {
+    harness.new_buffer().unwrap();
+    harness.type_text(text).unwrap();
+}
+
+/// Close the active (modified) tab with Alt+W and answer the
+/// unsaved-changes dialog with `key`.
+fn close_modified_tab_answering(harness: &mut EditorTestHarness, key: char) {
+    harness
+        .send_key(KeyCode::Char('w'), KeyModifiers::ALT)
+        .unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("Unsaved Changes");
+    harness
+        .send_key(KeyCode::Char(key), KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+}
+
+/// A vertical split draws its separator through the tab-bar row, between
+/// the two panes' tab bars.
+fn split_layout_shown(harness: &EditorTestHarness) -> bool {
+    use crate::common::harness::layout;
+    harness
+        .screen_row_text(layout::TAB_BAR_ROW as u16)
+        .contains('│')
+}
+
+/// The left pane, alone on screen, still shows `left.txt` with its tabs
+/// `expected_tabs`, and nothing of the closed pane is left.
+fn assert_only_left_pane(harness: &EditorTestHarness, expected_tabs: &[&str], gone: &str) {
+    use crate::common::harness::layout;
+    let screen = harness.screen_to_string();
+    assert!(
+        !split_layout_shown(harness),
+        "the emptied split must close:\n{screen}"
+    );
+    let tab_bar = harness.screen_row_text(layout::TAB_BAR_ROW as u16);
+    let tabs: Vec<&str> = tab_bar
+        .split('×')
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && *t != "+")
+        .collect();
+    assert_eq!(tabs, expected_tabs, "left pane tabs:\n{screen}");
+    harness.assert_screen_contains("left content");
+    harness.assert_screen_not_contains(gone);
+}
+
+/// Discarding the only tab of a split closes the split, leaving the other
+/// pane's tabs and active buffer as they were.
+#[test]
+fn test_confirmed_close_collapses_split_on_discard() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 20).unwrap();
+    split_with_sole_modified_tab(&mut harness, None, |h| type_in_new_buffer(h, "right draft"));
+
+    close_modified_tab_answering(&mut harness, 'd');
+
+    assert_only_left_pane(&harness, &["left.txt"], "right draft");
+}
+
+/// Same, when the other pane also holds an unsaved unnamed buffer: that
+/// buffer must not take over the emptied pane, nor be lost.
+#[test]
+fn test_confirmed_close_collapses_split_on_discard_beside_unnamed_buffer() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 20).unwrap();
+    split_with_sole_modified_tab(&mut harness, Some("left draft"), |h| {
+        type_in_new_buffer(h, "right draft")
+    });
+
+    close_modified_tab_answering(&mut harness, 'd');
+
+    assert_only_left_pane(&harness, &["left.txt", "[No Name]*"], "right draft");
+}
+
+/// Save on a file-backed buffer writes it, then closes its split.
+#[test]
+fn test_confirmed_close_collapses_split_on_save() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 20).unwrap();
+    let mut right = std::path::PathBuf::new();
+    split_with_sole_modified_tab(&mut harness, None, |h| {
+        right = h.project_dir().unwrap().join("right.txt");
+        std::fs::write(&right, "right content").unwrap();
+        h.open_file(&right).unwrap();
+        h.type_text("edited ").unwrap();
+    });
+
+    close_modified_tab_answering(&mut harness, 's');
+
+    assert_eq!(
+        std::fs::read_to_string(&right).unwrap(),
+        "edited right content"
+    );
+    assert_only_left_pane(&harness, &["left.txt"], "right.txt");
+}
+
+/// Same, when the tab is closed from its menu while the other pane is
+/// focused: saving must not leave the buffer behind as a tab of the focused
+/// pane, which would keep the emptied split open.
+#[test]
+fn test_confirmed_close_collapses_split_on_save_from_inactive_pane() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 20).unwrap();
+    let mut right = std::path::PathBuf::new();
+    split_with_sole_modified_tab(&mut harness, None, |h| {
+        right = h.project_dir().unwrap().join("right.txt");
+        std::fs::write(&right, "right content").unwrap();
+        h.open_file(&right).unwrap();
+        h.type_text("edited ").unwrap();
+    });
+    // Focus the left pane by clicking into its text.
+    let (col, row) = harness.find_text_on_screen("left content").unwrap();
+    harness.mouse_click(col, row).unwrap();
+    harness.render().unwrap();
+
+    let (col, row) = harness.find_text_on_screen("right.txt").unwrap();
+    harness.mouse_right_click(col, row).unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("Close Others");
+    // The menu's first item is "Close"; its other entries read "Close …".
+    let (col, row) = harness.find_text_on_screen("Close").unwrap();
+    harness.mouse_click(col, row).unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("Unsaved Changes");
+    harness
+        .send_key(KeyCode::Char('s'), KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&right).unwrap(),
+        "edited right content"
+    );
+    assert_only_left_pane(&harness, &["left.txt"], "right.txt");
+}
+
+/// Save on an unnamed buffer asks for a name, writes the file, then closes
+/// its split.
+#[test]
+fn test_confirmed_close_collapses_split_on_save_as() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 20).unwrap();
+    let root =
+        split_with_sole_modified_tab(&mut harness, None, |h| type_in_new_buffer(h, "right draft"));
+
+    close_modified_tab_answering(&mut harness, 's');
+    harness.assert_screen_contains("Save as:");
+    let target = root.join("saved.txt");
+    harness.type_text(target.to_str().unwrap()).unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "right draft");
+    assert_only_left_pane(&harness, &["left.txt"], "right draft");
+}
+
+/// Cancel keeps the split and its modified tab.
+#[test]
+fn test_confirmed_close_collapses_split_not_on_cancel() {
+    let mut harness = EditorTestHarness::with_temp_project(120, 20).unwrap();
+    split_with_sole_modified_tab(&mut harness, None, |h| type_in_new_buffer(h, "right draft"));
+
+    close_modified_tab_answering(&mut harness, 'c');
+
+    harness.assert_screen_contains("Close cancelled");
+    assert!(
+        split_layout_shown(&harness),
+        "cancel must keep the split:\n{}",
+        harness.screen_to_string()
+    );
+    harness.assert_screen_contains("[No Name]*");
+    harness.assert_screen_contains("right draft");
 }

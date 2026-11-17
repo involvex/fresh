@@ -9,8 +9,10 @@
 //! - `items.rs` - Convert schema to renderable items with control states
 //! - `state.rs` - Manage settings UI state and pending changes
 //! - `render.rs` - Render the settings modal
-//! - `layout.rs` - Hit testing for mouse interaction
+//! - `hit.rs` - The vocabulary a press resolves to, shared by both frontends
+//! - `live.rs` - A scalar control edited by its widget kind, against a surface's store
 //! - `entry_dialog.rs` - Dialog for editing complex map entries
+//! - `surface.rs` - What the page and the entry dialog share: list rows, typing into a live field
 
 // Schema is WASM-compatible (pure data types)
 pub mod schema;
@@ -19,11 +21,13 @@ pub mod schema;
 #[cfg(feature = "runtime")]
 pub mod entry_dialog;
 #[cfg(feature = "runtime")]
+pub mod hit;
+#[cfg(feature = "runtime")]
 pub mod input;
 #[cfg(feature = "runtime")]
 pub mod items;
 #[cfg(feature = "runtime")]
-pub mod layout;
+pub mod live;
 #[cfg(feature = "runtime")]
 pub mod mouse;
 #[cfg(feature = "runtime")]
@@ -32,6 +36,8 @@ pub mod render;
 pub mod search;
 #[cfg(feature = "runtime")]
 pub mod state;
+#[cfg(feature = "runtime")]
+pub mod surface;
 // Settings control → WidgetSpec mapping (Settings↔widget unification).
 #[cfg(feature = "runtime")]
 pub mod widget_map;
@@ -39,9 +45,8 @@ pub mod widget_map;
 #[cfg(feature = "runtime")]
 pub use entry_dialog::EntryDialogState;
 #[cfg(feature = "runtime")]
-pub use layout::{SettingsHit, SettingsLayout};
+pub use hit::SettingsHit;
 #[cfg(feature = "runtime")]
-pub use render::render_settings;
 #[cfg(feature = "runtime")]
 pub use search::{search_settings, SearchResult};
 #[cfg(feature = "runtime")]

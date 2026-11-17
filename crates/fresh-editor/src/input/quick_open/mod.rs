@@ -205,6 +205,23 @@ pub trait QuickOpenProvider: Send + Sync {
     /// The query has already had the prefix stripped.
     fn suggestions(&self, query: &str, context: &QuickOpenContext) -> Vec<Suggestion>;
 
+    /// Whether the list this provider just returned is short of every match
+    /// for the query — cut off at a row cap, or still being filled in.
+    ///
+    /// Callers that reason about the match *set* — Tab extending the query to
+    /// the longest prefix every matching path shares — must decline on an
+    /// incomplete list: the rows present are the top-scoring ones,
+    /// which is a ranking over the matches and not a slice of the path tree,
+    /// so they can agree on a directory that the dropped rows do not. Row
+    /// consumers (rendering, moving the selection, accepting one) are
+    /// unaffected.
+    ///
+    /// Providers whose lists are always complete — commands, buffers,
+    /// goto-line — keep the default.
+    fn suggestions_incomplete(&self, _suggestions: &[Suggestion]) -> bool {
+        false
+    }
+
     /// Handle selection of a suggestion
     ///
     /// `suggestion` is the currently selected suggestion (already resolved by the caller).
@@ -263,6 +280,35 @@ impl QuickOpenRegistry {
             if let Some(fp) = provider.as_any_mut().downcast_mut::<FileProvider>() {
                 fp.set_backends(filesystem, process_spawner);
                 return;
+            }
+        }
+    }
+
+    /// Keep the file picker aligned with the project explorer toggles.
+    pub fn set_file_visibility(&self, show_hidden: bool) {
+        if let Some((provider, _)) = self.get_provider_for_input("") {
+            if let Some(fp) = provider.as_any().downcast_ref::<FileProvider>() {
+                fp.set_visibility(show_hidden);
+            }
+        }
+    }
+
+    /// List gitignored files in the file picker when the project explorer
+    /// shows them.
+    pub fn set_file_include_gitignored(&self, include_gitignored: bool) {
+        if let Some((provider, _)) = self.get_provider_for_input("") {
+            if let Some(fp) = provider.as_any().downcast_ref::<FileProvider>() {
+                fp.set_include_gitignored(include_gitignored);
+            }
+        }
+    }
+
+    /// Leave out of the file picker what `file_explorer.custom_ignore_patterns`
+    /// ignores.
+    pub fn set_file_ignore_patterns(&self, patterns: &[String]) {
+        if let Some((provider, _)) = self.get_provider_for_input("") {
+            if let Some(fp) = provider.as_any().downcast_ref::<FileProvider>() {
+                fp.set_custom_ignore_patterns(patterns);
             }
         }
     }

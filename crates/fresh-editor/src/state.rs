@@ -1,11 +1,8 @@
-use crate::model::buffer::{Buffer, LineNumber};
+use crate::model::buffer::Buffer;
 use crate::model::cursor::{Cursor, Cursors};
-use crate::model::document_model::{
-    DocumentCapabilities, DocumentModel, DocumentPosition, ViewportContent, ViewportLine,
-};
 use crate::model::event::{
-    Event, MarginContentData, MarginPositionData, OverlayFace as EventOverlayFace, PopupData,
-    PopupPositionData,
+    EditText, Event, MarginContentData, MarginPositionData, OverlayFace as EventOverlayFace,
+    PopupData, PopupPositionData,
 };
 use crate::model::filesystem::FileSystem;
 use crate::model::marker::{MarkerId, MarkerList};
@@ -18,6 +15,7 @@ use crate::primitives::text_property::TextPropertyManager;
 use crate::view::bracket_highlight_overlay::BracketHighlightOverlay;
 use crate::view::conceal::ConcealManager;
 use crate::view::cursor_line_overlay::CursorLineOverlay;
+use crate::view::diff_gutter::DiffGutter;
 use crate::view::folding::LspFoldRanges;
 use crate::view::margin::{MarginAnnotation, MarginContent, MarginManager, MarginPosition};
 use crate::view::overlay::{Overlay, OverlayFace, OverlayManager, UnderlineStyle};
@@ -38,26 +36,51 @@ use std::sync::Arc;
 /// On undo, the marker is restored to its exact original position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DisplacedMarker {
-    /// Marker from the main marker_list (virtual text, overlays)
+    /// Marker from the main marker_list (overlays and the like)
     Main { id: u64, position: usize },
     /// Marker from margins.indicator_markers (breakpoints, line indicators)
     Margin { id: u64, position: usize },
+    /// A virtual text's marker, in the virtual-text manager's own lists:
+    /// `class` names the list, as `VirtualTextId::to_parts` numbers it.
+    VirtualText { class: u8, id: u64, position: usize },
 }
+
+/// [`DisplacedMarker::encode`]'s tags: the margin bit (63), the virtual-text
+/// bit (62) and, under it, the virtual-text class (bits 59..62). Marker ids
+/// stay below bit 59.
+const DISPLACED_MARGIN: u64 = 1 << 63;
+const DISPLACED_VIRTUAL_TEXT: u64 = 1 << 62;
+const DISPLACED_CLASS_SHIFT: u32 = 59;
+const DISPLACED_ID_MASK: u64 = (1 << DISPLACED_CLASS_SHIFT) - 1;
 
 impl DisplacedMarker {
     /// Encode as (u64, usize) for compact storage. Uses high bit to tag source.
     pub fn encode(&self) -> (u64, usize) {
         match self {
             Self::Main { id, position } => (*id, *position),
-            Self::Margin { id, position } => (*id | (1u64 << 63), *position),
+            Self::Margin { id, position } => (*id | DISPLACED_MARGIN, *position),
+            Self::VirtualText {
+                class,
+                id,
+                position,
+            } => (
+                *id | DISPLACED_VIRTUAL_TEXT | (u64::from(*class) << DISPLACED_CLASS_SHIFT),
+                *position,
+            ),
         }
     }
 
     /// Decode from (u64, usize) compact representation.
     pub fn decode(tagged_id: u64, position: usize) -> Self {
-        if (tagged_id >> 63) == 1 {
+        if tagged_id & DISPLACED_MARGIN != 0 {
             Self::Margin {
-                id: tagged_id & !(1u64 << 63),
+                id: tagged_id & !DISPLACED_MARGIN,
+                position,
+            }
+        } else if tagged_id & DISPLACED_VIRTUAL_TEXT != 0 {
+            Self::VirtualText {
+                class: ((tagged_id & !DISPLACED_VIRTUAL_TEXT) >> DISPLACED_CLASS_SHIFT) as u8,
+                id: tagged_id & DISPLACED_ID_MASK,
                 position,
             }
         } else {
@@ -297,12 +320,6 @@ pub struct EditorState {
     /// Margins for line numbers, annotations, gutter symbols, etc.)
     pub margins: MarginManager,
 
-    /// Cached line number for primary cursor (0-indexed)
-    /// Maintained incrementally to avoid O(n) scanning on every render.
-    /// Every path that moves the primary cursor must refresh this, or the status
-    /// bar shows stale coordinates (see `set_buffer_cursor_in_splits`).
-    pub primary_cursor_line_number: LineNumber,
-
     /// Current mode (for modal editing, if implemented)
     pub mode: String,
 
@@ -333,6 +350,14 @@ pub struct EditorState {
     /// When true, typing, deletion, cut/paste, undo/redo are blocked
     /// but navigation, selection, and copy are still allowed
     pub editing_disabled: bool,
+
+    /// The change on disk the file-change poll last reported for this
+    /// buffer while it had unsaved changes: the mtime recorded for its file
+    /// and the one found on disk. The poll finds that same change on every
+    /// pass until the buffer is saved or reverted, and says so again only
+    /// once either side has moved (issue #3403). Kept on the buffer so it
+    /// goes with it when the buffer is closed or reverted.
+    pub disk_change_reported: Option<(std::time::SystemTime, std::time::SystemTime)>,
 
     /// Whether this buffer can be scrolled (default true). Fixed buffer-group
     /// panels (toolbars, headers, footers) set this to false so the mouse
@@ -380,6 +405,9 @@ pub struct EditorState {
     /// declares one (`setCursorLineOverlay`); placed from the cursor at
     /// paint time, so it can never lag the caret it marks.
     pub cursor_line_overlay: CursorLineOverlay,
+    /// Line numbers derived from diff headers, for a plugin-composed diff
+    /// stream. `Some` also means the buffer opted into that gutter.
+    pub diff_gutter: Option<DiffGutter>,
 
     /// Cached LSP semantic tokens (converted to buffer byte ranges)
     pub semantic_tokens: Option<SemanticTokenStore>,
@@ -448,7 +476,15 @@ impl EditorState {
     pub fn apply_language(&mut self, detected: DetectedLanguage) {
         self.language = detected.name;
         self.display_name = detected.display_name;
-        self.highlighter = detected.highlighter;
+        // A buffer a plugin composed keeps the regions it declared through
+        // any change of grammar — a Set Language, a config reload: they
+        // describe its rows, not its name.
+        self.highlighter = match self.highlighter.take_declared_regions() {
+            Some((syntax_set, regions)) => {
+                HighlightEngine::declared_region_host(syntax_set, regions)
+            }
+            None => detected.highlighter,
+        };
         if let Some(lang) = &detected.ts_language {
             self.reference_highlighter.set_language(lang);
         }
@@ -482,6 +518,31 @@ impl EditorState {
             .unwrap_or(global_default);
     }
 
+    /// Stamp the `editor.*` settings onto an unnamed buffer the editor creates
+    /// itself rather than opens from a file: a new buffer (Ctrl+N), the initial
+    /// and per-window scratch buffers, and an unnamed buffer restored by hot
+    /// exit.
+    ///
+    /// [`EditorState::new`] takes no config, so the state it returns keeps
+    /// built-in defaults — occurrence highlighting on, `BufferSettings::default()`
+    /// for tab size, auto-close, whitespace indicators and the rest — until
+    /// something stamps it. The file-open paths stamp inline, between their
+    /// language and `.editorconfig` resolution; every unnamed buffer comes
+    /// through here, so a path that creates one cannot stamp only half of it.
+    pub fn apply_unnamed_buffer_config(&mut self, config: &crate::config::Config) {
+        self.margins
+            .configure_for_line_numbers(config.editor.line_numbers);
+        self.buffer
+            .set_default_line_ending(config.editor.default_line_ending.to_line_ending());
+        self.apply_occurrence_highlight(config.editor.highlight_occurrences);
+        // Buffer settings (whitespace visibility, tabs, guides, …): resolve
+        // from the user's config so a brand-new buffer behaves the same as an
+        // opened file. Without this the buffer kept `BufferSettings::default()`
+        // (e.g. tabs-on/spaces-off whitespace), so configured space indicators
+        // never showed in a new file (issue #2580).
+        self.apply_buffer_config(config);
+    }
+
     /// Create a new state with a buffer and default (plain text) language.
     /// All other fields are initialized to their defaults.
     fn new_from_buffer(buffer: Buffer) -> Self {
@@ -501,13 +562,13 @@ impl EditorState {
             soft_breaks: SoftBreakManager::new(),
             popups: PopupManager::new(),
             margins: MarginManager::new(),
-            primary_cursor_line_number: LineNumber::Absolute(0),
             mode: "insert".to_string(),
             text_properties: TextPropertyManager::new(),
             show_cursors: true,
             pending_virtual_lines: Vec::new(),
             cursor_visibility_locked: false,
             editing_disabled: false,
+            disk_change_reported: None,
             scrollable: true,
             indentation_guide_override: None,
             interactive_widget_panel: false,
@@ -518,6 +579,7 @@ impl EditorState {
             reference_highlight_overlay: ReferenceHighlightOverlay::new(),
             bracket_highlight_overlay: BracketHighlightOverlay::new(),
             cursor_line_overlay: CursorLineOverlay::new(),
+            diff_gutter: None,
             semantic_tokens: None,
             folding_ranges: LspFoldRanges::new(),
             language: "text".to_string(),
@@ -579,7 +641,7 @@ impl EditorState {
         let first_line = buffer.first_line_lossy();
         let detected = registry
             .find_by_path(path, first_line.as_deref())
-            .map(|entry| DetectedLanguage::from_entry(entry, registry))
+            .map(|entry| DetectedLanguage::from_entry_for_path(entry, path, registry))
             .unwrap_or_else(DetectedLanguage::plain_text);
         let mut state = Self::new_from_buffer(buffer);
         state.apply_language(detected);
@@ -604,8 +666,13 @@ impl EditorState {
     ) -> anyhow::Result<Self> {
         let buffer = Buffer::load_from_file(path, large_file_threshold, fs)?;
         let first_line = buffer.first_line_lossy();
-        let detected =
-            DetectedLanguage::from_path(path, first_line.as_deref(), registry, languages);
+        let detected = DetectedLanguage::from_path(
+            path,
+            first_line.as_deref(),
+            registry,
+            languages,
+            buffer.filesystem().as_ref(),
+        );
         let mut state = Self::new_from_buffer(buffer);
         state.apply_language(detected);
         Ok(state)
@@ -629,8 +696,13 @@ impl EditorState {
     ) -> anyhow::Result<Self> {
         let buffer = Buffer::load_from_file_force_text(path, large_file_threshold, fs)?;
         let first_line = buffer.first_line_lossy();
-        let detected =
-            DetectedLanguage::from_path(path, first_line.as_deref(), registry, languages);
+        let detected = DetectedLanguage::from_path(
+            path,
+            first_line.as_deref(),
+            registry,
+            languages,
+            buffer.filesystem().as_ref(),
+        );
         let mut state = Self::new_from_buffer(buffer);
         state.apply_language(detected);
         Ok(state)
@@ -688,10 +760,6 @@ impl EditorState {
     /// cursor-dependent activation is the renderer's business, and letting it
     /// reach the index would mean scroll position changed when a cursor moved.
     ///
-    /// `view_mode` decides the one namespace that is mode-specific:
-    /// markdown_compose's `md-syntax` conceals are emitted whenever any split
-    /// composes the buffer, so a Source-mode split must ignore them — the same
-    /// gate `build_view_data` applies.
     /// Collapsed byte ranges for `folds`, sorted — the form the index and the
     /// renderer both want. Folds live on the split, so they arrive as an
     /// argument rather than off `self`.
@@ -708,6 +776,14 @@ impl EditorState {
     /// or scroll position would change when a cursor moved. The one legitimate
     /// non-empty caller is the render path's cursor-line expansion, which
     /// re-wraps a single line the way the frame will draw it.
+    ///
+    /// `view_mode` is the mode of the pane the index serves, and decides which
+    /// of compose's decorations count. markdown_compose emits its soft breaks,
+    /// its `composeOnly` conceals, frame lines and code rails whenever *any*
+    /// split composes the buffer, so a Source-mode pane beside a composing one
+    /// (dual mode) must ignore them all — the same gates `build_view_data` and
+    /// `inject_virtual_lines` apply when they draw it. Rows the index reports
+    /// have to be the rows the pane draws.
     pub fn index_decorations(
         &self,
         view_mode: crate::view::line_wrap_cache::CacheViewMode,
@@ -718,22 +794,24 @@ impl EditorState {
         let end = self.buffer.len().saturating_add(1);
         let no_cursors = cursors;
 
-        let soft_breaks = if self.soft_breaks.is_empty() {
+        let is_compose = matches!(view_mode, CacheViewMode::Compose);
+
+        // Soft breaks are compose's wrapping: a Source-mode pane draws none of
+        // them (`build_view_data` applies them in page view only).
+        let soft_breaks = if self.soft_breaks.is_empty() || !is_compose {
             Vec::new()
         } else {
             // `theme: None` — the index measures and never draws, so a
             // continuation prefix contributes its width here but no colour.
             self.soft_breaks
-                .query_viewport_rendered(0, end, &self.marker_list, &no_cursors, None)
+                .query_viewport_rendered(0, end, &self.marker_list, no_cursors, None)
         };
 
         let conceals = if self.conceals.is_empty() {
             Vec::new()
         } else {
-            let exclude = (!matches!(view_mode, CacheViewMode::Compose))
-                .then(|| fresh_core::overlay::OverlayNamespace::from_string("md-syntax".into()));
             self.conceals
-                .query_viewport_excluding(0, end, &self.marker_list, exclude.as_ref(), &no_cursors)
+                .query_viewport_in(0, end, &self.marker_list, is_compose, no_cursors)
                 .into_iter()
                 .map(|(r, t)| (r, t.map(str::to_owned)))
                 .collect()
@@ -742,20 +820,29 @@ impl EditorState {
         let inline_hints = if self.virtual_texts.is_empty() {
             Vec::new()
         } else {
-            crate::view::ui::split_rendering::transforms::resolve_inline_hints(self, None, 0, end)
+            crate::view::ui::split_rendering::transforms::resolve_inline_hints(
+                self, None, 0, end, is_compose,
+            )
         };
 
-        let virtual_lines = if self.virtual_texts.is_empty() {
+        // Compose's frame lines and list spacers are drawn only in a
+        // composing pane. Every caller labels its index with the mode of the
+        // pane it serves (`wrap_index_geometry_for`), so a composing pane
+        // counts them and a source pane beside it does not.
+        let virtual_lines = self.collect_virtual_line_positions(is_compose);
+        // Which of them are drawn above their line, so the index can order a
+        // line's rows as the renderer draws them (`inject_virtual_lines`).
+        let virtual_lines_above = if virtual_lines.is_empty() {
             Vec::new()
         } else {
-            let mut v: Vec<usize> = self
-                .virtual_texts
-                .query_lines_in_range(&self.marker_list, 0, end)
+            self.virtual_texts
+                .all_lines(is_compose)
                 .into_iter()
+                .filter(|(_, vt)| {
+                    vt.position == crate::view::virtual_text::VirtualTextPosition::LineAbove
+                })
                 .map(|(pos, _)| pos)
-                .collect();
-            v.sort_unstable();
-            v
+                .collect()
         };
 
         crate::view::wrap_index::IndexDecorations {
@@ -764,6 +851,7 @@ impl EditorState {
             inline_hints,
             folds,
             virtual_lines,
+            virtual_lines_above,
         }
     }
 
@@ -815,21 +903,17 @@ impl EditorState {
         &mut self,
         cursors: &mut Cursors,
         position: usize,
-        text: &str,
+        text: &[u8],
         cursor_id: crate::model::event::CursorId,
     ) {
-        let newlines_inserted = text.matches('\n').count();
         let (line_before, line_start_before, line_end_before) =
             self.wrap_damage_coords(position, 0);
 
         // CRITICAL: Adjust markers BEFORE modifying buffer
-        self.marker_list.adjust_for_insert(position, text.len());
-        self.margins.adjust_for_insert(position, text.len());
-        self.scrollbar_markers
-            .adjust_for_insert(position, text.len());
+        self.adjust_markers_for_insert(position, text.len());
 
-        // Insert text into buffer
-        self.buffer.insert(position, text);
+        // Insert the exact bytes: text an undo puts back need not be UTF-8.
+        self.buffer.insert_bytes(position, text.to_vec());
 
         self.repair_wrap_indices(crate::view::wrap_index::EditDamage {
             start: position,
@@ -867,20 +951,6 @@ impl EditorState {
             cursor.sticky_column = None;
             cursor.virtual_lines_below = 0;
         }
-
-        // Update primary cursor line number if this was the primary cursor
-        if cursor_id == cursors.primary_id() {
-            self.primary_cursor_line_number = match self.primary_cursor_line_number {
-                LineNumber::Absolute(line) => LineNumber::Absolute(line + newlines_inserted),
-                LineNumber::Relative {
-                    line,
-                    from_cached_line,
-                } => LineNumber::Relative {
-                    line: line + newlines_inserted,
-                    from_cached_line,
-                },
-            };
-        }
     }
 
     /// Handle a Delete event - adjusts markers, buffer, highlighter, cursors, and line numbers
@@ -889,38 +959,20 @@ impl EditorState {
         cursors: &mut Cursors,
         range: &std::ops::Range<usize>,
         cursor_id: crate::model::event::CursorId,
-        deleted_text: &str,
     ) {
         let len = range.len();
         let (line_before, line_start_before, line_end_before) =
             self.wrap_damage_coords(range.start, len);
-
-        // Count newlines deleted BEFORE the primary cursor's original position.
-        // For backspace: cursor was at range.end, so all deleted newlines are before it.
-        // For forward delete: cursor was at range.start, so no deleted newlines are before it.
-        let primary_newlines_removed = if cursor_id == cursors.primary_id() {
-            let cursor_pos = cursors.get(cursor_id).map_or(range.start, |c| c.position);
-            let bytes_before_cursor = cursor_pos
-                .saturating_sub(range.start)
-                .min(len)
-                .min(deleted_text.len());
-            deleted_text[..bytes_before_cursor].matches('\n').count()
-        } else {
-            0
-        };
 
         // Drop virtual texts whose anchors are being erased. This is what
         // makes inlay hints disappear immediately when the range containing
         // them is deleted; without this the marker would just clamp to
         // range.start and the hint would linger at the wrong position until
         // the next LSP refresh.
-        self.virtual_texts
-            .remove_in_range(&mut self.marker_list, range.start, range.end);
+        self.virtual_texts.remove_in_range(range.start, range.end);
 
         // CRITICAL: Adjust markers BEFORE modifying buffer
-        self.marker_list.adjust_for_delete(range.start, len);
-        self.margins.adjust_for_delete(range.start, len);
-        self.scrollbar_markers.adjust_for_delete(range.start, len);
+        self.adjust_markers_for_delete(range.start, len);
 
         // Delete from buffer
         self.buffer.delete(range.clone());
@@ -958,22 +1010,6 @@ impl EditorState {
             cursor.sticky_column = None;
             cursor.virtual_lines_below = 0;
         }
-
-        // Update primary cursor line number if this was the primary cursor
-        if cursor_id == cursors.primary_id() && primary_newlines_removed > 0 {
-            self.primary_cursor_line_number = match self.primary_cursor_line_number {
-                LineNumber::Absolute(line) => {
-                    LineNumber::Absolute(line.saturating_sub(primary_newlines_removed))
-                }
-                LineNumber::Relative {
-                    line,
-                    from_cached_line,
-                } => LineNumber::Relative {
-                    line: line.saturating_sub(primary_newlines_removed),
-                    from_cached_line,
-                },
-            };
-        }
     }
 
     /// Apply an event to the state - THE ONLY WAY TO MODIFY STATE
@@ -984,13 +1020,11 @@ impl EditorState {
                 position,
                 text,
                 cursor_id,
-            } => self.apply_insert(cursors, *position, text, *cursor_id),
+            } => self.apply_insert(cursors, *position, text.as_bytes(), *cursor_id),
 
             Event::Delete {
-                range,
-                cursor_id,
-                deleted_text,
-            } => self.apply_delete(cursors, range, *cursor_id, deleted_text),
+                range, cursor_id, ..
+            } => self.apply_delete(cursors, range, *cursor_id),
 
             Event::MoveCursor {
                 cursor_id,
@@ -1016,9 +1050,9 @@ impl EditorState {
                 cursors.remove(*cursor_id);
             }
 
-            // View events (Scroll, SetViewport, Recenter) are now handled at Editor level
+            // View events (Scroll, Recenter) are now handled at Editor level
             // via SplitViewState. They should not reach EditorState.apply().
-            Event::Scroll { .. } | Event::SetViewport { .. } | Event::Recenter => {
+            Event::Scroll { .. } | Event::Recenter => {
                 // These events are intercepted in Editor::apply_event_to_active_buffer
                 // and routed to SplitViewState. If we get here, something is wrong.
                 tracing::warn!("View event {:?} reached EditorState.apply() - should be handled by SplitViewState", event);
@@ -1223,26 +1257,26 @@ impl EditorState {
                 cursor.virtual_lines_below = vlines;
             }
         }
+    }
 
-        // Update primary cursor line number if this is the primary cursor.
-        // Try to get exact line number from buffer, or estimate for large files.
-        if cursor_id == cursors.primary_id() {
-            self.primary_cursor_line_number = match self.buffer.offset_to_position(new_position) {
-                Some(pos) => LineNumber::Absolute(pos.line),
-                None => {
-                    // Large file without line metadata - estimate line number
-                    // using the default estimated_line_length of 80 bytes.
-                    LineNumber::Absolute(new_position / 80)
-                }
-            };
-        }
+    /// The 0-indexed line `position` is on.
+    ///
+    /// Derived on demand rather than cached: the piece tree keeps line-feed
+    /// counts per node, so this is a tree descent, not a scan. The status bar
+    /// used to read a per-buffer cache of the primary cursor's line instead,
+    /// which every path that placed a cursor had to refresh by hand; each one
+    /// that did not left the bar showing the wrong line (#2301, #3167,
+    /// #3397). A buffer loaded without line metadata has no exact answer, so
+    /// the line is estimated from the configured average line length.
+    pub fn line_of_position(&self, position: usize) -> usize {
+        self.buffer.get_line_number(position)
     }
 
     /// Insert a cursor under the exact id carried by the event. The id is
     /// preserved (rather than freshly allocated) so undo/redo stays
     /// deterministic.
     fn apply_add_cursor(
-        &self,
+        &mut self,
         cursors: &mut Cursors,
         cursor_id: crate::model::event::CursorId,
         position: usize,
@@ -1296,6 +1330,32 @@ impl EditorState {
         extend_to_line_end: bool,
         url: Option<String>,
     ) -> crate::view::overlay::OverlayHandle {
+        let overlay = self.build_overlay(
+            namespace,
+            range,
+            face,
+            priority,
+            message,
+            extend_to_line_end,
+            url,
+        );
+        self.overlays.add(overlay)
+    }
+
+    /// The overlay [`add_overlay`](Self::add_overlay) adds, built (its
+    /// markers created) but not yet added: for a caller that sets a field
+    /// `add_overlay` takes no argument for before the overlay goes in.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_overlay(
+        &mut self,
+        namespace: Option<crate::view::overlay::OverlayNamespace>,
+        range: Range<usize>,
+        face: EventOverlayFace,
+        priority: i32,
+        message: Option<String>,
+        extend_to_line_end: bool,
+        url: Option<String>,
+    ) -> Overlay {
         let overlay_face = convert_event_face_to_overlay_face(&face);
         let mut overlay =
             Overlay::with_priority(&mut self.marker_list, range, overlay_face, priority);
@@ -1303,24 +1363,24 @@ impl EditorState {
         overlay.message = message;
         overlay.extend_to_line_end = extend_to_line_end;
         overlay.url = url;
-        self.overlays.add(overlay)
+        overlay
     }
 
     /// Show a popup synthesized from replayed [`PopupData`].
     ///
-    /// The replay path has no theme handle, so the popup is built with theme
-    /// *defaults*. Editor-level callers
+    /// The replay path has no theme handle, so the popup is built with the
+    /// built-in dark theme's colors. Editor-level callers
     /// (`Editor::apply_event_to_active_buffer`) intercept `Event::ShowPopup`
     /// *before* it reaches `state.apply` and build the popup with the live
     /// theme — see `event_apply.rs`. This is reached only when tests drive
     /// `state.apply` directly (no surrounding `Editor`).
     fn apply_show_popup(&mut self, popup: &PopupData) {
-        use crate::view::theme::{default_popup_bg, default_popup_border_fg};
-        let popup_obj = convert_popup_data_to_popup(
-            popup,
-            default_popup_bg().into(),
-            default_popup_border_fg().into(),
-        );
+        use crate::view::theme::{Theme, THEME_DARK};
+        static POPUP_STYLES: std::sync::OnceLock<(Style, Style)> = std::sync::OnceLock::new();
+        let &(bg, border) = POPUP_STYLES.get_or_init(|| {
+            popup_styles(&Theme::load_builtin(THEME_DARK).expect("dark builtin theme"))
+        });
+        let popup_obj = convert_popup_data_to_popup(popup, bg, border);
         self.popups.show_or_replace(popup_obj);
     }
 
@@ -1391,7 +1451,7 @@ impl EditorState {
 
         // Clear ephemeral decorations — their source systems will re-push
         // correct positions after the edit notification.
-        self.virtual_texts.clear(&mut self.marker_list);
+        self.virtual_texts.clear();
 
         use crate::view::overlay::OverlayNamespace;
         let namespaces = ["lsp-diagnostic", "reference-highlight", "bracket-highlight"];
@@ -1412,13 +1472,6 @@ impl EditorState {
 
         // Invalidate highlight cache for entire buffer
         self.highlighter.invalidate_all();
-
-        // Update primary cursor line number
-        let primary_pos = cursors.primary().position;
-        self.primary_cursor_line_number = match self.buffer.offset_to_position(primary_pos) {
-            Some(pos) => LineNumber::Absolute(pos.line),
-            None => LineNumber::Absolute(0),
-        };
     }
 
     /// Replay the marker and margin position adjustments recorded for a bulk
@@ -1445,6 +1498,28 @@ impl EditorState {
         self.marker_list.adjust_for_bulk_edits(edits);
         self.margins.adjust_for_bulk_edits(edits);
         self.scrollbar_markers.adjust_for_bulk_edits(edits);
+        self.virtual_texts.adjust_for_bulk_edits(edits);
+    }
+
+    /// Move every marker the buffer's decorations hold for `length` bytes
+    /// inserted at `position`: the shared list (overlays and the like), the
+    /// gutter indicators', the scrollbar's and the virtual texts' own. The
+    /// one place an edit reaches them all, so an owner can't be left behind
+    /// at its old positions by an edit path that forgot it.
+    pub(crate) fn adjust_markers_for_insert(&mut self, position: usize, length: usize) {
+        self.marker_list.adjust_for_insert(position, length);
+        self.margins.adjust_for_insert(position, length);
+        self.scrollbar_markers.adjust_for_insert(position, length);
+        self.virtual_texts.adjust_for_insert(position, length);
+    }
+
+    /// [`Self::adjust_markers_for_insert`] for `length` bytes deleted at
+    /// `position`.
+    pub(crate) fn adjust_markers_for_delete(&mut self, position: usize, length: usize) {
+        self.marker_list.adjust_for_delete(position, length);
+        self.margins.adjust_for_delete(position, length);
+        self.scrollbar_markers.adjust_for_delete(position, length);
+        self.virtual_texts.adjust_for_delete(position, length);
     }
 
     /// Capture positions of markers strictly inside a deleted range.
@@ -1475,6 +1550,17 @@ impl EditorState {
                     .encode(),
                 );
             }
+        }
+        for (vt, position) in self.virtual_texts.strictly_inside(range.start, range.end) {
+            let (class, id) = vt.to_parts();
+            displaced.push(
+                DisplacedMarker::VirtualText {
+                    class,
+                    id,
+                    position,
+                }
+                .encode(),
+            );
         }
         displaced
     }
@@ -1516,17 +1602,21 @@ impl EditorState {
                 DisplacedMarker::Margin { id, position } => {
                     self.margins.set_indicator_position(MarkerId(id), position);
                 }
+                DisplacedMarker::VirtualText {
+                    class,
+                    id,
+                    position,
+                } => {
+                    if let Some(vt) =
+                        crate::view::virtual_text::VirtualTextId::from_parts(class, id)
+                    {
+                        self.virtual_texts.set_position(vt, position);
+                    }
+                }
             }
         }
         if !displaced.is_empty() {
             self.wrap_indices.damage_all();
-        }
-    }
-
-    /// Apply multiple events in sequence
-    pub fn apply_many(&mut self, cursors: &mut Cursors, events: &[Event]) {
-        for event in events {
-            self.apply(cursors, event);
         }
     }
 
@@ -1638,16 +1728,26 @@ fn convert_event_face_to_overlay_face(event_face: &EventOverlayFace) -> OverlayF
     }
 }
 
+/// A popup's background and border styles: the theme's `ui.popup_bg` and
+/// `ui.popup_border_fg`, each with its text attributes.
+pub(crate) fn popup_styles(theme: &crate::view::theme::Theme) -> (Style, Style) {
+    use crate::view::theme::ThemeStyle;
+    (
+        Style::default().theme_bg(theme, "ui.popup_bg"),
+        Style::default().theme_fg(theme, "ui.popup_border_fg"),
+    )
+}
+
 /// Convert popup data to the actual popup object.
 ///
-/// `popup_bg` and `popup_border_fg` come from the active theme (the
-/// caller resolves them from `Theme::popup_bg` / `Theme::popup_border_fg`,
-/// which are already `ratatui::style::Color`). The replay path inside
-/// `EditorState::apply` has no theme handle and falls back to theme defaults.
+/// `popup_bg` and `popup_border` are the active theme's `ui.popup_bg` and
+/// `ui.popup_border_fg`, resolved with their text attributes (see
+/// [`popup_styles`]). The replay path inside `EditorState::apply` has no
+/// theme handle and falls back to theme defaults.
 pub(crate) fn convert_popup_data_to_popup(
     data: &PopupData,
-    popup_bg: Color,
-    popup_border_fg: Color,
+    popup_bg: Style,
+    popup_border: Style,
 ) -> Popup {
     let content = match &data.content {
         crate::model::event::PopupContentData::Text(lines) => PopupContent::Text(lines.clone()),
@@ -1655,6 +1755,7 @@ pub(crate) fn convert_popup_data_to_popup(
             items: items
                 .iter()
                 .map(|item| PopupListItem {
+                    id: item.id.clone(),
                     text: item.text.clone(),
                     detail: item.detail.clone(),
                     icon: item.icon.clone(),
@@ -1673,9 +1774,6 @@ pub(crate) fn convert_popup_data_to_popup(
         PopupPositionData::Fixed { x, y } => PopupPosition::Fixed { x, y },
         PopupPositionData::Centered => PopupPosition::Centered,
         PopupPositionData::BottomRight => PopupPosition::BottomRight,
-        PopupPositionData::AboveStatusBarAt { x, status_row } => {
-            PopupPosition::AboveStatusBarAt { x, status_row }
-        }
     };
 
     // Map the explicit kind hint to PopupKind for input handling
@@ -1734,9 +1832,10 @@ pub(crate) fn convert_popup_data_to_popup(
         width: data.width,
         max_height: data.max_height,
         bordered: data.bordered,
-        border_style: Style::default().fg(popup_border_fg),
-        background_style: Style::default().bg(popup_bg),
+        border_style: popup_border,
+        background_style: popup_bg,
         scroll_offset: 0,
+        pager: Default::default(),
         text_selection: None,
         accept_key_hint: None,
         resolver,
@@ -1790,19 +1889,21 @@ impl EditorState {
     /// this, mouse wheel and PageDown clamp to a row count that
     /// ignores virtual lines and stop short of the buffer's real tail.
     ///
+    /// `is_compose` is whether the pane scrolling is in page view: the lines a
+    /// plugin added as `composeOnly` are drawn only there, so a source pane
+    /// sharing the buffer with a composing one (dual mode) must not count
+    /// them, or its scroll stalls on rows it never draws.
+    ///
     /// Empty when no plugin has added virtual lines.
-    pub fn collect_virtual_line_positions(&self) -> Vec<usize> {
+    pub fn collect_virtual_line_positions(&self, is_compose: bool) -> Vec<usize> {
         if self.virtual_texts.is_empty() {
             return Vec::new();
         }
-        let mut v: Vec<usize> = self
-            .virtual_texts
-            .query_lines_in_range(&self.marker_list, 0, self.buffer.len() + 1)
+        self.virtual_texts
+            .all_lines(is_compose)
             .into_iter()
             .map(|(pos, _vt)| pos)
-            .collect();
-        v.sort_unstable();
-        v
+            .collect()
     }
 
     /// Resolve all plugin-injected soft-break `(byte_position, indent)`
@@ -1816,9 +1917,11 @@ impl EditorState {
     /// after the break — the wrap counter needs it to compute the
     /// continuation segment's effective width correctly.
     ///
-    /// Empty when no plugin is wrapping the buffer.
-    pub fn collect_soft_break_positions(&self) -> Vec<(usize, u16)> {
-        if self.soft_breaks.is_empty() {
+    /// Empty when no plugin is wrapping the buffer, and for a pane not in
+    /// page view (`is_compose` false): the renderer applies soft breaks in
+    /// page view only, so a source pane beside a composing one draws none.
+    pub fn collect_soft_break_positions(&self, is_compose: bool) -> Vec<(usize, u16)> {
+        if self.soft_breaks.is_empty() || !is_compose {
             return Vec::new();
         }
         // query_viewport already returns pairs sorted by ascending position.
@@ -1828,13 +1931,7 @@ impl EditorState {
             .query_viewport(0, self.buffer.len() + 1, &self.marker_list, &[])
     }
 
-    // ========== DocumentModel Helper Methods ==========
-    // These methods provide convenient access to DocumentModel functionality
-    // while maintaining backward compatibility with existing code.
-
-    /// Get text in a range, driving lazy loading transparently
-    ///
-    /// This is a convenience wrapper around DocumentModel::get_range that:
+    /// Get text in a range, driving lazy loading transparently:
     /// - Drives lazy loading automatically (never fails due to unloaded data)
     /// - Uses byte offsets directly
     /// - Returns String (not Result) - errors are logged internally
@@ -1861,70 +1958,19 @@ impl EditorState {
         }
     }
 
-    /// Get the content of a line by its byte offset
-    ///
-    /// Returns the line containing the given offset, along with its start position.
-    /// This uses DocumentModel's viewport functionality for consistent behavior.
-    ///
-    /// # Returns
-    /// `Some((line_start_offset, line_content))` if successful, `None` if offset is invalid
-    pub fn get_line_at_offset(&mut self, offset: usize) -> Option<(usize, String)> {
-        use crate::model::document_model::DocumentModel;
-
-        // Find the start of the line containing this offset
-        // Scan backwards to find the previous newline or start of buffer
-        let mut line_start = offset;
-        while line_start > 0 {
-            if let Ok(text) = self.buffer.get_text_range_mut(line_start - 1, 1) {
-                if text.first() == Some(&b'\n') {
-                    break;
-                }
-                line_start -= 1;
-            } else {
-                break;
+    /// The bytes in `start..end` exactly as the buffer holds them, for an
+    /// event that removes them: undo puts back these bytes, so a lossy
+    /// `String` would turn bytes that are not UTF-8 into U+FFFD (#3652).
+    pub fn get_edit_text(&mut self, start: usize, end: usize) -> EditText {
+        match self
+            .buffer
+            .get_text_range_mut(start, end.saturating_sub(start))
+        {
+            Ok(bytes) => EditText::from_bytes(bytes),
+            Err(e) => {
+                tracing::warn!("Failed to get text range {}..{}: {}", start, end, e);
+                EditText::default()
             }
-        }
-
-        // Get a single line viewport starting at the line start
-        let viewport = self
-            .get_viewport_content(
-                crate::model::document_model::DocumentPosition::byte(line_start),
-                1,
-            )
-            .ok()?;
-
-        viewport
-            .lines
-            .first()
-            .map(|line| (line.byte_offset, line.content.clone()))
-    }
-
-    /// Get text from current cursor position to end of line
-    ///
-    /// This is a common pattern in editing operations. Uses DocumentModel
-    /// for consistent behavior across file sizes.
-    pub fn get_text_to_end_of_line(&mut self, cursor_pos: usize) -> Result<String> {
-        use crate::model::document_model::DocumentModel;
-
-        // Get the line containing cursor
-        let viewport = self.get_viewport_content(
-            crate::model::document_model::DocumentPosition::byte(cursor_pos),
-            1,
-        )?;
-
-        if let Some(line) = viewport.lines.first() {
-            let line_start = line.byte_offset;
-            let line_end = line_start + line.content.len();
-
-            if cursor_pos >= line_start && cursor_pos <= line_end {
-                let offset_in_line = cursor_pos - line_start;
-                // Use get() to safely handle potential non-char-boundary offsets
-                Ok(line.content.get(offset_in_line..).unwrap_or("").to_string())
-            } else {
-                Ok(String::new())
-            }
-        } else {
-            Ok(String::new())
         }
     }
 
@@ -1933,207 +1979,21 @@ impl EditorState {
         self.semantic_tokens = Some(store);
     }
 
-    /// Clear cached semantic tokens (e.g., when tokens are invalidated).
-    pub fn clear_semantic_tokens(&mut self) {
-        self.semantic_tokens = None;
-    }
-
-    /// Get the server-provided semantic token result_id if available.
-    pub fn semantic_tokens_result_id(&self) -> Option<&str> {
-        self.semantic_tokens
-            .as_ref()
-            .and_then(|store| store.result_id.as_deref())
-    }
-}
-
-/// Implement DocumentModel trait for EditorState
-///
-/// This provides a clean abstraction layer between rendering/editing operations
-/// and the underlying text buffer implementation.
-impl DocumentModel for EditorState {
-    fn capabilities(&self) -> DocumentCapabilities {
-        let line_count = self.buffer.line_count();
-        DocumentCapabilities {
-            has_line_index: line_count.is_some(),
-            uses_lazy_loading: false, // TODO: add large file detection
-            byte_length: self.buffer.len(),
-            approximate_line_count: line_count.unwrap_or_else(|| {
-                // Estimate assuming ~80 bytes per line
-                self.buffer.len() / 80
-            }),
-        }
-    }
-
-    fn get_viewport_content(
-        &mut self,
-        start_pos: DocumentPosition,
-        max_lines: usize,
-    ) -> Result<ViewportContent> {
-        // Convert to byte offset
-        let start_offset = self.position_to_offset(start_pos)?;
-
-        // Use new efficient line iteration that tracks line numbers during iteration
-        // by accumulating line_feed_cnt from pieces (single source of truth)
-        let line_iter = self.buffer.iter_lines_from(start_offset, max_lines)?;
-        let has_more = line_iter.has_more;
-
-        let lines = line_iter
-            .map(|line_data| ViewportLine {
-                byte_offset: line_data.byte_offset,
-                content: line_data.content,
-                has_newline: line_data.has_newline,
-                approximate_line_number: line_data.line_number,
-            })
-            .collect();
-
-        Ok(ViewportContent {
-            start_position: DocumentPosition::ByteOffset(start_offset),
-            lines,
-            has_more,
-        })
-    }
-
-    fn position_to_offset(&self, pos: DocumentPosition) -> Result<usize> {
-        match pos {
-            DocumentPosition::ByteOffset(offset) => Ok(offset),
-            DocumentPosition::LineColumn { line, column } => {
-                if !self.has_line_index() {
-                    anyhow::bail!("Line indexing not available for this document");
-                }
-                // Use piece tree's position conversion
-                let position = crate::model::piece_tree::Position { line, column };
-                Ok(self.buffer.position_to_offset(position))
+    /// Mark cached semantic tokens as needing a re-pull even though the
+    /// buffer has not changed (the server sent
+    /// `workspace/semanticTokens/refresh`, or it restarted). The tokens stay
+    /// displayed until the new response replaces them, avoiding a flicker.
+    ///
+    /// `forget_result_id` drops the server's `resultId` so the next request
+    /// is a plain `full` rather than a `full/delta` against a baseline the
+    /// (possibly new) server process has never seen.
+    pub fn mark_semantic_tokens_stale(&mut self, forget_result_id: bool) {
+        if let Some(store) = self.semantic_tokens.as_mut() {
+            store.stale = true;
+            if forget_result_id {
+                store.result_id = None;
             }
         }
-    }
-
-    fn offset_to_position(&self, offset: usize) -> DocumentPosition {
-        if self.has_line_index() {
-            if let Some(pos) = self.buffer.offset_to_position(offset) {
-                DocumentPosition::LineColumn {
-                    line: pos.line,
-                    column: pos.column,
-                }
-            } else {
-                // Line index exists but metadata unavailable - fall back to byte offset
-                DocumentPosition::ByteOffset(offset)
-            }
-        } else {
-            DocumentPosition::ByteOffset(offset)
-        }
-    }
-
-    fn get_range(&mut self, start: DocumentPosition, end: DocumentPosition) -> Result<String> {
-        let start_offset = self.position_to_offset(start)?;
-        let end_offset = self.position_to_offset(end)?;
-
-        if start_offset > end_offset {
-            anyhow::bail!(
-                "Invalid range: start offset {} > end offset {}",
-                start_offset,
-                end_offset
-            );
-        }
-
-        let bytes = self
-            .buffer
-            .get_text_range_mut(start_offset, end_offset - start_offset)?;
-
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
-    }
-
-    fn get_line_content(&mut self, line_number: usize) -> Option<String> {
-        if !self.has_line_index() {
-            return None;
-        }
-
-        // Convert line number to byte offset
-        let line_start_offset = self.buffer.line_start_offset(line_number)?;
-
-        // Get line content using iterator
-        let mut iter = self.buffer.line_iterator(line_start_offset, 80);
-        if let Some((_start, content)) = iter.next_line() {
-            let has_newline = content.ends_with('\n');
-            let line_content = if has_newline {
-                content[..content.len() - 1].to_string()
-            } else {
-                content
-            };
-            Some(line_content)
-        } else {
-            None
-        }
-    }
-
-    fn get_chunk_at_offset(&mut self, offset: usize, size: usize) -> Result<(usize, String)> {
-        let bytes = self.buffer.get_text_range_mut(offset, size)?;
-
-        Ok((offset, String::from_utf8_lossy(&bytes).into_owned()))
-    }
-
-    fn insert(&mut self, pos: DocumentPosition, text: &str) -> Result<usize> {
-        let offset = self.position_to_offset(pos)?;
-        self.buffer.insert_bytes(offset, text.as_bytes().to_vec());
-        Ok(text.len())
-    }
-
-    fn delete(&mut self, start: DocumentPosition, end: DocumentPosition) -> Result<()> {
-        let start_offset = self.position_to_offset(start)?;
-        let end_offset = self.position_to_offset(end)?;
-
-        if start_offset > end_offset {
-            anyhow::bail!(
-                "Invalid range: start offset {} > end offset {}",
-                start_offset,
-                end_offset
-            );
-        }
-
-        self.buffer.delete(start_offset..end_offset);
-        Ok(())
-    }
-
-    fn replace(
-        &mut self,
-        start: DocumentPosition,
-        end: DocumentPosition,
-        text: &str,
-    ) -> Result<()> {
-        // Delete then insert
-        self.delete(start, end)?;
-        self.insert(start, text)?;
-        Ok(())
-    }
-
-    fn find_matches(
-        &mut self,
-        pattern: &str,
-        search_range: Option<(DocumentPosition, DocumentPosition)>,
-    ) -> Result<Vec<usize>> {
-        let (start_offset, end_offset) = if let Some((start, end)) = search_range {
-            (
-                self.position_to_offset(start)?,
-                self.position_to_offset(end)?,
-            )
-        } else {
-            (0, self.buffer.len())
-        };
-
-        // Get text in range
-        let bytes = self
-            .buffer
-            .get_text_range_mut(start_offset, end_offset - start_offset)?;
-        let text = String::from_utf8_lossy(&bytes);
-
-        // Find all matches (simple substring search for now)
-        let mut matches = Vec::new();
-        let mut search_offset = 0;
-        while let Some(pos) = text[search_offset..].find(pattern) {
-            matches.push(start_offset + search_offset + pos);
-            search_offset += pos + pattern.len();
-        }
-
-        Ok(matches)
     }
 }
 
@@ -2148,6 +2008,9 @@ pub struct SemanticTokenStore {
     pub data: Vec<u32>,
     /// All semantic token spans resolved to byte ranges.
     pub tokens: Vec<SemanticTokenSpan>,
+    /// The server asked for a re-pull (refresh / restart): the tokens are
+    /// still shown, but must not count as up to date for `version`.
+    pub stale: bool,
 }
 
 /// A semantic token span resolved to buffer byte offsets.
@@ -2246,7 +2109,7 @@ mod tests {
             &mut cursors,
             &Event::Insert {
                 position: 0,
-                text: "hello".to_string(),
+                text: "hello".to_string().into(),
                 cursor_id,
             },
         );
@@ -2272,7 +2135,7 @@ mod tests {
             &mut cursors,
             &Event::Insert {
                 position: 0,
-                text: "hello world".to_string(),
+                text: "hello world".to_string().into(),
                 cursor_id,
             },
         );
@@ -2281,7 +2144,7 @@ mod tests {
             &mut cursors,
             &Event::Delete {
                 range: 5..11,
-                deleted_text: " world".to_string(),
+                deleted_text: " world".to_string().into(),
                 cursor_id,
             },
         );
@@ -2308,7 +2171,7 @@ mod tests {
             &mut cursors,
             &Event::Insert {
                 position: 0,
-                text: "hello".to_string(),
+                text: "hello".to_string().into(),
                 cursor_id,
             },
         );
@@ -2319,7 +2182,7 @@ mod tests {
             &mut cursors,
             &Event::Insert {
                 position: 5,
-                text: "!".to_string(),
+                text: "!".to_string().into(),
                 cursor_id,
             },
         );
@@ -2330,7 +2193,7 @@ mod tests {
             &mut cursors,
             &Event::Delete {
                 range: 5..6,
-                deleted_text: "!".to_string(),
+                deleted_text: "!".to_string().into(),
                 cursor_id,
             },
         );
@@ -2356,7 +2219,7 @@ mod tests {
             &mut cursors,
             &Event::Insert {
                 position: 0,
-                text: "line0\nTARGET\n".to_string(),
+                text: "line0\nTARGET\n".to_string().into(),
                 cursor_id,
             },
         );
@@ -2379,7 +2242,7 @@ mod tests {
             &mut cursors,
             &Event::Insert {
                 position: 0,
-                text: above.to_string(),
+                text: above.to_string().into(),
                 cursor_id,
             },
         );
@@ -2401,7 +2264,7 @@ mod tests {
             &mut cursors,
             &Event::Delete {
                 range: 0..above.len(),
-                deleted_text: above.to_string(),
+                deleted_text: above.to_string().into(),
                 cursor_id,
             },
         );
@@ -2434,7 +2297,7 @@ mod tests {
             &mut cursors,
             &Event::Insert {
                 position: 0,
-                text: "hello".to_string(),
+                text: "hello".to_string().into(),
                 cursor_id,
             },
         );
@@ -2479,35 +2342,6 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_many() {
-        let mut state = EditorState::new(
-            80,
-            24,
-            crate::config::LARGE_FILE_THRESHOLD_BYTES as usize,
-            test_fs(),
-        );
-        let mut cursors = Cursors::new();
-        let cursor_id = cursors.primary_id();
-
-        let events = vec![
-            Event::Insert {
-                position: 0,
-                text: "hello ".to_string(),
-                cursor_id,
-            },
-            Event::Insert {
-                position: 6,
-                text: "world".to_string(),
-                cursor_id,
-            },
-        ];
-
-        state.apply_many(&mut cursors, &events);
-
-        assert_eq!(state.buffer.to_string().unwrap(), "hello world");
-    }
-
-    #[test]
     fn test_cursor_adjustment_after_insert() {
         let mut state = EditorState::new(
             80,
@@ -2533,7 +2367,7 @@ mod tests {
             &mut cursors,
             &Event::Insert {
                 position: 0,
-                text: "abc".to_string(),
+                text: "abc".to_string().into(),
                 cursor_id,
             },
         );
@@ -2544,281 +2378,61 @@ mod tests {
         }
     }
 
-    // DocumentModel trait tests
-    mod document_model_tests {
-        use super::*;
-        use crate::model::document_model::{DocumentModel, DocumentPosition};
-
-        #[test]
-        fn test_capabilities_small_file() {
-            let mut state = EditorState::new(
-                80,
-                24,
-                crate::config::LARGE_FILE_THRESHOLD_BYTES as usize,
-                test_fs(),
-            );
-            state.buffer = Buffer::from_str_test("line1\nline2\nline3");
-
-            let caps = state.capabilities();
-            assert!(caps.has_line_index, "Small file should have line index");
-            assert_eq!(caps.byte_length, "line1\nline2\nline3".len());
-            assert_eq!(caps.approximate_line_count, 3, "Should have 3 lines");
-        }
-
-        #[test]
-        fn test_position_conversions() {
-            let mut state = EditorState::new(
-                80,
-                24,
-                crate::config::LARGE_FILE_THRESHOLD_BYTES as usize,
-                test_fs(),
-            );
-            state.buffer = Buffer::from_str_test("hello\nworld\ntest");
-
-            // Test ByteOffset -> offset
-            let pos1 = DocumentPosition::ByteOffset(6);
-            let offset1 = state.position_to_offset(pos1).unwrap();
-            assert_eq!(offset1, 6);
-
-            // Test LineColumn -> offset
-            let pos2 = DocumentPosition::LineColumn { line: 1, column: 0 };
-            let offset2 = state.position_to_offset(pos2).unwrap();
-            assert_eq!(offset2, 6, "Line 1, column 0 should be at byte 6");
-
-            // Test offset -> position (should return LineColumn for small files)
-            let converted = state.offset_to_position(6);
-            match converted {
-                DocumentPosition::LineColumn { line, column } => {
-                    assert_eq!(line, 1);
-                    assert_eq!(column, 0);
-                }
-                _ => panic!("Expected LineColumn for small file"),
-            }
-        }
-
-        #[test]
-        fn test_get_viewport_content() {
-            let mut state = EditorState::new(
-                80,
-                24,
-                crate::config::LARGE_FILE_THRESHOLD_BYTES as usize,
-                test_fs(),
-            );
-            state.buffer = Buffer::from_str_test("line1\nline2\nline3\nline4\nline5");
-
-            let content = state
-                .get_viewport_content(DocumentPosition::ByteOffset(0), 3)
-                .unwrap();
-
-            assert_eq!(content.lines.len(), 3);
-            assert_eq!(content.lines[0].content, "line1");
-            assert_eq!(content.lines[1].content, "line2");
-            assert_eq!(content.lines[2].content, "line3");
-            assert!(content.has_more);
-        }
-
-        #[test]
-        fn test_get_range() {
-            let mut state = EditorState::new(
-                80,
-                24,
-                crate::config::LARGE_FILE_THRESHOLD_BYTES as usize,
-                test_fs(),
-            );
-            state.buffer = Buffer::from_str_test("hello world");
-
-            let text = state
-                .get_range(
-                    DocumentPosition::ByteOffset(0),
-                    DocumentPosition::ByteOffset(5),
-                )
-                .unwrap();
-            assert_eq!(text, "hello");
-
-            let text2 = state
-                .get_range(
-                    DocumentPosition::ByteOffset(6),
-                    DocumentPosition::ByteOffset(11),
-                )
-                .unwrap();
-            assert_eq!(text2, "world");
-        }
-
-        #[test]
-        fn test_get_line_content() {
-            let mut state = EditorState::new(
-                80,
-                24,
-                crate::config::LARGE_FILE_THRESHOLD_BYTES as usize,
-                test_fs(),
-            );
-            state.buffer = Buffer::from_str_test("line1\nline2\nline3");
-
-            let line0 = state.get_line_content(0).unwrap();
-            assert_eq!(line0, "line1");
-
-            let line1 = state.get_line_content(1).unwrap();
-            assert_eq!(line1, "line2");
-
-            let line2 = state.get_line_content(2).unwrap();
-            assert_eq!(line2, "line3");
-        }
-
-        #[test]
-        fn test_insert_delete() {
-            let mut state = EditorState::new(
-                80,
-                24,
-                crate::config::LARGE_FILE_THRESHOLD_BYTES as usize,
-                test_fs(),
-            );
-            state.buffer = Buffer::from_str_test("hello world");
-
-            // Insert text
-            let bytes_inserted = state
-                .insert(DocumentPosition::ByteOffset(6), "beautiful ")
-                .unwrap();
-            assert_eq!(bytes_inserted, 10);
-            assert_eq!(state.buffer.to_string().unwrap(), "hello beautiful world");
-
-            // Delete text
-            state
-                .delete(
-                    DocumentPosition::ByteOffset(6),
-                    DocumentPosition::ByteOffset(16),
-                )
-                .unwrap();
-            assert_eq!(state.buffer.to_string().unwrap(), "hello world");
-        }
-
-        #[test]
-        fn test_replace() {
-            let mut state = EditorState::new(
-                80,
-                24,
-                crate::config::LARGE_FILE_THRESHOLD_BYTES as usize,
-                test_fs(),
-            );
-            state.buffer = Buffer::from_str_test("hello world");
-
-            state
-                .replace(
-                    DocumentPosition::ByteOffset(0),
-                    DocumentPosition::ByteOffset(5),
-                    "hi",
-                )
-                .unwrap();
-            assert_eq!(state.buffer.to_string().unwrap(), "hi world");
-        }
-
-        #[test]
-        fn test_find_matches() {
-            let mut state = EditorState::new(
-                80,
-                24,
-                crate::config::LARGE_FILE_THRESHOLD_BYTES as usize,
-                test_fs(),
-            );
-            state.buffer = Buffer::from_str_test("hello world hello");
-
-            let matches = state.find_matches("hello", None).unwrap();
-            assert_eq!(matches.len(), 2);
-            assert_eq!(matches[0], 0);
-            assert_eq!(matches[1], 12);
-        }
-
-        #[test]
-        fn test_prepare_for_render() {
-            let mut state = EditorState::new(
-                80,
-                24,
-                crate::config::LARGE_FILE_THRESHOLD_BYTES as usize,
-                test_fs(),
-            );
-            state.buffer = Buffer::from_str_test("line1\nline2\nline3\nline4\nline5");
-
-            // Should not panic - pass top_byte=0 and height=24 (typical viewport params)
-            state.prepare_for_render(0, 24).unwrap();
-        }
-
-        #[test]
-        fn test_helper_get_text_range() {
-            let mut state = EditorState::new(
-                80,
-                24,
-                crate::config::LARGE_FILE_THRESHOLD_BYTES as usize,
-                test_fs(),
-            );
-            state.buffer = Buffer::from_str_test("hello world");
-
-            // Test normal range
-            let text = state.get_text_range(0, 5);
-            assert_eq!(text, "hello");
-
-            // Test middle range
-            let text2 = state.get_text_range(6, 11);
-            assert_eq!(text2, "world");
-        }
-
-        #[test]
-        fn test_helper_get_line_at_offset() {
-            let mut state = EditorState::new(
-                80,
-                24,
-                crate::config::LARGE_FILE_THRESHOLD_BYTES as usize,
-                test_fs(),
-            );
-            state.buffer = Buffer::from_str_test("line1\nline2\nline3");
-
-            // Get first line (offset 0)
-            let (offset, content) = state.get_line_at_offset(0).unwrap();
-            assert_eq!(offset, 0);
-            assert_eq!(content, "line1");
-
-            // Get second line (offset in middle of line)
-            let (offset2, content2) = state.get_line_at_offset(8).unwrap();
-            assert_eq!(offset2, 6); // Line starts at byte 6
-            assert_eq!(content2, "line2");
-
-            // Get last line
-            let (offset3, content3) = state.get_line_at_offset(12).unwrap();
-            assert_eq!(offset3, 12);
-            assert_eq!(content3, "line3");
-        }
-
-        #[test]
-        fn test_helper_get_text_to_end_of_line() {
-            let mut state = EditorState::new(
-                80,
-                24,
-                crate::config::LARGE_FILE_THRESHOLD_BYTES as usize,
-                test_fs(),
-            );
-            state.buffer = Buffer::from_str_test("hello world\nline2");
-
-            // From beginning of line
-            let text = state.get_text_to_end_of_line(0).unwrap();
-            assert_eq!(text, "hello world");
-
-            // From middle of line
-            let text2 = state.get_text_to_end_of_line(6).unwrap();
-            assert_eq!(text2, "world");
-
-            // From end of line
-            let text3 = state.get_text_to_end_of_line(11).unwrap();
-            assert_eq!(text3, "");
-
-            // From second line
-            let text4 = state.get_text_to_end_of_line(12).unwrap();
-            assert_eq!(text4, "line2");
-        }
-    }
-
     // Virtual text integration tests
     mod virtual_text_integration_tests {
         use super::*;
         use crate::view::virtual_text::VirtualTextPosition;
         use ratatui::style::Style;
+
+        /// A virtual text a deletion clamps (a bulk edit doesn't drop the
+        /// entries in its ranges) is recorded as displaced, under its own
+        /// tag and class, and undoing puts it back where it was. Virtual
+        /// texts keep their markers in lists of their own, so the main
+        /// list's record would not find them.
+        #[test]
+        fn undo_restores_a_virtual_text_a_deletion_displaced() {
+            let mut state = EditorState::new(
+                80,
+                24,
+                crate::config::LARGE_FILE_THRESHOLD_BYTES as usize,
+                test_fs(),
+            );
+            state.buffer = Buffer::from_str_test("hello world");
+            let hint = state.virtual_texts.add(
+                7,
+                "h".to_string(),
+                Style::default(),
+                VirtualTextPosition::AfterChar,
+                0,
+            );
+            let line = state.virtual_texts.add_line(
+                8,
+                "l".to_string(),
+                Style::default(),
+                VirtualTextPosition::LineBelow,
+                crate::view::virtual_text::VirtualTextNamespace::from_string("t".into()),
+                0,
+            );
+
+            let displaced = state.capture_displaced_markers(&(5..10));
+            for &(tag, pos) in &displaced {
+                assert_eq!(DisplacedMarker::decode(tag, pos).encode(), (tag, pos));
+            }
+            assert_eq!(
+                displaced.len(),
+                2,
+                "both entries inside the range: {displaced:?}"
+            );
+
+            state.replay_bulk_marker_adjustments(&[(5, 5, 0)]);
+            assert_eq!(state.virtual_texts.position_of(hint), Some(5));
+            assert_eq!(state.virtual_texts.position_of(line), Some(5));
+
+            state.replay_bulk_marker_adjustments(&[(5, 0, 5)]);
+            state.restore_displaced_markers(&displaced);
+            assert_eq!(state.virtual_texts.position_of(hint), Some(7));
+            assert_eq!(state.virtual_texts.position_of(line), Some(8));
+        }
 
         #[test]
         fn test_virtual_text_add_and_query() {
@@ -2837,7 +2451,6 @@ mod tests {
 
             // Add virtual text at position 5 (after 'hello')
             let vtext_id = state.virtual_texts.add(
-                &mut state.marker_list,
                 5,
                 ": string".to_string(),
                 Style::default(),
@@ -2846,19 +2459,19 @@ mod tests {
             );
 
             // Query should return the virtual text
-            let results = state.virtual_texts.query_range(&state.marker_list, 0, 11);
+            let results = state.virtual_texts.query_range(0, 11);
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].0, 5); // Position
             assert_eq!(results[0].1.text, ": string");
 
             // Build lookup should work
-            let lookup = state.virtual_texts.build_lookup(&state.marker_list, 0, 11);
+            let lookup = state.virtual_texts.build_lookup(0, 11);
             assert!(lookup.contains_key(&5));
             assert_eq!(lookup[&5].len(), 1);
             assert_eq!(lookup[&5][0].text, ": string");
 
             // Clean up
-            state.virtual_texts.remove(&mut state.marker_list, vtext_id);
+            state.virtual_texts.remove(vtext_id);
             assert!(state.virtual_texts.is_empty());
         }
 
@@ -2879,7 +2492,6 @@ mod tests {
 
             // Add virtual text at position 6 (the 'w' in 'world')
             let _vtext_id = state.virtual_texts.add(
-                &mut state.marker_list,
                 6,
                 "/*param*/".to_string(),
                 Style::default(),
@@ -2894,16 +2506,62 @@ mod tests {
                 &mut cursors,
                 &Event::Insert {
                     position: 6,
-                    text: "beautiful ".to_string(),
+                    text: "beautiful ".to_string().into(),
                     cursor_id,
                 },
             );
 
             // Virtual text should now be at position 16 (6 + 10)
-            let results = state.virtual_texts.query_range(&state.marker_list, 0, 30);
+            let results = state.virtual_texts.query_range(0, 30);
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].0, 16); // Position should have moved
             assert_eq!(results[0].1.text, "/*param*/");
+        }
+
+        /// Entries added through [`VirtualTextManager::add`] keep the
+        /// default right gravity whichever side they render on: the
+        /// async-paste placeholder's marker *is* the eventual insertion
+        /// point, so it has to travel with the text typed at it. The
+        /// left-gravity variant is opt-in per entry (see
+        /// `view::virtual_text::MarkerGravity`) and is what inlay hints
+        /// ask for — issue #722.
+        #[test]
+        fn test_after_char_virtual_text_tracks_its_character_on_insert() {
+            let mut state = EditorState::new(
+                80,
+                24,
+                crate::config::LARGE_FILE_THRESHOLD_BYTES as usize,
+                test_fs(),
+            );
+            state.buffer = Buffer::from_str_test("hello world");
+
+            if !state.buffer.is_empty() {
+                state.marker_list.adjust_for_insert(0, state.buffer.len());
+            }
+
+            let _vtext_id = state.virtual_texts.add(
+                6,
+                ": string".to_string(),
+                Style::default(),
+                VirtualTextPosition::AfterChar,
+                0,
+            );
+
+            let mut cursors = Cursors::new();
+            let cursor_id = cursors.primary_id();
+            state.apply(
+                &mut cursors,
+                &Event::Insert {
+                    position: 6,
+                    text: "beautiful ".to_string().into(),
+                    cursor_id,
+                },
+            );
+
+            let results = state.virtual_texts.query_range(0, 30);
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].0, 16);
+            assert_eq!(results[0].1.text, ": string");
         }
 
         #[test]
@@ -2923,7 +2581,6 @@ mod tests {
 
             // Add virtual text at position 16 (the 'w' in 'world')
             let _vtext_id = state.virtual_texts.add(
-                &mut state.marker_list,
                 16,
                 ": string".to_string(),
                 Style::default(),
@@ -2938,13 +2595,13 @@ mod tests {
                 &mut cursors,
                 &Event::Delete {
                     range: 6..16,
-                    deleted_text: "beautiful ".to_string(),
+                    deleted_text: "beautiful ".to_string().into(),
                     cursor_id,
                 },
             );
 
             // Virtual text should now be at position 6
-            let results = state.virtual_texts.query_range(&state.marker_list, 0, 20);
+            let results = state.virtual_texts.query_range(0, 20);
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].0, 6); // Position should have moved back
             assert_eq!(results[0].1.text, ": string");
@@ -2967,7 +2624,6 @@ mod tests {
 
             // Add type hint after 'x' (position 5)
             state.virtual_texts.add(
-                &mut state.marker_list,
                 5,
                 ": i32".to_string(),
                 Style::default(),
@@ -2977,7 +2633,6 @@ mod tests {
 
             // Add another hint at same position with higher priority
             state.virtual_texts.add(
-                &mut state.marker_list,
                 5,
                 " /* inferred */".to_string(),
                 Style::default(),
@@ -2986,7 +2641,7 @@ mod tests {
             );
 
             // Build lookup - should have both, sorted by priority (lower first)
-            let lookup = state.virtual_texts.build_lookup(&state.marker_list, 0, 10);
+            let lookup = state.virtual_texts.build_lookup(0, 10);
             assert!(lookup.contains_key(&5));
             let vtexts = &lookup[&5];
             assert_eq!(vtexts.len(), 2);
@@ -3012,7 +2667,6 @@ mod tests {
 
             // Add multiple virtual texts
             state.virtual_texts.add(
-                &mut state.marker_list,
                 0,
                 "hint1".to_string(),
                 Style::default(),
@@ -3020,7 +2674,6 @@ mod tests {
                 0,
             );
             state.virtual_texts.add(
-                &mut state.marker_list,
                 2,
                 "hint2".to_string(),
                 Style::default(),
@@ -3031,11 +2684,11 @@ mod tests {
             assert_eq!(state.virtual_texts.len(), 2);
 
             // Clear all
-            state.virtual_texts.clear(&mut state.marker_list);
+            state.virtual_texts.clear();
             assert!(state.virtual_texts.is_empty());
 
             // Query should return nothing
-            let results = state.virtual_texts.query_range(&state.marker_list, 0, 10);
+            let results = state.virtual_texts.query_range(0, 10);
             assert!(results.is_empty());
         }
     }

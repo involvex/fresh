@@ -120,16 +120,6 @@ fn wait_for_container_authority(harness: &mut EditorTestHarness) -> String {
     let max_iters = 200; // ~10s at 50ms per tick
     for _ in 0..max_iters {
         harness.tick_and_render().unwrap();
-        // The plugin stages the new authority via
-        // `editor.setAuthority(payload)`, which `install_authority`
-        // turns into a `pending_authority` slot plus a restart
-        // request. Production's `main.rs` consumes both: it drops the
-        // old editor and builds a fresh one with `set_boot_authority`.
-        // The harness has no such loop, so we do the swap inline.
-        if let Some(auth) = harness.editor_mut().take_pending_authority() {
-            harness.editor_mut().set_boot_authority(auth);
-            return harness.editor().authority().display_label.clone();
-        }
         if harness
             .editor()
             .authority()
@@ -250,7 +240,7 @@ fn drop_workspace_temp(_workspace: &Path) {}
 ///
 /// The fake docker exposes two hooks that make this checkable
 /// without a real container:
-///   - `FAKE_DC_PROBE_RESPONSE`: stdout for any `docker exec ... -c env`,
+///   - `FAKE_DC_PROBE_RESPONSE`: stdout for any `docker exec ... -c <env dump>`,
 ///     standing in for what `bash -lic env` would print inside a
 ///     real container.
 ///   - `<state>/exec_history`: tab-separated record of every `docker
@@ -285,14 +275,19 @@ fn user_env_probe_capture_propagates_path_into_subsequent_execs() {
 
     // Pin the env-probe response in the per-test state dir (process
     // env vars would leak across parallel test bins). The fake docker
-    // shim cats this file when invoked with `... -c env`.
+    // shim cats this file when invoked with `... -c <env dump>`.
     let state = harness
         .fake_devcontainer_state()
         .expect("fake state present")
         .to_path_buf();
+    // Shaped like the real dump (lib/env_dump.ts): an rc file's noise,
+    // the marker line, then NUL-separated records — one a multi-line value
+    // whose second line looks like a `PATH` of its own (#3586).
     fs::write(
         state.join("probe_response"),
-        "PATH=/home/vscode/.local/bin:/usr/local/bin:/usr/bin\nHOME=/home/vscode\nLANG=C.UTF-8\n",
+        "rc says: PATH=/noise\n\n__FRESH_ENV_DUMP_5d0b7a__\n\
+         PATH=/home/vscode/.local/bin:/usr/local/bin:/usr/bin\0HOME=/home/vscode\0\
+         MULTI=line1\nPATH=/evil\0LANG=C.UTF-8\0",
     )
     .expect("write probe_response");
 
@@ -306,19 +301,23 @@ fn user_env_probe_capture_propagates_path_into_subsequent_execs() {
     let _label = wait_for_container_authority(&mut harness);
 
     // Read the recorded exec history. The probe call should be in
-    // there: a `bash -l -i -c env` invocation against the just-up
-    // container — the plugin's `captureContainerLoginEnv` runs this
-    // before handing the payload to `setAuthority`.
+    // there: a `bash -l -i -c <env dump>` invocation (lib/env_dump.ts)
+    // against the just-up container — the plugin's
+    // `captureContainerLoginEnv` runs this before handing the payload to
+    // `setAuthority`.
     let history_path = state.join("exec_history");
     let history = fs::read_to_string(&history_path)
         .unwrap_or_else(|e| panic!("exec_history not found at {history_path:?}: {e}"));
     let probe_lines: Vec<_> = history
         .lines()
-        .filter(|l| l.contains("bash -l -i -c env") || l.contains("bash -l -c env"))
+        .filter(|l| {
+            (l.contains("bash -l -i -c ") || l.contains("bash -l -c "))
+                && l.contains("__FRESH_ENV_DUMP_")
+        })
         .collect();
     assert!(
         !probe_lines.is_empty(),
-        "plugin must call `bash -lic env` to capture userEnvProbe; \
+        "plugin must run its env dump under `bash -lic` to capture userEnvProbe; \
          exec_history was:\n{history}"
     );
 
@@ -349,6 +348,11 @@ fn user_env_probe_capture_propagates_path_into_subsequent_execs() {
         last.contains("PATH=/home/vscode/.local/bin:/usr/local/bin:/usr/bin"),
         "command_exists probe must include the captured PATH; \
          got line: {last:?}\nfull history:\n{final_history}"
+    );
+    assert!(
+        !last.contains("/evil") && !last.contains("/noise"),
+        "neither rc noise nor a value's continuation line may become PATH; \
+         got line: {last:?}"
     );
 
     drop_workspace_temp(&workspace);
@@ -389,12 +393,12 @@ fn attach_failure_surfaces_failed_attach_popup() {
             .with_fake_devcontainer(),
     )
     .unwrap();
-    // Per-test env knob — set AFTER the harness exists so the
-    // fake-devcontainer mutex (held in `FakeDevcontainerHandle`)
-    // already serializes us with other tests. Setting before the
-    // mutex is acquired races against sibling tests' subprocesses.
-    std::env::set_var("FAKE_DC_UP_FAIL", "1");
-    std::env::set_var("FAKE_DC_UP_FAIL_REASON", "image not found: bogus:latest");
+    // Per-test env knobs, set through the harness's pin: it already
+    // serializes us with other tests, and it unsets them when the harness
+    // drops, even if an assertion below panics first.
+    let env = harness.fake_devcontainer_env();
+    env.set_env("FAKE_DC_UP_FAIL", "1");
+    env.set_env("FAKE_DC_UP_FAIL_REASON", "image not found: bogus:latest");
     harness.tick_and_render().unwrap();
 
     accept_attach(&mut harness);
@@ -412,11 +416,6 @@ fn attach_failure_surfaces_failed_attach_popup() {
         harness.editor().authority().display_label,
     );
 
-    // Clean up env vars before the harness drops (releases the
-    // mutex). The harness's mutex guard is the only thing keeping
-    // a sibling test's subprocess from inheriting these vars.
-    std::env::remove_var("FAKE_DC_UP_FAIL");
-    std::env::remove_var("FAKE_DC_UP_FAIL_REASON");
     drop(harness);
     drop_workspace_temp(&workspace);
 }
@@ -436,12 +435,11 @@ fn attach_bad_json_surfaces_failed_attach_popup() {
             .with_fake_devcontainer(),
     )
     .unwrap();
-    // Set after the harness exists — see comment in
-    // `attach_failure_surfaces_failed_attach_popup`. The fake-
-    // devcontainer mutex held by the harness serializes us with
-    // sibling tests; setting before that mutex is acquired races
-    // against their subprocesses.
-    std::env::set_var("FAKE_DC_UP_BAD_JSON", "1");
+    // Through the harness's pin — see
+    // `attach_failure_surfaces_failed_attach_popup`.
+    harness
+        .fake_devcontainer_env()
+        .set_env("FAKE_DC_UP_BAD_JSON", "1");
     harness.tick_and_render().unwrap();
 
     accept_attach(&mut harness);
@@ -456,7 +454,6 @@ fn attach_bad_json_surfaces_failed_attach_popup() {
         "bad-JSON failure must not install a container authority"
     );
 
-    std::env::remove_var("FAKE_DC_UP_BAD_JSON");
     drop(harness);
     drop_workspace_temp(&workspace);
 }
@@ -730,12 +727,11 @@ fn attach_missing_container_id_surfaces_failed_attach_popup() {
             .with_fake_devcontainer(),
     )
     .unwrap();
-    // Set after the harness exists — see comment in
-    // `attach_failure_surfaces_failed_attach_popup`. The fake-
-    // devcontainer mutex held by the harness serializes us with
-    // sibling tests; setting before that mutex is acquired races
-    // against their subprocesses.
-    std::env::set_var("FAKE_DC_UP_NO_CONTAINER_ID", "1");
+    // Through the harness's pin — see
+    // `attach_failure_surfaces_failed_attach_popup`.
+    harness
+        .fake_devcontainer_env()
+        .set_env("FAKE_DC_UP_NO_CONTAINER_ID", "1");
     harness.tick_and_render().unwrap();
 
     accept_attach(&mut harness);
@@ -750,7 +746,6 @@ fn attach_missing_container_id_surfaces_failed_attach_popup() {
         "missing-containerId failure must not install a container authority"
     );
 
-    std::env::remove_var("FAKE_DC_UP_NO_CONTAINER_ID");
     drop(harness);
     drop_workspace_temp(&workspace);
 }
@@ -780,9 +775,8 @@ fn attach_succeeds_when_which_cannot_locate_cli() {
     )
     .unwrap();
 
-    // Shadow `which` AFTER the harness exists so the fake-devcontainer
-    // mutex already serializes us with sibling tests (same reasoning
-    // as the FAKE_DC_* env knobs above). The shim fails only for
+    // Shadow `which` through the harness's pin (same reasoning as the
+    // FAKE_DC_* env knobs above). The shim fails only for
     // `devcontainer` and delegates everything else, so the rest of the
     // attach flow (sh, mkdir, docker) is unaffected.
     let shim_temp = tempfile::tempdir().unwrap();
@@ -799,11 +793,9 @@ fn attach_succeeds_when_which_cannot_locate_cli() {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let saved_path = std::env::var("PATH").unwrap_or_default();
-    std::env::set_var(
-        "PATH",
-        format!("{}:{}", shim_temp.path().display(), saved_path),
-    );
+    harness
+        .fake_devcontainer_env()
+        .prepend_dir(shim_temp.path());
     harness.tick_and_render().unwrap();
 
     accept_attach(&mut harness);
@@ -813,7 +805,6 @@ fn attach_succeeds_when_which_cannot_locate_cli() {
         "attach must succeed without `which` vouching for the CLI; label = {label:?}"
     );
 
-    std::env::set_var("PATH", saved_path);
     drop(harness);
     drop_workspace_temp(&workspace);
 }

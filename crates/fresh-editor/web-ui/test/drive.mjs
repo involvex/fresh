@@ -27,6 +27,9 @@ const SHOTS = process.env.SHOTS || '/tmp/pw/shots';
 mkdirSync(SHOTS, { recursive: true });
 let pass = 0, fail = 0;
 const check = (n, c, x = '') => { c ? (pass++, console.log('  PASS ' + n)) : (fail++, console.log('  FAIL ' + n + ' ' + x)); };
+// A section the suite deliberately does not run: printed, counted as neither
+// pass nor fail, so a temporarily-absent feature cannot quietly pass either.
+const skip = n => console.log('  SKIP ' + n);
 const scene = p => p.evaluate(() => JSON.parse(JSON.stringify(window.fresh.scene)));
 // Grid→page pixel mapping: the COSMOS shell insets #app from the page origin,
 // so cell coordinates offset by the app origin the metrics carry (ax/ay).
@@ -129,6 +132,42 @@ const s2 = await scene(page);
 check('typed text appears in the real pipeline-rendered cells', paneText(s2).includes('QWZX'), `head="${paneText(s2).slice(0, 40)}"`);
 await page.screenshot({ path: `${SHOTS}/21-real-pipeline-typed.png` });
 
+console.log('\n[unicode: the grid walks GRAPHEME CLUSTERS, not UTF-16 units]');
+// Every cell gets one x in the SVG. A ZWJ sequence, a flag, a skin tone or a
+// base+combining pair is ONE cell made of several UTF-16 units, so counting
+// `.length` used to hand each piece its own column: the emoji broke into
+// fragments and the rest of the line drifted right. The rendered row must stay
+// exactly as wide (in cells) as a plain ASCII row of the same pane.
+const UNI = 'UNI[\u{1F468}\u200D\u{1F469}\u200D\u{1F467}\u200D\u{1F466}|\u{1F1EE}\u{1F1F1}|\u{1F44D}\u{1F3FD}|a\u0301e\u0300o\u0302]';
+await page.keyboard.press('Home');
+await page.keyboard.insertText(UNI + '\n');
+await page.waitForFunction(t => window.fresh.scene.regions.panes[0].cells
+  .some(r => r.map(x => x.t).join('').includes(t)), 'UNI[', { timeout: 5000 }).catch(() => {});
+const uni = await page.evaluate(() => {
+  const texts = [...document.querySelectorAll('.region.pane-content svg.cells text')];
+  const xs = t => [...t.querySelectorAll('tspan')]
+    .reduce((n, sp) => n + (sp.getAttribute('x') || '').trim().split(/\s+/).filter(Boolean).length, 0);
+  const row = texts.find(t => t.textContent.includes('UNI['));
+  if (!row) return null;
+  const plain = texts.find(t => t !== row && /^[\x20-\x7E]*$/.test(t.textContent));
+  const cluster = [...row.querySelectorAll('tspan')].find(sp => sp.textContent === '\u{1F44D}\u{1F3FD}');
+  return {
+    cells: xs(row),
+    plainCells: plain ? xs(plain) : null,
+    clusterXs: cluster ? (cluster.getAttribute('x') || '').trim().split(/\s+/).filter(Boolean).length : null,
+  };
+});
+check('the unicode row rendered', !!uni, 'row not found');
+check('a multi-unit cluster is ONE positioned cell', uni && uni.clusterXs === 1, JSON.stringify(uni));
+check('the unicode row is exactly as wide (in cells) as an ASCII row',
+  !!uni && uni.plainCells != null && uni.cells === uni.plainCells, JSON.stringify(uni));
+await page.screenshot({ path: `${SHOTS}/21-unicode-graphemes.png` });
+// Undo the probe line so the rest of the suite sees the file it expected.
+for (let i = 0; i < 8 && (await scene(page)).regions.panes[0].cells
+  .some(r => r.map(x => x.t).join('').includes('UNI[')); i++) {
+  await page.keyboard.press('Control+z'); await page.waitForTimeout(120);
+}
+
 console.log('\n[file explorer = native tree, NOT cells]');
 await page.locator('body').click();
 // Open the sidebar if it isn't already (Ctrl+B toggles; the live editor may
@@ -173,213 +212,280 @@ await page.screenshot({ path: `${SHOTS}/27-native-widgets.png` });
 await page.keyboard.press('Escape'); await page.waitForTimeout(200);
 
 console.log('\n[plugin floating/dock widget = native WidgetSpec, NOT cells]');
-if (!((await scene(page)).regions.widgets || []).length) {
+// **This probe has a side effect, and it has to be undone when the probe comes
+// up empty.** The toggle opens the *editor's* dock to make a surface appear;
+// with the web projection deleted no surface ever appears, but the dock really
+// did open, and the guarded skip below means nothing closes it again. It then
+// eats ~30 columns for the whole rest of the run — which is not cosmetic: four
+// terminal-selection checks assert on status-bar segment text, and the narrower
+// bar truncates "… read only (Ctrl+Space …)" clean out of existence, exactly as
+// the comment further down this file has always warned.
+let dockProbeOpened = false;
+// **The plugin panels come to the web as the display list** (`regions.tree`):
+// the items the retained tree produced for the dock, a floating panel and the
+// plugin sidebar sections, folded into DOM by 72-tree.js. There is no widget
+// spec to walk and no hit list to echo — a click is a cell, routed over the
+// tree like a terminal click — so every assertion below reads the tree's
+// items and clicks their cells.
+const treeOf = async () => ((await scene(page)).regions.tree) || { surfaces: [], items: [] };
+const treeSurface = async kind => (await treeOf()).surfaces.find(s => s.kind === kind);
+const treeLines = (t, kind) => {
+  const si = t.surfaces.findIndex(s => s.kind === kind);
+  return t.items.filter(i => i.surface === si && i.kind === 'lines').map(i => ({ ...i, text: (i.lines || []).join('\n') }));
+};
+const findLine = (t, kind, re) => treeLines(t, kind).find(i => re.test(i.text));
+const surfaceText = (t, kind) => treeLines(t, kind).map(i => i.text).join('\n');
+const cellPx = async (col, row) => {
+  const m = await page.evaluate(() => window.fresh.metrics);
+  return { x: m.ax + (col + 0.5) * m.cw, y: m.ay + (row + 0.5) * m.ch };
+};
+const clickCell = async (col, row, opts) => { const p = await cellPx(col, row); await page.mouse.click(p.x, p.y, opts || {}); };
+const clickLine = async (it, opts) => clickCell(it.x + Math.min(it.w - 1, 2), it.y, opts);
+const waitTree = (pred, arg, ms) => page.waitForFunction((a) => {
+  const t = window.fresh.scene.regions.tree; if (!t || !t.surfaces) return false;
+  const lines = kind => { const si = t.surfaces.findIndex(s => s.kind === kind); return t.items.filter(i => i.surface === si && i.kind === 'lines').map(i => (i.lines || []).join('\n')); };
+  // eslint-disable-next-line no-new-func
+  return (new Function('t', 'lines', 'a', 'return (' + a.src + ')(t, lines, a.arg)'))(t, lines, a);
+}, { src: pred.toString(), arg }, { timeout: ms || 8000 }).catch(() => {});
+
+if (!(await treeSurface('dock'))) {
   await page.request.post(URL + '/action', { data: { action: 'orchestrator_dock_toggle' } });
+  dockProbeOpened = true;
 }
-await page.waitForFunction(() => { const w = window.fresh.scene.regions.widgets; return w && w.length > 0; }, { timeout: 8000 }).catch(() => {});
+await waitTree((t) => t.surfaces.some(s => s.kind === 'dock'));
 await page.waitForTimeout(300);
-check('editor reports a widget surface', !!((await scene(page)).regions.widgets || []).length);
-// The redesigned dock (hierarchical folder tree) collapses the filter
-// toggles behind a "Filters" disclosure — expand it so the full toolbar
-// (view / project / worktree / hide-trivial / Manage) is rendered.
-await page.locator('.widget-surface.w-dock .w-button', { hasText: 'Filters' }).first().click();
-await page.waitForTimeout(400);
-check('dock rendered as a native widget panel', (await page.locator('.widget-surface .w-button').count()) >= 3);
-check('NO svg/cells inside the widget panel', (await page.locator('.widget-surface svg').count()) === 0);
-await page.screenshot({ path: `${SHOTS}/28-native-dock.png` });
+const webDockPanels = !!(await treeSurface('dock'));
+check('the dock is in the display list the web folds', webDockPanels);
+if (webDockPanels) {
+  // The redesigned dock collapses the filter toggles behind a "Filters"
+  // disclosure — expand it so the full toolbar is rendered.
+  const filters = findLine(await treeOf(), 'dock', /Filters/);
+  if (filters) await clickLine(filters);
+  await page.waitForTimeout(400);
+  check('dock rendered from the display list', (await page.locator('.tree-item').count()) >= 5);
+  check('NO svg/cells inside the dock', (await page.locator('.tree svg').count()) === 0);
+  await page.screenshot({ path: `${SHOTS}/28-native-dock.png` });
 
-console.log('\n[dock widget clicks: identity-routed, robust against hit-list drift]');
-// Panel clicks are delivered by IDENTITY (widgetKey + eventType + payload),
-// with the raw hit index only as a tiebreaker — raw indices go stale whenever
-// the plugin re-renders between the pushed frame and the click, and list hits
-// are windowed to the TUI's visible rows (the web list is natively scrolled,
-// so its lower rows may have no recorded hit at all). Full multi-workspace
-// reproduction (start real workspaces, click rows below the TUI fold) is
-// deliberately NOT run here: each orchestrator workspace creates a real git
-// worktree + spawned shell session under ~/.local/share/fresh (persistent
-// side effects, seconds each, trust-dialog churn) — not CI-safe. The
-// off-window synthesis path is covered by the resolver's spec-driven design;
-// what CI covers is the identity routing itself, including stale indices.
-const dockSurf = async () => ((await scene(page)).regions.widgets || []).find(w => w.kind === 'dock');
-const findByKey = (sp, key) => { if (!sp) return undefined; if (sp.key === key) return sp;
-  for (const c of (sp.children || [])) { const r = findByKey(c, key); if (r !== undefined) return r; }
-  return sp.child ? findByKey(sp.child, key) : undefined; };
-const d0 = await dockSurf();
-const t0v = !!(findByKey(d0.spec, 'hide-trivial') || {}).checked;
-await page.locator('.widget-surface.w-dock .w-toggle', { hasText: 'empty' }).first().click();
-await page.waitForFunction(v0 => { const d = (window.fresh.scene.regions.widgets || []).find(w => w.kind === 'dock');
-  const f = sp => { if (!sp) return undefined; if (sp.key === 'hide-trivial') return sp; for (const c of (sp.children || [])) { const r = f(c); if (r !== undefined) return r; } return sp.child ? f(sp.child) : undefined; };
-  return d && !!(f(d.spec) || {}).checked !== v0; }, t0v, { timeout: 5000 }).catch(() => {});
-const t1v = !!(findByKey((await dockSurf()).spec, 'hide-trivial') || {}).checked;
-check('dock toggle click flips real plugin state (identity-routed)', t1v !== t0v, `checked ${t0v}->${t1v}`);
-// The hits list was regenerated by that re-render; the next click must still resolve.
-await page.locator('.widget-surface.w-dock .w-toggle', { hasText: 'empty' }).first().click();
-await page.waitForFunction(v1 => { const d = (window.fresh.scene.regions.widgets || []).find(w => w.kind === 'dock');
-  const f = sp => { if (!sp) return undefined; if (sp.key === 'hide-trivial') return sp; for (const c of (sp.children || [])) { const r = f(c); if (r !== undefined) return r; } return sp.child ? f(sp.child) : undefined; };
-  return d && !!(f(d.spec) || {}).checked !== v1; }, t1v, { timeout: 5000 }).catch(() => {});
-const t2v = !!(findByKey((await dockSurf()).spec, 'hide-trivial') || {}).checked;
-check('dock click still resolves after the hits list was regenerated', t2v === t0v, `checked ${t1v}->${t2v}`);
-// THE regression shape: a stale/bogus hitIndex with a correct identity must
-// still deliver (pre-fix, hitIndex was the only routing and this was a
-// silent no-op). Same bridge dispatch as the WS path.
-const dStale = await dockSurf();
-const staleHit = dStale.hits.find(h => h.widgetKey === 'hide-trivial');
-await page.request.post(URL + '/widget', { data: { surface: 'panel', plugin: dStale.plugin, panelId: dStale.panelId,
-  widgetKey: staleHit.widgetKey, eventType: staleHit.eventType, payload: staleHit.payload, hitIndex: 999 } });
-await page.waitForFunction(v2 => { const d = (window.fresh.scene.regions.widgets || []).find(w => w.kind === 'dock');
-  const f = sp => { if (!sp) return undefined; if (sp.key === 'hide-trivial') return sp; for (const c of (sp.children || [])) { const r = f(c); if (r !== undefined) return r; } return sp.child ? f(sp.child) : undefined; };
-  return d && !!(f(d.spec) || {}).checked !== v2; }, t2v, { timeout: 5000 }).catch(() => {});
-const t3v = !!(findByKey((await dockSurf()).spec, 'hide-trivial') || {}).checked;
-check('stale hitIndex + correct identity still delivers (drift regression)', t3v !== t2v, `checked ${t2v}->${t3v}`);
-// A session tree-row click selects it through the same identity path.
-await page.locator('.widget-surface.w-dock .w-tree-row').first().click();
-await page.waitForTimeout(500);
-const dSel = await dockSurf();
-check('clicking a dock workspace row selects it in the scene',
-  !!dSel && dSel.instances && dSel.instances.sessions && dSel.instances.sessions.selectedIndex === 0,
-  JSON.stringify(dSel && dSel.instances));
+  // What a second backend owes the display list, each one a way the dock came
+  // out wrong in a browser while the terminal drew it right.
+  console.log('\n[the dock is all of what the terminal draws there]');
+  {
+    const t = await treeOf();
+    const si = t.surfaces.findIndex(s => s.kind === 'dock');
+    const dk = t.surfaces[si];
+    // (1) The surface is the whole subtree: the wall down the column's last
+    // cell is `grip_strip`, a SIBLING of the keyed column, so a projection
+    // rooted at the column alone ships a dock with no right edge.
+    const wall = t.items.filter(i => i.surface === si && i.x === dk.x + dk.w - 1
+      && (i.lines || []).some(l => /[│┃]/.test(l)));
+    check('the dock\'s wall is in the display list, down its last column',
+      wall.length >= dk.h - 1, `${wall.length} of ${dk.h} rows`);
+    // (2) A vertical wall is drawn as a RULE, not as the font's glyph — the
+    // same substitution svg.cells makes, because a glyph stacked at our cell
+    // height leaves a gap between rows and the wall comes out dashed.
+    check('the wall is drawn as rules, not stacked glyphs',
+      (await page.locator('.tree .tree-rule').count()) >= dk.h - 1);
+    check('no │ glyph is left behind the rules',
+      (await page.evaluate(() => [...document.querySelectorAll('.tree .tree-line')]
+        .every(e => !/[│┃]/.test(e.textContent)))));
+    // (3) The surface carries its own ground. The terminal clears the frame to
+    // the theme background before folding; the web has no such clear, so a
+    // cell no item paints showed the page (the wallpaper) through the dock.
+    // A colour OR an image: the default ground is the theme background, and a
+    // web theme may dress it into something else (Cosmos frosts it, which is a
+    // gradient over a blurred backdrop and so has no background *colour*).
+    const ground = await page.evaluate(() => {
+      const el = document.querySelector('.tree-surface.dock');
+      if (!el) return null;
+      const cs = getComputedStyle(el);
+      return { color: cs.backgroundColor, image: cs.backgroundImage };
+    });
+    check('the dock surface paints a ground',
+      !!ground && (!/rgba\([^)]*,\s*0\)/.test(ground.color) || ground.image !== 'none'),
+      JSON.stringify(ground));
+    // (4) The runs are GRID text: pinned to the buffer's monospace stack at the
+    // measured size with the cell tracking, so a web theme that repoints the
+    // chrome font at a proportional stack (macOS) cannot shrink them out of the
+    // cells the tree laid them out in. Forced here on <body> directly — the
+    // editor never sees it, so nothing reflows.
+    const pitch = await page.evaluate(() => {
+      const pick = () => [...document.querySelectorAll('.tree .tree-line')]
+        .find(e => (e.textContent || '').trim().length >= 6);
+      const cw = window.fresh.metrics.cw;
+      const measure = () => { const e = pick(); return e ? e.getBoundingClientRect().width / e.textContent.length : null; };
+      const before = measure();
+      const b = document.body.style;
+      const keep = [b.fontFamily, b.fontSize, b.letterSpacing];
+      b.fontFamily = 'Georgia, serif'; b.fontSize = '9px'; b.letterSpacing = 'normal';
+      const after = measure();
+      const fam = getComputedStyle(pick()).fontFamily;
+      [b.fontFamily, b.fontSize, b.letterSpacing] = keep;
+      return { cw, before, after, fam };
+    });
+    check('a panel run advances one cell per character',
+      pitch.before != null && Math.abs(pitch.before - pitch.cw) < 0.5, JSON.stringify(pitch));
+    check('and keeps that pitch under a proportional chrome font',
+      pitch.after != null && Math.abs(pitch.after - pitch.cw) < 0.5 && /mono/i.test(pitch.fam), JSON.stringify(pitch));
+    // (5) A web theme has a say over the fold's answer, and the item's theme
+    // KEY is what it aims at. The fold's colour is the fallback in the var
+    // chain (`--fold-bg`), never an inline value, so an ordinary rule on
+    // `--ink-bg` wins — which is the whole reason a Winamp dock can be a green
+    // playlist while the editor's palette says otherwise.
+    const remap = await page.evaluate(() => {
+      const el = document.querySelector('.tree-item[data-surface-kind="dock"][data-bg]');
+      if (!el) return null;
+      const before = getComputedStyle(el).backgroundColor;
+      // Scoped through `#app` so the probe out-specifies whatever the ACTIVE
+      // theme already says about this key — the id beats any number of classes,
+      // and the first dock item carrying a key is often one the theme dresses
+      // (Cosmos re-maps `ui.menu_bg`, the title bar, at higher specificity than
+      // a bare `.tree-item[data-bg]`). What is under test is that the fold's
+      // colour is a *fallback* and so can be beaten by a rule at all; a rule
+      // that loses to the theme's own would prove nothing either way.
+      const st = document.createElement('style');
+      st.textContent = `#app .tree-item[data-bg="${el.dataset.bg}"]{--ink-bg:rgb(1, 2, 3)}`;
+      document.head.appendChild(st);
+      const after = getComputedStyle(el).backgroundColor;
+      st.remove();
+      return { key: el.dataset.bg, before, after, restored: getComputedStyle(el).backgroundColor };
+    });
+    check('a web theme re-maps an item by the theme key it names',
+      !!remap && remap.after === 'rgb(1, 2, 3)' && remap.restored === remap.before, JSON.stringify(remap));
 
-console.log('\n[dock right-click = plugin context menu (anchored popup, like the TUI)]');
-// Right-click on a session row fires a `context` widget event (never in the
-// recorded hits — the bridge synthesizes it, exactly like the TUI's
-// right-click path) and the orchestrator raises its anchored Visit / Move /
-// Archive / Delete popup, undimmed, dismissed by Esc or an outside click.
-const modalSurf = async () => ((await scene(page)).regions.widgets || []).find(w => w.kind === 'floatingModal');
-await page.locator('.widget-surface.w-dock .w-tree-row').first().click({ button: 'right' });
-await page.waitForFunction(() => (window.fresh.scene.regions.widgets || []).some(w => w.kind === 'floatingModal'), { timeout: 8000 }).catch(() => {});
-const ctxM = await modalSurf();
-check('right-click on a dock row opens the context-menu panel', !!ctxM);
-check('context menu is ANCHORED (popup placement, not centered)', !!ctxM && ctxM.anchored === true);
-const ctxText = ctxM ? await page.locator('.widget-surface.w-floatingModal').innerText() : '';
-check('context menu offers Visit / Move to folder / Archive / Delete',
-  /Visit/.test(ctxText) && /Move to Folder/i.test(ctxText) && /Archive/.test(ctxText) && /Delete/.test(ctxText), ctxText);
-check('anchored popup scrim is transparent (no modal dim)', (await page.locator('.modal-scrim.scrim-clear').count()) === 1);
-await page.screenshot({ path: `${SHOTS}/29-dock-context-menu.png` });
-// Esc dismisses the popup; the dock survives.
-await page.keyboard.press('Escape');
-await page.waitForFunction(() => !(window.fresh.scene.regions.widgets || []).some(w => w.kind === 'floatingModal'), { timeout: 8000 }).catch(() => {});
-check('Esc closes the context menu', !(await modalSurf()));
-// Reopen; a click outside the popup dismisses it (standard menu behaviour).
-await page.locator('.widget-surface.w-dock .w-tree-row').first().click({ button: 'right' });
-await page.waitForFunction(() => (window.fresh.scene.regions.widgets || []).some(w => w.kind === 'floatingModal'), { timeout: 8000 }).catch(() => {});
-await page.locator('.modal-scrim.scrim-clear').click({ position: { x: 900, y: 600 } });
-await page.waitForFunction(() => !(window.fresh.scene.regions.widgets || []).some(w => w.kind === 'floatingModal'), { timeout: 8000 }).catch(() => {});
-check('outside-click dismisses the context menu', !(await modalSurf()));
+    // (6) The column's last cell is the editor's width grip; the cell mapping
+    // forwards the drag, this is the affordance that says so.
+    const grip = await page.evaluate(() => {
+      const g = document.querySelector('.tree .resize-grip');
+      if (!g) return null;
+      const cs = getComputedStyle(g);
+      return { cursor: cs.cursor, pe: cs.pointerEvents, left: parseFloat(g.style.left) };
+    });
+    check('the dock edge carries a resize grip', !!grip && grip.cursor === 'col-resize'
+      && grip.pe === 'auto' && Math.abs(grip.left - (dk.x + dk.w - 1) * (await page.evaluate(() => window.fresh.metrics.cw))) < 1,
+      JSON.stringify(grip));
+  }
 
-console.log('\n[widget text field = native <input>, host-authoritative echo + caret]');
-// The dock's "Search Tasks" field is a widget Text: it must render as a real
-// <input> whose value/caret mirror the host TextEdit per keystroke (the spec
-// value is initial-only and would lag until the plugin round-trip).
-const dockSearch = page.locator('.widget-surface.w-dock input.w-text-input').first();
-check('widget text field renders as a native <input>', (await dockSearch.count()) === 1);
-await dockSearch.click();
-await page.waitForTimeout(400);
-check('clicking the field takes real DOM focus (native caret)', await page.evaluate(() =>
-  document.activeElement && document.activeElement.classList.contains('w-text-input')));
-let echoOk = true;
-for (const ch of 'abc') {
-  await page.keyboard.type(ch);
-  const want = 'abc'.slice(0, 'abc'.indexOf(ch) + 1);
-  const ok = await page.waitForFunction(w => document.activeElement.value === w, want, { timeout: 2000 }).then(() => true).catch(() => false);
-  if (!ok) { echoOk = false; break; }
+  console.log('\n[dock clicks are cells routed over the tree]');
+  // The "Empty workspaces" toggle: its row's marker changes state when
+  // clicked, and again when clicked once more. It lives in the menu the
+  // header's `Menu ▾` button opens, which is an anchored layer over the
+  // editor (a `floating` surface), not rows inside the dock column. A
+  // settings row leaves the menu open, so both clicks land on the same menu.
+  const DOCK_MENU = /Menu ▾/;
+  const openDockMenu = async () => {
+    const trigger = findLine(await treeOf(), 'dock', DOCK_MENU);
+    if (trigger) await clickLine(trigger);
+    await waitTree((t, lines) => lines('floating').some(l => /empty/i.test(l)), null, 5000);
+  };
+  const toggleLine = async () => findLine(await treeOf(), 'floating', /empty/i);
+  const toggleText = async () => { const it = await toggleLine(); return it ? it.text : null; };
+  // The toggle's own row, within the menu's text: the item is the whole menu.
+  const clickToggle = async () => {
+    const it = await toggleLine();
+    if (!it) return;
+    // The menu is two columns side by side: click the label's own cell.
+    const rows = it.text.split('\n');
+    const row = rows.findIndex(l => /empty/i.test(l));
+    await clickCell(it.x + rows[row].search(/empty/i), it.y + row);
+  };
+  await openDockMenu();
+  const t0 = await toggleText();
+  await clickToggle();
+  await waitTree((t, lines, v0) => lines('floating').some(l => /empty/i.test(l) && l !== v0), t0, 5000);
+  const t1 = await toggleText();
+  check('dock toggle click flips real plugin state', t1 !== null && t1 !== t0, `${JSON.stringify(t0)} -> ${JSON.stringify(t1)}`);
+  await clickToggle();
+  await waitTree((t, lines, v1) => lines('floating').some(l => /empty/i.test(l) && l !== v1), t1, 5000);
+  const t2 = await toggleText();
+  check('a second click flips it back (the frame the click landed on was rebuilt)', t2 === t0, `${JSON.stringify(t1)} -> ${JSON.stringify(t2)}`);
+  // Esc closes the menu and puts the dock back to its plain state for what
+  // follows.
+  await page.keyboard.press('Escape');
+  await waitTree((t) => !t.surfaces.some(s => s.kind === 'floating'), null, 5000);
+
+  console.log('\n[dock right-click = plugin context menu (anchored popup, like the TUI)]');
+  // Right-click on a session row fires the plugin's `context` event exactly as
+  // the TUI's right-click does, and the orchestrator raises its anchored
+  // Visit / Move / Archive / Delete popup as a floating panel — undimmed,
+  // dismissed by Esc or an outside click.
+  const sessionRow = async () => {
+    const t = await treeOf();
+    const rows = treeLines(t, 'dock');
+    const named = rows.find(i => /fresh/.test(i.text) && !/Filters|New Task|Search/.test(i.text));
+    return named || rows[rows.length - 1];
+  };
+  const floating = async () => (await treeOf()).surfaces.find(s => s.kind === 'floating');
+  let row = await sessionRow();
+  if (row) await clickLine(row, { button: 'right' });
+  await waitTree((t) => t.surfaces.some(s => s.kind === 'floating'));
+  const ctxM = await floating();
+  check('right-click on a dock row opens the context-menu panel', !!ctxM);
+  check('context menu is ANCHORED (popup placement, not centered)', !!ctxM && ctxM.anchored === true);
+  const ctxText = surfaceText(await treeOf(), 'floating');
+  check('context menu offers Visit / Move to folder / Archive / Delete',
+    /Visit/.test(ctxText) && /Move to Folder/i.test(ctxText) && /Archive/.test(ctxText) && /Delete/.test(ctxText), ctxText);
+  check('anchored popup has no dimming scrim', !(await treeOf()).items.some(i => i.kind === 'scrim' && i.dim));
+  await page.screenshot({ path: `${SHOTS}/29-dock-context-menu.png` });
+  await page.keyboard.press('Escape');
+  await waitTree((t) => !t.surfaces.some(s => s.kind === 'floating'));
+  check('Esc closes the context menu', !(await floating()));
+  row = await sessionRow();
+  if (row) await clickLine(row, { button: 'right' });
+  await waitTree((t) => t.surfaces.some(s => s.kind === 'floating'));
+  {
+    const sc = await scene(page);
+    await clickCell(sc.w - 2, sc.h - 3);
+  }
+  await waitTree((t) => !t.surfaces.some(s => s.kind === 'floating'));
+  check('outside-click dismisses the context menu', !(await floating()));
+
+  console.log('\n[widget text field: keys reach the host field through the tree]');
+  // The dock's "Search Tasks" field is a described text field: a press on it
+  // places the caret through the tree, and every keystroke goes to the host's
+  // TextEdit — what the display list then shows is the field's own text.
+  const search = findLine(await treeOf(), 'dock', /Search/i);
+  check('the search field is in the dock', !!search);
+  if (search) {
+    await clickLine(search);
+    await page.waitForTimeout(300);
+    await page.keyboard.type('zq');
+    await waitTree((t, lines) => lines('dock').some(l => /zq/.test(l)), null, 5000);
+    check('typed text reaches the field and comes back in the display list', !!findLine(await treeOf(), 'dock', /zq/));
+    for (let i = 0; i < 2; i++) await page.keyboard.press('Backspace');
+    await page.keyboard.press('Escape'); await page.waitForTimeout(200);
+  }
+
+  console.log('\n[the dock menu is an anchored layer under its trigger]');
+  // The header's `Menu ▾` opens the dock's menu as a floating layer anchored
+  // to the button; its rows are display-list items below the trigger.
+  const menuTrigger = findLine(await treeOf(), 'dock', DOCK_MENU);
+  if (menuTrigger) await clickLine(menuTrigger);
+  await waitTree((t, lines) => lines('floating').some(l => /Import sessions/i.test(l)), null, 5000);
+  const option = findLine(await treeOf(), 'floating', /Import sessions/i);
+  const optionRow = option ? option.y + option.text.split('\n').findIndex(l => /Import sessions/i.test(l)) : null;
+  check('dock menu rows are items below the trigger', !!option && !!menuTrigger && optionRow > menuTrigger.y, JSON.stringify({ trigger: menuTrigger && menuTrigger.y, option: optionRow }));
+  // One row is checked for the clipping a `list` inside a narrow column
+  // silently does: it came back as "Discover agent ses" until the rows were
+  // padded to the widest. "Import sessions…" because it is long enough to
+  // have been clipped, and its wording is not in play.
+  check('dock menu rows are not clipped',
+    !!option && /Import sessions…/.test(option.text), JSON.stringify(option && option.text));
+  await page.keyboard.press('Escape');
+  await waitTree((t) => !t.surfaces.some(s => s.kind === 'floating'), null, 5000);
+  await page.keyboard.press('Escape'); await page.waitForTimeout(150);
+} else {
+  skip('the dock panel sections (clicks, context menu, text field, dropdowns)');
+  if (dockProbeOpened) {
+    // Put the editor back the way the probe found it.
+    await page.request.post(URL + '/action', { data: { action: 'orchestrator_dock_toggle' } });
+    await page.waitForTimeout(250);
+  }
 }
-check('every keystroke echoes into the input (host TextEdit → instance state)', echoOk,
-  JSON.stringify(await page.evaluate(() => document.activeElement.value)));
-await page.keyboard.press('Home'); await page.waitForTimeout(300);
-check('caret follows the host cursor (Home → 0)', (await page.evaluate(() => document.activeElement.selectionStart)) === 0);
-// Clear the filter so later dock assertions see the full session list.
-await page.keyboard.press('End');
-for (let i = 0; i < 3; i++) await page.keyboard.press('Backspace');
-await page.keyboard.press('Escape'); await page.waitForTimeout(200);
-
-console.log('\n[dock chrome polish: no h-scroll, list fills, dropdowns float over content]');
-// Regression cover for the orchestrator-dock visual fixes: the dock never
-// raises a spurious horizontal scrollbar; the session tree fills the panel
-// (the TUI hint-padding rows are dropped in the web); and the toolbar
-// dropdowns float over the content (positioned by `layoutDockOverlays`)
-// instead of reflowing the list, with a full-width option highlight and an
-// outside-click dismiss.
-const dockOverlay = () => page.locator('.widget-surface.w-dock > .w-col > .w-overlay');
-const treeHeight = () => page.evaluate(() => {
-  const t = document.querySelector('.widget-surface.w-dock .w-tree');
-  return t ? Math.round(t.getBoundingClientRect().height) : -1;
-});
-
-// (1) No horizontal scrollbar: over-wide `pre` tree rows ellipsis-clip.
-const dockOverflowX = await page.evaluate(() =>
-  getComputedStyle(document.querySelector('.widget-surface.w-dock')).overflowX);
-check('dock never scrolls horizontally (overflow-x: hidden)', dockOverflowX === 'hidden', dockOverflowX);
-
-// (2) The session list fills the panel (no blank filler stealing the space).
-const fillRatio = await page.evaluate(() => {
-  const dock = document.querySelector('.widget-surface.w-dock');
-  const tree = document.querySelector('.widget-surface.w-dock .w-tree');
-  return tree ? tree.getBoundingClientRect().height / dock.getBoundingClientRect().height : 0;
-});
-check('session list fills the dock (tree ≥ 55% of dock height)', fillRatio >= 0.55, `ratio=${fillRatio.toFixed(2)}`);
-
-// (3) New Task… dropdown floats flush under its button (never on top of it),
-//     and its option highlight fills the row instead of hugging the text.
-await page.locator('.widget-surface.w-dock .w-button.primary', { hasText: 'New Task' }).first().click();
-await page.waitForFunction(() => !!document.querySelector('.widget-surface.w-dock > .w-col > .w-overlay'),
-  { timeout: 8000 }).catch(() => {});
-const newInfo = await page.evaluate(() => {
-  const ov = document.querySelector('.widget-surface.w-dock > .w-col > .w-overlay');
-  const btn = [...document.querySelectorAll('.widget-surface.w-dock .w-button.primary')]
-    .find(b => /New Task/.test(b.textContent));
-  if (!ov || !btn) return null;
-  const o = ov.getBoundingClientRect(), b = btn.getBoundingClientRect();
-  const opt = ov.querySelector('.w-button'), row = opt && opt.closest('.w-row');
-  return {
-    floats: getComputedStyle(ov).position === 'absolute',
-    belowButton: o.top >= b.bottom - 2,
-    optionFillsRow: !!row && opt.getBoundingClientRect().width >= row.getBoundingClientRect().width - 2,
-  };
-});
-check('New Task dropdown floats absolutely, flush below its button', !!newInfo && newInfo.floats && newInfo.belowButton, JSON.stringify(newInfo));
-check('dropdown option highlight fills the row (no half-width spacer)', !!newInfo && newInfo.optionFillsRow, JSON.stringify(newInfo));
-await page.keyboard.press('Escape');
-await page.waitForFunction(() => !document.querySelector('.widget-surface.w-dock > .w-col > .w-overlay'),
-  { timeout: 8000 }).catch(() => {});
-
-// (4) Move to Folder… floats over the tree without reflowing it, and an
-//     outside click dismisses it (the dropdowns carry no scrim of their own).
-await page.locator('.widget-surface.w-dock .w-tree-row').first().click({ button: 'right' });
-await page.waitForFunction(() => (window.fresh.scene.regions.widgets || []).some(w => w.kind === 'floatingModal'),
-  { timeout: 8000 }).catch(() => {});
-const treeBeforeMove = await treeHeight();
-await page.locator('.widget-surface.w-floatingModal .w-button', { hasText: 'Move to Folder' }).first().click();
-await page.waitForFunction(() => !!document.querySelector('.widget-surface.w-dock > .w-col > .w-overlay'),
-  { timeout: 8000 }).catch(() => {});
-const moveInfo = await page.evaluate(() => {
-  const ov = document.querySelector('.widget-surface.w-dock > .w-col > .w-overlay');
-  const tree = document.querySelector('.widget-surface.w-dock .w-tree');
-  const div = document.querySelector('.widget-surface.w-dock .w-divider');
-  if (!ov) return null;
-  const ovTop = Math.round(ov.getBoundingClientRect().top);
-  // The menu is pinned to the divider at the head of the tree (a small
-  // divider gap sits above the first tree row); the pre-fix bug parked it at
-  // the panel top over the toolbar, which this catches.
-  return {
-    floats: getComputedStyle(ov).position === 'absolute',
-    atTreeHead: !!div && Math.abs(ovTop - Math.round(div.getBoundingClientRect().top)) <= 3
-      && (!tree || ovTop >= Math.round(tree.getBoundingClientRect().top) - 16),
-    treeH: tree ? Math.round(tree.getBoundingClientRect().height) : -1,
-  };
-});
-check('Move to Folder floats absolutely at the head of the tree', !!moveInfo && moveInfo.floats && moveInfo.atTreeHead, JSON.stringify(moveInfo));
-check('Move to Folder does not collapse the session list', !!moveInfo && moveInfo.treeH >= treeBeforeMove * 0.7, `tree ${treeBeforeMove} -> ${moveInfo && moveInfo.treeH}`);
-await page.screenshot({ path: `${SHOTS}/30-dock-move-dropdown.png` });
-await page.mouse.click(1000, 700); // click in the editor, outside the dock
-await page.waitForFunction(() => !document.querySelector('.widget-surface.w-dock > .w-col > .w-overlay'),
-  { timeout: 8000 }).catch(() => {});
-check('outside-click dismisses the Move to Folder dropdown', (await dockOverlay().count()) === 0);
-await page.keyboard.press('Escape'); await page.waitForTimeout(150);
 
 console.log('\n[keybinding editor = full native modal incl. edit dialog]');
 // Start clean: dismiss any focused dock/floating panel so keys reach the editor.
 await page.keyboard.press('Escape'); await page.waitForTimeout(120);
-if (((await scene(page)).regions.widgets || []).length) {
+if (await treeSurface('dock')) {
   await page.request.post(URL + '/action', { data: { action: 'orchestrator_dock_toggle' } });
   await page.waitForTimeout(200);
 }
@@ -397,6 +503,16 @@ check('Add-binding dialog renders natively (fields)', (await page.locator('.kbed
 await page.screenshot({ path: `${SHOTS}/29-native-keybindings.png` });
 await page.keyboard.press('Escape'); await page.waitForTimeout(150); await page.keyboard.press('Escape'); await page.waitForTimeout(200);
 
+// Select a Settings category by clicking its row in the tree.
+async function openSettingsCategory(name) {
+  await page.locator('.settings-modal .set-cat', { hasText: name }).first().click();
+  await page.waitForFunction(n => {
+    const s = window.fresh.scene.regions.settings;
+    return s && s.categories.some(c => c.selected && c.name === n);
+  }, name, { timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(150);
+}
+
 console.log('\n[Settings = full native modal incl. entry dialog]');
 await page.keyboard.press('Escape'); await page.waitForTimeout(120);
 await page.request.post(URL + '/action', { data: { action: 'open_settings' } });
@@ -404,6 +520,8 @@ await page.waitForFunction(() => !!window.fresh.scene.regions.settings, { timeou
 await page.waitForTimeout(300);
 check('Settings is a native modal (categories+items)', (await page.locator('.settings-modal .set-cat').count()) >= 5 && (await page.locator('.settings-modal .set-item').count()) >= 3);
 check('NO svg/cells in the settings modal', (await page.locator('.settings-modal svg').count()) === 0);
+// The Languages map lives on the "Syntax & Languages" page.
+await openSettingsCategory('Syntax & Languages');
 await page.keyboard.press('Tab'); await page.waitForTimeout(120);
 for (let i = 0; i < 4; i++) { await page.keyboard.press('ArrowDown'); await page.waitForTimeout(80); }
 await page.keyboard.press('Enter');
@@ -472,6 +590,7 @@ console.log('\n[Settings map entry rows: mouse + keyboard, TUI-parity interactio
 await page.request.post(URL + '/action', { data: { action: 'open_settings' } });
 await page.waitForFunction(() => !!window.fresh.scene.regions.settings, { timeout: 8000 }).catch(() => {});
 await page.waitForTimeout(250);
+await openSettingsCategory('Syntax & Languages');
 const langIdx = await page.evaluate(() => [...document.querySelectorAll('.set-items > .set-item')]
   .findIndex(r => (r.querySelector('.set-name') || {}).textContent === 'Languages'));
 const langRowsLoc = page.locator('.set-items > .set-item').nth(langIdx).locator('.set-list-row:not(.set-list-head)');
@@ -541,7 +660,7 @@ const diffKeys = await page.evaluate(() => window.fresh.lastFrameKeys);
 check('a typing frame is a region DIFF (changed paths, not a scene)', diffKeys.length > 0, JSON.stringify(diffKeys));
 check('typing frame touches the pane, per index', diffKeys.some(k => k.startsWith('regions.panes.')), JSON.stringify(diffKeys));
 check('typing frame does NOT resend heavyweight unrelated regions',
-  !diffKeys.includes('regions.settings') && !diffKeys.includes('regions.keybindingEditor') && !diffKeys.includes('regions.widgets'),
+  !diffKeys.includes('regions.settings') && !diffKeys.includes('regions.keybindingEditor') && !diffKeys.includes('regions.tree'),
   JSON.stringify(diffKeys));
 
 console.log('\n[shared-view mirroring: multiple clients are all live at once]');
@@ -618,6 +737,62 @@ check('typing frame rebuilt the pane region (panes.N in renderedRegions)', rr.so
 check('typing frame did NOT rebuild the file explorer region', !rr.includes('fileExplorer'), JSON.stringify(rr));
 check('explorer DOM node survived the typing frame (same element, stamp intact)',
   stamped && await page.evaluate(() => document.querySelector('[data-region="fileExplorer"] .fileexplorer')?.dataset.stamp === 'untouched'));
+
+// The same claim with the roles reversed, and the one that actually drifted.
+// A hover moving between two dock rows produces a frame carrying exactly one
+// path, `regions.tree`. `applyFrame` routes a changed path to its container
+// through `PATH_REGION`, and a path the map does not know falls through to a
+// FULL rebuild — the safe default, and a silent one. `tree` was added to
+// `REGION_ORDER` and never to that map, so recolouring one dock row cleared and
+// re-filled all fourteen containers, re-emitting every pane's cell SVG among
+// them. Nothing failed; the UI just got slower. So the test names the region
+// rather than the pixels: the two lists must not drift again.
+console.log('\n[a dock hover repaints the dock, not the buffer]');
+let hoverProbeOpened = false;
+if (!(await treeSurface('dock'))) {
+  await page.request.post(URL + '/action', { data: { action: 'orchestrator_dock_toggle' } });
+  hoverProbeOpened = true;
+  await waitTree((t) => t.surfaces.some(s => s.kind === 'dock'));
+  await page.waitForTimeout(300);
+}
+// **Drive a tree-only frame rather than assume one.** Which dock rows exist
+// depends on what the editor is showing, and a hint-bar row answers no hover —
+// so the pointer is walked over candidate rows until the server actually sends
+// a frame that touches the tree and no pane. That frame is the premise; the
+// repaint is what is asserted. If none arrives (an empty dock), the section
+// skips rather than passing vacuously.
+const hoverRows = treeLines(await treeOf(), 'dock')
+  .filter(i => i.h === 1 && i.text.trim().length > 1)
+  .filter((i, n, all) => all.findIndex(j => j.y === i.y) === n);
+let hoverKeys = null, hoverRegions = null, hoverStampKept = null;
+for (const row of hoverRows) {
+  // Park the pointer off the dock, so the next move is an ENTER on this row.
+  await page.mouse.move(4, 4); await page.waitForTimeout(200);
+  await page.evaluate(() => { const e = document.querySelector('.pane-content'); if (e) e.dataset.stamp = 'untouched'; });
+  const seqH = await page.evaluate(() => window.fresh.seq);
+  const pt = await cellPx(row.x + 1, row.y);
+  await page.mouse.move(pt.x, pt.y);
+  await page.waitForFunction(s0 => window.fresh.seq > s0, seqH, { timeout: 2500 }).catch(() => {});
+  const hk = await page.evaluate(() => window.fresh.lastFrameKeys);
+  if (!hk.includes('regions.tree') || hk.some(k => k.startsWith('regions.panes'))) continue;
+  hoverKeys = hk;
+  hoverRegions = await page.evaluate(() => window.fresh.renderedRegions);
+  hoverStampKept = await page.evaluate(() => document.querySelector('.pane-content')?.dataset.stamp === 'untouched');
+  break;
+}
+if (!hoverKeys) {
+  skip('a dock hover repaints only the tree region (no hoverable dock row)');
+} else {
+  check('a tree frame rebuilds the tree region', hoverRegions.includes('tree'), JSON.stringify(hoverRegions));
+  check('a tree frame did NOT rebuild every region',
+    hoverRegions.length < 14 && !hoverRegions.some(r => /^panes(\.|$)/.test(r)), JSON.stringify(hoverRegions));
+  check('the buffer DOM survived the hover (same element, stamp intact)',
+    hoverStampKept, JSON.stringify(hoverKeys));
+}
+if (hoverProbeOpened) {
+  await page.request.post(URL + '/action', { data: { action: 'orchestrator_dock_toggle' } });
+  await page.waitForTimeout(250);
+}
 
 console.log('\n[measured metrics + app zoom (frontend-owned Ctrl+= / Ctrl+0)]');
 const m0 = await page.evaluate(() => window.fresh.metrics);
@@ -808,11 +983,13 @@ await page.waitForTimeout(300);
 const b1 = await fb();
 const dirIdx = b1.rows.findIndex(r => r.isDir && r.name !== '..');
 if (dirIdx >= 0) {
+  const clickCell = { col: b1.listRect.x + 1, row: b1.rows[dirIdx].row };
   await page.locator('.palette.filebrowser .fbrow').nth(dirIdx).click();
   await page.waitForTimeout(250);
   const afterClick = await fb();
   check('clicking a row selects it in the editor', afterClick.selected === b1.rows[dirIdx].index,
-    `selected=${afterClick.selected} want=${b1.rows[dirIdx].index}`);
+    `selected=${afterClick.selected} want=${b1.rows[dirIdx].index} cell=${JSON.stringify(clickCell)} ` +
+    `name=${b1.rows[dirIdx].name} rowsNow=${JSON.stringify(afterClick.rows.slice(0, 3).map(r => r.name))}`);
   await page.locator('.palette.filebrowser .fbrow').nth(dirIdx).dblclick();
   await page.waitForTimeout(400);
   const afterNav = await fb();
@@ -827,8 +1004,11 @@ check('clicking a column header re-sorts through the editor',
 const hidden0 = (await fb()).toggles.find(t => t.name === 'showHidden').active;
 await page.locator('.palette.filebrowser .fbtoggle').first().click();
 await page.waitForTimeout(300);
+const tog0 = (await fb()).toggles[0];
 check('clicking a checkbox toggles it through the editor',
-  (await fb()).toggles.find(t => t.name === 'showHidden').active === !hidden0);
+  (await fb()).toggles.find(t => t.name === 'showHidden').active === !hidden0,
+  `first toggle=${JSON.stringify({ n: tog0 && tog0.name, x: tog0 && tog0.x, y: tog0 && tog0.y, w: tog0 && tog0.w })} ` +
+  `was=${hidden0} now=${(await fb()).toggles.find(t => t.name === 'showHidden').active}`);
 await page.keyboard.press('Escape'); await page.waitForTimeout(150);
 check('Escape closed the Open File prompt', !(await scene(page)).regions.palette);
 check('status bar comes back once the prompt releases the row',
@@ -848,44 +1028,48 @@ check('command palette (Ctrl+P) still renders its suggestion list (no regression
 await page.keyboard.press('Escape'); await page.waitForTimeout(150);
 
 console.log('\n[New Workspace dialog is modal: a scrim dims + blocks the dock behind it]');
-if (!((await scene(page)).regions.widgets || []).some(w => w.kind === 'dock')) {
+if (webDockPanels) {
+  if (!(await treeSurface('dock'))) {
+    await page.request.post(URL + '/action', { data: { action: 'orchestrator_dock_toggle' } });
+    await waitTree((t) => t.surfaces.some(s => s.kind === 'dock'));
+  }
+  await page.waitForTimeout(200);
+  check('dock alone (no modal) has no scrim item', !(await treeOf()).items.some(i => i.kind === 'scrim'));
+  // `+ New` goes straight to the dialog — one click since the dock's header
+  // collapsed to two controls (it used to be "New Task… ▾" and then an option
+  // row in the dropdown it opened).
+  const nt = findLine(await treeOf(), 'dock', /\+ New/);
+  if (nt) await clickLine(nt);
+  await waitTree((t) => t.surfaces.some(s => s.kind === 'floating' && !s.anchored));
+  await page.waitForTimeout(200);
+  const modal = (await treeOf()).surfaces.find(s => s.kind === 'floating' && !s.anchored);
+  check('New Workspace dialog is a centered floating panel', !!modal);
+  check('a dimming scrim sits behind it', (await page.locator('.tree .tree-scrim').count()) === 1);
+  // A click over the dock lands on the scrim, which the tree routes to the
+  // modal: the dock's selection is untouched and the dialog stays open.
+  // The dock repaints on its own (project detection, titles), so the
+  // comparison is the clicked row and the modal, not the whole column.
+  const rowIt = treeLines(await treeOf(), 'dock').find(i => /fresh/.test(i.text));
+  if (rowIt) await clickLine(rowIt);
+  await page.waitForTimeout(400);
+  const stillModal = (await treeOf()).surfaces.some(s => s.kind === 'floating' && !s.anchored);
+  const rowAfter = treeLines(await treeOf(), 'dock').find(i => /fresh/.test(i.text));
+  check('a click over the dock is eaten by the modal (row unchanged, modal still open)',
+    stillModal && !!rowIt && !!rowAfter && rowAfter.text === rowIt.text && rowAfter.bg === rowIt.bg,
+    JSON.stringify({ stillModal, before: rowIt && { t: rowIt.text, bg: rowIt.bg, fg: rowIt.fg },
+      after: rowAfter && { t: rowAfter.text, bg: rowAfter.bg, fg: rowAfter.fg } }));
+  await page.screenshot({ path: `${SHOTS}/34-new-workspace-modal.png` });
+  await page.keyboard.press('Escape');
+  await waitTree((t) => !t.surfaces.some(s => s.kind === 'floating'));
+  check('Escape closed the New Workspace dialog', !(await treeOf()).surfaces.some(s => s.kind === 'floating'));
+  check('scrim gone once the modal closed', (await page.locator('.tree .tree-scrim').count()) === 0);
+  // Close the dock again: the sections below assert on status-bar text, and
+  // the dock's width pushes long status messages into truncation.
   await page.request.post(URL + '/action', { data: { action: 'orchestrator_dock_toggle' } });
-  await page.waitForFunction(() => (window.fresh.scene.regions.widgets || []).some(w => w.kind === 'dock'), { timeout: 8000 }).catch(() => {});
+  await waitTree((t) => !t.surfaces.some(s => s.kind === 'dock'));
+} else {
+  skip('New Workspace dialog is modal (needs the dock panel)');
 }
-await page.waitForTimeout(200);
-check('dock alone (no modal) has zero modal-scrims', (await page.locator('.modal-scrim').count()) === 0);
-// "New Task… ▾" opens a create dropdown first (dock redesign); pick the
-// "New Task…" option (rendered as "  New Task…" / "● New Task…") to open
-// the form.
-await page.locator('.widget-surface.w-dock .w-button', { hasText: 'New Task' }).first().click();
-await page.waitForTimeout(300);
-await page.locator('.widget-surface.w-dock .w-button', { hasText: /New Task…$/ }).first().click();
-await page.waitForFunction(() => (window.fresh.scene.regions.widgets || []).some(w => w.kind === 'floatingModal'), { timeout: 8000 }).catch(() => {});
-await page.waitForTimeout(200);
-check('New Workspace dialog is a floatingModal', ((await scene(page)).regions.widgets || []).some(w => w.kind === 'floatingModal'));
-check('exactly one modal-scrim behind the floatingModal', (await page.locator('.modal-scrim').count()) === 1);
-const dockSel = async () => { const d = ((await scene(page)).regions.widgets || []).find(w => w.kind === 'dock'); return d && d.instances && d.instances.sessions ? d.instances.sessions.selectedIndex : null; };
-// A freshly (re)opened dock reports selectedIndex -1 until an async probe
-// repaint pins it to the highlighted session (refreshOpenDialog re-pins on
-// every repaint) — wait for the pin so the scrim check below isn't racing it.
-await page.waitForFunction(() => { const d = (window.fresh.scene.regions.widgets || []).find(w => w.kind === 'dock');
-  return d && d.instances && d.instances.sessions && d.instances.sessions.selectedIndex >= 0; }, { timeout: 8000 }).catch(() => {});
-const sel0 = await dockSel();
-const cardBox = await page.locator('.widget-surface.w-dock .w-tree-row').first().boundingBox();
-if (cardBox) await page.mouse.click(cardBox.x + cardBox.width / 2, cardBox.y + cardBox.height / 2);
-await page.waitForTimeout(300);
-const sel1 = await dockSel();
-check('a click over the dock is eaten by the scrim (dock selection unchanged, modal still open)',
-  sel1 === sel0 && ((await scene(page)).regions.widgets || []).some(w => w.kind === 'floatingModal'), `sel ${sel0}->${sel1}`);
-await page.screenshot({ path: `${SHOTS}/34-new-workspace-modal.png` });
-await page.keyboard.press('Escape'); await page.waitForTimeout(250);
-check('Escape closed the New Workspace dialog', !((await scene(page)).regions.widgets || []).some(w => w.kind === 'floatingModal'));
-check('scrim removed once the modal closed', (await page.locator('.modal-scrim').count()) === 0);
-// Close the dock again: the sections below assert on status-bar text, and
-// with the COSMOS bezel already costing ~13 columns the dock's width pushes
-// long status messages ("… read only (Ctrl+Space …)") into truncation.
-await page.request.post(URL + '/action', { data: { action: 'orchestrator_dock_toggle' } });
-await page.waitForFunction(() => !(window.fresh.scene.regions.widgets || []).some(w => w.kind === 'dock'), { timeout: 8000 }).catch(() => {});
 
 console.log('\n[menu submenu panel sits edge-to-edge with its parent (no overlap seam)]');
 await page.keyboard.press('Escape'); await page.waitForTimeout(120);
@@ -1149,35 +1333,42 @@ await page.keyboard.press('Escape'); await page.waitForTimeout(120);
 // Skin is read from localStorage at boot; single-client bridge → /reset first,
 // then set the skin and reload so the vibrancy modal is in play.
 await page.request.post(URL + '/reset', { data: {} });
-await page.evaluate(() => { try { localStorage.setItem('fresh.webtheme', 'macos'); } catch (_) {} });
+// Cell-drawn: these checks press the display list's cells where the tree
+// placed them (the native layout is checked by role further down).
+await page.evaluate(() => { try { localStorage.setItem('fresh.webtheme', 'macos'); localStorage.setItem('fresh.nativePanels', 'off'); } catch (_) {} });
 await page.reload({ waitUntil: 'networkidle' });
 await page.waitForFunction(() => window.fresh && window.fresh.wsOpen && window.fresh.scene && window.fresh.scene.regions.panes.length > 0, null, { timeout: 20000 });
 await page.waitForTimeout(400);
 check('macOS skin active (vibrancy modal in play)',
   await page.evaluate(() => document.body.classList.contains('theme-macos')));
 
-// (a) Orchestrator "Run Agent" widget dropdown, mounted inside the
-// backdrop-filter modal — the case that regressed.
+// (a) Orchestrator "Run Agent" dropdown, inside a floating panel: the pop-over
+// is a layer the tree raises under the trigger, and it arrives as items in the
+// same display list, placed exactly where the tree placed them.
 await page.request.post(URL + '/action', { data: { action: 'orchestrator_run_agent' } });
-await page.waitForFunction(() => document.querySelectorAll('.w-dropdown .w-dd-pill').length > 0, null, { timeout: 8000 }).catch(() => {});
-const raBox = await page.locator('.w-dropdown .w-dd-pill').first().boundingBox();
-if (raBox) {
-  const closedW = await page.evaluate(() => document.querySelector('.w-dd-pill').getBoundingClientRect().width);
-  await page.mouse.click(raBox.x + raBox.width / 2, raBox.y + raBox.height / 2);
-  await page.waitForFunction(() => !!document.querySelector('.w-dd.w-dd-floating'), null, { timeout: 5000 }).catch(() => {});
-  const w = await page.evaluate(() => {
-    const list = document.querySelector('.w-dd.w-dd-floating'), pill = document.querySelector('.w-dd-pill');
-    if (!list || !pill) return null;
-    const lr = list.getBoundingClientRect(), pr = pill.getBoundingClientRect();
-    return { dx: Math.round(lr.left - pr.left), dy: Math.round(lr.top - pr.bottom), openW: pr.width };
-  });
-  await page.screenshot({ path: `${SHOTS}/34-macos-widget-dropdown.png` });
-  check('Run-Agent widget dropdown opens directly under its pill (not offset by the modal)',
-    !!w && Math.abs(w.dx) <= 4 && w.dy >= -2 && w.dy <= 8, JSON.stringify(w));
-  // The open (▴) and closed (▾) chevrons must be the same width so the pill
-  // doesn't jump — regressed when open used the full-size ▲ vs the small ▾.
-  check('closed pill width stays stable when opened (matched-size chevron)',
-    !!w && Math.abs(w.openW - closedW) <= 1, JSON.stringify({ closedW: Math.round(closedW), openW: Math.round(w.openW) }));
+await waitTree((t) => t.surfaces.some(s => s.kind === 'floating'));
+await page.waitForTimeout(300);
+{
+  const t0 = await treeOf();
+  // The trigger is drawn in pieces — `[value ` then `▼]` — so the arrow
+  // piece finds the row and the leftmost `[` piece on it is the trigger.
+  const arrow = treeLines(t0, 'floating').find(i => /[▾▼]/.test(i.text));
+  const pill = arrow && (treeLines(t0, 'floating').filter(i => i.y === arrow.y && i.x <= arrow.x && /^\[/.test(i.text)).sort((a, b) => a.x - b.x)[0] || arrow);
+  check('Run-Agent panel shows a dropdown trigger', !!pill, surfaceText(t0, 'floating').slice(0, 200));
+  if (pill) {
+    const before = treeLines(t0, 'floating').length;
+    await clickLine(arrow);
+    await waitTree((t, lines, n) => lines('floating').length > n, before, 5000);
+    const t1 = await treeOf();
+    // The pop-over's rows: new items under the pill, at the pill's column.
+    const was = new Set(treeLines(t0, 'floating').map(o => `${o.x},${o.y},${o.text}`));
+    const rows = treeLines(t1, 'floating').filter(i => i.y > pill.y && i.x >= pill.x - 1 && i.x <= pill.x + 2 && !was.has(`${i.x},${i.y},${i.text}`));
+    const first = rows.sort((p, q) => p.y - q.y)[0];
+    check('the dropdown opens directly under its trigger (the tree placed it)',
+      !!first && first.y - pill.y >= 1 && first.y - pill.y <= 2 && Math.abs(first.x - pill.x) <= 4,
+      JSON.stringify({ pill: { x: pill.x, y: pill.y }, first: first && { x: first.x, y: first.y, text: first.text } }));
+    await page.screenshot({ path: `${SHOTS}/34-macos-widget-dropdown.png` });
+  }
 }
 await page.keyboard.press('Escape'); await page.waitForTimeout(100);
 await page.keyboard.press('Escape'); await page.waitForTimeout(200);
@@ -1190,6 +1381,7 @@ await page.keyboard.press('Escape'); await page.waitForTimeout(200);
 await page.request.post(URL + '/action', { data: { action: 'open_settings' } });
 await page.waitForFunction(() => !!window.fresh.scene.regions.settings, { timeout: 8000 }).catch(() => {});
 await page.waitForTimeout(300);
+await openSettingsCategory('Syntax & Languages');
 const langPill = page.locator('.settings-modal .set-item', { hasText: 'Default Language' }).locator('.set-pill');
 await langPill.scrollIntoViewIfNeeded().catch(() => {});
 const lpBox = await langPill.boundingBox();
@@ -1215,6 +1407,167 @@ if (lpBox) {
   check('Settings dropdown is NOT clipped — fully inside the dialog', !!sd && sd.insideModal, JSON.stringify(sd));
 }
 await page.keyboard.press('Escape'); await page.waitForTimeout(120);
+
+// Native panels (js/73-native.js): in the themes that lay the shell's
+// surfaces out themselves, a plugin panel is its spec drawn by the page and a
+// confirmation is a real dialog. Every press goes back as the control's
+// identity, so these checks drive the real editor through them.
+console.log('\n[native panels (Compact): laid out by the page, pressed by identity]');
+await page.request.post(URL + '/reset', { data: {} });
+await page.evaluate(() => { try { localStorage.setItem('fresh.webtheme', 'compact'); localStorage.removeItem('fresh.nativePanels'); } catch (_) {} });
+await page.reload({ waitUntil: 'networkidle' });
+await page.waitForFunction(() => window.fresh && window.fresh.wsOpen && window.fresh.scene && window.fresh.scene.regions.panes.length > 0, null, { timeout: 20000 });
+const nerrs = []; page.on('pageerror', e => nerrs.push(String(e)));
+check('Compact lays the shell\'s surfaces out natively',
+  await page.evaluate(() => document.body.classList.contains('native-panels')));
+if (!(await page.evaluate(() => (window.fresh.scene.regions.native.panels || []).some(p => p.kind === 'dock')))) {
+  await page.request.post(URL + '/action', { data: { action: 'orchestrator_dock_toggle' } });
+}
+await page.waitForSelector('.native-panel.np-dock', { timeout: 8000 }).catch(() => {});
+check('the dock is a native panel', !!(await page.$('.native-panel.np-dock')));
+check('the dock\'s cell items are hidden under it', await page.evaluate(() => {
+  const items = [...document.querySelectorAll('.tree-item[data-surface-kind="dock"]')];
+  return items.length > 0 && items.every(e => getComputedStyle(e).visibility === 'hidden');
+}));
+// Found by role and name, as assistive tech finds them: what a native
+// surface draws must say what it is, not only look like it.
+const newBtn = page.locator('.np-dock').getByRole('button', { name: /New$/ }).first();
+check('the dock is a labelled region with real buttons', (await page.getByRole('region').count()) >= 1 && (await newBtn.count()) === 1);
+if (await newBtn.count()) {
+  await newBtn.click();
+  await page.getByRole('dialog', { name: 'New Workspace' }).waitFor({ timeout: 8000 }).catch(() => {});
+}
+const card = page.getByRole('dialog', { name: 'New Workspace' });
+check('a dock button opens a floating panel, a dialog named by its title', (await card.count()) === 1
+  && (await card.evaluate(e => e.classList.contains('card') && e.getAttribute('aria-modal') === 'true').catch(() => false)));
+if (await card.count()) {
+  await page.screenshot({ path: `${SHOTS}/40-native-floating.png` });
+  check('its choices are a radio group with one checked',
+    (await card.getByRole('radio', { checked: true }).count()) === 1 && (await card.getByRole('radio').count()) >= 2);
+  check('its agent picker is a combobox', (await card.getByRole('combobox').count()) >= 1);
+  check('its prompt is a labelled text box', (await card.getByRole('textbox', { name: /Describe the task/ }).count()) === 1);
+  await card.getByRole('button', { name: 'Close' }).click();
+  await page.waitForSelector('.native-panel.np-floating', { state: 'detached', timeout: 8000 }).catch(() => {});
+  check('its close button closes it', (await page.getByRole('dialog').count()) === 0);
+}
+await page.evaluate(() => window.fresh.sendKey({ key: 'Q', code: 'KeyQ', ctrl: false, meta: false, shift: true, alt: false }));
+await page.waitForTimeout(300);
+await page.request.post(URL + '/action', { data: { action: 'close' } });
+const confirm = page.getByRole('alertdialog');
+await confirm.waitFor({ timeout: 8000 }).catch(() => {});
+check('an unsaved-changes question is a native alert dialog, named by its question',
+  (await confirm.count()) === 1 && ((await confirm.getAttribute('aria-label')) || '').length > 0);
+const cancel = confirm.getByRole('button', { name: 'Cancel' });
+if (await cancel.count()) {
+  await page.screenshot({ path: `${SHOTS}/41-native-confirm.png` });
+  await cancel.click();
+  await page.waitForFunction(() => !window.fresh.scene.regions.native.confirm, null, { timeout: 8000 }).catch(() => {});
+  check('its Cancel answers the editor\'s question', await page.evaluate(() => !window.fresh.scene.regions.native.confirm && !document.querySelector('.native-confirm')));
+}
+// The menu bar, by role: a menubar of titles, each opening a menu.
+const fileTitle = page.getByRole('menubar').getByRole('menuitem', { name: 'File', exact: true });
+check('the menu bar is a menubar of titles', (await fileTitle.count()) === 1
+  && (await fileTitle.getAttribute('aria-expanded')) === 'false');
+await fileTitle.click();
+await page.getByRole('menu').first().waitFor({ timeout: 5000 }).catch(() => {});
+check('a title opens a menu of items, and says so',
+  (await fileTitle.getAttribute('aria-expanded')) === 'true'
+  && (await page.getByRole('menuitem', { name: 'New File' }).count()) === 1);
+await page.keyboard.press('Escape'); await page.waitForTimeout(150);
+// A panel mounted into a pane (Search & Replace): drawn natively over its
+// pane, and — for the themes that fold the display list — a surface of it,
+// so the pane is never left blank.
+await page.request.post(URL + '/action', { data: { action: 'start_search_replace' } });
+const searchBox = page.getByRole('textbox', { name: 'Search' });
+await searchBox.waitFor({ timeout: 8000 }).catch(() => {});
+check('a pane-mounted panel is drawn natively, its fields labelled text boxes',
+  (await searchBox.count()) === 1 && (await page.getByRole('textbox', { name: 'Replace' }).count()) === 1);
+check('and is a surface of the display list too', await page.evaluate(() =>
+  (window.fresh.scene.regions.tree.surfaces || []).some(s => s.kind === 'pane')));
+check('the search and files fields line up', await page.evaluate(() => {
+  const x = n => [...document.querySelectorAll('.np-pane .w-text-input')].find(i => i.getAttribute('aria-label') === n)?.getBoundingClientRect().left;
+  const a = x('Search'), b = x('Files');
+  return a != null && b != null && Math.abs(a - b) < 1;
+}));
+const caseSwitch = page.getByRole('switch', { name: /^Case/ });
+const before = await caseSwitch.getAttribute('aria-checked').catch(() => null);
+if (before != null) {
+  await caseSwitch.click();
+  await page.waitForFunction(b => document.querySelector('.np-pane [role=switch][aria-label^="Case"]')?.getAttribute('aria-checked') !== b,
+    before, { timeout: 5000 }).catch(() => {});
+}
+check('a switch says whether it is on, and pressing it turns it', before != null
+  && (await caseSwitch.getAttribute('aria-checked')) === String(before !== 'true'));
+await page.screenshot({ path: `${SHOTS}/42-native-pane-panel.png` });
+// A page (the Welcome screen): laid out in the page's own column, as the
+// terminal sets it, and scrolled by the editor — the web follows the
+// editor's window, so a card's jump, the wheel and the page keys are one
+// scroll position.
+await page.request.post(URL + '/action', { data: { action: 'welcome_open' } });
+const welcome = page.locator('.native-panel.np-pane.paged').first();
+await welcome.waitFor({ timeout: 8000 }).catch(() => {});
+check('the Welcome screen is a native page the editor scrolls', (await welcome.count()) === 1);
+// The doors are the sized cards that end in a jump (the code sample is
+// sized too); the page is wide enough here for the terminal to set them in a
+// row.
+const doors = await page.evaluate(() => [...document.querySelectorAll('.native-panel.paged .w-section.sized')]
+  .filter(e => /jump/.test(e.textContent)).map(e => e.getBoundingClientRect())
+  .map(r => ({ top: Math.round(r.top), h: Math.round(r.height) })));
+check('its door cards stand side by side, alike', doors.length === 3
+  && doors.every(d => d.top === doors[0].top && d.h === doors[0].h), JSON.stringify(doors));
+const pageOffset = () => page.evaluate(() =>
+  (window.fresh.scene.regions.native.panels.find(x => x.page) || {}).page?.offset ?? -1);
+const offsetPast = (cmp, o) => page.waitForFunction(([c, o]) => {
+  const v = (window.fresh.scene.regions.native.panels.find(x => x.page) || {}).page?.offset ?? -1;
+  return c === 'gt' ? v > o : c === 'lt' ? v >= 0 && v < o : v === o;
+}, [cmp, o], { timeout: 5000 }).catch(() => {});
+// A door card is one target: a blank row of it jumps as its button does.
+// Pressed on the row itself — whether the page shows the doors at the top
+// depends on the pane's height.
+const gapW = await page.evaluate(() => {
+  const g = document.querySelector('.native-panel.paged .w-section.sized .w-para-gap[data-wkey]');
+  if (!g) return 0;
+  g.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+  return g.getBoundingClientRect().width;
+});
+await offsetPast('gt', 0);
+const gapJump = await pageOffset();
+check('a blank row of a door card jumps the page', gapW > 0 && gapJump > 0, `width=${gapW} offset=${gapJump}`);
+// The wheel over the page scrolls it in the editor: back up to the top.
+const wbox = await welcome.boundingBox();
+if (wbox) {
+  await page.mouse.move(wbox.x + wbox.width / 2, wbox.y + wbox.height / 2);
+  for (let i = 0; i < 6 && (await pageOffset()) > 0; i++) { await page.mouse.wheel(0, -800); await offsetPast('lt', gapJump); }
+}
+const wheeled = await pageOffset();
+check('the wheel over the page scrolls it in the editor', wheeled >= 0 && wheeled < gapJump, `${gapJump} → ${wheeled}`);
+await page.waitForFunction(() => ((window.fresh.scene.regions.native.panels.find(x => x.page) || {}).page?.offset ?? -1) === 0,
+  null, { timeout: 5000 }).catch(() => {});
+await welcome.getByRole('button', { name: /jump/ }).first().click().catch(() => {});
+await offsetPast('gt', 0);
+const jumped = await pageOffset();
+check('a card\'s jump scrolls the page in the editor, and the view follows',
+  jumped > 0 && jumped === gapJump && await page.evaluate(() => document.querySelector('.native-panel.paged').scrollTop > 0),
+  `offset=${jumped} (gap ${gapJump})`);
+check('no cell caret is drawn over the page', await page.evaluate(() =>
+  [...document.querySelectorAll('.caret,.tree-caret')].every(c => getComputedStyle(c).visibility === 'hidden')));
+await page.screenshot({ path: `${SHOTS}/43-native-welcome.png` });
+// A strip: a toolbar a buffer group mounts in a pane one cell tall (the git
+// log's buttons). Laid out on that height, every control is whole in it.
+await page.request.post(URL + '/action', { data: { action: 'show_git_log' } });
+const strip = page.locator('.native-panel.np-pane.strip').first();
+await strip.waitFor({ timeout: 8000 }).catch(() => {});
+check('a one-row toolbar pane is a native strip', (await strip.count()) === 1);
+check('its buttons sit whole inside it', await page.evaluate(() => {
+  const s = document.querySelector('.native-panel.np-pane.strip');
+  if (!s) return false;
+  const r = s.getBoundingClientRect();
+  const bs = [...s.querySelectorAll('.w-button')];
+  return bs.length > 0 && bs.every(b => { const q = b.getBoundingClientRect(); return q.top >= r.top - 0.5 && q.bottom <= r.bottom + 0.5; })
+    && s.scrollHeight <= s.clientHeight + 1;
+}));
+await page.screenshot({ path: `${SHOTS}/44-native-strip.png` });
+check('no JS page errors (native panels)', nerrs.length === 0, nerrs.join(' | '));
 
 console.log('\n[touch pan/scroll on mobile (hasTouch context)]');
 // The bridge is single-client: close the desktop page (frees /ws) before

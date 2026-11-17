@@ -14,7 +14,7 @@ use crate::state::EditorState;
 use crate::view::soft_break::SoftBreakRender;
 use crate::view::theme::Theme;
 use crate::view::ui::view_pipeline::{LineStart, ViewLine};
-use crate::view::virtual_text::{VirtualTextNamespace, VirtualTextPosition};
+use crate::view::virtual_text::VirtualTextPosition;
 use crate::view::wrap_machine::{WrapMachine, WrapRule};
 use fresh_core::api::{ViewTokenStyle, ViewTokenWire, ViewTokenWireKind};
 use std::collections::{HashMap, HashSet};
@@ -25,6 +25,8 @@ use std::collections::{HashMap, HashSet};
 /// A thin driver over [`WrapMachine`], which owns the wrap rule. Splitting the
 /// decision (there) from the token splicing (here) is what lets the row index
 /// read the same run for its boundaries — see the `wrap_machine` module docs.
+/// Production code calls [`apply_wrapping_transform_from`] directly.
+#[cfg(test)]
 pub(crate) fn apply_wrapping_transform(
     tokens: Vec<ViewTokenWire>,
     content_width: usize,
@@ -214,6 +216,66 @@ pub(crate) fn apply_soft_breaks(
     }
 
     output
+}
+
+/// How many times the join estimate is allowed to re-measure. Each pass grows
+/// the window, which can bring more joins into view; two passes settle every
+/// realistic document (a paragraph's joins are found by the first), and the
+/// bound keeps a pathological one — a file that is one joined block — from
+/// walking the buffer.
+const JOIN_ESTIMATE_PASSES: usize = 2;
+
+/// Grow the visible-line estimate by the line breaks the viewport's conceals
+/// swallow.
+///
+/// A conceal whose range covers a newline renders the line below it as part of
+/// the line above — the mechanism compose mode reflows a paragraph with. N
+/// source lines then fill fewer than N rows, so a token build sized in source
+/// lines stops above the viewport's bottom and the frame ends in EOF tildes
+/// with the document still going. This counts the swallowed breaks and asks
+/// for that many lines more, re-measuring because the extra lines can carry
+/// joins of their own.
+///
+/// Returns `visible_count` unchanged for a non-composing split or an
+/// unconcealed buffer: every other conceal in the editor stays inside one
+/// line, so nothing else can pay for this query.
+pub(crate) fn join_adjusted_visible_count(
+    buffer: &crate::model::buffer::Buffer,
+    conceals: &crate::view::conceal::ConcealManager,
+    marker_list: &crate::model::marker::MarkerList,
+    cursor_positions: &[usize],
+    top_byte: usize,
+    visible_count: usize,
+    is_compose: bool,
+) -> usize {
+    if !is_compose || conceals.is_empty() || visible_count == 0 {
+        return visible_count;
+    }
+    let start_line = buffer.get_line_number(top_byte);
+    let mut total = visible_count;
+    for _ in 0..JOIN_ESTIMATE_PASSES {
+        let end_byte = buffer
+            .line_start_offset(start_line + total)
+            .unwrap_or_else(|| buffer.len());
+        if end_byte <= top_byte {
+            return total;
+        }
+        let swallowed: usize = conceals
+            .query_viewport(top_byte, end_byte, marker_list, cursor_positions)
+            .iter()
+            .map(|(range, _)| {
+                let from = buffer.get_line_number(range.start.max(top_byte));
+                let to = buffer.get_line_number(range.end.min(end_byte));
+                to.saturating_sub(from)
+            })
+            .sum();
+        let grown = visible_count.saturating_add(swallowed);
+        if grown <= total {
+            return total;
+        }
+        total = grown;
+    }
+    total
 }
 
 /// Apply conceal ranges to a token stream.
@@ -425,55 +487,104 @@ fn logical_end(source_lines: &[ViewLine], idx: usize) -> Option<usize> {
     end
 }
 
+/// The rows of a build that [`inject_virtual_lines`] has to produce: the
+/// first `before` of them lie above the window, which `rows` more fill.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RowWindow {
+    pub before: usize,
+    pub rows: usize,
+}
+
 /// Inject `LineAbove` / `LineBelow` virtual lines into the view line stream.
 ///
 /// `wrap_width` is the viewport's effective content width when soft-wrap is
 /// enabled, allowing a virtual line whose text exceeds the row width to be
 /// split across multiple visual rows (matching how source lines behave under
 /// `line_wrap = true`). Pass `None` to keep virtual lines on a single row.
+///
+/// With a `window`, only the virtual rows it can show are built: a virtual
+/// row above it is left out, and the stream ends once it is full. Returns the
+/// stream and how many rows above the window were left out, which the caller
+/// takes off its count of rows above the window. A line can carry a great
+/// many virtual lines (a comparison hangs every filler row for a change off
+/// one line); building them all to draw a screenful took ~60 ms a frame with
+/// 50 000. Without a window (the stream is folded after this, which can
+/// remove rows) every one is built, as before.
 pub(super) fn inject_virtual_lines(
     source_lines: Vec<ViewLine>,
     state: &EditorState,
     theme: &Theme,
     wrap_width: Option<usize>,
     is_compose: bool,
-) -> Vec<ViewLine> {
-    // Get viewport byte range from source lines.
-    // Use the last line that has source bytes (not a trailing empty line
-    // which the iterator may emit at the buffer end).
-    let viewport_start = source_lines
-        .first()
-        .and_then(|l| l.char_source_bytes.iter().find_map(|m| *m))
-        .unwrap_or(0);
-    let viewport_end = source_lines
-        .iter()
-        .rev()
-        .find_map(|l| l.char_source_bytes.iter().rev().find_map(|m| *m))
-        .map(|b| b + 1)
-        .unwrap_or(viewport_start);
-
-    let mut virtual_lines =
-        state
-            .virtual_texts
-            .query_lines_in_range(&state.marker_list, viewport_start, viewport_end);
-
-    // markdown_compose's table-border virtual lines (`md-tb`) frame the composed
-    // table and belong only to a Compose-mode split. Virtual lines live on the
-    // buffer, so in a Source-mode split sharing a buffer with a composing sibling
-    // they would otherwise draw a frame around the raw source. Drop that
-    // compose-only namespace here — mirroring the `md-syntax` conceal gate in
-    // `view_data.rs` and the `md-emphasis` overlay gate in `overlays.rs`. Every
-    // other virtual-line namespace (git blame, diff, …) renders in both modes.
-    if !is_compose {
-        let md_border_ns = VirtualTextNamespace::from_string("md-tb".to_string());
-        virtual_lines.retain(|(_, vt)| vt.namespace.as_ref() != Some(&md_border_ns));
+    window: Option<RowWindow>,
+) -> (Vec<ViewLine>, usize) {
+    // Compose-only lines (markdown_compose's table borders and list spacing)
+    // belong only to a Compose-mode split: virtual lines live on the buffer,
+    // so a Source-mode split sharing it with a composing sibling would
+    // otherwise draw a frame around the raw source. The virtual-text manager
+    // keeps them apart and counts and hands them out by `is_compose`.
+    let lines = &state.virtual_texts;
+    if lines.lines_before(usize::MAX, is_compose) == 0 {
+        return (source_lines, 0);
     }
 
-    if virtual_lines.is_empty() {
-        return source_lines;
-    }
+    // Rows built or left out so far, and where the build can stop.
+    let mut result = Vec::with_capacity(source_lines.len());
+    let mut skipped = 0usize;
+    let full_at = window.map(|w| w.before.saturating_add(w.rows));
 
-    let mut result = Vec::with_capacity(source_lines.len() + virtual_lines.len());
+    // Add the `placement` lines anchored in `[start, end)`: only those the
+    // window shows. Each line's count comes from the manager's trees, so the
+    // ones above the window — one row each, unwrapped — are left out by
+    // count, and those past it never fetched; the rest are fetched by rank.
+    // Returns `false` once the window is full.
+    let add = |result: &mut Vec<ViewLine>,
+               skipped: &mut usize,
+               placement: VirtualTextPosition,
+               start: usize,
+               end: usize|
+     -> bool {
+        let count = lines.lines_in(placement, is_compose, start, end);
+        if count == 0 {
+            return true;
+        }
+        let built = result.len() + *skipped;
+        let (skip, limit) = match window {
+            Some(w) => {
+                let room = full_at.map_or(usize::MAX, |n| n.saturating_sub(built));
+                if room == 0 {
+                    return false;
+                }
+                let above = if wrap_width.is_none() {
+                    count.min(w.before.saturating_sub(built))
+                } else {
+                    0
+                };
+                (above, room)
+            }
+            None => (0, usize::MAX),
+        };
+        *skipped += skip;
+        for (_, vtext) in lines.lines_window(placement, is_compose, start, end, skip, limit) {
+            if full_at.is_some_and(|n| result.len() + *skipped >= n) {
+                return false;
+            }
+            let glyph = vtext.gutter_glyph.as_ref().map(|g| {
+                (
+                    g.clone(),
+                    vtext.gutter_color.unwrap_or(theme.line_number_fg),
+                )
+            });
+            result.extend(create_wrapped_virtual_lines(
+                &vtext.text,
+                vtext.resolved_style(theme),
+                wrap_width,
+                glyph,
+                &vtext.text_overlays,
+            ));
+        }
+        true
+    };
 
     // `source_lines` are *visual* rows: a wrapped source line arrives as a
     // first row plus one `AfterBreak` continuation per fold. A virtual line
@@ -516,58 +627,39 @@ pub(super) fn inject_virtual_lines(
 
         if is_first_row {
             if let (Some(start), Some(end)) = (logical_start, logical_end(&source_lines, idx)) {
-                for (anchor_pos, vtext) in &virtual_lines {
-                    if *anchor_pos >= start
-                        && *anchor_pos < end
-                        && vtext.position == VirtualTextPosition::LineAbove
-                    {
-                        let glyph = vtext.gutter_glyph.as_ref().map(|g| {
-                            (
-                                g.clone(),
-                                vtext.gutter_color.unwrap_or(theme.line_number_fg),
-                            )
-                        });
-                        result.extend(create_wrapped_virtual_lines(
-                            &vtext.text,
-                            vtext.resolved_style(theme),
-                            wrap_width,
-                            glyph,
-                            &vtext.text_overlays,
-                        ));
-                    }
+                if !add(
+                    &mut result,
+                    &mut skipped,
+                    VirtualTextPosition::LineAbove,
+                    start,
+                    end,
+                ) {
+                    return (result, skipped);
                 }
             }
         }
 
+        if full_at.is_some_and(|n| result.len() + skipped >= n) {
+            return (result, skipped);
+        }
         result.push(source_line.clone());
 
         if is_last_row {
             if let (Some(start), Some(end)) = (logical_start, line_end_byte) {
-                for (anchor_pos, vtext) in &virtual_lines {
-                    if *anchor_pos >= start
-                        && *anchor_pos < end
-                        && vtext.position == VirtualTextPosition::LineBelow
-                    {
-                        let glyph = vtext.gutter_glyph.as_ref().map(|g| {
-                            (
-                                g.clone(),
-                                vtext.gutter_color.unwrap_or(theme.line_number_fg),
-                            )
-                        });
-                        result.extend(create_wrapped_virtual_lines(
-                            &vtext.text,
-                            vtext.resolved_style(theme),
-                            wrap_width,
-                            glyph,
-                            &vtext.text_overlays,
-                        ));
-                    }
+                if !add(
+                    &mut result,
+                    &mut skipped,
+                    VirtualTextPosition::LineBelow,
+                    start,
+                    end,
+                ) {
+                    return (result, skipped);
                 }
             }
         }
     }
 
-    result
+    (result, skipped)
 }
 
 /// One inline inlay-hint cell to splice into the token stream, already
@@ -576,6 +668,60 @@ pub(super) fn inject_virtual_lines(
 struct InlineHintCell {
     text: String,
     style: Option<ViewTokenStyle>,
+    /// See [`InlineHint::pad_to_column`].
+    pad_to_column: Option<u32>,
+}
+
+/// The splice's output, carrying the column its current row has reached and the
+/// hints waiting for that row to end.
+///
+/// The column lives on the sink because every push has to maintain it, though
+/// only a `pad_to_column` hint reads it. Advances match `WrapMachine`'s, since
+/// the two measure the same rows.
+struct SplicedRow {
+    tokens: Vec<ViewTokenWire>,
+    col: usize,
+    /// Hints waiting for the end of the row they were anchored in.
+    row_end: Vec<(String, Option<ViewTokenStyle>, u32)>,
+}
+
+impl SplicedRow {
+    /// Emit a hint at the end of the row its anchor fell in, not at the anchor.
+    fn defer_to_row_end(&mut self, text: String, style: Option<ViewTokenStyle>, target: u32) {
+        self.row_end.push((text, style, target));
+    }
+
+    fn flush_row_end(&mut self) {
+        for (text, style, target) in std::mem::take(&mut self.row_end) {
+            let end = self.col + crate::primitives::visual_layout::visual_width(&text, self.col);
+            let pad = (target as usize).saturating_sub(end);
+            let cell = format!("{}{text}", " ".repeat(pad));
+            self.col += crate::primitives::visual_layout::visual_width(&cell, self.col);
+            self.tokens.push(ViewTokenWire {
+                source_offset: None,
+                kind: ViewTokenWireKind::Text(cell),
+                style,
+            });
+        }
+    }
+
+    fn push(&mut self, token: ViewTokenWire) {
+        if matches!(
+            token.kind,
+            ViewTokenWireKind::Newline | ViewTokenWireKind::Break
+        ) {
+            self.flush_row_end();
+        }
+        match &token.kind {
+            ViewTokenWireKind::Newline | ViewTokenWireKind::Break => self.col = 0,
+            ViewTokenWireKind::Text(s) => {
+                self.col += crate::primitives::visual_layout::visual_width(s, self.col)
+            }
+            ViewTokenWireKind::Space => self.col += 1,
+            ViewTokenWireKind::BinaryByte(_) => self.col += 4,
+        }
+        self.tokens.push(token);
+    }
 }
 
 /// One inline hint, resolved: everything the splice needs and no borrow of
@@ -586,6 +732,16 @@ pub struct InlineHint {
     pub anchor: usize,
     pub text: String,
     pub position: VirtualTextPosition,
+    /// How the underlying marker moves when text is inserted at `anchor`.
+    ///
+    /// The wrap index keeps its own copy of these anchors and shifts them
+    /// itself (`IndexDecorations::shift_for_edit`); without the gravity it
+    /// would have to assume one, and a snapshot that disagrees with the live
+    /// marker makes the index lay out a line the renderer never draws.
+    pub gravity: crate::view::virtual_text::MarkerGravity,
+    /// Draw the hint at the END of the row its anchor falls in, left-padded to
+    /// end at this column. See [`splice_inline_virtual_text`].
+    pub pad_to_column: Option<u32>,
     /// `None` when the caller passed no theme — the scroll-math and index
     /// paths, where only the cell's *width* matters and nothing is drawn.
     pub style: Option<ViewTokenStyle>,
@@ -596,20 +752,31 @@ pub struct InlineHint {
 /// The state-dependent half of the splice, split out so the transform itself is
 /// pure. `theme` is `Some` on the draw path (so hint colours resolve) and `None`
 /// wherever the output is measured but never drawn.
+///
+/// `include_compose_only` is whether the pane is in page view. markdown_compose
+/// emits its code-block side rails whenever any split composes the buffer, so a
+/// Source-mode pane drops them the same way [`inject_virtual_lines`] drops its
+/// frame lines and shows the code literally. Measuring callers pass the mode of
+/// the pane they measure (`EditorState::index_decorations`), so the rows they
+/// count are the rows that pane draws.
 pub fn resolve_inline_hints(
     state: &EditorState,
     theme: Option<&Theme>,
     start: usize,
     end: usize,
+    include_compose_only: bool,
 ) -> Vec<InlineHint> {
     state
         .virtual_texts
-        .query_inline_in_range(&state.marker_list, start, end)
+        .query_inline_in_range(start, end)
         .into_iter()
+        .filter(|(_, vtext)| include_compose_only || !vtext.compose_only)
         .map(|(anchor, vtext)| InlineHint {
             anchor,
             text: vtext.text.clone(),
             position: vtext.position,
+            gravity: vtext.gravity,
+            pad_to_column: vtext.pad_to_column,
             style: theme.map(|t| token_style_from_ratatui(vtext.resolved_style(t))),
         })
         .collect()
@@ -651,20 +818,22 @@ pub fn splice_inline_virtual_text(
     // order. `before` stores the raw hint text — its leading-space padding
     // depends on whether the anchor cell is a newline, decided while
     // walking the token stream below.
-    let mut before: HashMap<usize, Vec<(String, Option<ViewTokenStyle>)>> = HashMap::new();
+    let mut before: HashMap<usize, Vec<InlineHintCell>> = HashMap::new();
     let mut after: HashMap<usize, Vec<InlineHintCell>> = HashMap::new();
     for hint in hints {
         match hint.position {
             VirtualTextPosition::BeforeChar => {
-                before
-                    .entry(hint.anchor)
-                    .or_default()
-                    .push((hint.text.clone(), hint.style.clone()));
+                before.entry(hint.anchor).or_default().push(InlineHintCell {
+                    text: hint.text.clone(),
+                    style: hint.style.clone(),
+                    pad_to_column: hint.pad_to_column,
+                });
             }
             VirtualTextPosition::AfterChar => {
                 after.entry(hint.anchor).or_default().push(InlineHintCell {
-                    text: format!(" {}", hint.text),
+                    text: hint.text.clone(),
                     style: hint.style.clone(),
+                    pad_to_column: hint.pad_to_column,
                 });
             }
             // Line-level positions are handled by `inject_virtual_lines`.
@@ -678,7 +847,11 @@ pub fn splice_inline_virtual_text(
         style,
     };
 
-    let mut out: Vec<ViewTokenWire> = Vec::with_capacity(tokens.len());
+    let mut out = SplicedRow {
+        tokens: Vec::with_capacity(tokens.len()),
+        col: 0,
+        row_end: Vec::new(),
+    };
     // Whether nothing of this line's own source has been emitted yet. Only
     // used to recognise a newline that *is* the whole line — an empty line —
     // whose hints have no neighbouring text to be separated from.
@@ -707,8 +880,16 @@ pub fn splice_inline_virtual_text(
                             });
                         }
                         seg_start = anchor;
-                        for (text, style) in hints {
-                            out.push(virt(format!("{text} "), style.clone()));
+                        for InlineHintCell {
+                            text,
+                            style,
+                            pad_to_column: target,
+                        } in hints
+                        {
+                            match target {
+                                Some(t) => out.defer_to_row_end(text.clone(), style.clone(), *t),
+                                None => out.push(virt(format!("{text} "), style.clone())),
+                            }
                         }
                     }
                     seg.push(ch);
@@ -721,7 +902,14 @@ pub fn splice_inline_virtual_text(
                         });
                         seg_start = token_start + byte_idx;
                         for hint in hints {
-                            out.push(virt(hint.text.clone(), hint.style.clone()));
+                            match hint.pad_to_column {
+                                Some(t) => {
+                                    out.defer_to_row_end(hint.text.clone(), hint.style.clone(), t)
+                                }
+                                None => {
+                                    out.push(virt(format!(" {}", hint.text), hint.style.clone()))
+                                }
+                            }
                         }
                     }
                 }
@@ -747,7 +935,16 @@ pub fn splice_inline_virtual_text(
                 let anchor_is_newline = matches!(kind, ViewTokenWireKind::Newline);
                 let empty_line = anchor_is_newline && line_start_cell;
                 if let Some(hints) = before.get(&anchor) {
-                    for (text, style) in hints {
+                    for InlineHintCell {
+                        text,
+                        style,
+                        pad_to_column: target,
+                    } in hints
+                    {
+                        if let Some(t) = target {
+                            out.defer_to_row_end(text.clone(), style.clone(), *t);
+                            continue;
+                        }
                         let padded = match (anchor_is_newline, empty_line) {
                             (_, true) => text.clone(),
                             (true, false) => format!(" {text} "),
@@ -760,7 +957,12 @@ pub fn splice_inline_virtual_text(
                 out.push(token);
                 if let Some(hints) = after_hints {
                     for hint in hints {
-                        out.push(virt(hint.text.clone(), hint.style.clone()));
+                        match hint.pad_to_column {
+                            Some(t) => {
+                                out.defer_to_row_end(hint.text.clone(), hint.style.clone(), t)
+                            }
+                            None => out.push(virt(format!(" {}", hint.text), hint.style.clone())),
+                        }
                     }
                 }
             }
@@ -770,7 +972,8 @@ pub fn splice_inline_virtual_text(
         }
     }
 
-    out
+    out.flush_row_end();
+    out.tokens
 }
 
 #[cfg(test)]
@@ -862,5 +1065,150 @@ mod soft_break_tests {
             })
             .collect();
         assert_eq!(tail, "onetwo", "no source character may be dropped");
+    }
+}
+
+/// Where a hint anchored on a line break is drawn — the contract markdown
+/// compose's code-block rails are anchored by.
+#[cfg(test)]
+mod line_break_hint_tests {
+    use super::*;
+    use crate::view::virtual_text::MarkerGravity;
+
+    fn line_with_break() -> Vec<ViewTokenWire> {
+        let mut tokens: Vec<ViewTokenWire> = "one"
+            .char_indices()
+            .map(|(i, c)| ViewTokenWire {
+                source_offset: Some(i),
+                kind: ViewTokenWireKind::Text(c.to_string()),
+                style: None,
+            })
+            .collect();
+        tokens.push(ViewTokenWire {
+            source_offset: Some(3),
+            kind: ViewTokenWireKind::Newline,
+            style: None,
+        });
+        tokens
+    }
+
+    fn hint(anchor: usize, position: VirtualTextPosition) -> InlineHint {
+        InlineHint {
+            anchor,
+            text: "|".to_string(),
+            position,
+            gravity: MarkerGravity::Right,
+            pad_to_column: None,
+            style: None,
+        }
+    }
+
+    /// Cells after the break — i.e. the head of the next row.
+    fn past_the_break(tokens: &[ViewTokenWire]) -> String {
+        let br = tokens
+            .iter()
+            .position(|t| matches!(t.kind, ViewTokenWireKind::Newline))
+            .expect("the line break survives the splice");
+        tokens[br + 1..]
+            .iter()
+            .filter_map(|t| match &t.kind {
+                ViewTokenWireKind::Text(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// So nothing that must stay on its own row can be anchored that way.
+    #[test]
+    fn an_after_hint_on_a_line_break_is_drawn_past_it() {
+        let out = splice_inline_virtual_text(
+            line_with_break(),
+            &[hint(3, VirtualTextPosition::AfterChar)],
+        );
+        assert_eq!(past_the_break(&out), " |");
+    }
+
+    #[test]
+    fn a_before_hint_on_a_line_break_is_drawn_at_the_end_of_its_line() {
+        let out = splice_inline_virtual_text(
+            line_with_break(),
+            &[hint(3, VirtualTextPosition::BeforeChar)],
+        );
+        assert_eq!(past_the_break(&out), "");
+        let head: String = out
+            .iter()
+            .take_while(|t| !matches!(t.kind, ViewTokenWireKind::Newline))
+            .filter_map(|t| match &t.kind {
+                ViewTokenWireKind::Text(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        // Padded on both sides — a caller sizing its own padding counts this.
+        assert_eq!(head, "one | ");
+    }
+
+    /// A target column is measured against the row being spliced, so the same
+    /// hint text lands on the same column whatever the content ahead of it —
+    /// the property that lets an emitter working from a stale snapshot still
+    /// place a column correctly.
+    #[test]
+    fn a_padded_hint_ends_at_its_target_column_whatever_precedes_it() {
+        let col_of_glyph = |text: &str| {
+            let tokens: Vec<ViewTokenWire> = text
+                .char_indices()
+                .map(|(i, c)| ViewTokenWire {
+                    source_offset: Some(i),
+                    kind: ViewTokenWireKind::Text(c.to_string()),
+                    style: None,
+                })
+                .chain(std::iter::once(ViewTokenWire {
+                    source_offset: Some(text.len()),
+                    kind: ViewTokenWireKind::Newline,
+                    style: None,
+                }))
+                .collect();
+            let mut h = hint(text.len(), VirtualTextPosition::BeforeChar);
+            h.pad_to_column = Some(20);
+            let out = splice_inline_virtual_text(tokens, &[h]);
+            let rendered: String = out
+                .iter()
+                .take_while(|t| !matches!(t.kind, ViewTokenWireKind::Newline))
+                .filter_map(|t| match &t.kind {
+                    ViewTokenWireKind::Text(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
+            rendered.chars().count()
+        };
+        assert_eq!(col_of_glyph("one"), 20);
+        assert_eq!(col_of_glyph("one two three"), 20);
+        // Past the target there is nothing left to pad with, so the row simply
+        // runs long rather than the glyph being dropped.
+        assert_eq!(col_of_glyph(&"x".repeat(25)), 26);
+    }
+
+    /// Why the break is a safe anchor: deleting the character in front of it
+    /// does not move the hint to another row.
+    #[test]
+    fn deleting_the_last_character_does_not_move_a_break_anchored_hint() {
+        let tokens: Vec<ViewTokenWire> = vec![
+            ViewTokenWire {
+                source_offset: Some(0),
+                kind: ViewTokenWireKind::Text("o".to_string()),
+                style: None,
+            },
+            ViewTokenWire {
+                source_offset: Some(1),
+                kind: ViewTokenWireKind::Text("n".to_string()),
+                style: None,
+            },
+            ViewTokenWire {
+                source_offset: Some(2),
+                kind: ViewTokenWireKind::Newline,
+                style: None,
+            },
+        ];
+        let out = splice_inline_virtual_text(tokens, &[hint(2, VirtualTextPosition::BeforeChar)]);
+        assert_eq!(past_the_break(&out), "");
     }
 }

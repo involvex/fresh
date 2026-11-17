@@ -16,8 +16,7 @@
 //! builds a `Layer` list; pure functions decide precedence); this module
 //! extends the pattern to key routing.
 
-use crate::input::keybindings::{Action, KeyContext, KeybindingResolver};
-use crate::view::popup::PopupKind;
+use crate::input::keybindings::{Action, Key, KeyContext, KeySeq, KeybindingResolver};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Convert a crossterm `KeyEvent` into the `KeyEventPayload` shape
@@ -58,6 +57,60 @@ pub fn key_event_to_payload(ev: &KeyEvent) -> fresh_core::api::KeyEventPayload {
     }
 }
 
+/// A `getNextKey` payload spelled as one chord string, `"x"`, `"ctrl+x"`,
+/// `"ctrl+alt+escape"`: the form a macro step stores it in. The inverse of
+/// [`next_key_payload`].
+pub fn next_key_chord(payload: &fresh_core::api::KeyEventPayload) -> String {
+    let mut chord = String::new();
+    for (held, name) in [
+        (payload.ctrl, "ctrl"),
+        (payload.alt, "alt"),
+        (payload.shift, "shift"),
+        (payload.meta, "meta"),
+    ] {
+        if held {
+            chord.push_str(name);
+            chord.push('+');
+        }
+    }
+    chord.push_str(&payload.key);
+    chord
+}
+
+/// Read a chord written by [`next_key_chord`] back into a payload. What is
+/// left once the modifier prefixes are taken off is the key, so a key that is
+/// itself `+` survives (`"ctrl++"`).
+pub fn next_key_payload(chord: &str) -> fresh_core::api::KeyEventPayload {
+    let mut payload = fresh_core::api::KeyEventPayload {
+        key: String::new(),
+        ctrl: false,
+        alt: false,
+        shift: false,
+        meta: false,
+    };
+    let mut rest = chord;
+    loop {
+        let flag = if let Some(r) = rest.strip_prefix("ctrl+") {
+            rest = r;
+            &mut payload.ctrl
+        } else if let Some(r) = rest.strip_prefix("alt+") {
+            rest = r;
+            &mut payload.alt
+        } else if let Some(r) = rest.strip_prefix("shift+") {
+            rest = r;
+            &mut payload.shift
+        } else if let Some(r) = rest.strip_prefix("meta+") {
+            rest = r;
+            &mut payload.meta
+        } else {
+            break;
+        };
+        *flag = true;
+    }
+    payload.key = rest.to_string();
+    payload
+}
+
 /// The chord built from what the key types on this layout, if the keymap
 /// binds it. `None` when there is no distinct layout character, or when
 /// nothing is bound to it and the physical chord should be used instead.
@@ -84,6 +137,58 @@ pub fn layout_reading(
     match action {
         Action::None | Action::InsertChar(_) => None,
         _ => Some((code, modifiers)),
+    }
+}
+
+/// The reading of a Ctrl+J the editor should act on: Enter, unless something
+/// wants Ctrl+J itself. `None` keeps the key as it came. Ctrl+Alt+J, which
+/// is ESC LF, is likewise Alt+Enter.
+///
+/// Only something *binding* the key keeps it
+/// ([`KeybindingResolver::binds_key`]), not the keymap merely typing it: on
+/// Windows Ctrl+Alt+<char> resolves to typed text, since crossterm and the
+/// GUI report AltGr that way
+/// ([`crate::input::keybindings::is_text_input_modifier`]). This reading is
+/// only asked of keys the input parser produced (`Editor::handle_key_press`),
+/// and there — Windows included, whose console is read in VT input mode —
+/// AltGr text arrives as the character it types, so a Ctrl+Alt+J can only
+/// be ESC LF.
+///
+/// Ctrl+J is LF. The parser reports a raw LF as Ctrl+J so a program in the
+/// integrated terminal can tell it from Enter's CR (sinelaw/fresh#3169), but
+/// to the editor it has always been a second Enter — a newline in the buffer,
+/// confirm in a prompt — and no built-in keymap binds it. So it is read as
+/// Enter except where it is going to a terminal's child (the `Terminal`
+/// context forwards it as 0x0A), where it continues a chord, or where the
+/// keymap or one of `modes` claims it: binds it (a `noop` too), or starts a
+/// chord with it. `modes` are the ones the focused surface resolves keys
+/// against (`Editor::focused_modes`): a mode the key never reaches — a
+/// buffer's, under a prompt — has no say (sinelaw/fresh#3384). Asking only for a single-key action missed the last two:
+/// a `noop` on Ctrl+J turned into Enter, and a `C-j …` chord could never
+/// start because its first key arrived as Enter.
+pub fn ctrl_j_reading(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    kb: &KeybindingResolver,
+    context: &KeyContext,
+    chord_pending: bool,
+    modes: &[&str],
+) -> Option<(KeyCode, KeyModifiers)> {
+    let ctrl = KeyModifiers::CONTROL;
+    if code != KeyCode::Char('j') || (modifiers != ctrl && modifiers != ctrl | KeyModifiers::ALT) {
+        return None;
+    }
+    if *context == KeyContext::Terminal || chord_pending {
+        return None;
+    }
+    let event = KeyEvent::new(code, modifiers);
+    let claimed = kb.binds_key(&event, context)
+        || modes
+            .iter()
+            .any(|mode| kb.binds_key(&event, &KeyContext::Mode((*mode).to_string())));
+    match claimed {
+        true => None,
+        false => Some((KeyCode::Enter, modifiers - ctrl)),
     }
 }
 
@@ -127,40 +232,47 @@ pub fn unfocused_popup_action(
     }
 }
 
-/// Resolve a key event against `KeyContext::Completion` when the topmost
-/// visible popup is a completion popup. Only `CompletionAccept` and
-/// `CompletionDismiss` are recognised here — every other key falls
-/// through to the popup's own handler so type-to-filter, navigation, and
-/// the "any other key dismisses + passthrough" behaviours stay intact.
-pub fn completion_popup_action(
-    topmost_kind: Option<PopupKind>,
-    kb: &KeybindingResolver,
-    event: &KeyEvent,
-) -> Option<Action> {
-    if topmost_kind != Some(PopupKind::Completion) {
-        return None;
-    }
-    match kb.resolve_in_context_only(event, KeyContext::Completion) {
-        Some(action @ (Action::CompletionAccept | Action::CompletionDismiss)) => Some(action),
-        _ => None,
-    }
-}
+// **`completion_popup_action` went with the walk that called it.** It asked
+// the keymap for the key as it arrived, from inside a stage the shell tree is
+// offered the key before, so a binding it would have found could be swallowed
+// ahead of it. `Editor::popup_keys` enumerates the same two actions out of the
+// `completion` section instead and declares them on the open popup's layer.
 
 /// Read-only view of the floating widget panel state that
 /// [`widget_panel_key`] decides over. Built by the Editor from live
 /// state; carries exactly what the decision needs and nothing else.
 pub struct WidgetPanelView {
-    /// The panel is the left dock (vs a centered modal). The dock is
-    /// non-modal: unhandled shortcuts blur it and fall through to the
-    /// editor; a centered modal swallows them.
-    pub is_left_dock: bool,
+    /// The panel is non-modal — the left dock or a sidebar section: Esc
+    /// blurs it and leaves it mounted, and an unbound shortcut blurs it and
+    /// falls through to the editor. A centered modal cancels on Esc and
+    /// swallows what it does not bind.
+    pub non_modal: bool,
+    /// The panel is mounted into a pane's buffer. Its widgets answer their
+    /// keys like any panel's; everything they do not answer — Esc, an
+    /// unbound chord, a function key — is the buffer's own route
+    /// (`FallThrough`), because there is nothing to blur, cancel or
+    /// swallow: the pane *is* the editor's content.
+    pub pane: bool,
     /// The panel's currently focused widget key (previous render).
     pub focus_key: Option<String>,
     /// The focused widget is a Text input (clipboard chords belong to it).
     pub focused_widget_is_text: bool,
-    /// The active window's editor mode, if any. A `defineMode` binding
-    /// for a key must win over the panel's default smart-key behaviour.
-    pub editor_mode: Option<String>,
+    /// The panel is a *page* (`WidgetPanelOptions::page`): a described
+    /// document in a pane, over a mirror buffer whose caret is where the
+    /// reader is.
+    ///
+    /// **A page binds no motion.** Its caret is the buffer's, so the arrows,
+    /// the page keys and `Home`/`End` are the editor's own — resolved once,
+    /// against the user's own keymap, by the machinery every other pane uses
+    /// — and the page reads where the caret ended up (`page_follows_caret`).
+    /// A page that named those keys itself re-implemented a fraction of that
+    /// vocabulary and swallowed the rest: `Ctrl+PageDown` stopped switching
+    /// tabs and `Ctrl+Up` stopped scrolling, because a claim is a claim
+    /// whatever the modifier.
+    ///
+    /// A focused text field is the exception, and the reason is the same one:
+    /// there the keys are the *field's*, and nothing above it wants them.
+    pub page: bool,
 }
 
 /// What a key aimed at a floating widget panel means. The Editor executes
@@ -168,12 +280,12 @@ pub struct WidgetPanelView {
 /// *not* consumed and continues down the normal dispatch pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WidgetKeyOutcome {
-    /// Fire a `widget_event` of this type at the dock's `sessions` widget.
-    DockEvent(&'static str),
-    /// Move panel focus to this widget key (and notify the plugin).
-    FocusWidget(&'static str),
-    /// Blur the panel — focus returns to the editor; the panel stays
-    /// mounted. Key consumed.
+    /// Not the panel's at all: the key goes on to the editor's own
+    /// keyboard unchanged. A pane-mounted panel's answer for what its
+    /// widgets decline.
+    FallThrough,
+    /// Blur the panel and let the editor handle the key (a non-modal
+    /// panel's Esc).
     Blur,
     /// Blur the panel and let the editor handle the key (dock-style
     /// unhandled shortcut: e.g. Ctrl+P should still open the palette).
@@ -181,9 +293,7 @@ pub enum WidgetKeyOutcome {
     /// Esc default: fire a `cancel` widget_event at the focused widget,
     /// then unmount the panel.
     CancelAndUnmount,
-    /// Route a named smart key ("Enter", "Tab", …) through the widget
-    /// command dispatcher.
-    SmartKey(&'static str),
+    SmartKey(KeySeq),
     /// Feed a printable character to the focused TextInput.
     TextChar(char),
     /// Clipboard / selection chord for the focused Text widget.
@@ -193,23 +303,18 @@ pub enum WidgetKeyOutcome {
     SelectAll,
     /// Consumed with no effect — the modal owns the input channel.
     Swallow,
-    /// The active mode explicitly binds this key — not consumed here.
-    FallThrough,
 }
 
 /// Decide what a keystroke aimed at a mounted floating widget panel
 /// means. Pure: reads the [`WidgetPanelView`] and the keymap, mutates
 /// nothing. See the outcome variants for the effect vocabulary.
 ///
-/// The left dock handles Enter / Esc / Space / "/" here, at the
-/// floating-panel layer, *independent of editor modes*: editor modes
-/// (`defineMode`) resolve against the active buffer's mode, which the
-/// dock floats over — so a session whose buffer has a local mode would
-/// shadow any global dock mode. Everywhere else, an explicit mode binding
-/// for the key wins (`FallThrough`) — that is what `defineMode` exists
-/// for. Only bindings *explicitly* set for the mode count: the resolver's
-/// full `resolve()` falls back to Normal-context bindings for any mode,
-/// which would falsely report Enter as bound everywhere.
+/// **This is a translation, not the order of precedence.** It names the
+/// generic vocabulary every panel shares — the widget keys the kinds answer,
+/// the characters a field types, and what an unbound chord does to a modal
+/// versus a non-modal panel. `Editor::dispatch_widget_panel_key` then offers
+/// the key to the focused control, then to the panel's plugin mode, and only
+/// then applies the outcome named here.
 pub fn widget_panel_key(
     view: &WidgetPanelView,
     kb: &KeybindingResolver,
@@ -218,170 +323,50 @@ pub fn widget_panel_key(
 ) -> WidgetKeyOutcome {
     use WidgetKeyOutcome::*;
 
-    let mode_has_binding = |code: KeyCode, modifiers: KeyModifiers| {
-        view.editor_mode
-            .as_ref()
-            .map(|mode_name| {
-                let key_event = KeyEvent::new(code, modifiers);
-                let mode_ctx = KeyContext::Mode(mode_name.to_string());
-                kb.has_explicit_binding(&key_event, &mode_ctx)
-            })
-            .unwrap_or(false)
-    };
-
-    // ACKNOWLEDGED RESIDUE (recorded in the v2 review doc): this dock
-    // branch hardcodes ONE plugin's widget-key conventions ("filter",
-    // "sessions", "project-pick:"/"menu-pick:" prefixes, dock_menu_*
-    // events) — orchestrator-specific panel semantics in host
-    // dispatch. The generalization (plugin-declared key policy, or
-    // these behaviors moving into kind/Component contracts) is part of
-    // the app-level focus-unification arc; until then this is the one
-    // deliberate plugin-shaped seam in the router.
-    if view.is_left_dock {
-        let on_filter = view.focus_key.as_deref() == Some("filter");
-        // Any of the dock's inline dropdowns (project scope, the
-        // "New Task…" create menu, or a session's "Move to…" folder
-        // menu) owns the keyboard while panel focus sits on one of its
-        // option rows. The plugin moves focus onto a `project-pick:` /
-        // `menu-pick:` button when a menu opens; in that state ↑/↓ move
-        // the cursor, Enter commits, Esc cancels — all routed to the
-        // plugin as `dock_menu_*` events so they don't leak to the
-        // session tree underneath.
-        let on_project_menu = view
-            .focus_key
-            .as_deref()
-            .map(|k| k.starts_with("project-pick:") || k.starts_with("menu-pick:"))
-            .unwrap_or(false);
-        if on_project_menu {
-            match code {
-                KeyCode::Up => return DockEvent("dock_menu_prev"),
-                KeyCode::Down => return DockEvent("dock_menu_next"),
-                // Tab/Shift+Tab navigate the menu too, so they can't
-                // tab focus *out* of the open dropdown into the dock
-                // toolbar behind it.
-                KeyCode::Tab if modifiers.contains(KeyModifiers::SHIFT) => {
-                    return DockEvent("dock_menu_prev")
-                }
-                KeyCode::BackTab => return DockEvent("dock_menu_prev"),
-                KeyCode::Tab => return DockEvent("dock_menu_next"),
-                KeyCode::Enter | KeyCode::Char(' ') => return DockEvent("dock_menu_accept"),
-                KeyCode::Esc => return DockEvent("dock_menu_cancel"),
-                _ => {}
-            }
-        }
-        let sessions_focused = view
-            .focus_key
-            .as_deref()
-            .map(|k| k == "sessions" || k.is_empty())
-            .unwrap_or(true);
-        match code {
-            KeyCode::Esc => {
-                return if on_filter {
-                    // Return from the filter to the session list.
-                    FocusWidget("sessions")
-                } else {
-                    // Leave the dock — focus the editor; dock stays visible.
-                    Blur
-                };
-            }
-            KeyCode::Enter => {
-                return if on_filter {
-                    FocusWidget("sessions")
-                } else if sessions_focused {
-                    // Enter on the session list activates the highlighted
-                    // row; handled plugin-side so the discovered-vs-live
-                    // decision lives next to the dialog's identical
-                    // `activate` logic.
-                    DockEvent("dock_activate")
-                } else {
-                    // A button or toggle is keyboard-focused. Run THAT
-                    // control's action via the generic smart-key
-                    // dispatcher instead of the list's dock_activate.
-                    SmartKey("Enter")
-                };
-            }
-            KeyCode::Char('/') if modifiers.is_empty() => return FocusWidget("filter"),
-            // The standard context-menu keys open the highlighted node's
-            // right-click menu. Only fire while the session tree itself is
-            // focused, matching the Enter branch above.
-            KeyCode::Menu if sessions_focused => return DockEvent("dock_context"),
-            // F2 — the classic TUI "user menu" key. Shift+F10 (the
-            // desktop-GUI convention) is unreliable in terminals.
-            KeyCode::F(2) if modifiers.is_empty() && sessions_focused => {
-                return DockEvent("dock_context")
-            }
-            // Alt+T / Alt+I / Alt+P / Alt+N: dialog OPEN_MODE chords the
-            // dock can't express as an editor mode (it floats over the
-            // active buffer's mode) — routed as dock widget_events.
-            KeyCode::Char('t' | 'T') if modifiers.contains(KeyModifiers::ALT) => {
-                return DockEvent("dock_toggle_worktrees")
-            }
-            KeyCode::Char('i' | 'I') if modifiers.contains(KeyModifiers::ALT) => {
-                return DockEvent("dock_toggle_trivial")
-            }
-            KeyCode::Char('p' | 'P') if modifiers.contains(KeyModifiers::ALT) => {
-                return DockEvent("dock_toggle_scope")
-            }
-            KeyCode::Char('n' | 'N') if modifiers.contains(KeyModifiers::ALT) => {
-                return DockEvent("dock_new")
-            }
-            // Toggle the highlighted row's multi-select checkbox (plugin
-            // owns the selection set).
-            KeyCode::Char(' ') => return DockEvent("dock_space"),
-            _ => {}
-        }
-    }
-
     if code == KeyCode::Esc {
-        // Mode-binding precedence: a plugin's `defineMode` entry for
-        // Escape wins over the default "Esc closes the modal" behaviour.
-        // Lets a plugin claim Esc for a nested dismiss-the-dropdown
-        // gesture before the outermost cancel fires.
-        if mode_has_binding(code, modifiers) {
+        // A pane's panel has nothing to leave: Esc is the buffer's.
+        if view.pane {
             return FallThrough;
+        }
+        // A non-modal panel stays mounted: Esc leaves it.
+        if view.non_modal {
+            return Blur;
         }
         return CancelAndUnmount;
     }
 
-    let key_name: Option<&'static str> = match code {
-        KeyCode::Tab => Some(if modifiers.contains(KeyModifiers::SHIFT) {
-            "Shift+Tab"
-        } else {
-            "Tab"
-        }),
-        KeyCode::BackTab => Some("Shift+Tab"),
-        KeyCode::Enter => Some("Enter"),
-        KeyCode::Backspace => Some("Backspace"),
-        KeyCode::Delete => Some("Delete"),
-        KeyCode::Home => Some("Home"),
-        KeyCode::End => Some("End"),
-        KeyCode::Left => Some("Left"),
-        KeyCode::Right => Some("Right"),
-        KeyCode::Up => Some("Up"),
-        KeyCode::Down => Some("Down"),
-        KeyCode::PageUp => Some("PageUp"),
-        KeyCode::PageDown => Some("PageDown"),
+    // **Reading, not editing a field**: a page whose caret is the buffer's,
+    // with no text widget holding the keyboard. Every motion key belongs to
+    // the editor there. See [`WidgetPanelView::page`].
+    let reader = view.page && !view.focused_widget_is_text;
+
+    // A modifier the vocabulary has no meaning for is masked off: the kinds
+    // decline what they do not recognise, and the key would be swallowed.
+    // `view::settings::live::key_name` masks the same way.
+    const CARET: KeyModifiers = KeyModifiers::CONTROL.union(KeyModifiers::SHIFT);
+    let widget_key = match code {
+        KeyCode::Tab => Some(modifiers & KeyModifiers::SHIFT),
+        KeyCode::BackTab | KeyCode::Enter => Some(KeyModifiers::NONE),
+        // Ctrl deletes a word rather than a character (`Text::on_key`).
+        KeyCode::Backspace | KeyCode::Delete => Some(modifiers & KeyModifiers::CONTROL),
+        KeyCode::PageUp | KeyCode::PageDown if !reader => Some(KeyModifiers::NONE),
+        KeyCode::Home
+        | KeyCode::End
+        | KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::Up
+        | KeyCode::Down
+            if !reader =>
+        {
+            Some(modifiers & CARET)
+        }
         _ => None,
     };
-    if let Some(name) = key_name {
-        // The orchestrator New-Session form relies on mode precedence so
-        // Enter submits the form regardless of which field is focused.
-        if mode_has_binding(code, modifiers) {
-            return FallThrough;
-        }
-        return SmartKey(name);
+    if let Some(mods) = widget_key {
+        return SmartKey(KeySeq::one(Key::new(code, mods)));
     }
 
     if let KeyCode::Char(c) = code {
-        // The active editor mode may have explicitly claimed this char
-        // via `defineMode`. This covers *plain* chars too (not just
-        // Ctrl/Alt chords): a plugin that binds a bare key like `/` gets
-        // it before the text-input fast path. The trade-off is that a
-        // bound bare key can't also be typed as text in that mode, which
-        // is what the plugin asked for by binding it.
-        if mode_has_binding(code, modifiers) {
-            return FallThrough;
-        }
         // Ctrl/Alt-modified chords with no mode binding: a centered
         // modal swallows them (it must not leak keys to global bindings
         // like Ctrl-P). The non-modal dock does the opposite — an
@@ -403,7 +388,10 @@ pub fn widget_panel_key(
                     _ => {}
                 }
             }
-            if view.is_left_dock {
+            if view.pane {
+                return FallThrough;
+            }
+            if view.non_modal {
                 return BlurUnconsumed;
             }
             return Swallow;
@@ -419,15 +407,37 @@ pub fn widget_panel_key(
         // inserts " " as a char for a focused Text widget, so typing
         // spaces into text fields keeps working.
         if ch == ' ' {
-            return SmartKey("Space");
+            return SmartKey(KeySeq::one(Key::new(
+                KeyCode::Char(' '),
+                KeyModifiers::NONE,
+            )));
         }
         return TextChar(ch);
     }
 
     // Any other keystroke (function keys, unhandled keycodes, …) is
     // swallowed — the modal is the exclusive owner of the input channel
-    // until it unmounts.
+    // until it unmounts. A pane's panel owns no channel: the key is the
+    // buffer's.
+    if view.pane {
+        return FallThrough;
+    }
     Swallow
+}
+
+/// Whether `key` — the widget-vocabulary key [`widget_panel_key`] named for
+/// `code` + `modifiers` — is that key exactly, with no modifier masked off.
+///
+/// Only an exact key is offered to the focused control ahead of the panel's
+/// mode: Ctrl+Enter reaches the vocabulary as Enter, and a text area handed
+/// it first would type a newline where the plugin bound "submit". Shift on
+/// `BackTab` is the one drop that loses nothing — the code already says it.
+pub fn widget_key_is_exact(key: &KeySeq, code: KeyCode, modifiers: KeyModifiers) -> bool {
+    let Some(k) = key.single() else {
+        return false;
+    };
+    let dropped = modifiers.difference(k.mods());
+    dropped.is_empty() || (code == KeyCode::BackTab && dropped == KeyModifiers::SHIFT)
 }
 
 /// Read-only view for [`should_dismiss_transient_popup`]: the state of the
@@ -470,32 +480,18 @@ pub fn should_dismiss_transient_popup(
 /// Read-only view for [`mode_key_disposition`]: the mode-related state a
 /// key is judged against while the editor buffer has focus.
 pub struct ModeKeyView {
-    /// The effective mode (buffer-local if present, else global) —
-    /// virtual buffer modes must not be hijacked by global modes.
+    /// The effective mode (buffer-local if present, else the window's
+    /// editor mode, else the input mode) — virtual buffer modes must not be
+    /// hijacked by either.
     pub effective_mode: Option<String>,
     /// The effective mode declares `allow_text_input` (e.g.
     /// search-replace-list): character keys are captured, other unbound
     /// keys are blocked.
     pub allows_text_input: bool,
-    /// The *global* editor mode's read-only flag, when a global mode is
-    /// active (e.g. vi-normal blocks all unbound keys when read-only).
+    /// The read-only flag of the mode beneath the buffer's — the window's
+    /// editor mode, else the editor-wide input mode — when one is active
+    /// (e.g. vi-normal blocks all unbound keys when read-only).
     pub global_mode_read_only: Option<bool>,
-    /// A widget Text input on the active buffer is focused — Shift+nav
-    /// extends its selection instead of reaching the buffer.
-    pub has_focused_text_widget: bool,
-}
-
-/// A selection-extending move on a focused widget text editor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WidgetSelectionMove {
-    WordLeft,
-    WordRight,
-    Left,
-    Right,
-    Up,
-    Down,
-    Home,
-    End,
 }
 
 /// What a key means under the active editor mode. The shell clears the
@@ -514,17 +510,38 @@ pub enum ModeKeyDisposition {
     /// action-name encoding survives only for user keymaps that bound
     /// the string form, behind a deprecation warning.
     TextInput(char),
-    /// Clipboard / select-all chord forwarded despite the text-input
-    /// mode block — it belongs to the focused widget Text input.
+    /// A navigation key forwarded despite the text-input mode block: it
+    /// resolves in the `Normal` context to the buffer's own motion.
     Forward(Action),
-    /// Shift+nav extends the focused widget text selection. Always
-    /// consumed, even when the move is a no-op at a boundary.
-    WidgetSelection(WidgetSelectionMove),
     /// Consumed with no effect (unbound key in a text-input or
     /// read-only mode).
     Block,
     /// No mode claims the key — continue down the pipeline.
     FallThrough,
+}
+
+/// The character this key event types, if it types one.
+///
+/// One definition for both places a mode can capture text, because two
+/// hand-rolled copies of "is this typing" is how they drift. It defers
+/// the modifier question to [`crate::input::keybindings::is_text_input_modifier`],
+/// which is the editor's own answer and knows the case a bare
+/// `!intersects(CONTROL | ALT)` gets wrong: on Windows crossterm reports
+/// AltGr as Ctrl+Alt, so excluding Ctrl+Alt excludes `@ [ ] { }` on
+/// German, French and Italian layouts — the characters those keyboards
+/// need most.
+fn typed_char(event: &KeyEvent) -> Option<char> {
+    let KeyCode::Char(c) = event.code else {
+        return None;
+    };
+    if !crate::input::keybindings::is_text_input_modifier(event.modifiers) {
+        return None;
+    }
+    Some(if event.modifiers.contains(KeyModifiers::SHIFT) {
+        c.to_uppercase().next().unwrap_or(c)
+    } else {
+        c
+    })
 }
 
 /// Decide what a key means while an editor mode is active. Pure: the
@@ -541,12 +558,34 @@ pub fn mode_key_disposition(
 ) -> ModeKeyDisposition {
     use crate::input::keybindings::ChordResolution;
 
+    // **A focused text field's keys never reach here.** A panel's widgets
+    // answer their keys through the widget router (`widget_panel_key`)
+    // before the buffer's route is asked, and the panel's own keymap
+    // (`view::shell::panel::Keymap`) lets a printable key through to a
+    // focused field ahead of the mode's bindings. What arrives at this
+    // stage is a key no widget took.
     if let Some(mode_name) = &view.effective_mode {
         let mode_ctx = KeyContext::Mode(mode_name.clone());
         match kb.resolve_chord(chord_state, event, mode_ctx.clone()) {
             ChordResolution::Complete(action) => return ModeKeyDisposition::Run(action),
             ChordResolution::Partial => return ModeKeyDisposition::ChordPending,
             ChordResolution::NoMatch => {}
+        }
+        // A chord is in flight: the mode's ui-fallthrough single-key
+        // resolution must not claim the next key before the Normal-
+        // context chord it extends has had its say. Without this, a plugin
+        // mode (e.g. markdown-source) made C-x C-c abandon the pending C-x
+        // and run the whitelisted Copy action instead ("Copied line"),
+        // breaking every keymap chord whose second key resolves to a
+        // ui-fallthrough action. Resolve the in-flight chord against
+        // Normal first; only a NoMatch lets the mode's own single-key
+        // stage run.
+        if !chord_state.is_empty() {
+            match kb.resolve_chord(chord_state, event, KeyContext::Normal) {
+                ChordResolution::Complete(action) => return ModeKeyDisposition::Run(action),
+                ChordResolution::Partial => return ModeKeyDisposition::ChordPending,
+                ChordResolution::NoMatch => {}
+            }
         }
         // Mode single-key resolution (custom > keymap > plugin defaults)
         let resolved = kb.resolve(event, mode_ctx);
@@ -563,52 +602,62 @@ pub fn mode_key_disposition(
     // fall through to normal keybinding handling so that Ctrl+C, arrows,
     // etc. still work.
     if view.effective_mode.is_some() && view.allows_text_input {
-        if let KeyCode::Char(c) = event.code {
-            let ch = if event.modifiers.contains(KeyModifiers::SHIFT) {
-                c.to_uppercase().next().unwrap_or(c)
-            } else {
-                c
-            };
-            if !event
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-            {
-                return ModeKeyDisposition::TextInput(ch);
+        if let Some(ch) = typed_char(event) {
+            return ModeKeyDisposition::TextInput(ch);
+        }
+        // Navigation is not the mode's to swallow.
+        //
+        // A mode declaring `allow_text_input` owns the keyboard, and
+        // everything it did not name was blocked here. That made every
+        // such page re-declare the whole navigation set — arrows, page
+        // keys, Home/End — and hand each one back to the host through a
+        // plugin handler, which is a lot of plumbing to arrive at the
+        // behaviour the host already implements. The welcome screen had
+        // nine such handlers; before they were written, Home and End
+        // simply did nothing on it.
+        //
+        // So navigation resolves the way it would anywhere else: to the
+        // focused text widget when there is one, and to the buffer
+        // otherwise. Character keys are still captured above, and every
+        // other unbound key is still blocked — a focused search field
+        // must not let Ctrl+O through.
+        // Plain navigation only. Shift+nav with no focused widget stays
+        // blocked, as it was: extending a *buffer* selection is not what
+        // a page like this is for, and widening that here would be a
+        // behaviour change to every `allow_text_input` mode rather than
+        // a fix to the one thing that was broken.
+        let plain = !event
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL);
+        // **Control is not plain.** It used to be — `plain` excluded only
+        // Shift and Alt — and with a non-text widget focused (a results tree,
+        // say) `Ctrl+Left` fell through here, resolved to `move_word_left`,
+        // and moved the *panel document's* own cursor: a cursor nothing
+        // draws, whose line and column the status bar then reported changing
+        // under a keystroke that visibly did nothing at all. A focused field
+        // gets its word-wise motion from `widget_panel_key`, which names the
+        // chord `C-Left` for the kind to answer.
+        let ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
+        let nav = matches!(
+            event.code,
+            KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Home
+                | KeyCode::End
+        );
+        // **`Ctrl`+the page keys are not navigation-in-a-document.** They are
+        // `prev_buffer` / `next_buffer` — switching tabs, which a reader
+        // expects to work from anywhere, panel included.
+        let page = matches!(event.code, KeyCode::PageUp | KeyCode::PageDown);
+        if (plain && (nav || page)) || (ctrl && page) {
+            let action = kb.resolve(event, KeyContext::Normal);
+            if action != Action::None {
+                return ModeKeyDisposition::Forward(action);
             }
         }
-        // Before blocking the key, resolve it against the Normal context
-        // and forward if it's one of the clipboard / select-all actions —
-        // those legitimately belong to the focused widget Text input, not
-        // the underlying buffer. Other Ctrl-modified actions (e.g. Open /
-        // Save / SplitVertical) stay blocked so they don't hijack a
-        // focused search field.
-        if let action @ (Action::Paste | Action::Copy | Action::Cut | Action::SelectAll) =
-            kb.resolve(event, KeyContext::Normal)
-        {
-            return ModeKeyDisposition::Forward(action);
-        }
-        // Shift+arrow / Ctrl+Shift+arrow extend the selection on the
-        // focused widget TextEdit, if any. Routed directly instead of
-        // through the IPC `WidgetAction` path because selection ops are
-        // host-internal — the plugin's model only cares about the
-        // post-`change` value.
-        if event.modifiers.contains(KeyModifiers::SHIFT) && view.has_focused_text_widget {
-            let ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
-            let mv = match event.code {
-                KeyCode::Left if ctrl => Some(WidgetSelectionMove::WordLeft),
-                KeyCode::Right if ctrl => Some(WidgetSelectionMove::WordRight),
-                KeyCode::Left => Some(WidgetSelectionMove::Left),
-                KeyCode::Right => Some(WidgetSelectionMove::Right),
-                KeyCode::Up => Some(WidgetSelectionMove::Up),
-                KeyCode::Down => Some(WidgetSelectionMove::Down),
-                KeyCode::Home => Some(WidgetSelectionMove::Home),
-                KeyCode::End => Some(WidgetSelectionMove::End),
-                _ => None,
-            };
-            if let Some(mv) = mv {
-                return ModeKeyDisposition::WidgetSelection(mv);
-            }
-        }
+
         return ModeKeyDisposition::Block;
     }
 
@@ -670,6 +719,28 @@ pub fn cancels_pending_lsp(action: &Action) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_next_key_chord_reads_back_as_the_same_payload() {
+        let cases = [
+            ("x", false, false, false, false),
+            ("ctrl+x", true, false, false, false),
+            ("ctrl+alt+shift+meta+escape", true, true, true, true),
+            ("ctrl++", true, false, false, false),
+            ("+", false, false, false, false),
+        ];
+        for (chord, ctrl, alt, shift, meta) in cases {
+            let payload = next_key_payload(chord);
+            assert_eq!(
+                (payload.ctrl, payload.alt, payload.shift, payload.meta),
+                (ctrl, alt, shift, meta),
+                "{chord}"
+            );
+            assert_eq!(next_key_chord(&payload), chord);
+        }
+        assert_eq!(next_key_payload("ctrl++").key, "+");
+    }
+
     use super::*;
     use crate::config::Config;
 
@@ -696,33 +767,12 @@ mod tests {
         KeyEvent::new(code, modifiers)
     }
 
-    #[test]
-    fn completion_action_requires_completion_popup() {
-        // Accept/dismiss aren't bound by default (the popup's own handler
-        // covers Tab/Enter); bind one so the gating is observable.
-        let mut config = config();
-        config.keybindings.push(crate::config::Keybinding {
-            key: "enter".to_string(),
-            modifiers: Vec::new(),
-            keys: Vec::new(),
-            action: "completion_accept".to_string(),
-            args: std::collections::HashMap::new(),
-            when: Some("completion".to_string()),
-        });
-        let kb = KeybindingResolver::new(&config);
-        let enter = event(KeyCode::Enter, KeyModifiers::NONE);
-        // The binding fires only when the topmost popup IS a completion
-        // popup; any other kind falls through to the popup's own handler.
-        assert_eq!(
-            completion_popup_action(Some(PopupKind::Completion), &kb, &enter),
-            Some(Action::CompletionAccept)
-        );
-        assert_eq!(
-            completion_popup_action(Some(PopupKind::Hover), &kb, &enter),
-            None
-        );
-        assert_eq!(completion_popup_action(None, &kb, &enter), None);
-    }
+    // `completion_action_requires_completion_popup` went with the function.
+    // The gating it pinned — the `completion` section's bindings apply only
+    // when the popup holding the keyboard is a completion list — is
+    // `Editor::popup_keys`'s, which reads the *kind* to decide which sections
+    // to enumerate, and `view::shell::popup::a_bound_key_runs_its_editor_action`
+    // is where a bound key is shown reaching the popup.
 
     #[test]
     fn unfocused_popup_esc_resolves_to_cancel() {
@@ -740,6 +790,84 @@ mod tests {
         assert_eq!(
             unfocused_popup_action(KeyContext::Normal, &kb, &char_a),
             None
+        );
+    }
+
+    /// An unbound Ctrl+J is read as Enter, except where it goes to a
+    /// terminal's child or something binds it.
+    #[test]
+    fn ctrl_j_reads_as_enter_unless_terminal_or_bound() {
+        let (j, ctrl) = (KeyCode::Char('j'), KeyModifiers::CONTROL);
+        let enter = Some((KeyCode::Enter, KeyModifiers::NONE));
+        let mut kb = resolver();
+        for context in [KeyContext::Normal, KeyContext::Prompt, KeyContext::Popup] {
+            assert_eq!(ctrl_j_reading(j, ctrl, &kb, &context, false, &[]), enter);
+        }
+        // The terminal forwards it to its child as LF (0x0A).
+        assert_eq!(
+            ctrl_j_reading(j, ctrl, &kb, &KeyContext::Terminal, false, &[]),
+            None
+        );
+        // The second key of a chord in progress.
+        assert_eq!(
+            ctrl_j_reading(j, ctrl, &kb, &KeyContext::Normal, true, &[]),
+            None
+        );
+        // Ctrl+Alt+J (ESC LF) is Alt+Enter, Windows included: there the
+        // keymap would type it (Ctrl+Alt is AltGr to it), which is not a
+        // binding.
+        for context in [KeyContext::Normal, KeyContext::Prompt] {
+            assert_eq!(
+                ctrl_j_reading(j, ctrl | KeyModifiers::ALT, &kb, &context, false, &[]),
+                Some((KeyCode::Enter, KeyModifiers::ALT))
+            );
+        }
+        // Only Ctrl+J itself.
+        for (code, mods) in [
+            (j, KeyModifiers::NONE),
+            (j, ctrl | KeyModifiers::SHIFT),
+            (KeyCode::Char('k'), ctrl),
+        ] {
+            assert_eq!(
+                ctrl_j_reading(code, mods, &kb, &KeyContext::Normal, false, &[]),
+                None
+            );
+        }
+        // A mode chord that starts with it holds it for the chord.
+        let chord_mode = KeyContext::Mode("chorded".to_string());
+        kb.load_plugin_chord_default(
+            chord_mode,
+            vec![(j, ctrl), (KeyCode::Char('k'), ctrl)],
+            Action::SelectAll,
+        );
+        assert_eq!(
+            ctrl_j_reading(j, ctrl, &kb, &KeyContext::Normal, false, &["chorded"]),
+            None
+        );
+        // So does a `noop` that disables it.
+        let quiet = KeyContext::Mode("quiet".to_string());
+        kb.load_plugin_default(quiet, j, ctrl, Action::None);
+        assert_eq!(
+            ctrl_j_reading(j, ctrl, &kb, &KeyContext::Normal, false, &["quiet"]),
+            None
+        );
+        // A mode that binds it (merge_conflict's `C-j`) keeps it.
+        let mode = KeyContext::Mode("merge-conflict".to_string());
+        kb.load_plugin_default(mode, j, ctrl, Action::MoveDown);
+        assert_eq!(
+            ctrl_j_reading(
+                j,
+                ctrl,
+                &kb,
+                &KeyContext::Normal,
+                false,
+                &["merge-conflict"]
+            ),
+            None
+        );
+        assert_eq!(
+            ctrl_j_reading(j, ctrl, &kb, &KeyContext::Normal, false, &["other"]),
+            enter
         );
     }
 
@@ -765,70 +893,39 @@ mod tests {
         assert_eq!(layout_reading(&plain, &kb, KeyContext::Normal), None);
     }
 
+    /// Esc leaves a non-modal panel mounted and blurs it; on a centered
+    /// modal it cancels and unmounts. A panel's own Esc — the dock's
+    /// "back to the list from the filter" — is its keymap's, on the tree,
+    /// and never reaches here.
     #[test]
-    fn dock_esc_depends_on_focus() {
+    fn esc_blurs_a_non_modal_panel_and_cancels_a_modal() {
         let kb = resolver();
-        let dock = |focus: Option<&str>| WidgetPanelView {
-            is_left_dock: true,
-            focus_key: focus.map(str::to_string),
+        let view = |non_modal: bool| WidgetPanelView {
+            non_modal,
+            pane: false,
+            focus_key: Some("sessions".to_string()),
             focused_widget_is_text: false,
-            editor_mode: None,
+            page: false,
         };
-        // Esc on the filter returns to the session list; elsewhere it
-        // blurs the dock (which stays mounted).
         assert_eq!(
-            widget_panel_key(&dock(Some("filter")), &kb, KeyCode::Esc, KeyModifiers::NONE),
-            WidgetKeyOutcome::FocusWidget("sessions")
-        );
-        assert_eq!(
-            widget_panel_key(
-                &dock(Some("sessions")),
-                &kb,
-                KeyCode::Esc,
-                KeyModifiers::NONE
-            ),
+            widget_panel_key(&view(true), &kb, KeyCode::Esc, KeyModifiers::NONE),
             WidgetKeyOutcome::Blur
         );
-        // On a centered modal, Esc cancels and unmounts.
-        let modal = WidgetPanelView {
-            is_left_dock: false,
-            focus_key: None,
-            focused_widget_is_text: false,
-            editor_mode: None,
-        };
         assert_eq!(
-            widget_panel_key(&modal, &kb, KeyCode::Esc, KeyModifiers::NONE),
+            widget_panel_key(&view(false), &kb, KeyCode::Esc, KeyModifiers::NONE),
             WidgetKeyOutcome::CancelAndUnmount
         );
     }
 
     #[test]
-    fn dock_dropdown_owns_navigation_keys() {
+    fn modal_swallows_chords_a_non_modal_panel_blurs_through() {
         let kb = resolver();
-        let view = WidgetPanelView {
-            is_left_dock: true,
-            focus_key: Some("project-pick:2".to_string()),
-            focused_widget_is_text: false,
-            editor_mode: None,
-        };
-        assert_eq!(
-            widget_panel_key(&view, &kb, KeyCode::Up, KeyModifiers::NONE),
-            WidgetKeyOutcome::DockEvent("dock_menu_prev")
-        );
-        assert_eq!(
-            widget_panel_key(&view, &kb, KeyCode::Enter, KeyModifiers::NONE),
-            WidgetKeyOutcome::DockEvent("dock_menu_accept")
-        );
-    }
-
-    #[test]
-    fn modal_swallows_chords_dock_blurs_through() {
-        let kb = resolver();
-        let mk = |is_left_dock| WidgetPanelView {
-            is_left_dock,
+        let mk = |non_modal| WidgetPanelView {
+            non_modal,
+            pane: false,
             focus_key: None,
             focused_widget_is_text: false,
-            editor_mode: None,
+            page: false,
         };
         let ctrl_p = (KeyCode::Char('p'), KeyModifiers::CONTROL);
         // A centered modal must not leak Ctrl+P to the palette…
@@ -843,14 +940,116 @@ mod tests {
         );
     }
 
+    /// A modifier the vocabulary has no meaning for is masked off.
     #[test]
-    fn text_input_mode_captures_plain_chars_and_forwards_clipboard() {
+    fn a_key_carries_only_the_modifiers_its_vocabulary_distinguishes() {
+        let kb = resolver();
+        let view = WidgetPanelView {
+            non_modal: true,
+            pane: true,
+            focus_key: Some("lst".to_string()),
+            focused_widget_is_text: false,
+            page: false,
+        };
+        let press = |code, mods| match widget_panel_key(&view, &kb, code, mods) {
+            WidgetKeyOutcome::SmartKey(seq) => seq.single().expect("one press"),
+            other => panic!("{code:?} + {mods:?} was {other:?}"),
+        };
+        for code in [
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::Enter,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Backspace,
+            KeyCode::Delete,
+        ] {
+            assert_eq!(
+                press(code, KeyModifiers::ALT),
+                Key::new(code, KeyModifiers::NONE),
+                "Alt+{code:?} should reach the kinds unmodified"
+            );
+        }
+        assert_eq!(
+            press(KeyCode::PageUp, KeyModifiers::SHIFT),
+            Key::new(KeyCode::PageUp, KeyModifiers::NONE)
+        );
+        assert_eq!(
+            press(KeyCode::Enter, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            Key::new(KeyCode::Enter, KeyModifiers::NONE)
+        );
+        assert_eq!(
+            press(
+                KeyCode::Backspace,
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            ),
+            Key::new(KeyCode::Backspace, KeyModifiers::CONTROL)
+        );
+        assert_eq!(
+            press(KeyCode::Left, KeyModifiers::CONTROL | KeyModifiers::ALT),
+            Key::new(KeyCode::Left, KeyModifiers::CONTROL)
+        );
+    }
+
+    /// A pane-mounted panel's widgets answer their keys like the dock's;
+    /// what they decline is the buffer's own route, with nothing to blur,
+    /// cancel or swallow.
+    #[test]
+    fn a_panes_panel_hands_what_its_widgets_decline_to_the_buffer() {
+        let kb = resolver();
+        let view = WidgetPanelView {
+            non_modal: true,
+            pane: true,
+            focus_key: Some("lst".to_string()),
+            focused_widget_is_text: false,
+            page: false,
+        };
+        assert_eq!(
+            widget_panel_key(&view, &kb, KeyCode::Down, KeyModifiers::NONE),
+            WidgetKeyOutcome::SmartKey(KeySeq::one(Key::new(KeyCode::Down, KeyModifiers::NONE)))
+        );
+        assert_eq!(
+            widget_panel_key(&view, &kb, KeyCode::Right, KeyModifiers::SHIFT),
+            WidgetKeyOutcome::SmartKey(KeySeq::one(Key::new(KeyCode::Right, KeyModifiers::SHIFT))),
+            "a caret key carries its modifiers to the kind"
+        );
+        assert_eq!(
+            widget_panel_key(
+                &view,
+                &kb,
+                KeyCode::Left,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            ),
+            WidgetKeyOutcome::SmartKey(KeySeq::one(Key::new(
+                KeyCode::Left,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )))
+        );
+        assert_eq!(
+            widget_panel_key(&view, &kb, KeyCode::Esc, KeyModifiers::NONE),
+            WidgetKeyOutcome::FallThrough
+        );
+        assert_eq!(
+            widget_panel_key(&view, &kb, KeyCode::Char('p'), KeyModifiers::CONTROL),
+            WidgetKeyOutcome::FallThrough
+        );
+        assert_eq!(
+            widget_panel_key(&view, &kb, KeyCode::F(2), KeyModifiers::NONE),
+            WidgetKeyOutcome::FallThrough
+        );
+    }
+
+    #[test]
+    fn text_input_mode_captures_plain_chars_and_blocks_chords() {
         let kb = resolver();
         let view = ModeKeyView {
             effective_mode: Some("search-replace-list".to_string()),
             allows_text_input: true,
             global_mode_read_only: None,
-            has_focused_text_widget: false,
         };
         // Plain characters feed the mode's text input (Shift upcases).
         assert_eq!(
@@ -871,7 +1070,9 @@ mod tests {
             ),
             ModeKeyDisposition::TextInput('A')
         );
-        // Clipboard chords are forwarded, not blocked…
+        // Chords and unbound named keys are blocked: a focused field's
+        // clipboard chords never reach the mode (the widget router takes
+        // them), and a page with no field must not let Ctrl+O through.
         assert_eq!(
             mode_key_disposition(
                 &view,
@@ -879,9 +1080,8 @@ mod tests {
                 &kb,
                 &event(KeyCode::Char('c'), KeyModifiers::CONTROL)
             ),
-            ModeKeyDisposition::Forward(Action::Copy)
+            ModeKeyDisposition::Block
         );
-        // …but other chords and unbound named keys are blocked.
         assert_eq!(
             mode_key_disposition(
                 &view,
@@ -894,41 +1094,82 @@ mod tests {
     }
 
     #[test]
-    fn text_input_mode_routes_shift_nav_to_focused_widget() {
+    /// Ctrl+nav must not reach the buffer from a text-input mode.
+    ///
+    /// It used to count as "plain" — `plain` excluded only Shift and Alt — so
+    /// `Ctrl+Left` in a mode like search-replace fell through to
+    /// `kb.resolve(…, Normal)`, resolved to `move_word_left`, and moved the
+    /// *panel document's* own cursor: a cursor nothing draws, whose line and
+    /// column the status bar then reported changing under a keystroke that
+    /// visibly did nothing at all. A focused field gets its word-wise motion
+    /// from `widget_panel_key` instead, which names the chord for the kind.
+    fn text_input_mode_keeps_ctrl_nav_off_the_buffer() {
         let kb = resolver();
-        let mk = |has_widget| ModeKeyView {
+        let view = ModeKeyView {
             effective_mode: Some("search-replace-list".to_string()),
             allows_text_input: true,
             global_mode_read_only: None,
-            has_focused_text_widget: has_widget,
+        };
+        for code in [
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Home,
+            KeyCode::End,
+        ] {
+            assert_eq!(
+                mode_key_disposition(&view, &[], &kb, &event(code, KeyModifiers::CONTROL)),
+                ModeKeyDisposition::Block,
+                "Ctrl+{code:?} must not reach the buffer from a text-input mode"
+            );
+        }
+        // Plain navigation still forwards, which is what this arm exists for.
+        assert!(matches!(
+            mode_key_disposition(&view, &[], &kb, &event(KeyCode::Down, KeyModifiers::NONE)),
+            ModeKeyDisposition::Forward(_)
+        ));
+        // And the page keys keep their Control: `Ctrl+PageUp` is
+        // `prev_buffer` — switching tabs, not moving a cursor — and a reader
+        // expects that from a panel too.
+        let page_up = mode_key_disposition(
+            &view,
+            &[],
+            &kb,
+            &event(KeyCode::PageUp, KeyModifiers::CONTROL),
+        );
+        assert!(
+            matches!(
+                page_up,
+                ModeKeyDisposition::Run(Action::PrevBuffer)
+                    | ModeKeyDisposition::Forward(Action::PrevBuffer)
+            ),
+            "Ctrl+PageUp switches buffers and must keep doing so, but resolved to {page_up:?}"
+        );
+    }
+
+    /// The word-wise half of the same chord: a focused field is reached
+    /// through the panel's own key vocabulary, where `C-Left` names it.
+    #[test]
+    fn a_focused_field_still_gets_its_word_wise_motion() {
+        let kb = resolver();
+        let view = WidgetPanelView {
+            non_modal: true,
+            pane: true,
+            focus_key: Some("search".to_string()),
+            focused_widget_is_text: true,
+            page: false,
         };
         assert_eq!(
-            mode_key_disposition(
-                &mk(true),
-                &[],
-                &kb,
-                &event(KeyCode::Left, KeyModifiers::SHIFT)
-            ),
-            ModeKeyDisposition::WidgetSelection(WidgetSelectionMove::Left)
+            widget_panel_key(&view, &kb, KeyCode::Left, KeyModifiers::CONTROL),
+            WidgetKeyOutcome::SmartKey(KeySeq::one(Key::new(KeyCode::Left, KeyModifiers::CONTROL)))
         );
         assert_eq!(
-            mode_key_disposition(
-                &mk(true),
-                &[],
-                &kb,
-                &event(KeyCode::Left, KeyModifiers::SHIFT | KeyModifiers::CONTROL)
-            ),
-            ModeKeyDisposition::WidgetSelection(WidgetSelectionMove::WordLeft)
-        );
-        // No focused widget Text → the key is simply blocked.
-        assert_eq!(
-            mode_key_disposition(
-                &mk(false),
-                &[],
-                &kb,
-                &event(KeyCode::Left, KeyModifiers::SHIFT)
-            ),
-            ModeKeyDisposition::Block
+            widget_panel_key(&view, &kb, KeyCode::Right, KeyModifiers::CONTROL),
+            WidgetKeyOutcome::SmartKey(KeySeq::one(Key::new(
+                KeyCode::Right,
+                KeyModifiers::CONTROL
+            )))
         );
     }
 
@@ -939,7 +1180,6 @@ mod tests {
             effective_mode: Some("vi-normal".to_string()),
             allows_text_input: false,
             global_mode_read_only: Some(read_only),
-            has_focused_text_widget: false,
         };
         // An unbound function key: read-only blocks, editable falls through.
         let f9 = event(KeyCode::F(9), KeyModifiers::NONE);
@@ -954,6 +1194,57 @@ mod tests {
     }
 
     #[test]
+    fn an_in_flight_chord_outranks_a_modes_single_key_fallthrough() {
+        // A buffer-local mode resolves single keys through the
+        // ui-fallthrough whitelist, which must not claim the second key of
+        // a chord already in flight — mode chords never match a Normal
+        // sequence, so nothing else would hold the prefix.
+        let mut config = config();
+        config.keybindings.push(crate::config::Keybinding {
+            key: String::new(),
+            modifiers: Vec::new(),
+            keys: vec![
+                crate::config::KeyPress {
+                    key: "x".to_string(),
+                    modifiers: vec!["ctrl".to_string()],
+                },
+                crate::config::KeyPress {
+                    key: "q".to_string(),
+                    modifiers: vec!["ctrl".to_string()],
+                },
+            ],
+            chord: String::new(),
+            action: "select_all".to_string(),
+            args: std::collections::HashMap::new(),
+            when: Some("normal".to_string()),
+        });
+        let kb = KeybindingResolver::new(&config);
+        let view = ModeKeyView {
+            effective_mode: Some("markdown-source".to_string()),
+            allows_text_input: false,
+            global_mode_read_only: None,
+        };
+        let ctrl_q = event(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        let ctrl_b = event(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        let pending_ctrl_x = [(KeyCode::Char('x'), KeyModifiers::CONTROL)];
+        // On its own, Ctrl+Q is still the mode's whitelisted fallthrough.
+        assert_eq!(
+            mode_key_disposition(&view, &[], &kb, &ctrl_q),
+            ModeKeyDisposition::Run(Action::Quit)
+        );
+        // After Ctrl+X, the same key completes the chord instead.
+        assert_eq!(
+            mode_key_disposition(&view, &pending_ctrl_x, &kb, &ctrl_q),
+            ModeKeyDisposition::Run(Action::SelectAll)
+        );
+        // A key that extends no chord still gets the mode's fallthrough.
+        assert_eq!(
+            mode_key_disposition(&view, &pending_ctrl_x, &kb, &ctrl_b),
+            ModeKeyDisposition::Run(Action::ToggleFileExplorer)
+        );
+    }
+
+    #[test]
     fn mode_bindings_win_over_capture() {
         // A `defineMode`-style binding (config `when: "mode:NAME"`) must
         // resolve ahead of the text-input capture.
@@ -962,6 +1253,7 @@ mod tests {
             key: "enter".to_string(),
             modifiers: Vec::new(),
             keys: Vec::new(),
+            chord: String::new(),
             action: "save".to_string(),
             args: std::collections::HashMap::new(),
             when: Some("mode:form".to_string()),
@@ -971,7 +1263,6 @@ mod tests {
             effective_mode: Some("form".to_string()),
             allows_text_input: true,
             global_mode_read_only: None,
-            has_focused_text_widget: false,
         };
         assert_eq!(
             mode_key_disposition(&view, &[], &kb, &event(KeyCode::Enter, KeyModifiers::NONE)),
@@ -995,6 +1286,7 @@ mod tests {
                     modifiers: vec!["ctrl".to_string()],
                 },
             ],
+            chord: String::new(),
             action: "save".to_string(),
             args: std::collections::HashMap::new(),
             when: Some("normal".to_string()),
@@ -1083,10 +1375,11 @@ mod tests {
     fn clipboard_chords_reach_a_focused_text_widget() {
         let kb = resolver();
         let view = WidgetPanelView {
-            is_left_dock: false,
+            non_modal: false,
+            pane: false,
             focus_key: Some("path".to_string()),
             focused_widget_is_text: true,
-            editor_mode: None,
+            page: false,
         };
         assert_eq!(
             widget_panel_key(&view, &kb, KeyCode::Char('v'), KeyModifiers::CONTROL),

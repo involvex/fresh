@@ -87,10 +87,10 @@ fn content_rect_for_buffer(
     harness: &EditorTestHarness,
     buffer_id: fresh::model::event::BufferId,
 ) -> ratatui::layout::Rect {
-    for (_, bid, content_rect, _, _, _) in harness.editor().get_split_areas() {
-        if *bid == buffer_id {
-            return *content_rect;
-        }
+    // The pane's rectangle is the tree's; the record names which pane shows
+    // which buffer.
+    if let Some(r) = harness.editor().pane_content_rect_for_buffer(buffer_id) {
+        return r;
     }
     panic!(
         "expected split area for buffer {:?}, cached layout has: {:?}",
@@ -99,7 +99,7 @@ fn content_rect_for_buffer(
             .editor()
             .get_split_areas()
             .iter()
-            .map(|(_, b, _, _, _, _)| *b)
+            .map(|(_, b)| *b)
             .collect::<Vec<_>>()
     );
 }
@@ -131,7 +131,7 @@ fn clicking_split_after_closing_buffer_in_another_split_does_not_panic() {
     // split; both panes initially show F1.
     harness.editor_mut().split_pane_vertical();
     harness.render().unwrap();
-    let split_after_split = harness.editor().get_active_split();
+    let split_after_split = harness.editor().active_window().get_active_split();
 
     // Step 3: open file B in S2 — tree[S2] = F2, SVS[S2] gets F2 keyed.
     // S1 is untouched: tree[S1] = F1, SVS[S1] = { active=F1, keyed={F1} }.
@@ -139,7 +139,7 @@ fn clicking_split_after_closing_buffer_in_another_split_does_not_panic() {
     let f2 = harness.editor().active_buffer_id();
     assert_ne!(f2, f1, "opening file B should yield a distinct buffer id");
     assert_eq!(
-        harness.editor().get_active_split(),
+        harness.editor().active_window().get_active_split(),
         split_after_split,
         "opening a file should open it in the currently active split, not create a new one"
     );
@@ -147,7 +147,7 @@ fn clicking_split_after_closing_buffer_in_another_split_does_not_panic() {
     // Sanity-check the precondition for the drift: S1 is non-active
     // and still has F1 in both its tree slot and its SplitViewState.
     assert_eq!(
-        harness.editor().get_split_count(),
+        harness.editor().active_window().get_split_count(),
         2,
         "expected exactly two splits after a single vertical split"
     );

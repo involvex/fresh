@@ -234,7 +234,10 @@ pub(crate) fn decoration_context(
 
     // Update bracket highlight overlays. Both toggles are re-read from the
     // config every frame, so flipping one in the settings UI takes effect on
-    // the next render for every buffer.
+    // the next render for every buffer. Whether `<`/`>` are brackets is not a
+    // toggle but the buffer's language — resolved here, the one place that
+    // knows which buffer is being drawn (issue #3090).
+    let bracket_highlight = bracket_highlight.with_language(state.highlighter.language());
     state.bracket_highlight_overlay.update(
         &state.buffer,
         &mut state.overlays,
@@ -250,8 +253,6 @@ pub(crate) fn decoration_context(
     // Semantic tokens are stored as overlays so their ranges track edits.
     // Convert them into highlight spans for the render pipeline.
     let is_compose = matches!(view_mode, ViewMode::PageView);
-    let md_emphasis_ns =
-        fresh_core::overlay::OverlayNamespace::from_string("md-emphasis".to_string());
     let mut semantic_token_spans = Vec::new();
     let mut viewport_overlays = Vec::new();
     for (overlay, range) in
@@ -271,9 +272,9 @@ pub(crate) fn decoration_context(
             continue;
         }
 
-        // Skip markdown compose overlays in Source mode — they should only
+        // Skip compose-only overlays in Source mode — they should only
         // render in the Compose-mode split.
-        if !is_compose && overlay.namespace.as_ref() == Some(&md_emphasis_ns) {
+        if !is_compose && overlay.compose_only {
             continue;
         }
 
@@ -296,10 +297,12 @@ pub(crate) fn decoration_context(
         .iter()
         .filter_map(|(overlay, range)| {
             if overlay.namespace.as_ref() == Some(&diagnostic_ns) {
-                return Some(indent_folding::find_line_start_byte(
-                    &state.buffer,
-                    range.start,
-                ));
+                // A diagnostic inside a line too long to find the start of is
+                // placed at its own byte: the row it lands on is still drawn.
+                return Some(
+                    indent_folding::find_line_start_byte(&state.buffer, range.start)
+                        .unwrap_or(range.start),
+                );
             }
             None
         })
@@ -313,7 +316,8 @@ pub(crate) fn decoration_context(
                 continue;
             }
             if let Some(ref message) = overlay.message {
-                let line_start = indent_folding::find_line_start_byte(&state.buffer, range.start);
+                let line_start = indent_folding::find_line_start_byte(&state.buffer, range.start)
+                    .unwrap_or(range.start);
                 let priority = overlay.priority;
                 let dominated = by_line
                     .get(&line_start)
@@ -339,6 +343,7 @@ pub(crate) fn decoration_context(
             .margins
             .get_indicators_for_viewport(viewport_start, viewport_end, |byte_offset| {
                 indent_folding::find_line_start_byte(&state.buffer, byte_offset)
+                    .unwrap_or(byte_offset)
             });
 
     // Merge native diff-since-saved indicators (cornflower blue │ for unsaved edits).

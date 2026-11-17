@@ -3,6 +3,9 @@
 //! piping, and the should_quit confirmation flow that walks modified buffers.
 
 use super::*;
+use crate::view::confirm::{Choice, Confirm, Tone};
+use fresh_core::WindowId;
+use fresh_i18n::tn;
 
 impl Editor {
     /// Check if the editor should quit
@@ -36,11 +39,6 @@ impl Editor {
         }
     }
 
-    /// Check if running in session mode
-    pub fn is_session_mode(&self) -> bool {
-        self.session_mode
-    }
-
     /// Mark that the backend does not render a hardware cursor.
     /// When set, the renderer always draws a software cursor indicator.
     pub fn set_software_cursor_only(&mut self, enabled: bool) {
@@ -60,25 +58,9 @@ impl Editor {
     /// For the status-bar label — which every daemon has, named or not — see
     /// [`Self::set_session_display_name`].
     ///
-    /// When a name is set, the recovery service is reinitialized to use a
-    /// session-scoped recovery directory so each named daemon's recovery data is
-    /// isolated.
+    /// Recovery data is not scoped by it: unsaved work is filed by workspace,
+    /// whatever launched the editor (see `services::recovery::store`).
     pub fn set_session_name(&mut self, name: Option<String>) {
-        if let Some(ref session_name) = name {
-            let base_recovery_dir = self.dir_context.recovery_dir();
-            let scope = crate::services::recovery::RecoveryScope::Session {
-                name: session_name.clone(),
-            };
-            let recovery_config = RecoveryConfig {
-                enabled: self.recovery_service.lock().unwrap().is_enabled(),
-                ..RecoveryConfig::default()
-            };
-            // Replace the shared service's contents in place — the
-            // `Arc<Mutex>` is cloned into every window, so we must not
-            // swap the `Arc` itself (that would desync the windows).
-            *self.recovery_service.lock().unwrap() =
-                RecoveryService::with_scope(recovery_config, &base_recovery_dir, &scope);
-        }
         self.session_name = name;
     }
 
@@ -103,7 +85,7 @@ impl Editor {
     pub fn session_display_name(&self) -> Option<&str> {
         self.session_display_name
             .as_deref()
-            .or_else(|| self.session_name.as_deref())
+            .or(self.session_name.as_deref())
     }
 
     /// Queue escape sequences to be sent to the client (session mode only)
@@ -116,6 +98,14 @@ impl Editor {
         std::mem::take(&mut self.pending_escape_sequences)
     }
 
+    pub fn take_pending_window_title(&mut self) -> Option<String> {
+        self.pending_window_title.take()
+    }
+
+    pub fn current_window_title(&self) -> Option<&str> {
+        self.last_window_title.as_deref()
+    }
+
     /// Take pending clipboard data queued in session mode, clearing the request
     pub fn take_pending_clipboard(
         &mut self,
@@ -123,19 +113,6 @@ impl Editor {
         self.clipboard.take_pending_clipboard()
     }
 
-    /// Check if the editor should restart with a new working directory
-    pub fn should_restart(&self) -> bool {
-        self.restart_with_dir.is_some()
-    }
-
-    /// Take the restart directory, clearing the restart request
-    /// Returns the new working directory if a restart was requested
-    pub fn take_restart_dir(&mut self) -> Option<PathBuf> {
-        self.restart_with_dir.take()
-    }
-
-    /// Request the editor to restart with a new working directory
-    /// This triggers a clean shutdown and restart with the new project root
     /// Request a full hardware terminal clear and redraw on the next frame.
     /// Used after external commands have messed up the terminal state.
     pub fn request_full_redraw(&mut self) {
@@ -163,16 +140,6 @@ impl Editor {
         requested
     }
 
-    pub fn request_restart(&mut self, new_working_dir: PathBuf) {
-        tracing::info!(
-            "Restart requested with new working directory: {}",
-            new_working_dir.display()
-        );
-        self.restart_with_dir = Some(new_working_dir);
-        // Also signal quit so the event loop exits
-        self.should_quit = true;
-    }
-
     /// Get the active theme (read lock).
     pub fn theme(&self) -> std::sync::RwLockReadGuard<'_, crate::view::theme::Theme> {
         self.theme.read().unwrap()
@@ -185,69 +152,207 @@ impl Editor {
 
     /// Request the editor to quit
     pub fn quit(&mut self) {
-        // Check for unsaved buffers (all are auto-persisted when hot_exit is enabled)
-        let modified_count = self.count_modified_buffers_needing_prompt();
-        if modified_count == 0 && self.config.editor.confirm_quit {
-            // No dirty buffers, but the user has opted into a
-            // safety-net confirmation for a stray Ctrl+Q (issue #2030).
-            let msg = t!("prompt.quit_confirm").to_string();
-            self.start_prompt(msg, PromptType::ConfirmQuit);
+        // **In a daemon session, "quit" is ambiguous.** The user who presses
+        // Ctrl+Q in an attached client usually wants their terminal back, not
+        // the daemon — and every terminal and agent it hosts — gone. Ask which:
+        // Detach (the default, and the safe one), Quit, or Cancel. Choosing
+        // Quit continues into the ordinary quit path, unsaved-changes prompt
+        // included; the `confirm_quit` opt-in is skipped since this dialog
+        // already asked.
+        if self.session_mode {
+            let body = t!("prompt.quit_daemon").to_string();
+            let confirm = Confirm::new(
+                t!("dialog.title.quit_daemon").into_owned(),
+                body.clone(),
+                vec![
+                    Choice::new(t!("dialog.btn.detach").into_owned(), "detach", Tone::Safe),
+                    Choice::new(
+                        t!("dialog.btn.quit_daemon").into_owned(),
+                        "quit",
+                        Tone::Destructive,
+                    ),
+                    crate::app::confirm_dialog::cancel(),
+                ],
+            )
+            .selecting(0);
+            self.start_confirm_prompt(body, PromptType::ConfirmQuitDaemon, confirm);
             return;
         }
-        if modified_count > 0 {
-            let save_key = t!("prompt.key.save").to_string();
-            let cancel_key = t!("prompt.key.cancel").to_string();
-            let hot_exit = self.config.editor.hot_exit;
+        self.quit_with_prompts(self.config.editor.confirm_quit);
+    }
 
-            let discard_key = t!("prompt.key.discard").to_string();
-            let msg = if hot_exit {
-                // With hot exit: offer save, discard, quit-without-saving (recoverable), or cancel
-                let quit_key = t!("prompt.key.quit").to_string();
-                if modified_count == 1 {
-                    t!(
-                        "prompt.quit_modified_hot_one",
-                        save_key = save_key,
-                        discard_key = discard_key,
-                        quit_key = quit_key,
-                        cancel_key = cancel_key
-                    )
-                    .to_string()
-                } else {
-                    t!(
-                        "prompt.quit_modified_hot_many",
-                        count = modified_count,
-                        save_key = save_key,
-                        discard_key = discard_key,
-                        quit_key = quit_key,
-                        cancel_key = cancel_key
-                    )
-                    .to_string()
-                }
-            } else {
-                // Without hot exit: offer save, discard, or cancel
-                if modified_count == 1 {
-                    t!(
-                        "prompt.quit_modified_one",
-                        save_key = save_key,
-                        discard_key = discard_key,
-                        cancel_key = cancel_key
-                    )
-                    .to_string()
-                } else {
-                    t!(
-                        "prompt.quit_modified_many",
-                        count = modified_count,
-                        save_key = save_key,
-                        discard_key = discard_key,
-                        cancel_key = cancel_key
-                    )
-                    .to_string()
-                }
-            };
-            self.start_prompt(msg, PromptType::ConfirmQuitWithModified);
+    /// The quit path past the daemon's Detach/Quit question: prompt for
+    /// unsaved buffers, else (when `confirm_clean` asks for it) confirm the
+    /// clean quit, else quit.
+    ///
+    /// With auto-save on, file-backed buffers are saved on the way out
+    /// instead of asked about — but not before the user has decided to quit:
+    /// a stray `Ctrl+Q` cancelled at the confirmation (issue #2030) must not
+    /// have written anything. So when the only unsaved work is what the
+    /// auto-save covers, the clean-quit confirmation comes first and the
+    /// save after it ([`Self::quit_after_auto_save`]); when there is other
+    /// unsaved work, the prompt asks about all of it, auto-save or not.
+    pub(crate) fn quit_with_prompts(&mut self, confirm_clean: bool) {
+        let auto_save = self.config.editor.auto_save_enabled;
+        let asked: Vec<ExitSaveEntry> = self
+            .exit_save_plan()
+            .into_iter()
+            .filter(|entry| entry.asked)
+            .collect();
+        // What the save on exit will write needs no question when auto-save
+        // does it; everything else asked about does.
+        let needs_prompt = asked
+            .iter()
+            .any(|entry| !(auto_save && matches!(entry.save, ExitSave::Write(_))));
+        if needs_prompt {
+            self.prompt_unsaved_changes(&[]);
+        } else if confirm_clean {
+            // No dirty buffers (or only ones auto-save will write), but the
+            // user has opted into a safety-net confirmation for a stray
+            // Ctrl+Q (issue #2030).
+            let msg = t!("prompt.quit_confirm").to_string();
+            let confirm = Confirm::new(
+                t!("dialog.title.quit").into_owned(),
+                msg.clone(),
+                vec![
+                    Choice::new(
+                        t!("dialog.btn.quit").into_owned(),
+                        t!("prompt.key.quit").into_owned(),
+                        Tone::Safe,
+                    ),
+                    crate::app::confirm_dialog::cancel(),
+                ],
+            )
+            // `(y)es, (N)o` — the capital was the default, and this prompt
+            // exists precisely to catch a *stray* `Ctrl+Q` (issue #2030), so
+            // an armed Quit one stray Enter later would defeat it.
+            .selecting(1);
+            self.start_confirm_prompt(msg, PromptType::ConfirmQuit, confirm);
         } else {
-            self.should_quit = true;
+            self.quit_after_auto_save();
         }
+    }
+
+    /// Quit, once the user has nothing left to be asked about but what the
+    /// auto-save on exit covers — first doing that save, when it is on.
+    ///
+    /// Whatever it can't write (a file that needs sudo, one changed on
+    /// disk) is still modified afterwards, and is asked about instead of the
+    /// exit dropping it.
+    ///
+    /// The save is the exit's own ([`Self::auto_save_on_exit`], which
+    /// [`Self::persist_on_exit`] runs for every exit), run here ahead of it:
+    /// once the quit is committed nothing can call it off any more.
+    pub(crate) fn quit_after_auto_save(&mut self) {
+        let failed = match self.auto_save_on_exit() {
+            Ok(outcome) => outcome.failed,
+            Err(e) => {
+                tracing::warn!("Auto-save on quit failed: {e}");
+                Vec::new()
+            }
+        };
+        match self.count_modified_buffers_needing_prompt() {
+            0 => self.should_quit = true,
+            _ => self.prompt_unsaved_changes(&failed),
+        }
+    }
+
+    /// Ask what to do about the unsaved buffers before quitting: save them,
+    /// discard them, keep them for hot exit, or cancel.
+    ///
+    /// `failed` are the files a save on the way out just tried and failed
+    /// to write, which the dialog reports as such rather than as merely
+    /// unsaved.
+    fn prompt_unsaved_changes(&mut self, failed: &[std::path::PathBuf]) {
+        let asked: Vec<ExitSaveEntry> = self
+            .exit_save_plan()
+            .into_iter()
+            .filter(|entry| entry.asked)
+            .collect();
+        let modified_count = asked.len();
+        let detail = self.unsaved_buffer_list(&asked, failed);
+        // When some of the unsaved work is in a workspace the user is not
+        // looking at, a bare count is the wrong thing to show: it says
+        // there is something to lose without saying where, and the whole
+        // failure this prompt exists to prevent is work going unnoticed in
+        // a background workspace (issue #3189). Name the workspaces then.
+        let where_clause = self.unsaved_workspace_summary();
+        // **The outcomes are buttons now, not letters in the sentence.**
+        // That is what collapsed eight message strings into four: the
+        // hot-exit variants differed only in offering a third way out,
+        // which is one more `Choice` rather than another whole phrasing
+        // of the question.
+        let body = match &where_clause {
+            Some(w) => tn!("prompt.quit_modified_where", modified_count, where = w).to_string(),
+            None => tn!("prompt.quit_modified", modified_count).to_string(),
+        };
+        let mut choices = vec![
+            Choice::new(
+                t!("dialog.btn.save_and_quit").into_owned(),
+                t!("prompt.key.save").into_owned(),
+                Tone::Safe,
+            ),
+            Choice::new(
+                t!("dialog.btn.discard_and_quit").into_owned(),
+                t!("prompt.key.discard").into_owned(),
+                Tone::Destructive,
+            ),
+        ];
+        if self.config.editor.hot_exit {
+            // Not destructive: hot exit is exactly the promise that this
+            // one gets the work back.
+            choices.push(Choice::new(
+                t!("dialog.btn.quit_recoverable").into_owned(),
+                t!("prompt.key.quit").into_owned(),
+                Tone::Safe,
+            ));
+        }
+        choices.push(crate::app::confirm_dialog::cancel());
+        let confirm = Confirm::new(
+            t!("dialog.title.unsaved_changes").into_owned(),
+            body.clone(),
+            choices,
+        )
+        .detail(detail);
+        self.start_confirm_prompt(body, PromptType::ConfirmQuitWithModified, confirm);
+    }
+
+    /// The quit prompt's list of what holds the quit, one buffer per line
+    /// with why it needs attention: unsaved, changed on disk (the save on
+    /// exit leaves it alone, issue #3346), or not saved because writing it
+    /// just failed (e.g. it needs sudo). Named as its tab is.
+    ///
+    /// At most [`QUIT_PROMPT_LISTED`] lines, then how many more there are:
+    /// the count in the question above stays exact either way.
+    fn unsaved_buffer_list(
+        &self,
+        asked: &[ExitSaveEntry],
+        failed: &[std::path::PathBuf],
+    ) -> String {
+        let mut lines: Vec<String> = asked
+            .iter()
+            .take(QUIT_PROMPT_LISTED)
+            .map(|entry| {
+                let name = self
+                    .windows
+                    .get(&entry.window)
+                    .and_then(|w| w.buffer_metadata.get(&entry.buffer))
+                    .map(|meta| meta.display_name.clone())
+                    .unwrap_or_else(|| t!("buffer.no_name").to_string());
+                let reason = match &entry.save {
+                    ExitSave::ChangedOnDisk(_) => t!("prompt.quit_reason.changed_on_disk"),
+                    ExitSave::Write(path) if failed.contains(path) => {
+                        t!("prompt.quit_reason.not_saved")
+                    }
+                    ExitSave::Write(_) | ExitSave::NoFile => t!("prompt.quit_reason.unsaved"),
+                };
+                t!("prompt.quit_buffer_line", name = name, reason = reason).to_string()
+            })
+            .collect();
+        if asked.len() > QUIT_PROMPT_LISTED {
+            lines.push(tn!("prompt.quit_more", asked.len() - QUIT_PROMPT_LISTED).to_string());
+        }
+        lines.join("\n")
     }
 
     /// Count modified buffers that would require a save prompt on quit.
@@ -255,39 +360,88 @@ impl Editor {
     /// When `hot_exit` is enabled, unnamed buffers are excluded (they are
     /// automatically recovered across restarts), but file-backed modified
     /// buffers still trigger a prompt with a "recoverable" option.
-    /// When `auto_save_enabled` is true, file-backed buffers are excluded
-    /// (they will be saved to disk on exit).
+    /// With `auto_save_enabled`, [`Self::quit_after_auto_save`] asks this
+    /// after saving file-backed buffers, so the ones still modified then are
+    /// those it couldn't save.
     fn count_modified_buffers_needing_prompt(&self) -> usize {
-        let hot_exit = self.config.editor.hot_exit;
-        let auto_save = self.config.editor.auto_save_enabled;
+        self.modified_buffers_needing_prompt().len()
+    }
 
-        self.windows
-            .get(&self.active_window)
-            .map(|w| &w.buffers)
-            .expect("active window present")
+    /// Which workspaces hold the unsaved work, for the quit prompt — or
+    /// `None` to keep the prompt plain.
+    ///
+    /// Plain when it is all in the workspace on screen: the modified markers
+    /// are already in the tab bar. Once any of it is elsewhere the count alone
+    /// misleads, which is the whole of issue #3189.
+    fn unsaved_workspace_summary(&self) -> Option<String> {
+        let dirty = self.modified_buffers_needing_prompt();
+        if dirty.is_empty() {
+            return None;
+        }
+        let mut per_window: Vec<(WindowId, usize)> = Vec::new();
+        for (window_id, _) in &dirty {
+            match per_window.last_mut() {
+                Some((id, n)) if id == window_id => *n += 1,
+                _ => per_window.push((*window_id, 1)),
+            }
+        }
+        // All of it in the workspace on screen: the plain prompt is enough.
+        if per_window.len() == 1 && per_window[0].0 == self.active_window {
+            return None;
+        }
+        let parts: Vec<String> = per_window
             .iter()
-            .filter(|(buffer_id, state)| {
-                if !state.buffer.is_modified() {
-                    return false;
+            .map(|(window_id, count)| {
+                let label = self
+                    .windows
+                    .get(window_id)
+                    .map(|w| w.label.clone())
+                    .unwrap_or_else(|| window_id.to_string());
+                if *count > 1 {
+                    format!("{label}: {count}")
+                } else {
+                    label
                 }
-                if let Some(meta) = self.active_window().buffer_metadata.get(buffer_id) {
-                    if let Some(path) = meta.file_path() {
-                        let is_unnamed = path.as_os_str().is_empty();
-                        if is_unnamed && hot_exit {
-                            return false; // unnamed buffer, auto-recovered via hot exit
-                        }
-                        if !is_unnamed && auto_save {
-                            return false; // file-backed, will be auto-saved on exit
-                        }
-                    }
-                }
-                true
             })
-            .count()
+            .collect();
+        Some(parts.join(", "))
+    }
+
+    /// Every `(window, buffer)` that must be resolved before the editor may
+    /// exit, across all workspaces: the entries of
+    /// [`Self::exit_save_plan`] the quit prompt asks about.
+    ///
+    /// Cross-window because `Ctrl+Q` quits the editor, not the workspace on
+    /// screen (issue #3189).
+    pub(crate) fn modified_buffers_needing_prompt(&self) -> Vec<(WindowId, BufferId)> {
+        self.exit_save_plan()
+            .into_iter()
+            .filter(|entry| entry.asked)
+            .map(|entry| (entry.window, entry.buffer))
+            .collect()
+    }
+
+    /// What exiting means for every modified buffer, across all workspaces
+    /// (see [`Window::exit_save_plan`](crate::app::window::Window::exit_save_plan)).
+    ///
+    /// The one place that decides it: the quit prompt reads it, to know what
+    /// to ask about, and the save on exit ([`Self::save_all_on_exit`])
+    /// carries it out.
+    pub(crate) fn exit_save_plan(&self) -> Vec<ExitSaveEntry> {
+        let hot_exit = self.config.editor.hot_exit;
+        self.window_ids_sorted()
+            .into_iter()
+            .filter_map(|window_id| {
+                let window = self.windows.get(&window_id)?;
+                Some(window.exit_save_plan(window_id, hot_exit))
+            })
+            .flatten()
+            .collect()
     }
 
     /// Handle terminal focus gained event
     pub fn focus_gained(&mut self) {
+        self.mark_plugin_snapshot_dirty();
         self.plugin_manager.read().unwrap().run_hook(
             "focus_gained",
             crate::services::plugins::hooks::HookArgs::FocusGained {},
@@ -384,9 +538,7 @@ impl Editor {
     /// plugin hook is signature-deduped, so callers never need to decide
     /// "did this actually change the layout?" — they just call `relayout`.
     pub fn relayout(&mut self) {
-        // Geometry moved: every chrome box the tree would derive may have a
-        // different rect now, so spoil the per-generation UI memos.
-        self.bump_ui_gen();
+        self.mark_plugin_snapshot_dirty();
         self.push_layout_geometry();
         self.notify_layout_changed();
     }
@@ -416,8 +568,24 @@ impl Editor {
         // editor-global, so every window — not just the active one —
         // sizes its terminals for the post-dock chrome, ready for a
         // dive without a stale first frame.
+        //
+        // In two steps, because where a window's panes are is a function of
+        // the screen size and the dock width it is about to adopt: every
+        // window adopts them first, then its grid is laid out at that size,
+        // and only then does it seed its viewports and size its PTYs from the
+        // result. The active window's grid is the frame's, laid out once with
+        // `layout_only`; every other window's grid the retained tree does not
+        // hold, so it is laid out offscreen from the same description.
         for window in self.windows.values_mut() {
-            window.apply_layout(width, height, dock_cols);
+            window.adopt_screen(width, height, dock_cols);
+        }
+        self.refresh_pane_rects();
+        let active = self.active_window;
+        for (id, window) in self.windows.iter_mut() {
+            if *id != active {
+                window.layout_panes_offscreen();
+            }
+            window.apply_layout();
         }
     }
 
@@ -435,11 +603,10 @@ impl Editor {
 
     /// Fire the plugin `resize` hook and rerender mounted panels, but only
     /// when the content geometry plugins observe has actually changed since
-    /// the last notification. The dedupe is load-bearing: the orchestrator
-    /// reacts to `resize` by re-issuing the dock's `dock_width`, which loops
-    /// back through `relayout`; without the signature guard that would
-    /// re-fire every frame. Once the dock width settles the signature stops
-    /// changing and the cascade stops.
+    /// the last notification. The dedupe is load-bearing: a plugin that
+    /// answers `resize` with a layout change of its own loops back through
+    /// `relayout`, and without the signature guard that would re-fire every
+    /// frame.
     fn notify_layout_changed(&mut self) {
         let dock_cols = self.dock_cols();
         // File-explorer width of the active window, measured against the
@@ -520,31 +687,95 @@ impl Editor {
 }
 
 impl crate::app::window::Window {
-    /// Adopt the geometry handed down by [`Editor::relayout`]: cache the
-    /// screen dimensions and the editor-global dock width, reseed every
+    /// What exiting means for each of this window's modified buffers:
+    /// whether the save on exit writes it, and whether the quit prompt asks
+    /// about it. See [`Editor::exit_save_plan`].
+    ///
+    /// In the order the buffers were opened, so the quit prompt lists them
+    /// the same way every time.
+    pub(crate) fn exit_save_plan(&self, window_id: WindowId, hot_exit: bool) -> Vec<ExitSaveEntry> {
+        let mut plan: Vec<ExitSaveEntry> = self
+            .buffers
+            .iter()
+            .filter(|(_, state)| state.buffer.is_modified())
+            .map(|(buffer_id, state)| {
+                let save = match state
+                    .buffer
+                    .file_path()
+                    .filter(|path| !path.as_os_str().is_empty())
+                {
+                    Some(path) if self.changed_on_disk(path).is_some() => {
+                        ExitSave::ChangedOnDisk(path.to_path_buf())
+                    }
+                    Some(path) => ExitSave::Write(path.to_path_buf()),
+                    None => ExitSave::NoFile,
+                };
+                // An unnamed buffer is auto-recovered by hot exit, so that
+                // keeps it without asking.
+                let recovered_unasked = hot_exit
+                    && self
+                        .buffer_metadata
+                        .get(buffer_id)
+                        .and_then(|meta| meta.file_path())
+                        .is_some_and(|path| path.as_os_str().is_empty());
+                ExitSaveEntry {
+                    window: window_id,
+                    buffer: *buffer_id,
+                    save,
+                    asked: !(self.quit_skips_buffer(*buffer_id) || recovered_unasked),
+                }
+            })
+            .collect();
+        plan.sort_by_key(|entry| entry.buffer.0);
+        plan
+    }
+
+    /// Whether quitting leaves `buffer_id` out of the unsaved-changes
+    /// question: composite, hidden and plugin-virtual buffers, which the
+    /// prompt can't name and the user can't act on (see
+    /// [`Editor::modified_buffers_needing_prompt`]).
+    ///
+    /// [`Editor::save_all_on_exit`] still saves a hidden one it can, as it
+    /// always has, but one it can't doesn't hold the quit either — the two
+    /// must agree on which buffers the user is answering for.
+    pub(crate) fn quit_skips_buffer(&self, buffer_id: BufferId) -> bool {
+        self.buffers
+            .get(&buffer_id)
+            .is_some_and(|state| state.is_composite_buffer)
+            || self
+                .buffer_metadata
+                .get(&buffer_id)
+                .is_some_and(|meta| meta.hidden_from_tabs || meta.is_virtual())
+    }
+
+    /// Adopt the screen dimensions and the editor-global dock width handed
+    /// down by [`Editor::relayout`] — the first half of what `apply_layout`
+    /// did, split off because the layout that places this window's panes
+    /// runs between the two: it is laid out at the size adopted here, and
+    /// [`Self::apply_layout`] reads the result.
+    pub fn adopt_screen(&mut self, width: u16, height: u16, dock_cols: u16) {
+        self.terminal_width = width;
+        self.terminal_height = height;
+        self.dock_cols = dock_cols;
+    }
+
+    /// Adopt the geometry handed down by [`Editor::relayout`]: reseed every
     /// split viewport against the pane rect that split will actually be
     /// painted into, and resize the visible terminal PTYs. Per-split
     /// viewport dimensions are refined again at paint time by
     /// `sync_viewport_to_content` (which subtracts each pane's own chrome —
     /// gutter, tab bar, scrollbars); terminals have no such paint-time sync,
     /// which is why their PTY size must be pushed here.
-    pub fn apply_layout(&mut self, width: u16, height: u16, dock_cols: u16) {
-        self.terminal_width = width;
-        self.terminal_height = height;
-        self.dock_cols = dock_cols;
+    ///
+    /// Reads the pane rects the funnel just laid out for this window
+    /// ([`Self::visible_panes`]), after [`Self::adopt_screen`].
+    pub fn apply_layout(&mut self) {
+        let height = self.terminal_height;
 
-        // Per-split pane rects, derived from the same content area the
-        // renderer and `resize_visible_terminals` lay out against — so the
-        // file explorer's columns (and a sibling split's) are already carved
-        // out of them.
-        let visible: Vec<(
-            crate::model::event::LeafId,
-            crate::model::event::BufferId,
-            ratatui::layout::Rect,
-        )> = match self.buffers.splits() {
-            Some((mgr, _)) => mgr.get_visible_buffers(self.editor_content_area()),
-            None => Vec::new(),
-        };
+        // Per-split pane rects, off the layout the funnel just ran at the
+        // adopted size — so the file explorer's columns (and a sibling
+        // split's) are already carved out of them.
+        let visible = self.visible_panes();
 
         // Seed each visible split's viewport from its own pane rect. Seeding
         // every split with the whole post-dock editor width instead — which is
@@ -566,11 +797,17 @@ impl crate::app::window::Window {
             .iter()
             .map(|(split_id, _, area)| (*split_id, *area))
             .collect();
-        if let Some(view_states) = self.split_view_states_mut() {
+        if let Some(view_states) = self.buffers.split_view_states_mut() {
             for (split_id, view_state) in view_states.iter_mut() {
                 match visible_rects.get(split_id) {
-                    Some(area) => view_state.viewport.resize(area.width, area.height),
-                    None => view_state.viewport.resize(content_width, height),
+                    Some(area) => view_state
+                        .buffer_tab_state_mut()
+                        .viewport
+                        .resize(area.width, area.height),
+                    None => view_state
+                        .buffer_tab_state_mut()
+                        .viewport
+                        .resize(content_width, height),
                 }
             }
         }
@@ -584,8 +821,42 @@ impl crate::app::window::Window {
         // tab-scroll offset is never revisited. Use each split's real area
         // width (dock/explorer/split-aware), not the whole-window width, so
         // a half-width vertical split scrolls correctly too.
-        for (split_id, buffer_id, area) in visible {
-            self.ensure_active_tab_visible(split_id, buffer_id, area.width);
+        for (split_id, _buffer_id, _area) in visible {
+            self.reveal_active_tab(split_id);
         }
     }
+}
+
+/// How many buffers the quit prompt names before summarising the rest as a
+/// count: enough for the common case, few enough that the dialog stays well
+/// inside a small terminal.
+const QUIT_PROMPT_LISTED: usize = 6;
+
+/// What the save on exit does with one modified buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExitSave {
+    /// It is backed by a named file, which the save writes.
+    Write(std::path::PathBuf),
+    /// Its file changed on disk since the window loaded or saved it, so the
+    /// save leaves it alone: overwriting it needs an explicit Save (issue
+    /// #3346).
+    ChangedOnDisk(std::path::PathBuf),
+    /// There is no file to write it to (an unnamed buffer): only the quit
+    /// prompt's Save As, Discard or hot exit resolves it.
+    NoFile,
+}
+
+/// One modified buffer of [`Editor::exit_save_plan`].
+#[derive(Debug, Clone)]
+pub(crate) struct ExitSaveEntry {
+    pub window: WindowId,
+    pub buffer: BufferId,
+    pub save: ExitSave,
+    /// Whether the quit prompt asks about it while it is unsaved: not for a
+    /// buffer hidden from the tabs ([`Window::quit_skips_buffer`]
+    /// (crate::app::window::Window::quit_skips_buffer)), which the prompt
+    /// can't name and the user can't act on, nor for an unnamed one hot exit
+    /// recovers. A hidden buffer is still saved where it can be, but one that
+    /// can't be doesn't hold the quit.
+    pub asked: bool,
 }

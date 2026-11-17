@@ -12,7 +12,7 @@ Fresh supports three types of packages:
 | **Theme** | Color schemes for the editor | See `:pkg init theme` |
 | **Language Pack** | Syntax highlighting, language config, and LSP | [Language Packs](./language-packs.md) |
 
-Use `fresh --init` to scaffold any package type.
+Use `fresh --cmd init` to scaffold any package type. To get TypeScript types, autocomplete and live reload for a plugin project, follow [Project Setup](./setup.md).
 
 ## Introduction
 
@@ -111,8 +111,8 @@ Many API calls return `Promise`s. Use `async/await` to work with them:
 
 ```typescript
 globalThis.search_files = async function(): Promise<void> {
-  const result = await editor.spawnProcess("rg", ["TODO", "."]);
-  if (result.exit_code === 0) {
+  const result = await editor.runOnTarget("rg", ["TODO", "."], editor.getCwd());
+  if (result.code === 0) {
     editor.setStatus(`Found matches`);
   }
 };

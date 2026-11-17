@@ -7,7 +7,8 @@
 //! - Config dump, save, and reload
 
 use crate::types::LspServerConfig;
-use rust_i18n::t;
+use fresh_editor_core::model::host_path::AsHostPath;
+use fresh_i18n::t;
 
 use crate::config::{Config, FileExplorerSide};
 use crate::config_io::{ConfigLayer, ConfigResolver};
@@ -44,41 +45,31 @@ impl Editor {
     ///     setting takes effect on source buffers and on leaving the mode. The
     ///     status message says so, so an apparently inert command is explained.
     ///
-    /// Scope is the active split's view state, matching
-    /// [`toggle_line_numbers_current_buffer`](Self::toggle_line_numbers_current_buffer).
-    /// It is deliberately not swept across every split: terminal splits, grouped
-    /// panels and plugin docks hold `show_line_numbers = false` directly, with no
-    /// override recorded, so re-resolving them would hand those panes a gutter
-    /// they are built never to have. Other views pick the new default up from
-    /// `apply_config_defaults`, the path that owns that stamping.
+    /// The pin is dropped on the active split's view state, matching
+    /// [`toggle_line_numbers_current_buffer`](Self::toggle_line_numbers_current_buffer);
+    /// `Window::resync_global_display_defaults` then re-resolves the new
+    /// default on every other open view.
+    ///
+    /// When the focused tab is not a text buffer (a terminal, a plugin panel)
+    /// only the setting changes: that view has no gutter of its own to show,
+    /// and stamping the default onto it drew line numbers down a terminal.
     pub fn toggle_line_numbers(&mut self) {
-        let active_split = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split();
         let new_value = !self.config.editor.line_numbers;
-        let Some(resolved) = self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
-            .expect("active window must have a populated split layout")
-            .get_mut(&active_split)
-            .map(|vs| {
-                // The user is expressing a global intent on this view, so drop
-                // any per-buffer pin here — otherwise the override would revert
-                // this change on the next view-mode switch / restart. Cleared
-                // before resolving, so the resolve below sees the same state a
-                // later `apply_config_defaults` will.
-                vs.line_numbers_override = None;
-                let resolved = vs.line_numbers_visible(new_value);
-                vs.show_line_numbers = resolved;
-                resolved
-            })
-        else {
-            return;
+        let resolved = if !self.buffer_capabilities().is_text_buffer {
+            new_value
+        } else {
+            // The buffer the user is on (`Window::focused_view_mut`): a
+            // shown group's focused panel, never the buffer behind it.
+            let vs = self.active_window_mut().focused_view_mut();
+            // The user is expressing a global intent on this view, so drop
+            // any per-buffer pin here — otherwise the override would revert
+            // this change on the next view-mode switch / restart. Cleared
+            // before resolving, so the resolve below sees the same state a
+            // later `apply_config_defaults` will.
+            vs.line_numbers_override = None;
+            let resolved = vs.line_numbers_visible(new_value);
+            vs.show_line_numbers = resolved;
+            resolved
         };
 
         // `editor.line_numbers` is a global preference, so persist the toggle
@@ -91,6 +82,9 @@ impl Editor {
         // reached only the editor-level config, so the very next file opened
         // still came up with the old setting.
         self.sync_windows_config();
+        for window in self.windows.values_mut() {
+            window.resync_global_display_defaults();
+        }
         self.persist_config_change(config_keys::EDITOR_LINE_NUMBERS, new_value);
 
         // When a mode outvotes the new setting the command looks inert, so say
@@ -112,29 +106,16 @@ impl Editor {
     /// view state, which is persisted in the per-file workspace state so the
     /// choice survives a restart (issue #474 follow-up).
     pub fn toggle_line_numbers_current_buffer(&mut self) {
-        let active_split = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split();
-        let Some(new_value) = self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
-            .expect("active window must have a populated split layout")
-            .get_mut(&active_split)
-            .map(|vs| {
-                // Deref reaches the active buffer's BufferViewState, so this
-                // scopes the override to the current buffer in this split only.
-                let new_value = !vs.show_line_numbers;
-                vs.show_line_numbers = new_value;
-                vs.line_numbers_override = Some(new_value);
-                new_value
-            })
-        else {
-            return;
+        let new_value = {
+            // The buffer the user is on (`Window::focused_view_mut`): a
+            // shown group's focused panel, never the buffer behind it.
+            let vs = self.active_window_mut().focused_view_mut();
+            // The focused buffer's own view state in its pane, so this
+            // scopes the override to that buffer in that pane only.
+            let new_value = !vs.show_line_numbers;
+            vs.show_line_numbers = new_value;
+            vs.line_numbers_override = Some(new_value);
+            new_value
         };
 
         let status = if new_value {
@@ -152,34 +133,21 @@ impl Editor {
     /// other buffers. Records an explicit per-buffer override, persisted in the
     /// per-file workspace state.
     pub fn toggle_line_wrap_current_buffer(&mut self) {
-        let active_split = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split();
         let buffer_id = self.active_buffer();
         let wrap_column = self
             .active_window()
             .resolve_wrap_column_for_buffer(buffer_id);
         let wrap_indent = self.config.editor.wrap_indent;
-        let Some(new_value) = self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
-            .expect("active window must have a populated split layout")
-            .get_mut(&active_split)
-            .map(|vs| {
-                let new_value = !vs.viewport.line_wrap_enabled;
-                vs.viewport.line_wrap_enabled = new_value;
-                vs.viewport.wrap_indent = wrap_indent;
-                vs.viewport.wrap_column = wrap_column;
-                vs.line_wrap_override = Some(new_value);
-                new_value
-            })
-        else {
-            return;
+        let new_value = {
+            // The buffer the user is on (`Window::focused_view_mut`): a
+            // shown group's focused panel, never the buffer behind it.
+            let vs = self.active_window_mut().focused_view_mut();
+            let new_value = !vs.viewport.line_wrap_enabled;
+            vs.viewport.line_wrap_enabled = new_value;
+            vs.viewport.wrap_indent = wrap_indent;
+            vs.viewport.wrap_column = wrap_column;
+            vs.line_wrap_override = Some(new_value);
+            new_value
         };
 
         let state = if new_value {
@@ -265,33 +233,20 @@ impl Editor {
         // The pin lives on the split's view state (like line numbers and the
         // current-line highlight), so the same buffer in another split keeps
         // its own choice.
-        let active_split = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split();
-        let Some(new_value) = self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
-            .expect("active window must have a populated split layout")
-            .get_mut(&active_split)
-            .map(|vs| {
-                let currently_on = resolve_indentation_guide_mode(IndentationGuideInputs {
-                    global,
-                    user_override: vs.indentation_guide_user_override,
-                    plugin_override,
-                    language_gate,
-                    is_virtual_buffer,
-                }) != IndentationGuideMode::None;
-                let new_value = !currently_on;
-                vs.indentation_guide_user_override = Some(new_value);
-                new_value
-            })
-        else {
-            return;
+        let new_value = {
+            // The buffer the user is on (`Window::focused_view_mut`): a
+            // shown group's focused panel, never the buffer behind it.
+            let vs = self.active_window_mut().focused_view_mut();
+            let currently_on = resolve_indentation_guide_mode(IndentationGuideInputs {
+                global,
+                user_override: vs.indentation_guide_user_override,
+                plugin_override,
+                language_gate,
+                is_virtual_buffer,
+            }) != IndentationGuideMode::None;
+            let new_value = !currently_on;
+            vs.indentation_guide_user_override = Some(new_value);
+            new_value
         };
 
         let status = if new_value {
@@ -308,29 +263,16 @@ impl Editor {
     /// setting. `BufferViewState` already stores the flag per (split, buffer),
     /// so this pins it there and records the intent for persistence.
     pub fn toggle_current_line_highlight_current_buffer(&mut self) {
-        let active_split = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split();
-        let Some(new_value) = self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
-            .expect("active window must have a populated split layout")
-            .get_mut(&active_split)
-            .map(|vs| {
-                // Deref reaches the active buffer's BufferViewState, so this
-                // scopes the override to the current buffer in this split only.
-                let new_value = !vs.highlight_current_line;
-                vs.highlight_current_line = new_value;
-                vs.highlight_current_line_override = Some(new_value);
-                new_value
-            })
-        else {
-            return;
+        let new_value = {
+            // The buffer the user is on (`Window::focused_view_mut`): a
+            // shown group's focused panel, never the buffer behind it.
+            let vs = self.active_window_mut().focused_view_mut();
+            // The focused buffer's own view state in its pane, so this
+            // scopes the override to that buffer in that pane only.
+            let new_value = !vs.highlight_current_line;
+            vs.highlight_current_line = new_value;
+            vs.highlight_current_line_override = Some(new_value);
+            new_value
         };
 
         let state = if new_value {
@@ -390,26 +332,13 @@ impl Editor {
         // The pin lives on the split's view state (like line numbers and the
         // current-line highlight), so the same buffer in another split keeps
         // its own choice.
-        let active_split = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split();
-        let Some(new_value) = self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
-            .expect("active window must have a populated split layout")
-            .get_mut(&active_split)
-            .map(|vs| {
-                let new_value = !vs.fold_indicators_visible();
-                vs.fold_indicators_override = Some(new_value);
-                new_value
-            })
-        else {
-            return;
+        let new_value = {
+            // The buffer the user is on (`Window::focused_view_mut`): a
+            // shown group's focused panel, never the buffer behind it.
+            let vs = self.active_window_mut().focused_view_mut();
+            let new_value = !vs.fold_indicators_visible();
+            vs.fold_indicators_override = Some(new_value);
+            new_value
         };
 
         let status = if new_value {
@@ -455,34 +384,69 @@ impl Editor {
             .any(|w| w.animations.has_dismissable())
     }
 
-    /// Dismiss the wave animation everywhere it's running.
+    /// Dismiss the wave animation everywhere it's running, and take down the
+    /// status line it posted with it.
+    ///
+    /// The message ("press any key or move the mouse to stop") is an
+    /// instruction for a show that is now over, so it must not outlive it —
+    /// it used to sit in the status bar until the next thing that wrote one.
+    /// Only that exact message is cleared: anything a later action posted on
+    /// top of it belongs to that action.
     pub fn cancel_wave_animation(&mut self) {
+        let posted = t!("wave.triggered").to_string();
         for w in self.windows.values_mut() {
             w.animations.cancel_dismissable();
+            if w.status_message.as_deref() == Some(posted.as_str()) {
+                w.clear_status_message();
+            }
         }
     }
 
     /// If the interactive wave animation is running, decide whether this raw
-    /// terminal event should dismiss it. Any key press or mouse activity ends
-    /// the show; that event is then *consumed* (it only stops the animation,
-    /// it doesn't also act on the editor).
+    /// terminal event should dismiss it. Anything that says the reader is
+    /// back at the editor ends the show.
     ///
-    /// Returns `true` when the event was consumed — the caller must skip
-    /// normal input handling for it and re-render. This lives on `Editor` so
-    /// every event loop (the local terminal loop in `main.rs` and the daemon
-    /// server loop) shares one dismissal path rather than duplicating it.
+    /// A key press or any mouse report is the obvious signal. **Focus is the
+    /// third**, and it is the one the screensaver needs: the wave starts
+    /// after minutes of idling, which is time spent in another window — and
+    /// a terminal reports pointer motion only over its own window, so the
+    /// mouse the status line promises never moves *here* on the way back.
+    /// What does arrive is `FocusGained`, the moment the reader returns.
+    /// Without it the show outlived the return until a key was pressed.
+    /// A bracketed paste is the same story told by the clipboard.
+    ///
+    /// `FocusLost` and `Resize` are deliberately not dismissals: the first
+    /// is the reader leaving, and the second is the window manager, not the
+    /// reader (the effect re-snapshots and carries on across a resize).
+    ///
+    /// Ending the show and *consuming* the event are two different things.
+    /// A key or a mouse report means nothing here but "stop", so it is
+    /// swallowed. Focus and a paste carry work of their own — focus drives
+    /// the editor's on-return housekeeping, and pasted text is content the
+    /// reader asked for — so they end the wave and then go on to be handled
+    /// normally.
+    ///
+    /// Returns `true` only when the event was consumed — the caller must
+    /// then skip normal input handling for it and re-render. This lives on
+    /// `Editor` so every frontend (the local terminal loop in `main.rs`, the
+    /// daemon server loop, the web bridge and the GUI window) shares one
+    /// dismissal path rather than duplicating the rule.
     pub fn maybe_dismiss_wave_animation(&mut self, event: &fresh_input_parser::Event) -> bool {
         use crate::input::is_keystroke;
         use fresh_input_parser::Event;
         if !self.wave_animation_active() {
             return false;
         }
-        let dismiss = matches!(event, Event::Key(k) if is_keystroke(k.kind))
-            || matches!(event, Event::Mouse(_));
+        let (dismiss, consume) = match event {
+            Event::Key(k) => (is_keystroke(k.kind), true),
+            Event::Mouse(_) => (true, true),
+            Event::FocusGained | Event::Paste(_) => (true, false),
+            Event::FocusLost | Event::Resize(_, _) => (false, false),
+        };
         if dismiss {
             self.cancel_wave_animation();
         }
-        dismiss
+        dismiss && consume
     }
 
     /// The configured screensaver idle threshold, or `None` when the
@@ -691,40 +655,29 @@ impl Editor {
         let wrap_column = self
             .active_window()
             .resolve_wrap_column_for_buffer(buffer_id);
-        let leaf_ids: Vec<_> = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
-            .keys()
-            .copied()
-            .collect();
-        for leaf_id in leaf_ids {
-            if self.split_manager_mut().get_buffer_id(leaf_id.into()) != Some(buffer_id) {
-                continue;
-            }
-            if let Some(view_state) = self
-                .windows
-                .get_mut(&self.active_window)
-                .and_then(|w| w.split_view_states_mut())
-                .expect("active window must have a populated split layout")
-                .get_mut(&leaf_id)
-            {
-                view_state.line_numbers_override = None;
-                view_state.line_wrap_override = None;
-                view_state.highlight_current_line_override = None;
-                view_state.indentation_guide_user_override = None;
-                view_state.fold_indicators_override = None;
-                view_state.apply_config_defaults(crate::view::split::ViewConfigDefaults {
-                    line_numbers: self.config.editor.line_numbers,
-                    highlight_current_line: self.config.editor.highlight_current_line,
-                    line_wrap,
-                    wrap_indent: self.config.editor.wrap_indent,
-                    wrap_column,
-                    rulers: self.config.editor.rulers.clone(),
-                    scroll_offset: self.config.editor.scroll_offset,
-                });
+        // `buffer_id`'s own view state in every pane that keeps one — its
+        // tab or not, a group's panel included.
+        let defaults = crate::view::split::ViewConfigDefaults {
+            line_numbers: self.config.editor.line_numbers,
+            highlight_current_line: self.config.editor.highlight_current_line,
+            line_wrap,
+            wrap_indent: self.config.editor.wrap_indent,
+            wrap_column,
+            rulers: self.config.editor.rulers.clone(),
+            scroll_offset: self.config.editor.scroll_offset,
+        };
+        for vs in self
+            .active_window_mut()
+            .split_view_states_mut()
+            .values_mut()
+        {
+            if let Some(view) = vs.buffer_state_mut(buffer_id) {
+                view.line_numbers_override = None;
+                view.line_wrap_override = None;
+                view.highlight_current_line_override = None;
+                view.indentation_guide_user_override = None;
+                view.fold_indicators_override = None;
+                view.apply_config_defaults(defaults.clone());
             }
         }
 
@@ -805,11 +758,6 @@ impl Editor {
         }
     }
 
-    /// Check if mouse hover is enabled
-    pub fn is_mouse_hover_enabled(&self) -> bool {
-        self.config.editor.mouse_hover_enabled
-    }
-
     /// Set GPM active flag (enables software mouse cursor rendering)
     ///
     /// When GPM is used for mouse input on Linux consoles, we need to draw
@@ -817,6 +765,21 @@ impl Editor {
     /// buffer used by TUI applications.
     pub fn set_gpm_active(&mut self, active: bool) {
         self.active_window_mut().gpm_active = active;
+    }
+
+    /// Whether the terminal is a Linux console (`TERM=linux`), whose fonts
+    /// lack some of the glyphs Fresh draws by default.
+    pub fn set_linux_console(&mut self, linux_console: bool) {
+        self.linux_console = linux_console;
+    }
+
+    /// The colors the terminal can show, which every frame is converted to.
+    /// A daemon sets it per frame from the terminal in use.
+    pub fn set_color_capability(
+        &mut self,
+        capability: crate::view::color_support::ColorCapability,
+    ) {
+        self.color_capability = capability;
     }
 
     /// Toggle inlay hints visibility
@@ -841,7 +804,7 @@ impl Editor {
                 .map(|w| &mut w.buffers)
                 .expect("active window present")
             {
-                state.virtual_texts.clear(&mut state.marker_list);
+                state.virtual_texts.clear();
             }
             self.set_status_message(t!("toggle.inlay_hints_disabled").to_string());
         }
@@ -853,7 +816,7 @@ impl Editor {
         if let Err(e) = self
             .authority()
             .filesystem
-            .create_dir_all(&self.dir_context.config_dir)
+            .create_dir_all(self.dir_context.config_dir.as_host())
         {
             self.set_status_message(
                 t!("error.config_dir_failed", error = e.to_string()).to_string(),
@@ -905,7 +868,7 @@ impl Editor {
         // Create the config directory if it doesn't exist
         self.authority()
             .filesystem
-            .create_dir_all(&self.dir_context.config_dir)
+            .create_dir_all(self.dir_context.config_dir.as_host())
             .map_err(|e| format!("Failed to create config directory: {}", e))?;
 
         let resolver =
@@ -973,6 +936,13 @@ impl Editor {
                 .filter(|c| c.enabled)
                 .collect();
             lsp.set_universal_configs(universal_servers);
+        }
+
+        // A reload replaces the display settings too, so the open views owe the
+        // same re-resolution a toggle gives them (#3449). Only `editor.reloadConfig()`
+        // reaches here — there is no command or menu item for it.
+        for window in self.windows.values_mut() {
+            window.resync_global_display_defaults();
         }
 
         // Control-event bus: in-process observers (the test harness's
@@ -1060,26 +1030,39 @@ impl Editor {
                 return;
             }
         };
+        self.persist_config_pointer(key.pointer(), json);
+    }
+
+    /// Write one JSON pointer into whichever layer already defines it,
+    /// defaulting to the user layer.
+    ///
+    /// The body of [`Self::persist_config_change`], split out for the one
+    /// caller that cannot name a [`SettingKey`]: `handle_save_setting`,
+    /// which takes its path from a plugin at runtime and validates it for
+    /// itself. Everything inside the editor should go through the typed
+    /// key — the pointer is unchecked here, which is exactly what the key
+    /// exists to prevent.
+    pub(super) fn persist_config_pointer(&self, pointer: &str, json: serde_json::Value) {
         let resolver =
             ConfigResolver::new(self.dir_context.clone(), self.working_dir().to_path_buf());
         let layer = match resolver.get_layer_sources() {
-            Ok(sources) => match sources.get(key.pointer()) {
+            Ok(sources) => match sources.get(pointer) {
                 Some(ConfigLayer::Session) => ConfigLayer::Session,
                 Some(ConfigLayer::Project) => ConfigLayer::Project,
                 _ => ConfigLayer::User,
             },
             Err(e) => {
                 tracing::warn!(
-                    "Could not resolve the config layer defining {}: {e}; writing the user layer",
-                    key.pointer()
+                    "Could not resolve the config layer defining {pointer}: {e}; \
+                     writing the user layer"
                 );
                 ConfigLayer::User
             }
         };
-        let changes = std::collections::HashMap::from([(key.pointer().to_string(), json)]);
+        let changes = std::collections::HashMap::from([(pointer.to_string(), json)]);
         let deletions = std::collections::HashSet::new();
         if let Err(e) = resolver.save_changes_to_layer(&changes, &deletions, layer) {
-            tracing::error!("Failed to persist config change {}: {}", key.pointer(), e);
+            tracing::error!("Failed to persist config change {pointer}: {e}");
         }
     }
 }

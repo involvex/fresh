@@ -1,124 +1,55 @@
 //! Scroll-sync orchestrators on `Editor`.
 //!
-//! - `ensure_active_tab_visible` — adjusts a split's tab-bar scroll offset
-//!   so the active tab is on screen.
 //! - `sync_scroll_groups` — when splits share a scroll group (e.g. for
 //!   side-by-side diffs), keep their viewports in lockstep.
 //! - `pre_sync_ensure_visible` — pre-sync hook that ensures the active
 //!   split's cursor is on screen so the scroll-group sync uses a valid
 //!   anchor.
 
-use crate::model::event::{BufferId, LeafId, SplitId};
+use crate::model::event::{LeafId, SplitId};
+
+/// A pane's rows, as [`crate::app::window::Window::pane_rows`] reads them.
+struct PaneRows {
+    geometry: crate::view::wrap_index::WrapIndexGeometry,
+    top: u32,
+    height: u32,
+    max_top: u32,
+}
 
 impl crate::app::window::Window {
-    /// Ensure the active tab in a split is visible by adjusting its
-    /// scroll offset. Pure window-state mutation: split tree +
-    /// view_states + buffer_metadata + composite_buffers + grouped_subtrees
-    /// all live on `Window`.
-    pub fn ensure_active_tab_visible(
-        &mut self,
-        split_id: LeafId,
-        active_buffer: BufferId,
-        available_width: u16,
-    ) {
-        tracing::debug!(
-            "ensure_active_tab_visible called: split={:?}, buffer={:?}, width={}",
-            split_id,
-            active_buffer,
-            available_width
-        );
-        let group_names: std::collections::HashMap<LeafId, String> = self
-            .grouped_subtrees
-            .iter()
-            .filter_map(|(leaf_id, node)| {
-                if let crate::view::split::SplitNode::Grouped { name, .. } = node {
-                    Some((*leaf_id, name.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let metadata = &self.buffer_metadata;
-        let composites = &self.composite_buffers;
-        let preview_buffer = self.preview.map(|(_, b)| b);
-
-        self.buffers.with_all_mut(|buffer_map, _mgr, vs_map| {
-            let Some(view_state) = vs_map.get_mut(&split_id) else {
-                return;
-            };
-            let split_buffers = view_state.open_buffers.clone();
-            let (tab_widths, rendered_targets) = crate::view::ui::tabs::calculate_tab_widths(
-                &split_buffers,
-                buffer_map,
-                metadata,
-                composites,
-                &group_names,
-                preview_buffer,
-                available_width as usize,
-            );
-
-            let total_tabs_width: usize = tab_widths.iter().sum();
-            // Reserve the pinned "+" button's column when the tabs overflow, so
-            // the active tab stays fully visible and never slips under it.
-            let max_visible_width = crate::view::ui::tabs::tabs_render_width(
-                total_tabs_width,
-                available_width as usize,
-            );
-
-            let active_target = view_state.active_target();
-            let active_target = if matches!(active_target, crate::view::split::TabTarget::Buffer(_))
-            {
-                crate::view::split::TabTarget::Buffer(active_buffer)
-            } else {
-                active_target
-            };
-
-            let active_tab_index = rendered_targets.iter().position(|t| *t == active_target);
-            let active_width_index =
-                active_tab_index.map(|buf_idx| if buf_idx == 0 { 0 } else { buf_idx * 2 });
-
-            let old_offset = view_state.tab_scroll_offset;
-            let new_scroll_offset = if let Some(idx) = active_width_index {
-                crate::view::ui::tabs::scroll_to_show_tab(
-                    &tab_widths,
-                    idx,
-                    view_state.tab_scroll_offset,
-                    max_visible_width,
-                )
-            } else {
-                view_state
-                    .tab_scroll_offset
-                    .min(total_tabs_width.saturating_sub(max_visible_width))
-            };
-
-            tracing::debug!(
-                "  -> offset: {} -> {} (idx={:?}, max_width={}, total={})",
-                old_offset,
-                new_scroll_offset,
-                active_width_index,
-                max_visible_width,
-                total_tabs_width
-            );
-            view_state.tab_scroll_offset = new_scroll_offset;
-        });
-    }
-
     /// Synchronize viewports for all scroll-sync groups in this window.
     ///
     /// For each registered group containing the active split, derive the
     /// active split's top line from its viewport and project it onto the
-    /// paired split via the group's mapping. Then, when same-buffer
+    /// paired split via the group's mapping — or, for a group whose two panes
+    /// show the same buffer, in visual rows (`sync_same_buffer_rows`). The
+    /// active split is the focused one unless the pointer scrolled another
+    /// since the last sync (`scroll_sync_driver`). (Horizontal scroll is copied
+    /// after layout instead, see `sync_left_column_from`.) Then, when same-buffer
     /// scroll sync is enabled, also mirror the active split's `top_byte`
     /// onto every other split that shows the same buffer (and isn't in
     /// an explicit sync group). The bottom-edge case sets
     /// `sync_scroll_to_end` so the render pass does the
     /// soft-break-aware fix-up using view lines.
     pub(super) fn sync_scroll_groups(&mut self) {
-        let (mgr, vs_map) = self
+        // The pane the user is in: a shown group's focused panel, not the
+        // pane showing the group. Panels are not in the split tree, so a
+        // pane's buffer is read off its view state (`shown_buffer`). A pane
+        // the pointer scrolled since the last sync drives this one instead.
+        let focused = self.effective_active_split();
+        let active_split = self
+            .scroll_sync_driver
+            .take()
+            .filter(|leaf| {
+                self.buffers
+                    .split_view_states()
+                    .is_some_and(|vs_map| vs_map.contains_key(leaf))
+            })
+            .unwrap_or(focused);
+        let vs_map = self
             .buffers
-            .splits()
+            .split_view_states()
             .expect("window must have a populated split layout");
-        let active_split = mgr.active_split();
         let group_count = self.scroll_sync_manager.groups().len();
 
         if group_count > 0 {
@@ -149,8 +80,9 @@ impl crate::app::window::Window {
                     return None;
                 }
 
-                let active_top_byte = vs_map.get(&active_split)?.viewport.top_byte();
-                let active_buffer_id = mgr.buffer_for_split(active_split)?;
+                let active_vs = vs_map.get(&active_split)?;
+                let active_top_byte = active_vs.buffer_tab_state().viewport.top_byte();
+                let active_buffer_id = active_vs.shown_buffer()?;
                 let buffer_state = self.buffers.get(&active_buffer_id)?;
                 let buffer_len = buffer_state.buffer.len();
                 let active_line = buffer_state.buffer.get_line_number(active_top_byte);
@@ -176,21 +108,37 @@ impl crate::app::window::Window {
                     other_line
                 );
 
-                Some((other_split, other_line))
+                let same_buffer = vs_map
+                    .get(&LeafId(other_split))
+                    .and_then(|vs| vs.shown_buffer())
+                    == Some(active_buffer_id);
+                Some((group.id, other_split, other_line, same_buffer))
             })
             .collect();
 
-        for (other_split, target_line) in sync_info {
+        for (group_id, other_split, target_line, same_buffer) in sync_info {
             let other_leaf = LeafId(other_split);
             let buffer_id = self
                 .buffers
-                .splits()
-                .expect("window must have a populated split layout")
-                .0
-                .buffer_for_split(other_leaf);
-            if let Some(buffer_id) = buffer_id {
-                self.scroll_split_viewport_to(buffer_id, other_leaf, target_line, false);
+                .split_view_states()
+                .and_then(|vs_map| vs_map.get(&other_leaf))
+                .and_then(|vs| vs.shown_buffer());
+            let Some(buffer_id) = buffer_id else {
+                continue;
+            };
+            if same_buffer
+                && self.sync_same_buffer_rows(group_id, buffer_id, active_split, other_leaf)
+            {
+                continue;
             }
+            if !same_buffer && self.sync_flat_rows(group_id, active_split, other_leaf) {
+                continue;
+            }
+            // `target_line` is 0-based, like the anchors and
+            // `get_line_number`; `Viewport::scroll_to` counts from 1.
+            // Passed as-is, the partner sat one line above the line the
+            // anchors name — a row out of step with the active pane.
+            self.scroll_split_viewport_to(buffer_id, other_leaf, target_line + 1, false);
         }
 
         let active_buffer_id = if self.same_buffer_scroll_sync {
@@ -207,10 +155,12 @@ impl crate::app::window::Window {
                 .buffers
                 .splits()
                 .expect("window must have a populated split layout");
-            let active_top_byte = vs_map.get(&active_split).map(|vs| vs.viewport.top_byte());
+            let active_top_byte = vs_map
+                .get(&active_split)
+                .map(|vs| vs.buffer_tab_state().viewport.top_byte());
             let active_viewport_height = vs_map
                 .get(&active_split)
-                .map(|vs| vs.viewport.visible_line_count())
+                .map(|vs| vs.buffer_tab_state().viewport.visible_line_count())
                 .unwrap_or(0);
 
             if let Some(top_byte) = active_top_byte {
@@ -245,12 +195,401 @@ impl crate::app::window::Window {
                         .expect("window must have a populated split layout");
                     for other_split in other_splits {
                         if let Some(view_state) = vs_map_mut.get_mut(&other_split) {
-                            view_state.viewport.set_top_byte(top_byte);
-                            view_state.viewport.sync_scroll_to_end = at_bottom;
+                            view_state
+                                .buffer_tab_state_mut()
+                                .viewport
+                                .set_top_byte(top_byte);
+                            view_state
+                                .buffer_tab_state_mut()
+                                .viewport
+                                .sync_scroll_to_end = at_bottom;
                         }
                     }
                 }
             }
+        }
+    }
+
+    /// Sync a group whose two panes show the same buffer — markdown's source
+    /// beside its rendered preview — in visual rows. Returns `false` when the
+    /// rows cannot be had (a buffer beyond the wrap index's size ceilings, a
+    /// pane not laid out yet), leaving the caller's line mapping to do it.
+    ///
+    /// The line mapping a diff's anchors call for is the identity here, and it
+    /// is not enough: the two panes lay the same lines out in different rows
+    /// (the preview frames tables, spaces list items, wraps paragraphs), so
+    /// "same top line" keeps only the top row together, lets everything below
+    /// drift apart, and moves the partner by whole lines of uneven height. Rows
+    /// carry the position inside a line too, so the partner moves smoothly, and
+    /// a row is lined up wherever the window is (`scroll_sync::synced_top`).
+    fn sync_same_buffer_rows(
+        &mut self,
+        group_id: crate::view::scroll_sync::ScrollSyncGroupId,
+        buffer_id: crate::model::event::BufferId,
+        active: LeafId,
+        other: LeafId,
+    ) -> bool {
+        use crate::view::scroll_sync::{inverse_synced_top, map_row, synced_top, RowSyncState};
+
+        let Some(left_is_active) = self
+            .scroll_sync_manager
+            .get_group_mut(group_id)
+            .map(|g| g.is_left_split(active.into()))
+        else {
+            return false;
+        };
+        let (Some(a), Some(o)) = (
+            self.pane_rows(buffer_id, active),
+            self.pane_rows(buffer_id, other),
+        ) else {
+            return false;
+        };
+        let last = self
+            .scroll_sync_manager
+            .get_group_mut(group_id)
+            .and_then(|g| g.row_sync);
+        let record = |mgr: &mut crate::view::scroll_sync::ScrollSyncManager, other_top: u32| {
+            if let Some(group) = mgr.get_group_mut(group_id) {
+                group.row_sync = Some(RowSyncState {
+                    active: active.into(),
+                    active_top: a.top,
+                    other_top,
+                });
+            }
+        };
+
+        // The focus moved to the other pane and nothing has scrolled since: the
+        // pair is where the last sync put it, and stays there.
+        if let Some(last) = last {
+            if last.active != SplitId::from(active) && a.top == last.other_top {
+                record(&mut self.scroll_sync_manager, o.top);
+                return true;
+            }
+        }
+
+        let Some(state) = self.buffers.get(&buffer_id) else {
+            return false;
+        };
+        let (Some(index_a), Some(index_o)) = (
+            state.wrap_indices.get(&a.geometry),
+            state.wrap_indices.get(&o.geometry),
+        ) else {
+            return false;
+        };
+        // One curve relates the pair, driven from the group's left pane (the
+        // source): the right pane's top for each left top. Scrolling the right
+        // pane inverts it, so the pair sits on the same curve whichever pane
+        // the user scrolls.
+        let (left, right, index_l, index_r) = if left_is_active {
+            (&a, &o, index_a, index_o)
+        } else {
+            (&o, &a, index_o, index_a)
+        };
+        let curve = |top: u32| {
+            synced_top(top, left.max_top, left.height, right.max_top, |row| {
+                map_row(index_l, index_r, &state.buffer, row)
+            })
+        };
+        let mut target = if left_is_active {
+            curve(a.top)
+        } else if a.top == 0 {
+            0
+        } else if a.top >= a.max_top {
+            o.max_top
+        } else {
+            inverse_synced_top(a.top, o.max_top, curve)
+        };
+        // Never against the scroll: the driver went down, so the partner does
+        // not go up, and the other way round. The curve is monotonic, but the
+        // aligned row slides with the window and a line laid out shorter in the
+        // partner could still pull it back a row.
+        if let Some(last) = last.filter(|l| l.active == SplitId::from(active)) {
+            if a.top > last.active_top {
+                target = target.max(last.other_top.min(o.max_top));
+            } else if a.top < last.active_top {
+                target = target.min(last.other_top);
+            }
+        }
+        let addr = index_o.byte_of_row(&state.buffer, target);
+        let line_start = state.buffer.line_start_offset(addr.line).unwrap_or(0);
+
+        if let Some(vs) = self
+            .buffers
+            .split_view_states_mut()
+            .and_then(|vs_map| vs_map.get_mut(&other))
+        {
+            let viewport = &mut vs.buffer_tab_state_mut().viewport;
+            viewport.set_top_byte(line_start);
+            viewport.set_top_view_line_offset(addr.row_in_line);
+            viewport.set_skip_ensure_visible();
+        }
+        record(&mut self.scroll_sync_manager, target);
+        true
+    }
+
+    /// Sync a group whose panes show two different buffers, both unwrapped
+    /// (a comparison), in screen rows. Returns `false` when either pane isn't
+    /// laid out that way (wrapping, folds, large-file mode), leaving the
+    /// caller's line mapping to do it.
+    ///
+    /// Lines are not enough: the filler rows that keep a comparison's matching
+    /// lines level are virtual lines, rows that belong to no line of their own.
+    /// Synced by line, a pane scrolled into the fillers left its partner
+    /// standing at the edge of the change, and a pane scrolled through a long
+    /// change carried its partner on past it, into lines that don't match.
+    ///
+    /// An anchor pairs the rows its two lines' text is drawn on; from the last
+    /// anchor at or above the active pane's top, the partner moves row for row
+    /// (with no anchor above, from the top of both). Fillers that keep the
+    /// panes level make that the same row in both.
+    fn sync_flat_rows(
+        &mut self,
+        group_id: crate::view::scroll_sync::ScrollSyncGroupId,
+        active: LeafId,
+        other: LeafId,
+    ) -> bool {
+        let Some(group) = self.scroll_sync_manager.get_group_mut(group_id) else {
+            return false;
+        };
+        let left_is_active = group.is_left_split(active.into());
+        let anchors: Vec<(usize, usize)> = group
+            .anchors
+            .iter()
+            .map(|a| {
+                if left_is_active {
+                    (a.left_line, a.right_line)
+                } else {
+                    (a.right_line, a.left_line)
+                }
+            })
+            .collect();
+        // The rows below are read straight off each buffer's virtual-line
+        // trees, so they are worked out inside the call that reaches the
+        // buffer: first the active pane's top and its side of the anchors,
+        // then the partner's side and where that puts it.
+        let flat = |vs: &crate::view::split::BufferViewState| {
+            !vs.viewport.line_wrap_enabled && vs.folds.is_empty()
+        };
+        let shown = |window: &Self, leaf: LeafId| {
+            window
+                .buffers
+                .split_view_states()?
+                .get(&leaf)?
+                .shown_buffer()
+        };
+        let (Some(active_buffer), Some(other_buffer)) = (shown(self, active), shown(self, other))
+        else {
+            return false;
+        };
+        let Some((a_top, a_anchors)) = self
+            .buffers
+            .with_buffer_and_split(active_buffer, active, |state, vs| {
+                if !flat(vs) {
+                    return None;
+                }
+                let rows = crate::view::flat_rows::FlatRows::new(state, vs.is_page_view())?;
+                let top_line = state.buffer.get_line_number(vs.viewport.top_byte());
+                let top = rows.first_row(top_line) + vs.viewport.top_view_line_offset();
+                let anchors: Vec<usize> = anchors.iter().map(|(a, _)| rows.text_row(*a)).collect();
+                Some((top, anchors))
+            })
+            .flatten()
+        else {
+            return false;
+        };
+        self.buffers
+            .with_buffer_and_split(other_buffer, other, |state, vs| {
+                if !flat(vs) {
+                    return false;
+                }
+                let Some(rows) = crate::view::flat_rows::FlatRows::new(state, vs.is_page_view())
+                else {
+                    return false;
+                };
+                // The anchors in rows, through the same mapping the line sync
+                // uses: row for row from the anchor above, never past the next.
+                let row_anchors: Vec<crate::view::scroll_sync::SyncAnchor> = a_anchors
+                    .iter()
+                    .zip(&anchors)
+                    .map(|(a, (_, o))| crate::view::scroll_sync::SyncAnchor {
+                        left_line: *a,
+                        right_line: rows.text_row(*o),
+                    })
+                    .collect();
+                let mapped =
+                    crate::view::scroll_sync::map_through_anchors(&row_anchors, a_top, |a| {
+                        (a.left_line, a.right_line)
+                    });
+                // The two sides can end a row apart — one file ends with a
+                // newline, so it has an empty last line the other lacks —
+                // and both at their last page would then stand a row out of
+                // step. The partner goes where the rows say, past its own
+                // last page if it must (blank rows below its end), so long
+                // as a row of it stays in view.
+                let target = mapped.min(rows.total_rows().saturating_sub(1));
+                let (line, offset) = rows.locate(target);
+                let line_start = state.buffer.line_start_offset(line).unwrap_or(0);
+                vs.viewport.set_top_byte(line_start);
+                vs.viewport.set_top_view_line_offset(offset);
+                vs.viewport.set_skip_ensure_visible();
+                true
+            })
+            .unwrap_or(false)
+    }
+
+    /// `leaf`'s rows as the frame will lay them out: the wrap index for its
+    /// geometry (built here if stale, as the frame's reconcile would), and its
+    /// top row, height and furthest top row in that index. `None` beyond the
+    /// index's size ceilings, or for a pane not laid out yet.
+    fn pane_rows(
+        &mut self,
+        buffer_id: crate::model::event::BufferId,
+        leaf: LeafId,
+    ) -> Option<PaneRows> {
+        use crate::view::ui::split_rendering::scrollbar::{
+            MAX_WRAP_SCROLLBAR_BYTES, MAX_WRAP_SCROLLBAR_LINES,
+        };
+        self.buffers
+            .with_buffer_and_split(buffer_id, leaf, |state, vs| {
+                let within_bounds = !state.buffer.is_large_file()
+                    && state.buffer.len() <= MAX_WRAP_SCROLLBAR_BYTES
+                    && state
+                        .buffer
+                        .line_count()
+                        .is_some_and(|lc| lc <= MAX_WRAP_SCROLLBAR_LINES);
+                let height = vs.viewport.visible_line_count() as u32;
+                if !within_bounds || height == 0 {
+                    return None;
+                }
+                let fold_ranges = state.fold_ranges(&vs.folds);
+                let geometry = crate::view::ui::split_rendering::wrap_index_geometry_for(
+                    &vs.viewport,
+                    &state.buffer,
+                    vs.viewport.line_wrap_enabled,
+                    &vs.view_mode,
+                    crate::view::wrap_index::fold_signature(&fold_ranges),
+                );
+                let inputs = state.pipeline_inputs();
+                let line_ending = state.buffer.line_ending();
+                let decorations = state.index_decorations(geometry.view_mode, fold_ranges, &[]);
+                let index = state.wrap_indices.entry(geometry);
+                index.ensure_built(
+                    &mut state.buffer,
+                    geometry,
+                    inputs,
+                    line_ending,
+                    &decorations,
+                );
+                let top_line = state.buffer.get_line_number(vs.viewport.top_byte());
+                let max_top = index.total_rows().saturating_sub(height);
+                let top = (index.line_first_row(top_line)
+                    + vs.viewport.top_view_line_offset() as u32)
+                    .min(max_top);
+                Some(PaneRows {
+                    geometry,
+                    top,
+                    height,
+                    max_top,
+                })
+            })
+            .flatten()
+    }
+
+    /// Carry `source`'s horizontal scroll to its partner in every
+    /// scroll-sync group it is in. Returns whether a partner moved.
+    ///
+    /// Vertical sync maps lines through the group's anchors; horizontal sync
+    /// is a plain column copy, and only between panes that pan horizontally
+    /// at all (`shares_horizontal_scroll`). A wrapped or compose pane neither drives
+    /// its partner back to column 0 nor gets shifted off screen by it.
+    /// Same-buffer scroll sync stays vertical only.
+    ///
+    /// Called after a frame's layout for the focused pane (whose column is
+    /// only final then: the cursor's visual column needs the laid-out rows),
+    /// and on a wheel pan for the pane under the pointer.
+    pub(super) fn sync_left_column_from(&mut self, source: LeafId) -> bool {
+        let source_id: SplitId = source.into();
+        let Some(left_column) = self
+            .buffers
+            .split_view_states()
+            .and_then(|vs_map| vs_map.get(&source))
+            .map(|vs| vs.buffer_tab_state())
+            .filter(|state| state.shares_horizontal_scroll())
+            .map(|state| state.viewport.left_column)
+        else {
+            return false;
+        };
+        let partners: Vec<LeafId> = self
+            .scroll_sync_manager
+            .groups()
+            .iter()
+            .filter(|group| group.contains_split(source_id))
+            .map(|group| {
+                LeafId(if group.is_left_split(source_id) {
+                    group.right_split
+                } else {
+                    group.left_split
+                })
+            })
+            .collect();
+        let Some(vs_map) = self.buffers.split_view_states_mut() else {
+            return false;
+        };
+        let mut moved = false;
+        for partner in partners {
+            let Some(state) = vs_map.get_mut(&partner).map(|vs| vs.buffer_tab_state_mut()) else {
+                continue;
+            };
+            if state.shares_horizontal_scroll() && state.viewport.left_column != left_column {
+                state.viewport.left_column = left_column;
+                state.viewport.set_skip_ensure_visible();
+                moved = true;
+            }
+        }
+        moved
+    }
+
+    /// After a frame's layout, carry the focused pane's column to its
+    /// partners. Returns whether one more frame is owed.
+    ///
+    /// The focused pane's column is only final after layout: the cursor's
+    /// column is a visual one (tabs, wide characters, inlay hints), which
+    /// only the laid-out rows know. Its partners were laid out from their old
+    /// column, so a move owes a frame.
+    ///
+    /// Only a column not synced yet is copied. A partner that cannot scroll
+    /// as far (a file of shorter lines) settles short of it; copying the same
+    /// column again would push it back out, its settle would pull it in, and
+    /// each frame would owe the next.
+    pub(crate) fn sync_left_column_after_layout(&mut self) -> bool {
+        let focused = self.effective_active_split();
+        let Some(column) = self
+            .buffers
+            .split_view_states()
+            .and_then(|vs_map| vs_map.get(&focused))
+            .map(|vs| vs.buffer_tab_state().viewport.left_column)
+        else {
+            return false;
+        };
+        if self.last_horizontal_sync == Some((focused, column)) {
+            return false;
+        }
+        self.last_horizontal_sync = Some((focused, column));
+        self.sync_left_column_from(focused)
+    }
+
+    /// Drop every scroll-sync group with a pane that has closed.
+    ///
+    /// A group dies with either of its panes. Panes close on several paths
+    /// (close split, tab drag, buffer-group close), all of which drop the
+    /// pane's view state, so the check is on that rather than at each path.
+    /// It runs at the start of every frame's sync, and before a group is
+    /// created: a plugin closing a pane and pairing again under the same id
+    /// does both in one batch of commands, with no frame between.
+    pub(crate) fn prune_scroll_sync_groups(&mut self) {
+        if let Some(vs_map) = self.buffers.split_view_states() {
+            self.scroll_sync_manager
+                .retain_live_groups(|split| vs_map.contains_key(&LeafId(split)));
         }
     }
 
@@ -262,21 +601,52 @@ impl crate::app::window::Window {
     /// the group is then marked to skip `ensure_visible` during render
     /// so the sync isn't undone. Same-buffer sync mirrors the same
     /// "skip" mark across the other splits showing the same buffer.
+    ///
+    /// First it drops groups whose pane has closed
+    /// (`prune_scroll_sync_groups`), so nothing below reads one.
     pub(super) fn pre_sync_ensure_visible(&mut self, active_split: LeafId) {
+        self.prune_scroll_sync_groups();
+
         let group_info = self
             .scroll_sync_manager
             .find_group_for_split(active_split.into())
             .map(|g| (g.left_split, g.right_split));
 
         if let Some((left_split, right_split)) = group_info {
+            // Off the view state: a group's panel is not in the split tree.
             let buffer_id = self
                 .buffers
-                .splits()
-                .expect("window must have a populated split layout")
-                .0
-                .buffer_for_split(active_split);
+                .split_view_states()
+                .and_then(|vs_map| vs_map.get(&active_split))
+                .and_then(|vs| vs.shown_buffer());
             if let Some(buffer_id) = buffer_id {
-                self.ensure_cursor_visible_for_split(buffer_id, active_split);
+                // An unwrapped pane with virtual lines (a comparison's
+                // fillers) is placed in rows, as the frame will place it.
+                // Placed by line here and in rows by the frame, a pane with
+                // filler rows above the cursor came out short of where the
+                // frame then put it, and its partner, synced to the first
+                // answer, sat a row out of step.
+                let placed_in_rows = self
+                    .buffers
+                    .with_buffer_and_split(buffer_id, active_split, |state, vs| {
+                        if vs.viewport.line_wrap_enabled || !vs.folds.is_empty() {
+                            return false;
+                        }
+                        let Some(rows) =
+                            crate::view::flat_rows::FlatRows::new(state, vs.is_page_view())
+                                .filter(|rows| rows.has_virtual_lines())
+                        else {
+                            return false;
+                        };
+                        let cursor = vs.cursors.primary().position;
+                        vs.viewport
+                            .ensure_visible_in_flat_rows(&rows, &state.buffer, cursor);
+                        true
+                    })
+                    .unwrap_or(false);
+                if !placed_in_rows {
+                    self.ensure_cursor_visible_for_split(buffer_id, active_split);
+                }
             }
 
             let active_sid: SplitId = active_split.into();
@@ -288,7 +658,10 @@ impl crate::app::window::Window {
 
             if let Some((_, vs_map)) = self.buffers.splits_mut() {
                 if let Some(view_state) = vs_map.get_mut(&LeafId(other_split)) {
-                    view_state.viewport.set_skip_ensure_visible();
+                    view_state
+                        .buffer_tab_state_mut()
+                        .viewport
+                        .set_skip_ensure_visible();
                     tracing::debug!(
                         "pre_sync_ensure_visible: marked other split {:?} to skip ensure_visible",
                         other_split
@@ -330,7 +703,10 @@ impl crate::app::window::Window {
         if let Some((_, vs_map)) = self.buffers.splits_mut() {
             for other_split in other_same_buffer_splits {
                 if let Some(view_state) = vs_map.get_mut(&other_split) {
-                    view_state.viewport.set_skip_ensure_visible();
+                    view_state
+                        .buffer_tab_state_mut()
+                        .viewport
+                        .set_skip_ensure_visible();
                 }
             }
         }

@@ -2,7 +2,6 @@
 
 use crate::config::{KeyPress, Keybinding};
 use crossterm::event::{KeyCode, KeyModifiers};
-use ratatui::layout::Rect;
 
 /// Where a binding comes from
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,17 +21,47 @@ pub enum BindingSource {
 pub enum DeleteResult {
     /// A custom binding was removed
     CustomRemoved,
-    /// A keymap binding was overridden with a noop custom binding
-    KeymapOverridden,
+    /// A keymap or plugin binding was removed with an `unbind` entry
+    KeymapRemoved,
+    /// The binding was disabled with a `noop` override (a real binding that
+    /// makes the key do nothing in that context)
+    Disabled,
     /// Cannot delete (e.g. unbound entry)
     CannotDelete,
     /// Nothing was selected
     NothingSelected,
 }
 
+/// What one row of the keybinding table is, for as long as the editor is
+/// open: issued when the row is created and kept through edits.
+///
+/// **The row's identity, because nothing about the binding is.** The same
+/// action can be bound twice in one context (`Ctrl+S` and `F2`, both *save*),
+/// and adding or editing a binding can leave two rows with the same key and
+/// context until the conflict is resolved — so neither pair is unique. The
+/// table keys its rows by this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BindingId(pub u64);
+
+/// Issues [`BindingId`]s: every row created gets one no other row has had.
+#[derive(Debug, Default)]
+pub struct BindingIds {
+    next: u64,
+}
+
+impl BindingIds {
+    pub fn issue(&mut self) -> BindingId {
+        let id = BindingId(self.next);
+        self.next += 1;
+        id
+    }
+}
+
 /// A single resolved keybinding entry for display
 #[derive(Debug, Clone)]
 pub struct ResolvedBinding {
+    /// This row's identity. See [`BindingId`].
+    pub id: BindingId,
     /// Formatted key combination for display (e.g., "Ctrl+S")
     pub key_display: String,
     /// Action name (machine-readable, e.g., "save")
@@ -246,6 +275,16 @@ pub enum SourceFilter {
     PluginOnly,
 }
 
+/// What a [`DisplayRow`] is, independent of where it is: the editor holds
+/// its selection by this.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RowKey {
+    /// A section header, by its plugin name (`None` = builtin).
+    Section(Option<String>),
+    /// A binding row, by its binding.
+    Binding(BindingId),
+}
+
 /// A row in the keybinding editor display list — either a section header or a binding
 #[derive(Debug, Clone)]
 pub enum DisplayRow {
@@ -260,29 +299,4 @@ pub enum DisplayRow {
     },
     /// A binding row (index into `bindings`)
     Binding(usize),
-}
-
-/// Layout information for mouse hit testing
-#[derive(Debug, Clone, Default)]
-pub struct KeybindingEditorLayout {
-    /// The full modal area (all mouse events inside are captured)
-    pub modal_area: Rect,
-    /// The table area (for scroll and click)
-    pub table_area: Rect,
-    /// The y-offset of the first visible row in the table
-    pub table_first_row_y: u16,
-    /// Edit dialog button areas: (save_rect, cancel_rect)
-    pub dialog_buttons: Option<(Rect, Rect)>,
-    /// Edit dialog key field area
-    pub dialog_key_field: Option<Rect>,
-    /// Edit dialog action field area
-    pub dialog_action_field: Option<Rect>,
-    /// Edit dialog context field area
-    pub dialog_context_field: Option<Rect>,
-    /// Confirm dialog button areas: (save, discard, cancel)
-    pub confirm_buttons: Option<(Rect, Rect, Rect)>,
-    /// Search bar area (for clicking to focus)
-    pub search_bar: Option<Rect>,
-    /// Vertical scrollbar area for the table (1 column wide), if rendered
-    pub table_scrollbar: Option<Rect>,
 }

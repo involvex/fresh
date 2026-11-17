@@ -2,6 +2,22 @@ use crate::common::harness::{EditorTestHarness, HarnessOptions};
 use crossterm::event::{KeyCode, KeyModifiers};
 use fresh::services::remote::{spawn_local_agent, RemoteFileSystem};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Effectively-unbounded per-request timeout for the test harness.
+///
+/// `AgentChannel` defaults to 10s, which is right for a real interactive
+/// session and wrong for a test: these run as threads of one binary alongside
+/// ~4700 others, each `create_test_filesystem` spins up its own multi-threaded
+/// Tokio runtime and a `python3` agent process, and a loaded machine can take
+/// longer than that to turn round even the tiny `info` request while still
+/// making forward progress. A blown deadline is not a failed assertion — it
+/// surfaces as `home_dir()` handing back `None` and the `unwrap` below
+/// panicking, which reads like the anchoring regression the test is here to
+/// catch. Removing the deadline removes the ambiguity (and the time
+/// dependency CONTRIBUTING.md §Testing 3 rules out); `remote_filesystem_tests`
+/// does the same for the same reason.
+const TEST_HARNESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 fn create_test_filesystem() -> Option<(RemoteFileSystem, tempfile::TempDir, tokio::runtime::Runtime)>
 {
@@ -9,6 +25,7 @@ fn create_test_filesystem() -> Option<(RemoteFileSystem, tempfile::TempDir, toki
     let rt = tokio::runtime::Runtime::new().ok()?;
 
     let channel = rt.block_on(spawn_local_agent()).ok()?;
+    channel.set_request_timeout(TEST_HARNESS_REQUEST_TIMEOUT);
     let fs = RemoteFileSystem::new(channel, "test@localhost".to_string());
 
     Some((fs, temp_dir, rt))
@@ -38,6 +55,14 @@ fn test_remote_file_explorer_anchored_at_working_dir() {
     // What the test needs from `home_dir()` is only that the working dir is
     // *not* it, which any path outside home satisfies.
     let home_dir = fs_arc.home_dir().unwrap();
+    // Read before the filesystem is handed to the harness, and under *its*
+    // rules: the name of a remote home is the remote host's to split.
+    let home_dir_name = fs_arc
+        .at(&home_dir)
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
     let project_dir = temp_dir.path().join("my_test_project");
     std::fs::create_dir_all(&project_dir).unwrap();
     std::fs::write(project_dir.join("hello.txt"), "hello world").unwrap();
@@ -60,7 +85,6 @@ fn test_remote_file_explorer_anchored_at_working_dir() {
 
     // The file explorer root should show "my_test_project" (the working dir name)
     // as the first directory entry, NOT the home directory name.
-    let home_dir_name = home_dir.file_name().unwrap().to_string_lossy().to_string();
 
     // Wait for the async tree build to land — the panel chrome (remote
     // "[hostname]" title) appears immediately with a "Loading…" body, so
@@ -234,9 +258,9 @@ fn test_remote_huge_file_mid_and_start_insert() {
     let mut last_edit_line = None;
 
     let _iterations = 3;
-    for target_line in vec![5000, 3] {
+    for target_line in [5000, 3] {
         // Compute byte offset for the target line, accounting for prior edits
-        let extra = if last_edit_line.map_or(false, |l: usize| l < target_line) {
+        let extra = if last_edit_line.is_some_and(|l: usize| l < target_line) {
             extra_bytes_before_line
         } else {
             0
@@ -248,10 +272,7 @@ fn test_remote_huge_file_mid_and_start_insert() {
             .send_key(KeyCode::Char('g'), KeyModifiers::CONTROL)
             .unwrap();
         // Dismiss the scan confirmation prompt — opens byte offset prompt
-        let _ = harness.type_text("n");
-        harness
-            .send_key(KeyCode::Enter, KeyModifiers::NONE)
-            .unwrap();
+        let _ = harness.type_text("g");
         let _ = harness.type_text(&format!("{}B", target_byte));
         harness
             .send_key(KeyCode::Enter, KeyModifiers::NONE)
@@ -348,10 +369,7 @@ fn test_remote_large_file_edits_beginning_middle_end() {
             .send_key(KeyCode::Char('g'), KeyModifiers::CONTROL)
             .unwrap();
         // Dismiss the scan confirmation prompt — opens byte offset prompt
-        let _ = harness.type_text("n");
-        harness
-            .send_key(KeyCode::Enter, KeyModifiers::NONE)
-            .unwrap();
+        let _ = harness.type_text("g");
         println!("target byte: {}", target_byte);
         let _ = harness.type_text(&format!("{}B", target_byte).to_string());
         println!("{}", harness.screen_to_string());
@@ -382,7 +400,7 @@ fn test_remote_large_file_edits_beginning_middle_end() {
         .unwrap();
     harness.send_key(KeyCode::Home, KeyModifiers::NONE).unwrap();
     harness.type_text("END_EDIT").unwrap();
-    expected_lines.push(format!("END_EDIT"));
+    expected_lines.push("END_EDIT".to_string());
 
     // Save
     harness

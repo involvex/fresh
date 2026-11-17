@@ -5,8 +5,271 @@
 //! render-time "mega struct" is required.
 
 use super::MAX_SAFE_LINE_WIDTH;
+
+/// How far the builder scans for the end of a line it had to cut short.
+///
+/// Reaching the next line means finding this line's break, and on a file that
+/// is one enormous line there isn't one — so the search is bounded and a
+/// failure means "there is nothing below this row to draw", which is the truth
+/// for such a file. Sized to skip over any line a person wrote and to stop long
+/// before the cost shows up in a frame.
+const LINE_SKIP_SCAN_BYTES: usize = 256 * 1024;
 use crate::model::buffer::{Buffer, LineEnding};
 use fresh_core::api::{ViewTokenWire, ViewTokenWireKind};
+
+/// Byte offset of the line's own terminator, when the piece just read carries
+/// it.
+///
+/// A reader hands back at most a fixed number of bytes at a time, so a piece
+/// that ends without a terminator may be either the end of the document or the
+/// middle of a line that continues past the read. Telling the two apart is what
+/// keeps a row that was cut short from stepping over the line below it.
+///
+/// The offset is the terminator's *first* byte, so a CRLF pair reports the
+/// `\r` — the same anchor the character loop above gives a `Newline` token it
+/// emits itself.
+fn line_terminator_offset(
+    content: &[u8],
+    line_start: usize,
+    line_ending: LineEnding,
+) -> Option<usize> {
+    if content.last() != Some(&b'\n') {
+        return None;
+    }
+    let mut idx = content.len() - 1;
+    if line_ending == LineEnding::CRLF && idx > 0 && content[idx - 1] == b'\r' {
+        idx -= 1;
+    }
+    Some(line_start + idx)
+}
+
+/// Build the rows a horizontally scrolled pane draws, reading only the window
+/// each row shows rather than the line that leads up to it.
+///
+/// With soft wrap off on a large file a logical line is one visual row, and the
+/// pane draws a screenful of columns somewhere along it. Building that row as a
+/// *prefix* — every column from the line's start out to the right-hand edge —
+/// makes both the cost and the reach of a frame scale with how far right the
+/// view is scrolled: reading 50 MB to draw 160 columns, and, past the point
+/// where the read gives up, drawing nothing at all. `End` on a one-line file
+/// left an empty row and the caret in the gutter for exactly that reason.
+///
+/// So the window is read where it is. `window_byte` is how far into each
+/// logical line the row starts, which is the horizontal offset the viewport
+/// maintains — in bytes, as every column measurement on this path already is.
+/// Source offsets stay absolute, so a row that begins mid-line still says which
+/// bytes it shows, and the mapping the click and caret paths use is built from
+/// the drawn cells either way.
+///
+/// A line shorter than the offset draws nothing, which is what a line scrolled
+/// off the left edge looks like.
+pub(super) fn build_windowed_tokens(
+    buffer: &mut Buffer,
+    top_byte: usize,
+    visible_count: usize,
+    line_ending: LineEnding,
+    fold_skip: &[std::ops::Range<usize>],
+    window_byte: usize,
+    window_chars: usize,
+) -> Vec<ViewTokenWire> {
+    let mut tokens = Vec::new();
+    let buffer_len = buffer.len();
+    // Four bytes per character covers any UTF-8 scalar, plus room for the
+    // terminator the window may carry.
+    let read_bytes = window_chars.saturating_mul(4).saturating_add(16);
+    let mut line_start = top_byte.min(buffer_len);
+    let mut rows = 0usize;
+
+    while rows < visible_count {
+        // A line inside a collapsed fold is not drawn; step over the fold.
+        if let Some(r) = fold_skip.iter().find(|r| r.contains(&line_start)) {
+            line_start = r.end;
+            continue;
+        }
+        if line_start > buffer_len {
+            break;
+        }
+
+        // Where this line ends, when that is within reach. Out of reach means
+        // the line runs past anything a row could show, so the window is
+        // certainly inside it.
+        let next_line = buffer.next_line_start_within(line_start, LINE_SKIP_SCAN_BYTES);
+        let line_end = next_line.map(|n| n.saturating_sub(1)).unwrap_or(buffer_len);
+
+        // The window's offset is a byte count, so on multi-byte text it can
+        // fall inside a character; the row starts at the next whole one.
+        let read_from = buffer
+            .char_boundary_at_or_after(line_start.saturating_add(window_byte).min(line_end))
+            .min(line_end);
+        let take = (line_end.saturating_sub(read_from)).min(read_bytes);
+        let raw = buffer
+            .get_text_range_mut(read_from, take)
+            .unwrap_or_default();
+        // The end-of-line search is bounded, so `line_end` can be the buffer's
+        // end for a line whose break is merely far away. Stopping at the first
+        // break in what was read keeps a row to one line regardless.
+        let text = match raw.iter().position(|&b| b == b'\n') {
+            Some(i) => &raw[..=i],
+            None => &raw[..],
+        };
+
+        emit_line_text(&mut tokens, read_from, text, line_ending, window_chars);
+
+        // End the row. A window carrying the line's own terminator ends on a
+        // byte the document has; one that does not is a break the layout is
+        // inventing, and says so by carrying no source byte.
+        let terminator = line_terminator_offset(text, read_from, line_ending);
+        let more_below = next_line.is_some_and(|n| n < buffer_len);
+        if !more_below {
+            break;
+        }
+        tokens.push(ViewTokenWire {
+            source_offset: terminator,
+            kind: ViewTokenWireKind::Newline,
+            style: None,
+        });
+
+        rows += 1;
+        match next_line {
+            Some(n) => line_start = n,
+            // No break within reach: this line is the last row there is.
+            None => break,
+        }
+    }
+
+    tokens
+}
+
+/// Emit one run of a line's text as tokens, anchored at `text_start`.
+///
+/// Shared by the two ways a row gets its text: reading a line from its start,
+/// and reading only the window of it that a horizontally scrolled pane draws.
+/// Source offsets are absolute either way, which is what lets the second exist
+/// — a row that begins mid-line still says which bytes it is showing.
+///
+/// Takes the bytes as the buffer holds them, not a decoded string, because every
+/// token's source offset is counted along them. Lossy decoding turns each
+/// invalid byte into a three-byte U+FFFD, and offsets counted along *that* drift
+/// two bytes per invalid byte from the document — the caret and every click on
+/// the rest of the row then land inside characters, and typing there splits
+/// them (issue #3285). An invalid byte is instead emitted as the
+/// `BinaryByte` it is, one token per byte, the way control characters are.
+///
+/// Returns how many characters were emitted, and whether it stopped on
+/// `max_chars` with text still to come. The caller owns what that means: on a
+/// frame budget there is no room for another row, on a row budget there is.
+fn emit_line_text(
+    tokens: &mut Vec<ViewTokenWire>,
+    text_start: usize,
+    content_bytes: &[u8],
+    line_ending: LineEnding,
+    max_chars: usize,
+) -> (usize, bool) {
+    let mut byte_offset = 0usize;
+    let mut skip_next_lf = false; // Track if we should skip \n after \r in CRLF
+    let mut emitted = 0usize;
+
+    for chunk in content_bytes.utf8_chunks() {
+        for ch in chunk.valid().chars() {
+            if emitted >= max_chars {
+                return (emitted, true);
+            }
+            emitted += 1;
+
+            let ch_len = ch.len_utf8();
+            let source_offset = Some(text_start + byte_offset);
+
+            match ch {
+                '\r' => {
+                    // In CRLF mode with \r\n: emit Newline at \r position, skip the \n.
+                    // In LF/Unix files, ANY \r is unusual and should be shown as <0D>.
+                    let is_crlf_file = line_ending == LineEnding::CRLF;
+                    let next_byte = content_bytes.get(byte_offset + 1);
+                    if is_crlf_file && next_byte == Some(&b'\n') {
+                        tokens.push(ViewTokenWire {
+                            source_offset,
+                            kind: ViewTokenWireKind::Newline,
+                            style: None,
+                        });
+                        skip_next_lf = true;
+                        byte_offset += ch_len;
+                        continue;
+                    }
+                    tokens.push(ViewTokenWire {
+                        source_offset,
+                        kind: ViewTokenWireKind::BinaryByte(ch as u8),
+                        style: None,
+                    });
+                }
+                '\n' if skip_next_lf => {
+                    skip_next_lf = false;
+                    byte_offset += ch_len;
+                    continue;
+                }
+                '\n' => {
+                    tokens.push(ViewTokenWire {
+                        source_offset,
+                        kind: ViewTokenWireKind::Newline,
+                        style: None,
+                    });
+                }
+                ' ' => {
+                    tokens.push(ViewTokenWire {
+                        source_offset,
+                        kind: ViewTokenWireKind::Space,
+                        style: None,
+                    });
+                }
+                '\t' => {
+                    tokens.push(ViewTokenWire {
+                        source_offset,
+                        kind: ViewTokenWireKind::Text(ch.to_string()),
+                        style: None,
+                    });
+                }
+                _ if is_control_char(ch) => {
+                    tokens.push(ViewTokenWire {
+                        source_offset,
+                        kind: ViewTokenWireKind::BinaryByte(ch as u8),
+                        style: None,
+                    });
+                }
+                _ => {
+                    if let Some(last) = tokens.last_mut() {
+                        if let ViewTokenWireKind::Text(ref mut s) = last.kind {
+                            let expected_offset = last.source_offset.map(|o| o + s.len());
+                            if expected_offset == Some(text_start + byte_offset) {
+                                s.push(ch);
+                                byte_offset += ch_len;
+                                continue;
+                            }
+                        }
+                    }
+                    tokens.push(ViewTokenWire {
+                        source_offset,
+                        kind: ViewTokenWireKind::Text(ch.to_string()),
+                        style: None,
+                    });
+                }
+            }
+            byte_offset += ch_len;
+        }
+        for &byte in chunk.invalid() {
+            if emitted >= max_chars {
+                return (emitted, true);
+            }
+            emitted += 1;
+            tokens.push(ViewTokenWire {
+                source_offset: Some(text_start + byte_offset),
+                kind: ViewTokenWireKind::BinaryByte(byte),
+                style: None,
+            });
+            byte_offset += 1;
+        }
+    }
+
+    (emitted, false)
+}
 
 /// Build tokens from a text buffer starting at `top_byte`, stopping roughly
 /// after `visible_count` visual lines. Honors CRLF / LF line endings and
@@ -15,11 +278,20 @@ use fresh_core::api::{ViewTokenWire, ViewTokenWireKind};
 /// `char_budget` is a second, independent stop condition: tokenising ends once
 /// this many characters have been emitted, whatever `lines_seen` says. The
 /// line budget alone is not enough on a file whose logical lines are far wider
-/// than the screen — `lines_seen` only advances once per
-/// [`MAX_SAFE_LINE_WIDTH`] characters inside a single line, so a 50-row
-/// viewport would ask for 54 "lines" and tokenise 540,000 characters to fill
-/// rows that hold a few thousand. Callers that know the width a row wraps at
-/// pass roughly `rows × width`; pass `None` to bound by source lines only.
+/// than the screen — `lines_seen` advances once per line the reader yields, and
+/// it yields a long line in [`MAX_LINE_BYTES`] pieces, so a 50-row viewport
+/// would ask for 54 "lines" and tokenise megabytes to fill rows that hold a few
+/// thousand characters. Callers that know the width a row wraps at pass roughly
+/// `rows × width`; pass `None` to bound by source lines only.
+///
+/// `line_char_budget` bounds a *single* line the same way: once a line has
+/// contributed this many characters the rest of it is skipped and the build
+/// moves to the next line, with an injected `Newline` ending the row. This is
+/// what soft-wrap-off needs, where one logical line is one visual row and the
+/// only part of it that can ever be drawn is the columns the pane shows —
+/// `left_column + width`. Without it a file of a few enormous lines fills its
+/// whole budget on the first of them and leaves the rest of the screen blank.
+/// `None` means a line is bounded only by the total budget above.
 ///
 /// `start_mid_line` means `top_byte` is a *visual row* start rather than a
 /// logical line start — the caller obtained it from the wrap index — so the read
@@ -35,6 +307,7 @@ pub(crate) fn build_base_tokens(
     line_ending: LineEnding,
     fold_skip: &[std::ops::Range<usize>],
     char_budget: Option<usize>,
+    line_char_budget: Option<usize>,
     start_mid_line: bool,
 ) -> Vec<ViewTokenWire> {
     let mut tokens = Vec::new();
@@ -96,16 +369,17 @@ pub(crate) fn build_base_tokens(
         } else {
             buffer.line_iterator(cursor, estimated_line_length)
         };
-        if let Some(budget) = char_budget {
-            // Bytes, not characters — UTF-8 runs to 4 bytes per character — so
-            // the first piece the iterator yields always covers the whole
-            // budget and the loop below never asks for a second one. Without
-            // this the iterator reads and UTF-8-decodes 100 KB of a long line
-            // to hand back text we stop consuming after a few thousand chars.
+        // Bytes, not characters — UTF-8 runs to 4 bytes per character — so the
+        // first piece the iterator yields always covers the whole budget and
+        // the loop below never asks for a second one. Without this the iterator
+        // reads and UTF-8-decodes 100 KB of a long line to hand back text we
+        // stop consuming after a few thousand chars. The per-line budget binds
+        // it tighter still: nothing past it is ever emitted.
+        if let Some(budget) = line_char_budget.or(char_budget) {
             iter = iter.with_max_line_bytes(budget.saturating_mul(4).saturating_add(1024));
         }
         while lines_seen < max_lines {
-            let Some((line_start, line_content)) = iter.next_line() else {
+            let Some((line_start, line_content)) = iter.next_line_raw() else {
                 break 'segments;
             };
             // Stop the inner loop when the next line crosses into the
@@ -115,111 +389,72 @@ pub(crate) fn build_base_tokens(
             if next_fold_start.is_some_and(|s| line_start >= s) {
                 break;
             }
-            let mut byte_offset = 0usize;
-            let content_bytes = line_content.as_bytes();
-            let mut skip_next_lf = false; // Track if we should skip \n after \r in CRLF
-            let mut chars_this_line = 0usize; // Track chars to enforce MAX_SAFE_LINE_WIDTH
-            for ch in line_content.chars() {
-                // Stop once the viewport's rows are covered. Unlike the
-                // `lines_seen` bound this fires inside a single long line,
-                // which is the only place it can fire at all.
-                if char_budget.is_some_and(|budget| chars_seen >= budget) {
-                    break 'segments;
-                }
-                chars_seen += 1;
-                // Limit characters per line to prevent memory exhaustion from huge lines.
-                // Insert a Break token to force wrapping at safe intervals.
-                if chars_this_line >= MAX_SAFE_LINE_WIDTH {
-                    tokens.push(ViewTokenWire {
-                        source_offset: None,
-                        kind: ViewTokenWireKind::Break,
-                        style: None,
-                    });
-                    chars_this_line = 0;
-                    lines_seen += 1;
-                    if lines_seen >= max_lines {
-                        break;
-                    }
-                }
-                chars_this_line += 1;
-
-                let ch_len = ch.len_utf8();
-                let source_offset = Some(line_start + byte_offset);
-
-                match ch {
-                    '\r' => {
-                        // In CRLF mode with \r\n: emit Newline at \r position, skip the \n.
-                        // In LF/Unix files, ANY \r is unusual and should be shown as <0D>.
-                        let is_crlf_file = line_ending == LineEnding::CRLF;
-                        let next_byte = content_bytes.get(byte_offset + 1);
-                        if is_crlf_file && next_byte == Some(&b'\n') {
-                            tokens.push(ViewTokenWire {
-                                source_offset,
-                                kind: ViewTokenWireKind::Newline,
-                                style: None,
-                            });
-                            skip_next_lf = true;
-                            byte_offset += ch_len;
-                            continue;
-                        }
+            let content_bytes = line_content.as_slice();
+            // Two budgets bound this line: the frame's remaining characters,
+            // which ends the whole build, and the row's own width, which ends
+            // only this line. Whichever is smaller stops the emission; which
+            // one it was decides what happens next.
+            let remaining_global = char_budget.map(|b| b.saturating_sub(chars_seen));
+            let line_cap = match (remaining_global, line_char_budget) {
+                (Some(g), Some(l)) => g.min(l),
+                (Some(g), None) => g,
+                (None, Some(l)) => l,
+                (None, None) => usize::MAX,
+            };
+            if remaining_global == Some(0) {
+                break 'segments;
+            }
+            let (emitted, stopped_short) = emit_line_text(
+                &mut tokens,
+                line_start,
+                &line_content,
+                line_ending,
+                line_cap,
+            );
+            chars_seen += emitted;
+            // Stopped on the frame's budget rather than the row's: there is no
+            // room for another row, so nothing below this one can be drawn.
+            if stopped_short && remaining_global.is_some_and(|g| emitted >= g) {
+                break 'segments;
+            }
+            let cut_line = stopped_short;
+            if cut_line {
+                // The rest of the line is off the right-hand edge of the pane,
+                // but the row still has to end and the lines under it still
+                // have to be drawn. Where the rest of the line lies decides how.
+                match line_terminator_offset(content_bytes, line_start, line_ending) {
+                    // This piece already carried the line's own terminator, so
+                    // the iterator is standing on the next line and the break is
+                    // a real one at a byte the document has. Skipping here would
+                    // step over that next line and drop it from the frame
+                    // entirely — which is what happens to every other line of a
+                    // large file whose lines are merely wider than the pane.
+                    Some(offset) => {
                         tokens.push(ViewTokenWire {
-                            source_offset,
-                            kind: ViewTokenWireKind::BinaryByte(ch as u8),
-                            style: None,
-                        });
-                    }
-                    '\n' if skip_next_lf => {
-                        skip_next_lf = false;
-                        byte_offset += ch_len;
-                        continue;
-                    }
-                    '\n' => {
-                        tokens.push(ViewTokenWire {
-                            source_offset,
+                            source_offset: Some(offset),
                             kind: ViewTokenWireKind::Newline,
                             style: None,
                         });
                     }
-                    ' ' => {
-                        tokens.push(ViewTokenWire {
-                            source_offset,
-                            kind: ViewTokenWireKind::Space,
-                            style: None,
-                        });
-                    }
-                    '\t' => {
-                        tokens.push(ViewTokenWire {
-                            source_offset,
-                            kind: ViewTokenWireKind::Text(ch.to_string()),
-                            style: None,
-                        });
-                    }
-                    _ if is_control_char(ch) => {
-                        tokens.push(ViewTokenWire {
-                            source_offset,
-                            kind: ViewTokenWireKind::BinaryByte(ch as u8),
-                            style: None,
-                        });
-                    }
-                    _ => {
-                        if let Some(last) = tokens.last_mut() {
-                            if let ViewTokenWireKind::Text(ref mut s) = last.kind {
-                                let expected_offset = last.source_offset.map(|o| o + s.len());
-                                if expected_offset == Some(line_start + byte_offset) {
-                                    s.push(ch);
-                                    byte_offset += ch_len;
-                                    continue;
-                                }
-                            }
+                    // The line runs past what was read. Step over the remainder
+                    // without reading it — and if its end is out of reach, stop
+                    // rather than scan the file for it: the row is left
+                    // unterminated, which is what it is, and no row follows.
+                    None => {
+                        if !iter.skip_to_next_line_within(LINE_SKIP_SCAN_BYTES) {
+                            break 'segments;
                         }
+                        // The break carries no source byte, because the line's
+                        // own newline is somewhere past the part that could be
+                        // drawn; the row after it starts a genuinely new logical
+                        // line, which is what `AfterInjectedNewline` says.
                         tokens.push(ViewTokenWire {
-                            source_offset,
-                            kind: ViewTokenWireKind::Text(ch.to_string()),
+                            source_offset: None,
+                            kind: ViewTokenWireKind::Newline,
                             style: None,
                         });
                     }
                 }
-                byte_offset += ch_len;
             }
             lines_seen += 1;
         }
@@ -381,6 +616,82 @@ fn is_control_char(ch: char) -> bool {
     b < 0x20 || b == 0x7F
 }
 
+/// Base tokens for exactly one logical line, without its terminating newline.
+///
+/// This is what feeds [`crate::view::wrap_index::WrapIndex`]. It goes through
+/// the same tokenizer the renderer uses rather than wrapping raw line text in a
+/// synthetic `Text` token: the count-only helpers that did the latter never
+/// produced `Space` tokens, so the space-overflow back-up (issue #1363) could
+/// not fire in them and their row counts could disagree with what was drawn.
+/// [`build_line_tokens`], but starting at `from_byte` instead of the line's
+/// start.
+///
+/// Repair needs only the tail from its resume row, and reading the prefix to
+/// throw it away is the difference between O(rows) and O(line): on a 500 KB
+/// single-line file the untargeted version tokenised and allocated the whole
+/// line for every character typed. `from_byte` must be a visual-row start the
+/// caller got from the index, which is what makes skipping the backward scan
+/// sound.
+pub(crate) fn build_line_tokens_from(
+    buffer: &mut Buffer,
+    line: usize,
+    line_ending: LineEnding,
+    fold_skip: &[std::ops::Range<usize>],
+    from_byte: Option<usize>,
+    char_budget: Option<usize>,
+) -> Vec<ViewTokenWire> {
+    use crate::primitives::line_iterator::MAX_LINE_BYTES;
+
+    let line_start = buffer.line_start_offset(line).unwrap_or(0);
+    let buffer_len = buffer.len();
+    let line_end = buffer
+        .line_start_offset(line + 1)
+        .unwrap_or(buffer_len)
+        .min(buffer_len);
+    let estimated = buffer.estimated_line_length().max(1);
+
+    // The whole line, however long: this feeds the wrap index, and an index
+    // that has seen only part of a line reports a row count for the part. A
+    // scrollbar reading that maps the whole track onto the prefix.
+    //
+    // `build_base_tokens`'s budget counts *units*, and a single long line
+    // spends one per `MAX_LINE_BYTES` piece the reader yields. The second term
+    // is left over from a forced break the character loop used to inject every
+    // `MAX_SAFE_LINE_WIDTH` characters; it stays because over-asking is free
+    // here and under-asking truncates a line the index is about to measure.
+    //
+    // `char_budget` is the exception: a repair that only needs the rows next
+    // to an edit asks for a window instead, and stops reading there. Text
+    // merges across the reader's pieces, so the window's tokens are the full
+    // read's tokens up to the cut — only the last one may be cut short.
+    let start = from_byte.filter(|b| *b > line_start && *b < line_end);
+    let read_from = start.unwrap_or(line_start);
+    let line_bytes = line_end.saturating_sub(read_from);
+    let units = line_bytes / MAX_SAFE_LINE_WIDTH + line_bytes / MAX_LINE_BYTES + 2;
+    let mut tokens = build_base_tokens(
+        buffer,
+        read_from,
+        estimated,
+        units,
+        false,
+        line_ending,
+        fold_skip,
+        char_budget,
+        None,
+        start.is_some(),
+    );
+    // The read runs past the line end; keep only this line, and drop its
+    // terminator — a newline belongs to the line break, not to a row.
+    tokens.retain(|t| t.source_offset.is_none_or(|o| o < line_end));
+    while matches!(
+        tokens.last().map(|t| &t.kind),
+        Some(ViewTokenWireKind::Newline)
+    ) {
+        tokens.pop();
+    }
+    tokens
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,9 +715,8 @@ mod tests {
     }
 
     /// The line budget alone cannot bound a file that is one enormous line:
-    /// `lines_seen` advances once per `MAX_SAFE_LINE_WIDTH` characters, so a
-    /// 50-row viewport pulls in 540,000 characters. The character budget is
-    /// what actually stops the read.
+    /// `lines_seen` advances once per read piece, so a 50-row viewport pulls in
+    /// megabytes. The character budget is what actually stops the read.
     #[test]
     fn char_budget_bounds_a_single_enormous_line() {
         let content = "x".repeat(500_000);
@@ -420,6 +730,7 @@ mod tests {
             false,
             LineEnding::LF,
             &[],
+            None,
             None,
             false,
         );
@@ -439,6 +750,7 @@ mod tests {
             LineEnding::LF,
             &[],
             Some(50 * 200),
+            None,
             false,
         );
         let budgeted_chars = char_count(&budgeted);
@@ -471,6 +783,7 @@ mod tests {
             LineEnding::LF,
             &[],
             None,
+            None,
             false,
         );
         let budgeted = build_base_tokens(
@@ -482,6 +795,7 @@ mod tests {
             LineEnding::LF,
             &[],
             Some(30 * 200),
+            None,
             false,
         );
 
@@ -505,6 +819,7 @@ mod tests {
             LineEnding::LF,
             &[],
             Some(0),
+            None,
             false,
         );
         assert!(
@@ -530,6 +845,7 @@ mod tests {
             LineEnding::LF,
             &[],
             None,
+            None,
             false,
         );
         let budgeted = build_base_tokens(
@@ -541,6 +857,7 @@ mod tests {
             LineEnding::LF,
             &[],
             Some(4_000),
+            None,
             false,
         );
 
@@ -553,75 +870,48 @@ mod tests {
             );
         }
     }
-}
 
-/// Base tokens for exactly one logical line, without its terminating newline.
-///
-/// This is what feeds [`crate::view::wrap_index::WrapIndex`]. It goes through
-/// the same tokenizer the renderer uses rather than wrapping raw line text in a
-/// synthetic `Text` token: the count-only helpers that did the latter never
-/// produced `Space` tokens, so the space-overflow back-up (issue #1363) could
-/// not fire in them and their row counts could disagree with what was drawn.
-/// [`build_line_tokens`], but starting at `from_byte` instead of the line's
-/// start.
-///
-/// Repair needs only the tail from its resume row, and reading the prefix to
-/// throw it away is the difference between O(rows) and O(line): on a 500 KB
-/// single-line file the untargeted version tokenised and allocated the whole
-/// line for every character typed. `from_byte` must be a visual-row start the
-/// caller got from the index, which is what makes skipping the backward scan
-/// sound.
-pub(crate) fn build_line_tokens_from(
-    buffer: &mut Buffer,
-    line: usize,
-    line_ending: LineEnding,
-    fold_skip: &[std::ops::Range<usize>],
-    from_byte: Option<usize>,
-) -> Vec<ViewTokenWire> {
-    use crate::primitives::line_iterator::MAX_LINE_BYTES;
+    /// Source offsets are counted along the bytes the buffer holds. Counting
+    /// them along the lossy decode made each invalid byte three bytes long
+    /// (its U+FFFD), so everything after it on the row claimed an offset two
+    /// bytes too far on — inside a character, for CJK (issue #3285).
+    #[test]
+    fn invalid_bytes_keep_the_offsets_after_them_exact() {
+        let mut bytes = vec![0xA1, 0xB2];
+        bytes.extend_from_slice("信x\n".as_bytes());
+        // Declared UTF-8, so the bytes are kept as they are rather than
+        // detected as some other encoding and converted.
+        let mut buffer = Buffer::from_bytes_with_encoding(
+            bytes,
+            crate::model::encoding::Encoding::Utf8,
+            test_fs(),
+        );
 
-    let line_start = buffer.line_start_offset(line).unwrap_or(0);
-    let buffer_len = buffer.len();
-    let line_end = buffer
-        .line_start_offset(line + 1)
-        .unwrap_or(buffer_len)
-        .min(buffer_len);
-    let estimated = buffer.estimated_line_length().max(1);
-
-    // The whole line, however long: this feeds the wrap index, and an index
-    // that has seen only part of a line reports a row count for the part. A
-    // scrollbar reading that maps the whole track onto the prefix.
-    //
-    // `build_base_tokens`'s budget counts *units*, and a single long line
-    // spends two kinds. `LineIterator` yields it in `MAX_LINE_BYTES` pieces
-    // and each piece costs one; independently, the forced-break counter inside
-    // the character loop costs one per `MAX_SAFE_LINE_WIDTH` characters — the
-    // smaller of the two by 10×, and the one this used to overlook. Bytes are
-    // an upper bound on characters, so deriving both from byte length can only
-    // over-ask.
-    let start = from_byte.filter(|b| *b > line_start && *b < line_end);
-    let read_from = start.unwrap_or(line_start);
-    let line_bytes = line_end.saturating_sub(read_from);
-    let units = line_bytes / MAX_SAFE_LINE_WIDTH + line_bytes / MAX_LINE_BYTES + 2;
-    let mut tokens = build_base_tokens(
-        buffer,
-        read_from,
-        estimated,
-        units,
-        false,
-        line_ending,
-        fold_skip,
-        None,
-        start.is_some(),
-    );
-    // The read runs past the line end; keep only this line, and drop its
-    // terminator — a newline belongs to the line break, not to a row.
-    tokens.retain(|t| t.source_offset.is_none_or(|o| o < line_end));
-    while matches!(
-        tokens.last().map(|t| &t.kind),
-        Some(ViewTokenWireKind::Newline)
-    ) {
-        tokens.pop();
+        let tokens = build_base_tokens(
+            &mut buffer,
+            0,
+            80,
+            1,
+            false,
+            LineEnding::LF,
+            &[],
+            None,
+            None,
+            false,
+        );
+        // The token kind has no `PartialEq`; its `Debug` form says the same.
+        let got: Vec<_> = tokens
+            .iter()
+            .map(|t| format!("{:?} {:?}", t.source_offset, t.kind))
+            .collect();
+        assert_eq!(
+            got[..4],
+            [
+                "Some(0) BinaryByte(161)",
+                "Some(1) BinaryByte(178)",
+                "Some(2) Text(\"信x\")",
+                "Some(6) Newline",
+            ]
+        );
     }
-    tokens
 }

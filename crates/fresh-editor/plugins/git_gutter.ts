@@ -76,6 +76,27 @@ interface BufferGitState {
 /** Git state per buffer */
 const bufferStates: Map<number, BufferGitState> = new Map();
 
+/** A buffer's starting state, in one place because six handlers need one.
+ *
+ *  It was six hand-written object literals, and the one in
+ *  `after_file_revert` left both baseline fields out. That is `undefined`,
+ *  not `null`, so `ensureBaselines` read them as *already registered*,
+ *  skipped registration, and `refreshDiffBaseline(undefined)` rejected with
+ *  `Error converting from js 'undefined' into type 'f64'` — a reverted
+ *  buffer (an external `git checkout` of the open file, say) lost its gutter
+ *  until it was reopened. A literal that omits a required field is a type
+ *  error `check-types.sh` reports; a constructor is one that cannot be
+ *  written. */
+function newBufferState(filePath: string): BufferGitState {
+  return {
+    filePath,
+    hunks: [],
+    updating: false,
+    diskBaselineId: null,
+    headBaselineId: null,
+  };
+}
+
 
 // =============================================================================
 // Hunk mapping (host-side diff)
@@ -194,12 +215,38 @@ async function updateGitGutter(bufferId: number): Promise<void> {
     // the disk content (and possibly HEAD) just changed, so re-fetch
     // both references before diffing. The diff itself runs host-side;
     // no file content crosses the plugin bridge.
-    await editor.refreshDiffBaseline(state.diskBaselineId!);
-    await editor.refreshDiffBaseline(state.headBaselineId!);
-    const result = await editor.diffBaselinePair(
-      state.headBaselineId!,
-      state.diskBaselineId!,
-    );
+    //
+    // **A buffer that closed under us is not an error, and only these three
+    // awaits can see it.** The host drops a buffer's diff baselines when the
+    // buffer closes (`app/buffer_close.rs`) and fires `buffer_closed` only
+    // afterwards — and that hook is where this plugin deletes `bufferStates`.
+    // So a missing entry is exactly "the buffer went away while we were
+    // reloading": the ids below are gone, there is nothing left to decorate,
+    // and the host's rejection is noise. Without this the rejection escaped as
+    // an "Unhandled Promise rejection" in the log, because every call site
+    // invokes `updateGitGutter` without a `.catch()`.
+    //
+    // Discriminated by STATE, not by the host's error text. The two messages
+    // ("unknown baseline id N", "baseline released during load") are `format!`
+    // internals with no contract behind them, so a reworded string would
+    // silently restore the old behaviour with nothing to catch it; and
+    // matching them would also swallow the save-as path below, where
+    // `after_file_save` calls `releaseBaselines` with no regard for
+    // `state.updating` and so can pull these ids out from under an update in
+    // flight. That one is a real ordering bug and keeps its stack.
+    // `live_diff.ts` answers the same race the same way.
+    let result: DiffBaselineResult;
+    try {
+      await editor.refreshDiffBaseline(state.diskBaselineId!);
+      await editor.refreshDiffBaseline(state.headBaselineId!);
+      result = await editor.diffBaselinePair(
+        state.headBaselineId!,
+        state.diskBaselineId!,
+      );
+    } catch (e) {
+      if (!bufferStates.has(bufferId)) return;
+      throw e;
+    }
     const hunks = hostHunksToGutterHunks(result.hunks);
     editor.debug(`Git Gutter: ${hunks.length} hunks from host diff`);
 
@@ -333,13 +380,7 @@ function git_gutter_refresh() : void {
 
   // Ensure state exists
   if (!bufferStates.has(bufferId)) {
-    bufferStates.set(bufferId, {
-      filePath,
-      hunks: [],
-      updating: false,
-      diskBaselineId: null,
-      headBaselineId: null,
-    });
+    bufferStates.set(bufferId, newBufferState(filePath));
   }
 
   // Force immediate update
@@ -367,13 +408,7 @@ editor.on("after_file_open", (args) => {
   }
 
   // Initialize state for this buffer
-  bufferStates.set(bufferId, {
-    filePath,
-    hunks: [],
-    updating: false,
-    diskBaselineId: null,
-    headBaselineId: null,
-  });
+  bufferStates.set(bufferId, newBufferState(filePath));
 
   // Update immediately (no debounce for file open)
   updateGitGutter(bufferId);
@@ -387,13 +422,7 @@ editor.on("buffer_activated", (args) => {
   if (!bufferStates.has(bufferId)) {
     const filePath = editor.getBufferPath(bufferId);
     if (filePath && filePath !== "") {
-      bufferStates.set(bufferId, {
-        filePath,
-        hunks: [],
-        updating: false,
-        diskBaselineId: null,
-        headBaselineId: null,
-      });
+      bufferStates.set(bufferId, newBufferState(filePath));
       updateGitGutter(bufferId);
     }
   }
@@ -414,13 +443,7 @@ editor.on("after_file_save", (args) => {
       releaseBaselines(state);
     }
   } else {
-    bufferStates.set(bufferId, {
-      filePath: args.path,
-      hunks: [],
-      updating: false,
-      diskBaselineId: null,
-      headBaselineId: null,
-    });
+    bufferStates.set(bufferId, newBufferState(args.path));
   }
 
   // Update immediately after save (no debounce)
@@ -440,11 +463,7 @@ editor.on("after_file_revert", (args) => {
   if (state) {
     state.filePath = args.path;
   } else {
-    bufferStates.set(bufferId, {
-      filePath: args.path,
-      hunks: [],
-      updating: false,
-    });
+    bufferStates.set(bufferId, newBufferState(args.path));
   }
 
   updateGitGutter(bufferId);
@@ -468,13 +487,7 @@ editor.registerCommand(
 const initBufferId = editor.getActiveBufferId();
 const initPath = editor.getBufferPath(initBufferId);
 if (initPath && initPath !== "") {
-  bufferStates.set(initBufferId, {
-    filePath: initPath,
-    hunks: [],
-    updating: false,
-    diskBaselineId: null,
-    headBaselineId: null,
-  });
+  bufferStates.set(initBufferId, newBufferState(initPath));
   updateGitGutter(initBufferId);
 }
 

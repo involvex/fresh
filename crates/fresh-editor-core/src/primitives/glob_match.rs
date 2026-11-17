@@ -1,0 +1,539 @@
+//! Glob pattern matching for filename and path detection.
+//!
+//! Supports `*` (matches any sequence of characters) and `?` (matches exactly one character,
+//! i.e. one grapheme cluster) for filename matching, plus `**` (matches across directory boundaries) for path matching.
+
+use crate::primitives::grapheme::next_grapheme_boundary;
+use std::path::Path;
+
+/// Check if a pattern string contains glob characters (`*` or `?`).
+pub fn is_glob_pattern(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?')
+}
+
+/// Check if a pattern is a path pattern (should be matched against the full path, not just filename).
+///
+/// A pattern is considered a path pattern if it contains `/` (or `\` on Windows),
+/// indicating it references directory structure. Such patterns should be matched
+/// using [`path_glob_matches`] against the full file path rather than
+/// [`filename_glob_matches`] against just the filename.
+pub fn is_path_pattern(pattern: &str) -> bool {
+    pattern.contains('/') || pattern.contains('\\')
+}
+
+/// Match a glob pattern against a filename (not a full path).
+///
+/// Supports `*` (matches any sequence of characters) and `?` (matches exactly one character, i.e. one grapheme cluster, so decomposed
+/// `e` + U+0301 counts as one). The match is performed against the entire filename.
+///
+/// Examples:
+/// - `"*.conf"` matches `"nftables.conf"`, `"resolv.conf"`
+/// - `"*rc"` matches `"lfrc"`, `".bashrc"`
+/// - `"Dockerfile*"` matches `"Dockerfile"`, `"Dockerfile.dev"`
+/// - `".env.*"` matches `".env.local"`, `".env.production"`
+pub fn filename_glob_matches(pattern: &str, filename: &str) -> bool {
+    glob_match_bytes(pattern.as_bytes(), filename)
+}
+
+/// Match a glob pattern against a full file path.
+///
+/// In path mode:
+/// - `*` matches any sequence of characters **except** `/`
+/// - `**` matches any sequence of characters **including** `/` (crosses directory boundaries)
+/// - `?` matches exactly one character (grapheme cluster) that is not `/`
+/// - `**/` is treated as a unit that matches zero or more directory levels
+///
+/// Examples:
+/// - `"/etc/**/rc.*"` matches `"/etc/rc.conf"`, `"/etc/init/rc.local"`
+/// - `"/etc/*.conf"` matches `"/etc/nftables.conf"` but not `"/etc/sub/nftables.conf"`
+/// - `"**/rc.*"` matches `"/etc/rc.conf"`, `"rc.conf"`
+pub fn path_glob_matches(pattern: &str, path: &str) -> bool {
+    path_glob_match_bytes(pattern.as_bytes(), path)
+}
+
+// ---------------------------------------------------------------------------
+// Config pattern lists
+//
+// Several config keys hold a list of file patterns (`languages.*.filenames`,
+// `editor.ephemeral_file_patterns`). They all share one dialect so a pattern
+// a user learns in one place works in the other: a literal entry must equal
+// the file *name* exactly, a wildcard entry is a glob matched against the
+// full path when it names directories and against the file name otherwise.
+// ---------------------------------------------------------------------------
+
+/// Does a literal (wildcard-free) pattern entry match `filename` exactly?
+/// `false` for glob entries, which [`glob_entry_matches`] handles.
+pub fn literal_entry_matches(pattern: &str, filename: &str) -> bool {
+    !is_glob_pattern(pattern) && pattern == filename
+}
+
+/// Does a wildcard pattern entry match? `false` for literal entries.
+pub fn glob_entry_matches(pattern: &str, path: &str, filename: &str) -> bool {
+    is_glob_pattern(pattern)
+        && if is_path_pattern(pattern) {
+            path_glob_matches(pattern, path)
+        } else {
+            filename_glob_matches(pattern, filename)
+        }
+}
+
+/// Does `path` match any entry of a pattern list?
+///
+/// For callers that just need a yes/no. Consumers that must rank matches
+/// (language detection prefers a literal hit in *any* language over a glob
+/// hit in another) use the two entry predicates directly instead.
+pub fn matches_any_entry(patterns: &[String], path: &Path) -> bool {
+    let path_str = path.to_string_lossy();
+    let filename = path
+        .file_name()
+        .map(|f| f.to_string_lossy())
+        .unwrap_or_default();
+    patterns
+        .iter()
+        .any(|p| literal_entry_matches(p, &filename) || glob_entry_matches(p, &path_str, &filename))
+}
+
+/// Length in bytes of the character starting at byte `pos` of `text`.
+///
+/// Globs are matched on the bytes of a `&str`, so the backtracking of `*` has
+/// to step over a whole character, not a single byte, or a literal could be
+/// compared against the middle of a multi-byte character.
+#[inline]
+fn char_len_at(text: &str, pos: usize) -> usize {
+    text.get(pos..)
+        .and_then(|rest| rest.chars().next())
+        .map_or(1, char::len_utf8)
+}
+
+/// End of the grapheme cluster starting at byte `pos` of `text`: what one `?`
+/// consumes, so a decomposed `e` + U+0301 or an emoji with a skin-tone
+/// modifier counts as a single character.
+#[inline]
+fn grapheme_end(text: &str, pos: usize) -> usize {
+    next_grapheme_boundary(text, pos)
+}
+
+/// Iterative glob matching on byte slices using a backtracking algorithm.
+/// Used for filename matching where `*` matches any character.
+fn glob_match_bytes(pattern: &[u8], text: &str) -> bool {
+    let text_bytes = text.as_bytes();
+    let mut p = 0;
+    let mut t = 0;
+    // Track the last `*` position for backtracking
+    let mut star_p = usize::MAX;
+    let mut star_t = 0;
+
+    while t < text_bytes.len() {
+        if p < pattern.len() && pattern[p] == b'?' {
+            p += 1;
+            t = grapheme_end(text, t);
+        } else if p < pattern.len() && pattern[p] == text_bytes[t] {
+            p += 1;
+            t += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star_p = p;
+            star_t = t;
+            p += 1;
+        } else if star_p != usize::MAX {
+            // Backtrack: consume one more char with the last `*`
+            p = star_p + 1;
+            star_t += char_len_at(text, star_t);
+            t = star_t;
+        } else {
+            return false;
+        }
+    }
+
+    // Consume trailing `*`s in pattern
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+
+    p == pattern.len()
+}
+
+/// Check if a byte is a path separator (`/` or `\`).
+///
+/// On Windows, paths use `\` as a separator; on Unix, `/` is used.
+/// For cross-platform glob matching, we treat both as equivalent.
+#[inline]
+fn is_path_sep(b: u8) -> bool {
+    b == b'/' || b == b'\\'
+}
+
+/// Check if two bytes match as path characters, treating `/` and `\` as equivalent.
+#[inline]
+fn path_chars_match(pattern_byte: u8, text_byte: u8) -> bool {
+    if pattern_byte == text_byte {
+        return true;
+    }
+    // Treat `/` and `\` as interchangeable
+    is_path_sep(pattern_byte) && is_path_sep(text_byte)
+}
+
+/// Path-aware glob matching where `*` does not cross `/` but `**` does.
+///
+/// In addition to `/`, the `\` separator is treated equivalently so that
+/// patterns written with `/` work on Windows paths that use `\`.
+///
+/// When `**` is followed by `/` (or `\`), the trailing separator is consumed
+/// as part of the `**` token, allowing `**/` to match zero or more complete
+/// directory levels.
+fn path_glob_match_bytes(pattern: &[u8], text: &str) -> bool {
+    let text_bytes = text.as_bytes();
+    let mut p = 0;
+    let mut t = 0;
+    // Track the last `**` position for backtracking
+    let mut dstar_p: Option<usize> = None;
+    let mut dstar_t: usize = 0;
+    // Track the last `*` position for backtracking
+    let mut star_p: Option<usize> = None;
+    let mut star_t: usize = 0;
+
+    while t < text_bytes.len() {
+        // Check for `**` (double star)
+        if p + 1 < pattern.len() && pattern[p] == b'*' && pattern[p + 1] == b'*' {
+            let mut next_p = p + 2;
+            // Skip additional `*` characters
+            while next_p < pattern.len() && pattern[next_p] == b'*' {
+                next_p += 1;
+            }
+            // Skip trailing path separator so `**/` matches zero or more directory levels
+            if next_p < pattern.len() && is_path_sep(pattern[next_p]) {
+                next_p += 1;
+            }
+            dstar_p = Some(next_p);
+            dstar_t = t;
+            p = next_p;
+            // Reset single-star tracking since `**` subsumes it
+            star_p = None;
+            continue;
+        }
+
+        // Check for `*` (single star, does not cross path separators)
+        if p < pattern.len() && pattern[p] == b'*' {
+            star_p = Some(p + 1);
+            star_t = t;
+            p += 1;
+            continue;
+        }
+
+        // Check for `?` (matches one non-separator character)
+        if p < pattern.len() && pattern[p] == b'?' && !is_path_sep(text_bytes[t]) {
+            p += 1;
+            t = grapheme_end(text, t);
+            continue;
+        }
+
+        // Literal character match (treating `/` and `\` as equivalent)
+        if p < pattern.len() && path_chars_match(pattern[p], text_bytes[t]) {
+            p += 1;
+            t += 1;
+            continue;
+        }
+
+        // Mismatch — try backtracking to single `*` first (if it won't cross a separator)
+        if let Some(sp) = star_p {
+            if !is_path_sep(text_bytes[star_t]) {
+                star_t += char_len_at(text, star_t);
+                t = star_t;
+                p = sp;
+                continue;
+            }
+            // `*` can't help (would need to cross a separator), fall through to `**`
+        }
+
+        // Backtrack to `**` (can cross anything including separators)
+        if let Some(dp) = dstar_p {
+            dstar_t += char_len_at(text, dstar_t);
+            t = dstar_t;
+            p = dp;
+            star_p = None;
+            continue;
+        }
+
+        return false;
+    }
+
+    // Consume trailing `*`s and `**`s in pattern
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+
+    p == pattern.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_glob_pattern() {
+        assert!(is_glob_pattern("*.conf"));
+        assert!(is_glob_pattern("Dockerfile*"));
+        assert!(is_glob_pattern("file?.txt"));
+        assert!(is_glob_pattern("*"));
+        assert!(!is_glob_pattern("Makefile"));
+        assert!(!is_glob_pattern(".bashrc"));
+        assert!(!is_glob_pattern(""));
+    }
+
+    #[test]
+    fn test_is_path_pattern() {
+        assert!(is_path_pattern("/etc/**/rc.*"));
+        assert!(is_path_pattern("/etc/*.conf"));
+        assert!(is_path_pattern("**/rc.*"));
+        assert!(is_path_pattern("src/*.rs"));
+        assert!(!is_path_pattern("*.conf"));
+        assert!(!is_path_pattern("*rc"));
+        assert!(!is_path_pattern("Makefile"));
+    }
+
+    #[test]
+    fn test_star_prefix() {
+        assert!(filename_glob_matches("*.conf", "nftables.conf"));
+        assert!(filename_glob_matches("*.conf", "resolv.conf"));
+        assert!(filename_glob_matches("*.conf", ".conf"));
+        assert!(!filename_glob_matches("*.conf", "conf"));
+        assert!(!filename_glob_matches("*.conf", "nftables.txt"));
+    }
+
+    #[test]
+    fn test_star_suffix() {
+        assert!(filename_glob_matches("Dockerfile*", "Dockerfile"));
+        assert!(filename_glob_matches("Dockerfile*", "Dockerfile.dev"));
+        assert!(!filename_glob_matches("Dockerfile*", "dockerfile"));
+    }
+
+    #[test]
+    fn test_star_middle() {
+        assert!(filename_glob_matches(".env.*", ".env.local"));
+        assert!(filename_glob_matches(".env.*", ".env.production"));
+        assert!(!filename_glob_matches(".env.*", ".env"));
+    }
+
+    #[test]
+    fn test_star_suffix_pattern() {
+        assert!(filename_glob_matches("*rc", "lfrc"));
+        assert!(filename_glob_matches("*rc", ".bashrc"));
+        assert!(filename_glob_matches("*rc", "rc"));
+        assert!(!filename_glob_matches("*rc", "lfrc.bak"));
+    }
+
+    #[test]
+    fn test_question_mark() {
+        assert!(filename_glob_matches("file?.txt", "file1.txt"));
+        assert!(filename_glob_matches("file?.txt", "fileA.txt"));
+        assert!(!filename_glob_matches("file?.txt", "file.txt"));
+        assert!(!filename_glob_matches("file?.txt", "file12.txt"));
+    }
+
+    #[test]
+    fn test_bare_star() {
+        assert!(filename_glob_matches("*", "anything"));
+        assert!(filename_glob_matches("*", ""));
+    }
+
+    #[test]
+    fn test_exact_match() {
+        assert!(filename_glob_matches("Makefile", "Makefile"));
+        assert!(!filename_glob_matches("Makefile", "makefile"));
+    }
+
+    #[test]
+    fn test_multiple_stars() {
+        assert!(filename_glob_matches("*.*", "file.txt"));
+        assert!(filename_glob_matches("*.*", ".bashrc"));
+        assert!(!filename_glob_matches("*.*", "Makefile"));
+    }
+
+    // --- Path glob matching tests ---
+
+    #[test]
+    fn test_path_doublestar_middle() {
+        // /etc/**/rc.* should match across directory levels
+        assert!(path_glob_matches("/etc/**/rc.*", "/etc/rc.conf"));
+        assert!(path_glob_matches("/etc/**/rc.*", "/etc/init/rc.local"));
+        assert!(path_glob_matches("/etc/**/rc.*", "/etc/a/b/c/rc.d"));
+        assert!(!path_glob_matches("/etc/**/rc.*", "/var/rc.conf"));
+        assert!(!path_glob_matches("/etc/**/rc.*", "/etc/init/nope"));
+    }
+
+    #[test]
+    fn test_path_single_star_no_slash_crossing() {
+        // * in path mode should NOT cross /
+        assert!(path_glob_matches("/etc/*.conf", "/etc/nftables.conf"));
+        assert!(path_glob_matches("/etc/*.conf", "/etc/resolv.conf"));
+        assert!(!path_glob_matches("/etc/*.conf", "/etc/sub/nftables.conf"));
+    }
+
+    #[test]
+    fn test_path_doublestar_prefix() {
+        // **/filename matches the file anywhere in the tree
+        assert!(path_glob_matches("**/rc.*", "/etc/rc.conf"));
+        assert!(path_glob_matches("**/rc.*", "/etc/init/rc.local"));
+        assert!(path_glob_matches("**/rc.*", "rc.conf"));
+    }
+
+    #[test]
+    fn test_path_doublestar_suffix() {
+        // /etc/** matches everything under /etc
+        assert!(path_glob_matches("/etc/**", "/etc/foo"));
+        assert!(path_glob_matches("/etc/**", "/etc/foo/bar"));
+        assert!(path_glob_matches("/etc/**", "/etc/foo/bar/baz.conf"));
+        assert!(!path_glob_matches("/etc/**", "/var/foo"));
+    }
+
+    #[test]
+    fn test_path_question_mark() {
+        // ? should not cross /
+        assert!(path_glob_matches("/etc/rc.?", "/etc/rc.d"));
+        assert!(!path_glob_matches("/etc/rc.?", "/etc/rc.dd"));
+        assert!(!path_glob_matches("/etc/?", "/etc/ab"));
+    }
+
+    #[test]
+    fn test_path_literal_match() {
+        assert!(path_glob_matches("/etc/hosts", "/etc/hosts"));
+        assert!(!path_glob_matches("/etc/hosts", "/etc/hostname"));
+    }
+
+    #[test]
+    fn test_path_doublestar_and_single_star() {
+        // Combine ** and *
+        assert!(path_glob_matches("/etc/**/*.conf", "/etc/nftables.conf"));
+        assert!(path_glob_matches(
+            "/etc/**/*.conf",
+            "/etc/sub/nftables.conf"
+        ));
+        assert!(path_glob_matches("/etc/**/*.conf", "/etc/a/b/c/foo.conf"));
+        assert!(!path_glob_matches("/etc/**/*.conf", "/etc/a/b/c/foo.txt"));
+        assert!(!path_glob_matches("/etc/**/*.conf", "/var/foo.conf"));
+    }
+
+    #[test]
+    fn test_path_doublestar_zero_segments() {
+        // ** matching zero directory levels
+        assert!(path_glob_matches("**/Makefile", "Makefile"));
+        assert!(path_glob_matches("**/Makefile", "/src/Makefile"));
+        assert!(path_glob_matches("/src/**/main.rs", "/src/main.rs"));
+    }
+
+    #[test]
+    fn test_path_multiple_doublestars() {
+        assert!(path_glob_matches(
+            "/**/src/**/*.rs",
+            "/home/user/src/main.rs"
+        ));
+        assert!(path_glob_matches("/**/src/**/*.rs", "/src/lib.rs"));
+        assert!(path_glob_matches("/**/src/**/*.rs", "/a/b/src/c/d/foo.rs"));
+    }
+
+    // --- Windows path separator tests ---
+
+    #[test]
+    fn test_is_path_pattern_backslash() {
+        assert!(is_path_pattern("C:\\Users\\**\\rc.*"));
+        assert!(is_path_pattern("src\\*.rs"));
+        assert!(!is_path_pattern("*.conf"));
+    }
+
+    #[test]
+    fn test_path_backslash_separators() {
+        // Windows-style paths with backslash separators
+        assert!(path_glob_matches(
+            "C:\\Users\\**\\rc.*",
+            "C:\\Users\\etc\\rc.conf"
+        ));
+        assert!(path_glob_matches(
+            "C:\\Users\\**\\rc.*",
+            "C:\\Users\\etc\\init\\rc.local"
+        ));
+        assert!(!path_glob_matches(
+            "C:\\Users\\**\\rc.*",
+            "D:\\Users\\etc\\rc.conf"
+        ));
+    }
+
+    #[test]
+    fn test_path_mixed_separators() {
+        // Pattern uses `/` but path uses `\` (common on Windows)
+        assert!(path_glob_matches("/etc/**/rc.*", "\\etc\\rc.conf"));
+        assert!(path_glob_matches("/etc/**/rc.*", "\\etc\\init\\rc.local"));
+
+        // Pattern uses `\` but path uses `/`
+        assert!(path_glob_matches("\\etc\\**\\rc.*", "/etc/rc.conf"));
+        assert!(path_glob_matches("\\etc\\**\\rc.*", "/etc/init/rc.local"));
+    }
+
+    #[test]
+    fn test_path_backslash_single_star_no_crossing() {
+        // Single `*` should not cross `\` separators
+        assert!(path_glob_matches(
+            "C:\\etc\\*.conf",
+            "C:\\etc\\nftables.conf"
+        ));
+        assert!(!path_glob_matches(
+            "C:\\etc\\*.conf",
+            "C:\\etc\\sub\\nftables.conf"
+        ));
+    }
+
+    #[test]
+    fn test_path_backslash_question_mark() {
+        // `?` should not match `\`
+        assert!(path_glob_matches("C:\\etc\\rc.?", "C:\\etc\\rc.d"));
+        assert!(!path_glob_matches("C:\\etc\\?", "C:\\etc\\ab"));
+    }
+
+    #[test]
+    fn test_question_mark_matches_one_multibyte_character() {
+        assert!(filename_glob_matches("caf?.txt", "café.txt"));
+        assert!(filename_glob_matches("?.md", "日.md"));
+        assert!(filename_glob_matches("a?c", "a😀c"));
+        assert!(!filename_glob_matches("caf?.txt", "caf.txt"));
+        // Two question marks are two characters, not the two bytes of one.
+        assert!(!filename_glob_matches("caf??.txt", "café.txt"));
+        assert!(filename_glob_matches("caf??.txt", "cafés.txt"));
+        // A star in front must not let `?` land inside a character either.
+        assert!(!filename_glob_matches("*??", "é"));
+        assert!(filename_glob_matches("*?", "é"));
+    }
+
+    #[test]
+    fn test_question_mark_matches_one_grapheme() {
+        // Decomposed "café" (what macOS returns for filenames) is the same
+        // visible name as the precomposed one, so `?` covers both.
+        assert!(filename_glob_matches("caf?.txt", "cafe\u{301}.txt"));
+        assert!(!filename_glob_matches("caf??.txt", "cafe\u{301}.txt"));
+        // Emoji with a skin-tone modifier is one character.
+        assert!(filename_glob_matches("?.png", "\u{1F44D}\u{1F3FD}.png"));
+        assert!(!filename_glob_matches("??.png", "\u{1F44D}\u{1F3FD}.png"));
+        // `*` may still stop between code points, so a literal mark matches.
+        assert!(filename_glob_matches("caf*\u{301}.txt", "cafe\u{301}.txt"));
+    }
+
+    #[test]
+    fn test_path_question_mark_matches_one_grapheme() {
+        assert!(path_glob_matches("/docs/caf?.md", "/docs/cafe\u{301}.md"));
+        assert!(!path_glob_matches("/docs/caf??.md", "/docs/cafe\u{301}.md"));
+        assert!(path_glob_matches(
+            "/docs/?.png",
+            "/docs/\u{1F44D}\u{1F3FD}.png"
+        ));
+        assert!(!path_glob_matches(
+            "/docs/??.png",
+            "/docs/\u{1F44D}\u{1F3FD}.png"
+        ));
+    }
+
+    #[test]
+    fn test_path_question_mark_matches_one_multibyte_character() {
+        assert!(path_glob_matches("/docs/caf?.md", "/docs/café.md"));
+        assert!(path_glob_matches("/docs/?/readme", "/docs/日/readme"));
+        assert!(!path_glob_matches("/docs/caf??.md", "/docs/café.md"));
+        assert!(!path_glob_matches("/docs/?", "/docs/é/x"));
+        assert!(!path_glob_matches("/docs/**/??", "/docs/a/é"));
+        assert!(path_glob_matches("/docs/**/?", "/docs/a/é"));
+    }
+}

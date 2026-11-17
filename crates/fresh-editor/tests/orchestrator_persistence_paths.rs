@@ -12,8 +12,6 @@
 //! protected still holds, and the file's expected location has been
 //! updated accordingly.
 
-mod common;
-
 use fresh::config::Config;
 use fresh::config_io::DirectoryContext;
 use fresh::model::filesystem::StdFileSystem;
@@ -51,6 +49,7 @@ fn save_orchestrator_state_does_not_create_dotfresh_in_working_dir() {
         None,  // grammar registry
         false, // enable_plugins
         false, // enable_embedded_plugins
+        false,
     )
     .unwrap();
 
@@ -141,6 +140,7 @@ fn startup_in_project_a_ignores_persisted_active_in_project_b() {
         filesystem,
         None,
         None,
+        false,
         false,
         false,
     )

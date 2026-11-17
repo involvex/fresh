@@ -22,10 +22,10 @@
 //!
 //! Performance: O(1) ≈ 10ms (lazy load) vs O(n) ≈ 1000ms (log replay)
 
-use rust_i18n::t;
+use fresh_editor_core::model::host_path::AsHostPath;
+use fresh_i18n::t;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use crate::state::EditorState;
 
@@ -43,6 +43,61 @@ use crate::workspace::{
 
 use super::bookmarks::{Bookmark, BookmarkState};
 use super::Editor;
+
+/// The prompt histories kept in the global `<data_dir>/<name>_history.json`
+/// files: loaded into the active window at startup, saved on exit.
+/// How the file explorer comes up when a directory is entered, after any
+/// workspace restore (see `Window::apply_fresh_session_explorer_default`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExplorerOnEntry {
+    /// Switching into a directory (a dock dive, a new window): show the tree
+    /// for a brand-new directory; a restored workspace keeps what it had.
+    Enter,
+    /// A launch that named files, or nothing (a bare `fresh`): leave the
+    /// explorer as restored, closed when nothing was.
+    Keep,
+    /// `fresh DIR`: show the tree unless the user closed it in this
+    /// directory (`FileExplorerState::closed_by_user`).
+    Directory,
+    /// `--simple`: closed, whatever was restored.
+    Closed,
+}
+
+impl ExplorerOnEntry {
+    /// The launch's own answer: `--simple` closes it, a single directory
+    /// argument (`fresh DIR`) opens it, anything else keeps what was there.
+    pub fn for_launch(simple: bool, directory_arg: bool) -> Self {
+        if simple {
+            Self::Closed
+        } else if directory_arg {
+            Self::Directory
+        } else {
+            Self::Keep
+        }
+    }
+}
+
+pub(super) const GLOBAL_PROMPT_HISTORIES: [&str; 3] = ["search", "replace", "goto_line"];
+
+/// The on-disk workspace a window with this `root` and durable id restores
+/// from — the one lookup both restore and the unrestored-save history merge
+/// use, so they agree on which file is "this window's".
+///
+/// One store, whatever launched this editor — see `save_workspace_for`.
+fn load_window_workspace(
+    root: &Path,
+    stable_id: &str,
+) -> Result<Option<Workspace>, WorkspaceError> {
+    if stable_id.is_empty() {
+        // No durable id yet (a brand-new window): fall back to the
+        // freshest file for the root.
+        Workspace::load(root)
+    } else {
+        // THIS window's own identity, not merely the freshest file for the
+        // root — several co-tenant workspaces may share the root.
+        Workspace::load_by_id(root, stable_id)
+    }
+}
 
 /// Resolve a saved fold's header_line against the current buffer, using
 /// `header_text` to detect drift from external edits (issue #1568).
@@ -118,10 +173,6 @@ fn resolve_fold_header_line(
 pub struct WorkspaceTracker {
     /// Whether workspace has unsaved changes
     dirty: bool,
-    /// Last save time
-    last_save: Instant,
-    /// Minimum interval between saves (debounce)
-    save_interval: std::time::Duration,
     /// Whether workspace persistence is enabled
     enabled: bool,
 }
@@ -131,8 +182,6 @@ impl WorkspaceTracker {
     pub fn new(enabled: bool) -> Self {
         Self {
             dirty: false,
-            last_save: Instant::now(),
-            save_interval: std::time::Duration::from_secs(5),
             enabled,
         }
     }
@@ -147,17 +196,6 @@ impl WorkspaceTracker {
         if self.enabled {
             self.dirty = true;
         }
-    }
-
-    /// Check if a save is needed and enough time has passed
-    pub fn should_save(&self) -> bool {
-        self.enabled && self.dirty && self.last_save.elapsed() >= self.save_interval
-    }
-
-    /// Record that a save was performed
-    pub fn record_save(&mut self) {
-        self.dirty = false;
-        self.last_save = Instant::now();
     }
 
     /// Check if there are unsaved changes (for shutdown)
@@ -198,14 +236,36 @@ impl Editor {
     /// Set to `false` for a `--no-restore` run: the flag means "this session
     /// neither reads nor writes workspace state", so quit-time saves and
     /// mid-session checkpoints are suppressed alike (#2735).
+    ///
+    /// That covers the global prompt-history rings too: they were already
+    /// read from disk when the editor was built, so disabling persistence
+    /// (which happens at startup) forgets them again rather than offering
+    /// history this session will never save back.
     pub fn set_workspace_persistence(&mut self, enabled: bool) {
         self.workspace_persistence_enabled = enabled;
+        if !enabled {
+            for window in self.windows.values_mut() {
+                for history in window.prompt_histories.values_mut() {
+                    history.clear();
+                }
+            }
+        }
     }
 
     /// Try to load and apply a workspace for the active window. Thin
     /// active-window wrapper over [`Editor::restore_workspace_for`].
     ///
     /// Returns true if a workspace was successfully loaded and applied.
+    /// Stamp the active window as the one in front now, as a switch to it
+    /// does (`set_active_window`). For the window a launch boots into, which
+    /// is never switched to: its restore re-adopts the stamp it last saved,
+    /// so without this a workspace reached by a launch would look older than
+    /// one reached by a switch, and `open_last_workspace` would reopen the
+    /// wrong one.
+    pub fn mark_active_window_focused(&mut self) {
+        self.active_window_mut().last_focused_at = crate::workspace::now_millis();
+    }
+
     pub fn try_restore_workspace(&mut self) -> Result<bool, WorkspaceError> {
         self.restore_workspace_for(self.active_window)
     }
@@ -220,16 +280,15 @@ impl Editor {
     /// defaults to the tree. Operates on `windows[id]` directly, so it is
     /// correct for a background window that is not active yet.
     ///
-    /// `opened_files` suppresses the explorer default when the launch
-    /// opened specific files instead of a bare directory.
+    /// `entry` says how the explorer comes up (see [`ExplorerOnEntry`]).
     pub fn restore_window(
         &mut self,
         id: fresh_core::WindowId,
-        opened_files: bool,
+        entry: ExplorerOnEntry,
     ) -> Result<bool, WorkspaceError> {
         let restored = self.restore_workspace_for(id)?;
         if let Some(win) = self.windows.get_mut(&id) {
-            win.apply_fresh_session_explorer_default(opened_files, restored);
+            win.apply_fresh_session_explorer_default(entry, restored);
         }
         Ok(restored)
     }
@@ -240,9 +299,9 @@ impl Editor {
     /// [`Editor::restore_window`].
     pub fn restore_active_window_on_launch(
         &mut self,
-        opened_files: bool,
+        entry: ExplorerOnEntry,
     ) -> Result<bool, WorkspaceError> {
-        self.restore_window(self.active_window, opened_files)
+        self.restore_window(self.active_window, entry)
     }
 
     /// Apply the fresh-session explorer default to the active window for
@@ -252,165 +311,25 @@ impl Editor {
     /// bundle it with.
     pub fn apply_active_window_explorer_default(
         &mut self,
-        opened_files: bool,
+        entry: ExplorerOnEntry,
         workspace_restored: bool,
     ) {
         self.active_window_mut()
-            .apply_fresh_session_explorer_default(opened_files, workspace_restored);
+            .apply_fresh_session_explorer_default(entry, workspace_restored);
     }
 
     /// Apply hot exit recovery to all currently open file-backed buffers.
     ///
     /// This restores unsaved changes from recovery files for buffers that were
-    /// opened via CLI (without workspace restore). Returns the number of buffers
+    /// opened via CLI (without workspace restore): only theirs, since a file
+    /// launch is about the files it names. Returns the number of buffers
     /// recovered.
     pub fn apply_hot_exit_recovery(&mut self) -> anyhow::Result<usize> {
-        if !self.config.editor.hot_exit {
-            return Ok(0);
-        }
-
-        let entries = self.recovery_service.lock().unwrap().list_recoverable()?;
-        if entries.is_empty() {
-            return Ok(0);
-        }
-
-        // Collect buffer IDs and their file paths
-        let buffer_files: Vec<_> = self
-            .buffers()
-            .iter()
-            .filter_map(|(buffer_id, state)| {
-                let path = state.buffer.file_path()?.to_path_buf();
-                if path.as_os_str().is_empty() {
-                    return None; // Skip unnamed buffers
-                }
-                Some((*buffer_id, path))
-            })
-            .collect();
-
-        let mut recovered = 0;
-        for (buffer_id, file_path) in buffer_files {
-            let recovery_id = self
-                .recovery_service
-                .lock()
-                .unwrap()
-                .get_buffer_id(Some(&file_path));
-            let entry = entries.iter().find(|e| e.id == recovery_id);
-            if let Some(entry) = entry {
-                let loaded = self.recovery_service.lock().unwrap().load_recovery(entry);
-                match loaded {
-                    Ok(crate::services::recovery::RecoveryResult::Recovered {
-                        content, ..
-                    }) => {
-                        let mut mutated = false;
-                        if let Some(state) = self
-                            .windows
-                            .get_mut(&self.active_window)
-                            .map(|w| &mut w.buffers)
-                            .expect("active window present")
-                            .get_mut(&buffer_id)
-                        {
-                            let current_len = state.buffer.total_bytes();
-                            let text = String::from_utf8_lossy(&content).into_owned();
-                            let current = state.buffer.get_text_range_mut(0, current_len).ok();
-                            let current_text = current
-                                .as_ref()
-                                .map(|b| String::from_utf8_lossy(b).into_owned());
-                            if current_text.as_deref() != Some(&text) {
-                                state.buffer.delete(0..current_len);
-                                state.buffer.insert(0, &text);
-                                state.buffer.set_modified(true);
-                                state.buffer.set_recovery_pending(false);
-                                // The document is a different document now, and
-                                // this path never described the change as edit
-                                // damage. See `WrapIndex::damage_all`.
-                                state.wrap_indices.damage_all();
-                                // Invalidate saved position so undo can't
-                                // incorrectly clear the modified flag
-                                if let Some(log) =
-                                    self.active_window_mut().event_logs.get_mut(&buffer_id)
-                                {
-                                    log.clear_saved_position();
-                                }
-                                mutated = true;
-                                recovered += 1;
-                                tracing::info!(
-                                    "Restored unsaved changes for {:?} from hot exit recovery",
-                                    file_path
-                                );
-                            }
-                        }
-                        if mutated {
-                            self.sync_lsp_after_recovery_replay(buffer_id);
-                        }
-                    }
-                    Ok(crate::services::recovery::RecoveryResult::RecoveredChunks {
-                        chunks,
-                        ..
-                    }) => {
-                        let mut mutated = false;
-                        if let Some(state) = self
-                            .windows
-                            .get_mut(&self.active_window)
-                            .map(|w| &mut w.buffers)
-                            .expect("active window present")
-                            .get_mut(&buffer_id)
-                        {
-                            for chunk in chunks.into_iter().rev() {
-                                let text = String::from_utf8_lossy(&chunk.content).into_owned();
-                                if chunk.original_len > 0 {
-                                    state
-                                        .buffer
-                                        .delete(chunk.offset..chunk.offset + chunk.original_len);
-                                }
-                                state.buffer.insert(chunk.offset, &text);
-                            }
-                            state.buffer.set_modified(true);
-                            state.buffer.set_recovery_pending(false);
-                            // Invalidate saved position so undo can't
-                            // incorrectly clear the modified flag
-                            if let Some(log) =
-                                self.active_window_mut().event_logs.get_mut(&buffer_id)
-                            {
-                                log.clear_saved_position();
-                            }
-                            mutated = true;
-                            recovered += 1;
-                            tracing::info!(
-                                "Restored unsaved changes (chunked) for {:?} from hot exit recovery",
-                                file_path
-                            );
-                        }
-                        if mutated {
-                            self.sync_lsp_after_recovery_replay(buffer_id);
-                        }
-                    }
-                    Ok(crate::services::recovery::RecoveryResult::OriginalFileModified {
-                        original_path,
-                        ..
-                    }) => {
-                        let name = original_path
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy();
-                        tracing::warn!("{} changed on disk; unsaved changes not restored", name);
-                        self.set_status_message(format!(
-                            "{} changed on disk; unsaved changes not restored",
-                            name
-                        ));
-                    }
-                    Ok(_) => {} // Corrupted, NotFound - skip
-                    Err(e) => {
-                        tracing::debug!(
-                            "Failed to load hot exit recovery for {:?}: {}",
-                            file_path,
-                            e
-                        );
-                    }
-                }
-            }
-        }
-
-        Ok(recovered)
+        Ok(self.adopt_recovery_for_window(
+            self.active_window,
+            None,
+            super::recovery_actions::AdoptScope::OpenFiles,
+        ))
     }
 
     /// Apply only the **editor-global** config overrides from a
@@ -460,13 +379,15 @@ impl Editor {
         if self.preparing_windows.contains_key(&id) {
             return Ok(());
         }
+        // Ensure terminal backing files have complete state, and persist
+        // per-file global states, before snapshotting.
+        let Some(win) = self.windows.get_mut(&id) else {
+            return Ok(());
+        };
+        win.sync_terminal_backing_files();
         let Some(win) = self.windows.get(&id) else {
             return Ok(());
         };
-
-        // Ensure terminal backing files have complete state, and persist
-        // per-file global states, before snapshotting.
-        win.sync_terminal_backing_files();
         win.save_all_global_file_states();
 
         // The single funnel for every workspace write, so `--no-restore`
@@ -479,14 +400,49 @@ impl Editor {
             );
             return Ok(());
         }
+        // A file launch never restored the workspace, so what it holds is
+        // the named files, not the project's session: saving it would
+        // replace the project's tabs and layout with, say, COMMIT_EDITMSG.
+        if self.file_launch {
+            tracing::debug!("Skipping workspace save for window {id}: file launch");
+            return Ok(());
+        }
 
-        let workspace = win.capture_workspace();
+        let mut workspace = win.capture_workspace();
+        // The sidebar's sections are editor state (see `app::sidebar`), so
+        // the window's snapshot does not know them; they ride in its file.
+        workspace.file_explorer.sections = self.sidebar_section_states(id);
+
+        // The snapshot records the prompt-history rings wholesale, but a
+        // window that never restored its workspace (`fresh file.rs` skips
+        // the restore by default) started without the project's stored
+        // history — writing its rings as they are would erase what earlier
+        // sessions saved. Keep the stored entries beneath this session's.
+        if !win.workspace_restored {
+            if let Ok(Some(stored)) = load_window_workspace(&win.root, &win.stable_id) {
+                workspace.histories = stored.histories.merged_with(&workspace.histories);
+            }
+        }
 
         // Refuse to overwrite a non-empty on-disk workspace with an
         // all-virtual snapshot (issue #2027). The protection is for
         // FILE/unnamed content only — terminals are live runtime state, so
         // a terminal-only on-disk workspace must NOT block this save.
-        if workspace.has_no_real_content() && win.has_any_virtual_buffer() {
+        //
+        // Only for a window that never restored. The guard exists for an
+        // instance that boots straight to a virtual surface without ever
+        // reading the workspace — it must not wipe content it never held.
+        // A window that *did* restore and is now all-virtual is the user
+        // having closed their files, and refusing that save resurrected
+        // them on the next launch: the welcome screen is a virtual
+        // buffer, so closing the last file left exactly the shape this
+        // guard rejects, and the stale snapshot survived every save and
+        // every checkpoint for the rest of the session (issue #2027's
+        // guard also sits on `checkpoint_window_workspace`).
+        if !win.workspace_restored
+            && workspace.has_no_real_content()
+            && win.has_any_virtual_buffer()
+        {
             let root = win.root.clone();
             let on_disk = Workspace::load(&root).ok().flatten();
             if let Some(existing) = on_disk {
@@ -529,19 +485,16 @@ impl Editor {
         else {
             return Ok(false);
         };
-
-        // One store, whatever launched this editor — see `save_workspace_for`.
-        let workspace = if stable_id.is_empty() {
-            // No durable id yet (a brand-new window): fall back to the
-            // freshest file for the root.
-            Workspace::load(&root)?
-        } else {
-            // Restore THIS window's own identity, not merely the freshest file
-            // for the root — several co-tenant workspaces may share the root.
-            Workspace::load_by_id(&root, &stable_id)?
-        };
-        let Some(workspace) = workspace else {
+        let Some(workspace) = load_window_workspace(&root, &stable_id)? else {
             tracing::debug!("No workspace found for {:?}", root);
+            // No workspace record for this directory: either none was ever
+            // saved, or its file could not be parsed and was moved aside.
+            // Its unsaved work is still the directory's.
+            self.adopt_recovery_for_window(
+                id,
+                None,
+                super::recovery_actions::AdoptScope::Workspace,
+            );
             return Ok(false);
         };
 
@@ -587,7 +540,7 @@ impl Editor {
             let (label, root2, authority, resources, tw, th, pstate) = (
                 old.label,
                 old.root,
-                old.authority,
+                old.connection,
                 old.resources,
                 old.terminal_width,
                 old.terminal_height,
@@ -602,6 +555,10 @@ impl Editor {
             built.authority_spec = workspace.authority_spec.clone();
             self.windows.insert(id, built);
         }
+
+        // The window's own sections come back scoped to it; the editor-wide
+        // ones to everyone (see `app::sidebar::SectionScope`).
+        self.restore_sidebar_sections(id, &workspace.file_explorer.sections);
 
         // Active-window only: the restored active buffer never went through a
         // focus path, so nothing has derived the terminal live/scrollback
@@ -619,7 +576,21 @@ impl Editor {
         // drops the binding), so this correctly leaves it read-only.
         if id == self.active_window {
             self.sync_terminal_mode_to_active_buffer();
+            // Quick Open follows a restored Show Hidden Files even before the explorer opens.
+            self.sync_quick_open_file_visibility();
         }
+
+        // A file has one buffer across workspaces: one another workspace has
+        // open stays there, and this one comes back without its tab.
+        self.close_files_open_elsewhere(id);
+        // ... and one another editor has open is read-only here
+        self.sync_file_locks();
+
+        // Its unsaved work: the changes to the files its layout opened, and
+        // whatever else is this workspace's in the store — left by a crash,
+        // or by an editor launched another way. Before the focus
+        // announcement, so a buffer this opens is the one announced.
+        self.adopt_recovery_for_window(id, None, super::recovery_actions::AdoptScope::Workspace);
 
         // Active-window only: refresh the plugin snapshot and fire
         // buffer_activated for the restored active buffer. Background
@@ -627,16 +598,11 @@ impl Editor {
         if id == self.active_window {
             #[cfg(feature = "plugins")]
             {
-                let buffer_id = self.active_buffer();
-                self.update_plugin_state_snapshot();
                 tracing::debug!(
-                    "Firing buffer_activated for active buffer {:?} after workspace restore",
-                    buffer_id
+                    "Announcing focus for active buffer {:?} after workspace restore",
+                    self.active_buffer()
                 );
-                self.plugin_manager.read().unwrap().run_hook(
-                    "buffer_activated",
-                    crate::services::plugins::hooks::HookArgs::BufferActivated { buffer_id },
-                );
+                self.announce_focus();
             }
         }
 
@@ -650,21 +616,8 @@ impl Editor {
     /// past per-window failures so a single bad window can't block the
     /// other quits.
     pub fn save_all_windows_workspaces(&mut self) -> Result<(), WorkspaceError> {
-        let targets: Vec<fresh_core::WindowId> = self
-            .windows
-            .iter()
-            // Never overwrite a window we never materialized: it still
-            // holds only its empty seed layout, while its on-disk
-            // workspace is the authoritative copy. Saving the seed would
-            // clobber the real file (issue: lazy restore + per-dir save).
-            .filter(|(id, w)| {
-                w.buffers.splits().is_some() && !self.materialize_pending.contains(id)
-            })
-            .map(|(id, _)| *id)
-            .collect();
-
         let mut first_err = None;
-        for id in targets {
+        for id in self.windows_to_persist() {
             if let Err(e) = self.save_workspace_for(id) {
                 tracing::warn!("Failed to save workspace for window {id}: {e}");
                 if first_err.is_none() {
@@ -676,6 +629,162 @@ impl Editor {
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
+        }
+    }
+
+    /// The windows a quit-time save visits: those whose split layout is
+    /// populated.
+    fn windows_to_persist(&self) -> Vec<fresh_core::WindowId> {
+        self.windows
+            .iter()
+            // Never overwrite a window we never materialized: it still
+            // holds only its empty seed layout, while its on-disk
+            // workspace is the authoritative copy. Saving the seed would
+            // clobber the real file (issue: lazy restore + per-dir save).
+            .filter(|(id, w)| {
+                w.buffers.splits().is_some() && !self.materialize_pending.contains(id)
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Flush every window's per-file cursor/scroll state to the global
+    /// per-file store, and write no workspace file. The same windows
+    /// [`Self::save_workspace_for`] would flush, for a quit that saves no
+    /// workspaces.
+    fn save_all_windows_file_states(&self) {
+        for id in self.windows_to_persist() {
+            // `save_workspace_for` returns before its own flush for these:
+            // a dormant remote's window is only a disconnected shell, and a
+            // preparing window's contents are still being built.
+            if self.dormant_remote.contains_key(&id) || self.preparing_windows.contains_key(&id) {
+                continue;
+            }
+            if let Some(win) = self.windows.get(&id) {
+                win.save_all_global_file_states();
+            }
+        }
+    }
+
+    /// Everything the editor persists when it quits, in order: auto-save
+    /// ([`Self::auto_save_on_exit`]), end the recovery session (flushes dirty
+    /// buffers and assigns the recovery ids the workspace then records), the
+    /// workspaces, the global prompt histories, editor-global plugin state
+    /// and the dock chrome.
+    ///
+    /// The one exit path shared by the terminal event loop (`main.rs`), the
+    /// GUI, the daemon and the test harness, so no front end — and no test —
+    /// can drift from the others by dropping a step; the prompt-history save
+    /// went missing from all of them exactly that way.
+    ///
+    /// It owns the auto-save on exit, whatever ended the session: a quit, a
+    /// Force Quit, the GUI window closing, the daemon shutting down. A quit
+    /// the user confirms runs that same save first
+    /// (`Editor::quit_after_auto_save`), while a buffer it can't write can
+    /// still hold the quit; what it wrote is no longer modified, so the run
+    /// here only meets what the user chose to leave unsaved.
+    ///
+    /// `save_workspaces` is the front end's own gate on the per-window
+    /// workspace files; `--no-restore` is honoured separately, inside every
+    /// write, through `workspace_persistence_enabled`. Neither gates the
+    /// per-file cursor/scroll store, which is written either way. Best-effort: every
+    /// step runs even when an earlier one failed, each failure is logged and
+    /// the first is returned.
+    pub fn persist_on_exit(&mut self, save_workspaces: bool) -> anyhow::Result<()> {
+        let mut first_err: Option<anyhow::Error> = None;
+        let mut record = |what: &str, result: anyhow::Result<()>| {
+            if let Err(e) = result {
+                tracing::warn!("Failed to {what} on exit: {e}");
+                first_err.get_or_insert(e);
+            }
+        };
+
+        let saved = self.auto_save_on_exit().map(|_| ());
+        record("auto-save", saved);
+        let ended = self.end_recovery_session();
+        record("end recovery session", ended);
+        if save_workspaces {
+            // Every window, not just the active one, so an Orchestrator
+            // restart paints each session's preview without diving in.
+            // Each window's save flushes its per-file states as well.
+            let saved = self.save_all_windows_workspaces().map_err(Into::into);
+            record("save workspaces", saved);
+        } else {
+            // Per-file cursor/scroll state is not a workspace file, so a
+            // launch that writes none (`fresh FILE`, `--no-restore`, a GUI
+            // run given files) still records it. Without this a file left
+            // open at quit reopened at line 1 (#3748).
+            self.save_all_windows_file_states();
+        }
+        self.save_histories();
+        self.save_orchestrator_state();
+        // The dock's open/closed state is a session preference like the
+        // workspace itself: a launch that does not persist the workspace
+        // (`--no-restore`, `fresh FILE`) must not record it for the next one.
+        if self.workspace_persistence_enabled && !self.file_launch {
+            self.save_dock_chrome();
+        }
+
+        first_err.map_or(Ok(()), Err)
+    }
+
+    /// The auto-save on exit: with `auto_save_enabled`, carry out the exit
+    /// save plan ([`Self::save_all_on_exit`]) and log what it did. Nothing
+    /// otherwise. Owned by [`Self::persist_on_exit`]. Returns what it did,
+    /// so a quit that runs it early can tell the user what it couldn't save.
+    pub(crate) fn auto_save_on_exit(
+        &mut self,
+    ) -> anyhow::Result<crate::app::file_operations::ExitSaveOutcome> {
+        if !self.config().editor.auto_save_enabled {
+            return Ok(Default::default());
+        }
+        let outcome = self.save_all_on_exit()?;
+        if outcome.saved > 0 {
+            tracing::info!("Auto-saved {} buffer(s) on exit", outcome.saved);
+        }
+        if !outcome.changed_on_disk.is_empty() {
+            tracing::warn!(
+                "Not auto-saved on exit, changed on disk: {:?}",
+                outcome.changed_on_disk
+            );
+        }
+        Ok(outcome)
+    }
+
+    /// Save the prompt-history rings (search / replace / goto-line) to the
+    /// global `<data_dir>/<name>_history.json` files that every launch loads
+    /// at startup — the history a launch that does not restore its workspace
+    /// starts from.
+    ///
+    /// Each window keeps its own rings, so all of them are folded in, least
+    /// recently focused first and the active window on top. And the result
+    /// is merged into the file rather than overwriting it: another editor
+    /// may have quit since this one loaded it, and its entries stay (beneath
+    /// this session's). Skipped when workspace persistence is off
+    /// (`--no-restore`).
+    pub fn save_histories(&self) {
+        if !self.workspace_persistence_enabled {
+            return;
+        }
+        let mut windows: Vec<&crate::app::window::Window> = self.windows.values().collect();
+        windows.sort_by_key(|w| (w.id == self.active_window, w.last_focused_at));
+        for key in GLOBAL_PROMPT_HISTORIES {
+            let path = self.dir_context.prompt_history_path(key);
+            let mut merged = crate::input::input_history::InputHistory::load_from_file(&path)
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Failed to read {} history, rewriting it: {}", key, e);
+                    crate::input::input_history::InputHistory::new()
+                });
+            for window in &windows {
+                if let Some(history) = window.prompt_histories.get(key) {
+                    merged.merge_newer(history.items());
+                }
+            }
+            if let Err(e) = merged.save_to_file(&path) {
+                tracing::warn!("Failed to save {} history: {}", key, e);
+            } else {
+                tracing::debug!("Saved {} history to {:?}", key, path);
+            }
         }
     }
 
@@ -729,7 +838,7 @@ impl Editor {
         // `restore_window` flow, so a dock-switched directory applies its
         // persisted explorer visibility (or the fresh-session default)
         // exactly as a cold launch would. No CLI files on this path.
-        match self.restore_window(id, false) {
+        match self.restore_window(id, ExplorerOnEntry::Enter) {
             Ok(true) => tracing::debug!("Materialized window {id} from workspace"),
             Ok(false) => {
                 tracing::trace!("No persisted workspace for window {id}; empty seed kept")
@@ -806,10 +915,7 @@ impl crate::app::window::Window {
     /// split after the workspace has been applied.
     fn clean_orphaned_buffers(&mut self) {
         let referenced: HashSet<BufferId> = self
-            .buffers
-            .splits()
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
+            .split_view_states()
             .values()
             .flat_map(|vs| vs.buffer_tab_ids())
             .collect();
@@ -836,18 +942,36 @@ impl crate::app::window::Window {
     fn log_restore_summary(&mut self, session_name: Option<&str>) {
         tracing::debug!(
             "Workspace restore complete: {} splits, {} buffers",
-            self.buffers
-                .splits()
-                .map(|(_, vs)| vs)
-                .expect("active window must have a populated split layout")
-                .len(),
+            self.split_view_states().len(),
             self.buffers.len()
         );
-        let restored_count = self.buffers.count_where(|id, _| {
-            self.buffer_metadata
-                .get(&id)
-                .is_some_and(|m| !m.hidden_from_tabs && !m.is_virtual())
+        // What the restore could *not* do matters more than the count, and
+        // the status bar holds one line, so a warning takes it — including
+        // when there was nothing to count. Every warning is logged whatever
+        // happens here; only the one the user is left looking at is chosen.
+        let mut notices = std::mem::take(&mut self.recovery_notices);
+        let notice = match notices.len() {
+            0 => None,
+            1 => notices.pop(),
+            n => Some(format!(
+                "{} (and {} more recovery warning(s) — see the log)",
+                notices.remove(0),
+                n - 1
+            )),
+        };
+        // An empty unnamed buffer is the placeholder a window gets when
+        // nothing else came back, not something restored.
+        let restored_count = self.buffers.count_where(|id, state| {
+            self.buffer_metadata.get(&id).is_some_and(|m| {
+                let placeholder = m.file_path().is_some_and(|p| p.as_os_str().is_empty())
+                    && state.buffer.total_bytes() == 0;
+                !m.hidden_from_tabs && !m.is_virtual() && !placeholder
+            })
         });
+        if let Some(notice) = notice {
+            self.set_status_message(notice);
+            return;
+        }
         if restored_count == 0 {
             return;
         }
@@ -895,7 +1019,8 @@ impl crate::app::window::Window {
             log_path
                 .parent()
                 .or_else(|| backing_path.parent())
-                .unwrap_or(&terminals_root),
+                .unwrap_or(&terminals_root)
+                .as_host(),
         );
 
         // Record paths using the predicted ID so buffer creation can reuse them
@@ -957,10 +1082,17 @@ impl crate::app::window::Window {
         } else {
             std::collections::HashMap::new()
         };
+        // A saved cwd that has since been removed would otherwise land the
+        // shell in $HOME (portable-pty's fallback); the workspace root is
+        // the better guess. `manages_cwd` wrappers ignore this value.
+        let cwd = match terminal.cwd.as_ref() {
+            Some(dir) if !dir.is_dir() => Some(self.root.clone()),
+            other => other.cloned(),
+        };
         let terminal_id = match self.terminal_manager.spawn(
             terminal.cols,
             terminal.rows,
-            terminal.cwd.clone(),
+            cwd,
             Some(log_path.clone()),
             Some(backing_path.clone()),
             // Restore: this terminal's own saved transcript — keep streaming
@@ -1053,6 +1185,13 @@ impl crate::app::window::Window {
         // the exit path does — the PTY this id names no longer exists.
         let buffer_id = self.create_terminal_buffer_detached(terminal_id);
         self.apply_restored_terminal_title(buffer_id, terminal.title.as_deref());
+        // An auto-named tab's name, for the case `apply_restored_terminal_title`
+        // cannot serve: this terminal is dead, so there is no foreground
+        // process to re-derive a name from and the tab read `*Terminal N*`
+        // (#3074). Applied only when there is no explicit title to prefer,
+        // and *without* marking the tab explicitly titled, so a restart still
+        // hands the name back to auto-naming.
+        self.apply_restored_terminal_auto_title(buffer_id, terminal.auto_title.as_deref());
         self.load_terminal_backing_file_as_buffer(buffer_id, &backing_path);
         // A restored-dead tab shows the same "(exited)" marker a tab that died
         // in this session does — the state is identical, so it must read
@@ -1080,6 +1219,10 @@ impl crate::app::window::Window {
                 // is carried so the restart (which does spawn) mints one.
                 script_access: terminal.script_access,
                 title: terminal.title.clone(),
+                // Carried so the next save re-persists it and the name
+                // survives any number of restarts of the editor, exactly as
+                // the launch/resume argv above do.
+                auto_title: terminal.auto_title.clone(),
             },
         );
         Some(buffer_id)
@@ -1101,6 +1244,33 @@ impl crate::app::window::Window {
         // Mark it explicit so `sync_terminal_titles` leaves it alone, exactly
         // as `create_plugin_terminal` does for a freshly-launched agent.
         self.terminal_explicit_titles.insert(buffer_id);
+    }
+
+    /// Re-apply an *auto-named* terminal tab's last name after restore, for a
+    /// terminal that comes back dead.
+    ///
+    /// Auto-naming reads the foreground process every frame, so a live
+    /// terminal needs nothing restored. A dead one has no process to read:
+    /// `sync_terminal_titles` never visits it (it walks live
+    /// `terminal_buffers` only), so the tab keeps whatever name it is given
+    /// here, and with nothing given it kept the `*Terminal N*` default —
+    /// which also made two dead terminals indistinguishable (#3074).
+    ///
+    /// Unlike [`Self::apply_restored_terminal_title`] this does **not** mark
+    /// the tab explicitly titled: the name is a remembered derivation, not a
+    /// choice, so restarting the terminal must hand naming back to the reborn
+    /// process. An explicit title, when there is one, is applied first and
+    /// wins — this leaves it alone.
+    fn apply_restored_terminal_auto_title(&mut self, buffer_id: BufferId, name: Option<&str>) {
+        let Some(name) = name.filter(|n| !n.is_empty()) else {
+            return;
+        };
+        if self.terminal_explicit_titles.contains(&buffer_id) {
+            return;
+        }
+        if let Some(meta) = self.buffer_metadata.get_mut(&buffer_id) {
+            meta.display_name = name.to_string();
+        }
     }
 
     /// Load a terminal backing file directly as a read-only buffer.
@@ -1175,21 +1345,12 @@ impl crate::app::window::Window {
 
                 let current_leaf_id = if is_first_leaf {
                     // First leaf reuses the existing split
-                    let leaf_id = self
-                        .buffers
-                        .splits()
-                        .map(|(mgr, _)| mgr)
-                        .expect("active window must have a populated split layout")
-                        .active_split();
+                    let leaf_id = self.split_manager().active_split();
                     self.set_pane_buffer(leaf_id, buffer_id);
                     leaf_id
                 } else {
                     // Non-first leaves use the active split (created by split_active)
-                    self.buffers
-                        .splits()
-                        .map(|(mgr, _)| mgr)
-                        .expect("active window must have a populated split layout")
-                        .active_split()
+                    self.split_manager().active_split()
                 };
 
                 // Map old split ID to new one
@@ -1197,22 +1358,15 @@ impl crate::app::window::Window {
 
                 // Restore label if present
                 if let Some(label) = label {
-                    self.buffers
-                        .split_manager_mut()
-                        .expect("active window must have a populated split layout")
+                    self.split_manager_mut()
                         .set_label(current_leaf_id, label.clone());
                 }
 
                 // Restore role tag if present (clearing any prior holder
                 // first to preserve the at-most-one-leaf-per-role invariant).
                 if let Some(role) = role {
-                    self.buffers
-                        .split_manager_mut()
-                        .expect("active window must have a populated split layout")
-                        .clear_role(*role);
-                    self.buffers
-                        .split_manager_mut()
-                        .expect("active window must have a populated split layout")
+                    self.split_manager_mut().clear_role(*role);
+                    self.split_manager_mut()
                         .set_leaf_role(current_leaf_id, Some(*role));
                 }
 
@@ -1238,48 +1392,30 @@ impl crate::app::window::Window {
                     .unwrap_or(self.active_buffer());
 
                 let current_leaf_id = if is_first_leaf {
-                    let leaf_id = self
-                        .buffers
-                        .splits()
-                        .map(|(mgr, _)| mgr)
-                        .expect("active window must have a populated split layout")
-                        .active_split();
+                    let leaf_id = self.split_manager().active_split();
                     self.set_pane_buffer(leaf_id, buffer_id);
                     leaf_id
                 } else {
-                    self.buffers
-                        .splits()
-                        .map(|(mgr, _)| mgr)
-                        .expect("active window must have a populated split layout")
-                        .active_split()
+                    self.split_manager().active_split()
                 };
 
                 split_id_map.insert(*split_id, current_leaf_id.into());
 
                 // Restore label if present
                 if let Some(label) = label {
-                    self.buffers
-                        .split_manager_mut()
-                        .expect("active window must have a populated split layout")
+                    self.split_manager_mut()
                         .set_label(current_leaf_id, label.clone());
                 }
 
                 // Restore role tag for terminal leaves (same one-per-role
                 // invariant as the file-leaf branch above).
                 if let Some(role) = role {
-                    self.buffers
-                        .split_manager_mut()
-                        .expect("active window must have a populated split layout")
-                        .clear_role(*role);
-                    self.buffers
-                        .split_manager_mut()
-                        .expect("active window must have a populated split layout")
+                    self.split_manager_mut().clear_role(*role);
+                    self.split_manager_mut()
                         .set_leaf_role(current_leaf_id, Some(*role));
                 }
 
-                self.buffers
-                    .split_manager_mut()
-                    .expect("active window must have a populated split layout")
+                self.split_manager_mut()
                     .set_split_buffer(current_leaf_id, buffer_id);
 
                 self.restore_split_view_state(
@@ -1325,36 +1461,20 @@ impl crate::app::window::Window {
                 };
 
                 // Create the split for the second child
-                match self
-                    .buffers
-                    .split_manager_mut()
-                    .expect("active window must have a populated split layout")
-                    .split_active(split_direction, second_buffer_id, *ratio)
-                {
+                match self.split_manager_mut().split_active(
+                    split_direction,
+                    second_buffer_id,
+                    *ratio,
+                ) {
                     Ok(new_leaf_id) => {
                         // Create view state for the new split
-                        let mut view_state = SplitViewState::with_buffer(
+                        let view_state = SplitViewState::with_buffer(
                             self.terminal_width,
                             self.terminal_height,
                             second_buffer_id,
                         );
-                        view_state.apply_config_defaults(crate::view::split::ViewConfigDefaults {
-                            line_numbers: self.resources.config.editor.line_numbers,
-                            highlight_current_line: self
-                                .resources
-                                .config
-                                .editor
-                                .highlight_current_line,
-                            line_wrap: self.resolve_line_wrap_for_buffer(second_buffer_id),
-                            wrap_indent: self.resources.config.editor.wrap_indent,
-                            wrap_column: self.resolve_wrap_column_for_buffer(second_buffer_id),
-                            rulers: self.resources.config.editor.rulers.clone(),
-                            scroll_offset: self.resources.config.editor.scroll_offset,
-                        });
-                        self.buffers
-                            .split_view_states_mut()
-                            .expect("active window must have a populated split layout")
-                            .insert(new_leaf_id, view_state);
+                        self.split_view_states_mut().insert(new_leaf_id, view_state);
+                        self.seed_view_config_defaults(new_leaf_id, second_buffer_id);
 
                         // Map the container split ID (though we mainly care about leaves)
                         split_id_map.insert(*split_id, new_leaf_id.into());
@@ -1388,20 +1508,69 @@ impl crate::app::window::Window {
         terminal_buffers: &HashMap<usize, BufferId>,
         unnamed_buffers: &HashMap<String, BufferId>,
     ) {
+        // Resolve the split-manager-assigned buffer before taking the
+        // &mut borrow on windows so the borrow stays disjoint from
+        // any subsequent reads.
+        let split_buf_for_current = self.split_manager().buffer_for_split(current_split_id);
+
+        // Every view state the restore seeds starts life as a
+        // `BufferViewState::new`, whose display flags are hard-coded
+        // (`highlight_current_line: true`, `show_line_numbers: true`, no
+        // rulers, …) rather than the user's `editor.*` settings. A restored
+        // *file* buffer is stamped on the way in, because it comes back
+        // through `open_file_internal`; unnamed (hot-exit) and terminal
+        // buffers never pass that way, so the stamp has to happen here or the
+        // restored pane renders against the built-in defaults — the
+        // current-line highlight coming back for a restored `[No Name]`
+        // buffer even with `highlight_current_line: false` (#3426).
+        //
+        // The pane's own buffer first. `restore_split_node` has already pointed
+        // the pane at it — via `set_pane_buffer` for the leaf that reuses the
+        // active split, via `set_split_buffer` for a terminal leaf, and via
+        // `SplitViewState::with_buffer` for a leaf `split_active` created — so
+        // by here the pane keeps a `BufferViewState` for it, created by
+        // whichever of those ran. That is independent of the saved view state
+        // looked up below, which a partial workspace can be missing.
+        if let Some(buffer_id) = split_buf_for_current {
+            self.seed_view_config_defaults(current_split_id, buffer_id);
+        }
+
         // Try to find the saved state for this split
         let Some(split_state) = split_states.get(&saved_split_id) else {
             return;
         };
         let ephemeral_patterns = self.config().editor.ephemeral_file_patterns.clone();
 
-        // Resolve the split-manager-assigned buffer before taking the
-        // &mut borrow on windows so the borrow stays disjoint from
-        // any subsequent reads.
-        let split_buf_for_current = self
-            .buffers
-            .split_manager()
-            .expect("active window must have a populated split layout")
-            .buffer_for_split(current_split_id);
+        // …then the defaults for every buffer the restore could seed a view
+        // state for here, resolved up front because the wrap resolvers need
+        // `&self`, which the view-state borrow below rules out. Keyed by
+        // buffer, over every buffer the restore produced, so the loops below
+        // stay the only place that maps a saved tab to one.
+        let mut view_defaults: HashMap<BufferId, crate::view::split::ViewConfigDefaults> =
+            HashMap::new();
+        for buffer_id in path_to_buffer
+            .values()
+            .chain(terminal_buffers.values())
+            .chain(unnamed_buffers.values())
+            .copied()
+        {
+            view_defaults
+                .entry(buffer_id)
+                .or_insert_with(|| self.view_config_defaults_for_buffer(buffer_id));
+        }
+        // Seed a tab's view state from those defaults, creating it if this is
+        // the first the pane has seen of the buffer. Pins restored further
+        // down from `file_states` are applied after this, and
+        // `apply_config_defaults` keeps any already set, so a pinned buffer
+        // keeps its pin either way. The pane's own buffer is the one that can
+        // be absent from all three maps (the #1278 fallback below) — seeded
+        // directly above, so it just gets its state here.
+        let seed_tab_state = |view_state: &mut SplitViewState, buffer_id: BufferId| {
+            let state = view_state.ensure_buffer_state(buffer_id);
+            if let Some(defaults) = view_defaults.get(&buffer_id) {
+                state.apply_config_defaults(defaults.clone());
+            }
+        };
         let active_buffer_id = self
             .buffers
             .with_all_mut(|__buffers_mut, _mgr, vs_map| {
@@ -1420,7 +1589,7 @@ impl crate::app::window::Window {
                                         view_state.add_buffer(buffer_id);
                                     }
                                     // Ensure keyed state exists for this buffer
-                                    view_state.ensure_buffer_state(buffer_id);
+                                    seed_tab_state(view_state, buffer_id);
                                     if terminal_buffers.values().any(|&tid| tid == buffer_id) {
                                         let buf_state =
                                             view_state.buffer_state_mut(buffer_id).unwrap();
@@ -1438,7 +1607,8 @@ impl crate::app::window::Window {
                                     if !view_state.has_buffer(buffer_id) {
                                         view_state.add_buffer(buffer_id);
                                     }
-                                    let buf_state = view_state.ensure_buffer_state(buffer_id);
+                                    seed_tab_state(view_state, buffer_id);
+                                    let buf_state = view_state.buffer_state_mut(buffer_id).unwrap();
                                     buf_state.viewport.line_wrap_enabled = false;
                                     // Match the freshly-spawned terminal path: no
                                     // gutter / current-line highlight when this
@@ -1452,7 +1622,7 @@ impl crate::app::window::Window {
                                     if !view_state.has_buffer(buffer_id) {
                                         view_state.add_buffer(buffer_id);
                                     }
-                                    view_state.ensure_buffer_state(buffer_id);
+                                    seed_tab_state(view_state, buffer_id);
                                 }
                             }
                         }
@@ -1465,7 +1635,7 @@ impl crate::app::window::Window {
                     if view_state.open_buffers.is_empty() {
                         if let Some(buf) = split_buf_for_current {
                             view_state.add_buffer(buf);
-                            view_state.ensure_buffer_state(buf);
+                            seed_tab_state(view_state, buf);
                         }
                     }
 
@@ -1487,7 +1657,7 @@ impl crate::app::window::Window {
                             if !view_state.has_buffer(buffer_id) {
                                 view_state.add_buffer(buffer_id);
                             }
-                            view_state.ensure_buffer_state(buffer_id);
+                            seed_tab_state(view_state, buffer_id);
                         }
                     }
 
@@ -1524,7 +1694,8 @@ impl crate::app::window::Window {
                         .unwrap_or(0);
 
                     // Ensure keyed state exists for this buffer
-                    let buf_state = view_state.ensure_buffer_state(buffer_id);
+                    seed_tab_state(view_state, buffer_id);
+                    let buf_state = view_state.buffer_state_mut(buffer_id).unwrap();
 
                     let cursor_pos = file_state.cursor.position.min(max_pos);
                     buf_state.cursors.primary_mut().position = cursor_pos;
@@ -1555,21 +1726,6 @@ impl crate::app::window::Window {
                             buf_state,
                             &mut state.buffer,
                         );
-
-                        // Refresh the buffer's cached primary cursor line number.
-                        // The cursor-position fields above are written directly
-                        // (no MoveCursor event), so without this the cache stays
-                        // at EditorState::new's default `Absolute(0)`. Status bar
-                        // and plugin-side `getCursorLine` both read this cache —
-                        // a Git Blame invoked right after restore would see 0 and
-                        // land on Ln 1 even though the cursor is at line 5000.
-                        let line = state
-                            .buffer
-                            .offset_to_position(cursor_pos)
-                            .map(|p| p.line)
-                            .unwrap_or(0);
-                        state.primary_cursor_line_number =
-                            crate::model::buffer::LineNumber::Absolute(line);
                     }
 
                     // Restore per-buffer view mode and compose width
@@ -1716,29 +1872,19 @@ impl crate::app::window::Window {
                     active_buffer_id = view_state.buffer_tab_ids().next();
                 }
 
-                // For buffers without saved file_state (e.g., terminals), apply split-level
-                // view_mode/compose_width as fallback (backward compatibility)
-                let restored_view_mode = match split_state.view_mode {
-                    SerializedViewMode::Source => ViewMode::Source,
-                    SerializedViewMode::PageView => ViewMode::PageView,
-                };
-
+                // **A buffer restores its own view state or none.** What used
+                // to stand here read the split's `view_mode` and
+                // `compose_width` — a copy of whatever buffer was active when
+                // the session was saved — onto whatever buffer came up active
+                // now, whenever that buffer had no state of its own. A scratch
+                // buffer never has state of its own, so the session saved with
+                // the welcome page in front reopened with that page's column
+                // around an empty buffer. Both fields are gone from the split
+                // (see `SerializedSplitViewState`); the per-buffer restore
+                // above is the only one there is.
                 if let Some(active_buf_id) = active_buffer_id {
-                    // Switch the split to the active buffer
-                    view_state.switch_buffer(active_buf_id);
-
-                    // If no per-buffer file_state was saved, apply split-level settings
-                    let active_has_file_state = split_state.file_states.keys().any(|rel_path| {
-                        path_to_buffer.get(rel_path).copied() == Some(active_buf_id)
-                    });
-                    if !active_has_file_state {
-                        view_state.active_state_mut().view_mode = restored_view_mode.clone();
-                        view_state.active_state_mut().compose_width = split_state.compose_width;
-                    }
-
-                    // Cursors now live in SplitViewState, no need to sync to EditorState
+                    view_state.set_buffer_tab(active_buf_id);
                 }
-                view_state.tab_scroll_offset = split_state.tab_scroll_offset;
                 active_buffer_id
             })
             .flatten();
@@ -1747,18 +1893,31 @@ impl crate::app::window::Window {
         // hook). Done after the view_state borrow ends so we can take a
         // second &mut borrow on self.windows for the split manager.
         if let Some(active_buf_id) = active_buffer_id {
-            self.buffers
-                .split_manager_mut()
-                .expect("active window must have a populated split layout")
+            self.split_manager_mut()
                 .set_split_buffer(current_split_id, active_buf_id);
         }
     }
 
-    fn restore_search_options(&mut self, opts: &SearchOptions) {
-        self.search_case_sensitive = opts.case_sensitive;
-        self.search_whole_word = opts.whole_word;
-        self.search_use_regex = opts.use_regex;
-        self.search_confirm_each = opts.confirm_each;
+    /// Apply a workspace's per-field search overrides on top of whatever
+    /// the window already holds.
+    ///
+    /// A `None` field is left alone deliberately: the window's flags are
+    /// what `Window::new` seeded from the `editor.search` preset, so
+    /// "no opinion" resolves to the preset without this needing to read
+    /// the config again.
+    fn apply_search_overrides(&mut self, o: &crate::workspace::SearchOverrides) {
+        if let Some(v) = o.case_sensitive {
+            self.search_case_sensitive = v;
+        }
+        if let Some(v) = o.whole_word {
+            self.search_whole_word = v;
+        }
+        if let Some(v) = o.use_regex {
+            self.search_use_regex = v;
+        }
+        if let Some(v) = o.confirm_each {
+            self.search_confirm_each = v;
+        }
     }
 
     fn restore_prompt_histories(&mut self, histories: &WorkspaceHistories) {
@@ -1768,38 +1927,31 @@ impl crate::app::window::Window {
             histories.replace.len(),
             histories.goto_line.len()
         );
-        for item in &histories.search {
+        // The rings already hold the global history loaded at startup, which
+        // is saved from these same rings on quit — so the two overlap, and a
+        // plain push would repeat the shared entries on every launch.
+        for (key, items) in [
+            ("search", &histories.search),
+            ("replace", &histories.replace),
+            ("goto_line", &histories.goto_line),
+        ] {
             self.prompt_histories
-                .entry("search".to_string())
+                .entry(key.to_string())
                 .or_default()
-                .push(item.clone());
-        }
-        for item in &histories.replace {
-            self.prompt_histories
-                .entry("replace".to_string())
-                .or_default()
-                .push(item.clone());
-        }
-        for item in &histories.goto_line {
-            self.prompt_histories
-                .entry("goto_line".to_string())
-                .or_default()
-                .push(item.clone());
+                .merge_newer(items);
         }
     }
 
     fn restore_file_explorer_settings(&mut self, fe: &FileExplorerState) {
         self.file_explorer_visible = fe.visible;
+        self.file_explorer_closed_by_user = fe.closed_by_user && !fe.visible;
         self.file_explorer_width = fe.width;
         self.file_explorer_side = fe.side;
 
         // Store pending settings (fixes #569); applied when explorer initialises (async).
-        if fe.show_hidden {
-            self.pending_file_explorer_show_hidden = Some(true);
-        }
-        if fe.show_gitignored {
-            self.pending_file_explorer_show_gitignored = Some(true);
-        }
+        // `None` leaves the config default.
+        self.pending_file_explorer_show_hidden = fe.restored_show_hidden();
+        self.pending_file_explorer_show_gitignored = fe.restored_show_gitignored();
 
         // Keep key_context as Normal so the editor (not the explorer) has focus.
         if self.file_explorer_visible && self.file_explorer.is_none() {
@@ -1807,27 +1959,34 @@ impl crate::app::window::Window {
         }
     }
 
-    /// The fresh-session file-explorer default: show the tree for a
-    /// brand-new directory. This is the single rule shared by every way
-    /// of entering a directory — startup restore, the orchestrator
-    /// dock/preview materialization, and the new-window (`fresh <dir>`
-    /// into a running instance) path — all of which funnel their restore
-    /// through [`Editor::restore_window`].
+    /// The file-explorer default for entering a directory, after any
+    /// restore. This is the single rule shared by every way of entering
+    /// one — startup restore, the orchestrator dock/preview
+    /// materialization, and the new-window (`fresh <dir>` into a running
+    /// instance) path — all of which funnel their restore through
+    /// [`Editor::restore_window`]. See [`ExplorerOnEntry`] for each case.
     ///
-    /// It fires *only* when nothing was restored: a restored workspace
-    /// already carries the explorer's persisted visibility (applied by
-    /// [`Window::restore_file_explorer_settings`]), so re-showing here
-    /// would reopen a deliberately-closed explorer on every relaunch.
-    /// `opened_files` suppresses it when the launch opened specific files
-    /// rather than a bare directory. Visibility only — `key_context`
+    /// A restored workspace already carries the explorer's persisted
+    /// visibility (applied by [`Window::restore_file_explorer_settings`]),
+    /// which `Enter` and `Keep` leave alone. Visibility only — `key_context`
     /// stays Normal so the buffer keeps focus, mirroring
     /// `restore_file_explorer_settings`.
     pub(crate) fn apply_fresh_session_explorer_default(
         &mut self,
-        opened_files: bool,
+        entry: ExplorerOnEntry,
         workspace_restored: bool,
     ) {
-        if opened_files || workspace_restored {
+        let show = match entry {
+            ExplorerOnEntry::Keep => return,
+            ExplorerOnEntry::Enter => !workspace_restored,
+            ExplorerOnEntry::Directory => !self.file_explorer_closed_by_user,
+            ExplorerOnEntry::Closed => {
+                // Not the user's close: the next `fresh DIR` still opens it.
+                self.file_explorer_visible = false;
+                return;
+            }
+        };
+        if !show {
             return;
         }
         self.file_explorer_visible = true;
@@ -1853,6 +2012,7 @@ impl crate::app::window::Window {
             Some(bytes) => {
                 let mut b = crate::model::buffer::Buffer::from_bytes(bytes, fs);
                 b.set_file_path(path.to_path_buf());
+                b.set_large_file_threshold(threshold);
                 b
             }
             None => crate::model::buffer::Buffer::new_with_path(threshold, fs, path.to_path_buf()),
@@ -1865,6 +2025,7 @@ impl crate::app::window::Window {
                 &self.resources.grammar_registry,
                 &self.resources.config.languages,
                 self.resources.config.default_language.as_deref(),
+                buffer.filesystem().as_ref(),
             );
         let mut state = EditorState::from_buffer_with_language(buffer, detected);
         state
@@ -1910,14 +2071,23 @@ impl crate::app::window::Window {
             .remote_connection_info()
             .is_some()
         {
+            // The workspace filesystem's rules, bound before the loop so the
+            // `&mut self` call below does not fight the borrow.
+            let style = self.authority().filesystem.style();
             let mut path_to_buffer: HashMap<PathBuf, BufferId> = HashMap::new();
             for rel_path in collect_file_paths_from_states(split_states) {
-                let abs_path = self.root.join(&rel_path);
+                let abs_path = self
+                    .root
+                    .as_host()
+                    .under(style)
+                    .join_rel(&rel_path.to_string_lossy())
+                    .into_path_buf();
                 let buffer_id = self.install_remote_placeholder(&abs_path);
                 path_to_buffer.insert(rel_path, buffer_id);
             }
             return path_to_buffer;
         }
+        self.unopened_files.clear();
         let file_paths = collect_file_paths_from_states(split_states);
         tracing::debug!(
             "Workspace has {} files to restore: {:?}",
@@ -1938,7 +2108,13 @@ impl crate::app::window::Window {
                         tracing::debug!("Opened file {:?} as buffer {:?}", rel_path, buffer_id);
                         path_to_buffer.insert(rel_path, buffer_id);
                     }
-                    Err(e) => tracing::warn!("Failed to open file {:?}: {}", abs_path, e),
+                    Err(e) => {
+                        tracing::warn!("Failed to open file {:?}: {}", abs_path, e);
+                        let state = split_states
+                            .values()
+                            .find_map(|s| s.file_states.get(&rel_path).cloned());
+                        self.hold_unopened_file(rel_path, true, state, &e);
+                    }
                 }
             } else {
                 tracing::debug!("Skipping non-existent file: {:?}", abs_path);
@@ -1991,9 +2167,43 @@ impl crate::app::window::Window {
                         buffer_id
                     );
                 }
-                Err(e) => tracing::warn!("Failed to restore external file {:?}: {}", abs_path, e),
+                Err(e) => {
+                    tracing::warn!("Failed to restore external file {:?}: {}", abs_path, e);
+                    self.hold_unopened_file(abs_path.clone(), false, None, &e);
+                }
             }
         }
+    }
+
+    /// Keep a file that exists but could not be opened in this window's
+    /// workspace (#3532), and tell the user. Its contents are safe on disk;
+    /// only its place in the layout was at stake. `in_tabs` says whether it
+    /// was a split's tab (else it is an `external_files` entry); a file that is
+    /// both is held, and reported, once.
+    fn hold_unopened_file(
+        &mut self,
+        path: PathBuf,
+        in_tabs: bool,
+        state: Option<SerializedFileState>,
+        error: &dyn std::fmt::Display,
+    ) {
+        if let Some(held) = self.unopened_files.iter_mut().find(|f| f.path == path) {
+            held.in_tabs |= in_tabs;
+            held.external |= !in_tabs;
+            return;
+        }
+        self.recovery_notices.push(format!(
+            "Could not open {}: {}. It stays in this workspace and will be \
+             reopened once it can be read.",
+            path.display(),
+            error
+        ));
+        self.unopened_files.push(crate::app::window::UnopenedFile {
+            path,
+            in_tabs,
+            external: !in_tabs,
+            state,
+        });
     }
 
     /// Re-apply read-only flags for files that were locked in the saved workspace.
@@ -2039,10 +2249,10 @@ impl crate::app::window::Window {
                 .map(|(mgr, _)| mgr)
                 .expect("window must have a populated split layout")
                 .root()
-                .get_leaves_with_rects(ratatui::layout::Rect::default())
+                .visible_leaves()
                 .into_iter()
-                .find(|(sid, _, _)| *sid == *leaf_id)
-                .map(|(_, buffer_id, _)| buffer_id);
+                .find(|(sid, _)| *sid == *leaf_id)
+                .map(|(_, buffer_id)| buffer_id);
 
             if let Some(buffer_id) = active_buffer {
                 self.save_buffer_file_state(buffer_id, view_state);
@@ -2060,7 +2270,7 @@ impl crate::app::window::Window {
             None => return,
         };
 
-        let primary_cursor = view_state.cursors.primary();
+        let primary_cursor = view_state.buffer_tab_state().cursors.primary();
         let file_state = SerializedFileState {
             cursor: SerializedCursor {
                 position: primary_cursor.position,
@@ -2068,6 +2278,7 @@ impl crate::app::window::Window {
                 sticky_column: primary_cursor.sticky_column.unwrap_or(0),
             },
             additional_cursors: view_state
+                .buffer_tab_state()
                 .cursors
                 .iter()
                 .skip(1)
@@ -2078,9 +2289,12 @@ impl crate::app::window::Window {
                 })
                 .collect(),
             scroll: SerializedScroll {
-                top_byte: view_state.viewport.top_byte(),
-                top_view_line_offset: view_state.viewport.top_view_line_offset(),
-                left_column: view_state.viewport.left_column,
+                top_byte: view_state.buffer_tab_state().viewport.top_byte(),
+                top_view_line_offset: view_state
+                    .buffer_tab_state()
+                    .viewport
+                    .top_view_line_offset(),
+                left_column: view_state.buffer_tab_state().viewport.left_column,
             },
             view_mode: Default::default(),
             compose_width: None,
@@ -2109,9 +2323,7 @@ impl crate::app::window::Window {
 
     /// Sync this window's active terminal visible screens to their
     /// backing files (so the snapshot captures complete terminal state).
-    pub(crate) fn sync_terminal_backing_files(&self) {
-        use std::io::BufWriter;
-
+    pub(crate) fn sync_terminal_backing_files(&mut self) {
         let terminals_to_sync: Vec<_> = self
             .terminal_buffers
             .values()
@@ -2123,37 +2335,25 @@ impl crate::app::window::Window {
             })
             .collect();
 
+        let fs = crate::app::terminal::terminal_backing_fs();
         for (terminal_id, backing_path) in terminals_to_sync {
+            self.pin_terminal_view_tail(terminal_id);
             if let Some(handle) = self.terminal_manager.get(terminal_id) {
                 if let Ok(mut state) = handle.state.lock() {
-                    // Persist any scrolled-off lines not yet in the file (e.g.
-                    // lines a resize spilled into history on a terminal that was
-                    // never viewed before quitting) so a restored workspace keeps
-                    // the full scrollback.
-                    if let Ok(mut file) = crate::app::terminal::terminal_backing_fs()
-                        .open_file_for_append(&backing_path)
-                    {
-                        let mut writer = BufWriter::new(&mut *file);
-                        if let Err(e) = state.flush_new_scrollback(&mut writer) {
-                            tracing::warn!(
-                                "Failed to flush terminal {:?} scrollback: {}",
-                                terminal_id,
-                                e
-                            );
-                        }
-                    }
-
-                    if let Ok(mut file) = crate::app::terminal::terminal_backing_fs()
-                        .open_file_for_append(&backing_path)
-                    {
-                        let mut writer = BufWriter::new(&mut *file);
-                        if let Err(e) = state.append_visible_screen(&mut writer) {
-                            tracing::warn!(
-                                "Failed to sync terminal {:?} to backing file: {}",
-                                terminal_id,
-                                e
-                            );
-                        }
+                    // Persists scrolled-off lines not yet in the file too
+                    // (e.g. lines a resize spilled into history on a terminal
+                    // that was never viewed before quitting), so a restored
+                    // workspace keeps the full scrollback.
+                    let mut file = crate::services::terminal::BackingFileAt {
+                        fs: fs.as_ref(),
+                        path: &backing_path,
+                    };
+                    if let Err(e) = state.write_backing_file_tail(&mut file) {
+                        tracing::warn!(
+                            "Failed to sync terminal {:?} to backing file: {}",
+                            terminal_id,
+                            e
+                        );
                     }
                 }
             }
@@ -2166,7 +2366,7 @@ impl crate::app::window::Window {
     pub(crate) fn create_unnamed_recovery_buffer(
         &mut self,
         text: &str,
-        recovery_id: String,
+        entry: &crate::services::recovery::RecoveryEntry,
         display_name: String,
     ) -> BufferId {
         let buffer_id = self.alloc_buffer_id();
@@ -2176,19 +2376,10 @@ impl crate::app::window::Window {
             self.resources.config.editor.large_file_threshold_bytes as usize,
             std::sync::Arc::clone(&self.authority().filesystem),
         );
-        state
-            .margins
-            .configure_for_line_numbers(self.resources.config.editor.line_numbers);
-        state.buffer.set_default_line_ending(
-            self.resources
-                .config
-                .editor
-                .default_line_ending
-                .to_line_ending(),
-        );
+        state.apply_unnamed_buffer_config(&self.resources.config);
         state.buffer.insert(0, text);
         state.buffer.set_modified(true);
-        state.buffer.set_recovery_pending(false);
+        state.buffer.set_backed_by(entry.handle());
         self.buffers.insert(buffer_id, state);
 
         let mut log = crate::model::event::EventLog::new();
@@ -2196,7 +2387,7 @@ impl crate::app::window::Window {
         self.event_logs.insert(buffer_id, log);
 
         let mut meta = crate::app::types::BufferMetadata::new();
-        meta.recovery_id = Some(recovery_id);
+        meta.recovery_id = Some(entry.id.clone());
         meta.display_name = display_name;
         self.buffer_metadata.insert(buffer_id, meta);
 
@@ -2217,16 +2408,7 @@ impl crate::app::window::Window {
             self.resources.config.editor.large_file_threshold_bytes as usize,
             std::sync::Arc::clone(&self.authority().filesystem),
         );
-        state
-            .margins
-            .configure_for_line_numbers(self.resources.config.editor.line_numbers);
-        state.buffer.set_default_line_ending(
-            self.resources
-                .config
-                .editor
-                .default_line_ending
-                .to_line_ending(),
-        );
+        state.apply_unnamed_buffer_config(&self.resources.config);
         let manager = crate::view::split::SplitManager::new(buf);
         let active_leaf = manager.active_split();
         let mut view_states = HashMap::new();
@@ -2240,6 +2422,11 @@ impl crate::app::window::Window {
             .insert(buf, crate::app::types::BufferMetadata::new());
         self.event_logs
             .insert(buf, crate::model::event::EventLog::new());
+        // `SplitViewState::with_buffer` above leaves the view on
+        // `BufferViewState::new`'s hard-coded display flags, which ignore
+        // `editor.*` — the same miss as the restore path in #3426. Stamped
+        // after the buffer is in, so the wrap values resolve against it.
+        self.seed_view_config_defaults(active_leaf, buf);
     }
 
     /// Push a recovered buffer's full content to this window's LSP after
@@ -2266,204 +2453,119 @@ impl crate::app::window::Window {
     /// `self.resources`). Returns a map from `recovery_id` to the new
     /// `BufferId`. No focus side-effects — the split-layout restore wires
     /// each buffer into a tab afterwards.
+    ///
+    /// A reference only places a tab. The content is found by its
+    /// workspace stamp whether or not anything refers to it (see
+    /// `Editor::adopt_recovery_for_window`), so a reference whose entry is
+    /// not there — saved, discarded, or held by another running editor — is
+    /// simply dropped, and nothing is stranded by dropping it.
     fn restore_unnamed_buffers(
         &mut self,
         unnamed_buffers: &[UnnamedBufferRef],
     ) -> HashMap<String, BufferId> {
+        use crate::services::recovery::{RecoveryResult, RecoveryService};
+
         let mut unnamed_buffer_map: HashMap<String, BufferId> = HashMap::new();
-        if !self.resources.config.editor.hot_exit || unnamed_buffers.is_empty() {
+        if unnamed_buffers.is_empty() {
             return unnamed_buffer_map;
         }
         tracing::debug!(
             "Restoring {} unnamed buffers from recovery",
             unnamed_buffers.len()
         );
+        let root = self.root.clone();
+        let service = std::sync::Arc::clone(&self.resources.recovery_service);
+        // Which of an earlier version's shared store's entries are this root's
+        let known = RecoveryService::known_workspace_ids(&root, [self.stable_id.clone()]);
+        // Local or remote alike: a reference names its entry, and a remote
+        // workspace restored before its connection is back still has the
+        // local placeholder authority.
+        let entries = service
+            .lock()
+            .unwrap()
+            .list_recoverable(Some((&root, &known)), None);
+
         for unnamed_ref in unnamed_buffers {
-            let entries = match self
-                .resources
-                .recovery_service
-                .lock()
-                .unwrap()
-                .list_recoverable()
-            {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::warn!("Failed to list recovery entries: {}", e);
-                    continue;
-                }
-            };
+            if unnamed_buffer_map.contains_key(&unnamed_ref.recovery_id) {
+                continue;
+            }
             let Some(entry) = entries.iter().find(|e| e.id == unnamed_ref.recovery_id) else {
                 tracing::debug!(
-                    "Recovery file not found for unnamed buffer {}",
+                    "Unnamed buffer {} is not in the recovery store; dropping its tab",
                     unnamed_ref.recovery_id
                 );
                 continue;
             };
-            let loaded = self
-                .resources
-                .recovery_service
-                .lock()
-                .unwrap()
-                .load_recovery(entry);
-            match loaded {
-                Ok(crate::services::recovery::RecoveryResult::Recovered { content, .. }) => {
-                    let text = String::from_utf8_lossy(&content).into_owned();
-                    let buffer_id = self.create_unnamed_recovery_buffer(
-                        &text,
-                        unnamed_ref.recovery_id.clone(),
-                        unnamed_ref.display_name.clone(),
-                    );
-                    unnamed_buffer_map.insert(unnamed_ref.recovery_id.clone(), buffer_id);
-                    tracing::info!(
-                        "Restored unnamed buffer '{}' (recovery_id={})",
-                        unnamed_ref.display_name,
+            let claimed = service.lock().unwrap().claim(entry);
+            let entry = match claimed {
+                Ok(Some(entry)) => entry,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to take over unnamed buffer {}: {e}",
                         unnamed_ref.recovery_id
                     );
+                    continue;
                 }
-                Ok(other) => {
-                    tracing::warn!(
-                        "Unexpected recovery result for unnamed buffer {}: {:?}",
-                        unnamed_ref.recovery_id,
-                        std::mem::discriminant(&other)
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to load recovery for unnamed buffer {}: {}",
-                        unnamed_ref.recovery_id,
-                        e
-                    );
-                }
-            }
-        }
-        unnamed_buffer_map
-    }
-
-    /// Replay hot-exit recovery data onto this window's file-backed
-    /// buffers that were modified when the editor last exited (via the
-    /// shared recovery service in `self.resources`).
-    fn restore_hot_exit_changes(&mut self, path_to_buffer: &HashMap<PathBuf, BufferId>) {
-        if !self.resources.config.editor.hot_exit {
-            return;
-        }
-        let entries = self
-            .resources
-            .recovery_service
-            .lock()
-            .unwrap()
-            .list_recoverable()
-            .unwrap_or_default();
-        if entries.is_empty() {
-            return;
-        }
-        let buffer_ids: Vec<BufferId> = path_to_buffer.values().copied().collect();
-        for buffer_id in buffer_ids {
-            let file_path = self
-                .buffers
-                .get(&buffer_id)
-                .and_then(|s| s.buffer.file_path().map(|p| p.to_path_buf()));
-            let Some(file_path) = file_path else { continue };
-
-            let recovery_id = self
-                .resources
-                .recovery_service
-                .lock()
-                .unwrap()
-                .get_buffer_id(Some(&file_path));
-            let Some(entry) = entries.iter().find(|e| e.id == recovery_id) else {
-                continue;
             };
-            let loaded = self
-                .resources
-                .recovery_service
-                .lock()
-                .unwrap()
-                .load_recovery(entry);
-            match loaded {
-                Ok(crate::services::recovery::RecoveryResult::Recovered { content, .. }) => {
-                    let mut mutated = false;
-                    if let Some(state) = self.buffers.get_mut(&buffer_id) {
-                        let current_len = state.buffer.total_bytes();
-                        let text = String::from_utf8_lossy(&content).into_owned();
-                        let current = state.buffer.get_text_range_mut(0, current_len).ok();
-                        let current_text = current
-                            .as_ref()
-                            .map(|b| String::from_utf8_lossy(b).into_owned());
-                        if current_text.as_deref() != Some(&text) {
-                            state.buffer.delete(0..current_len);
-                            state.buffer.insert(0, &text);
-                            state.buffer.set_modified(true);
-                            state.buffer.set_recovery_pending(false);
-                            // Wholesale replacement, never described as edit
-                            // damage. See `WrapIndex::damage_all`.
-                            state.wrap_indices.damage_all();
-                            mutated = true;
-                            tracing::info!(
-                                "Restored unsaved changes for {:?} from hot exit recovery",
-                                file_path
-                            );
-                        }
-                    }
-                    if let Some(log) = self.event_logs.get_mut(&buffer_id) {
-                        log.clear_saved_position();
-                    }
-                    if mutated {
-                        self.sync_lsp_after_recovery_replay(buffer_id);
-                    }
-                }
-                Ok(crate::services::recovery::RecoveryResult::RecoveredChunks {
-                    chunks, ..
-                }) => {
-                    let mut mutated = false;
-                    if let Some(state) = self.buffers.get_mut(&buffer_id) {
-                        for chunk in chunks.into_iter().rev() {
-                            let text = String::from_utf8_lossy(&chunk.content).into_owned();
-                            if chunk.original_len > 0 {
-                                state
-                                    .buffer
-                                    .delete(chunk.offset..chunk.offset + chunk.original_len);
-                            }
-                            state.buffer.insert(chunk.offset, &text);
-                        }
-                        state.buffer.set_modified(true);
-                        state.buffer.set_recovery_pending(false);
-                        mutated = true;
-                        tracing::info!(
-                            "Restored unsaved changes (chunked) for {:?} from hot exit recovery",
-                            file_path
-                        );
-                    }
-                    if let Some(log) = self.event_logs.get_mut(&buffer_id) {
-                        log.clear_saved_position();
-                    }
-                    if mutated {
-                        self.sync_lsp_after_recovery_replay(buffer_id);
-                    }
-                }
-                Ok(crate::services::recovery::RecoveryResult::OriginalFileModified {
-                    original_path,
+            let loaded = service.lock().unwrap().load_recovery(&entry);
+            let content = match loaded {
+                Ok(RecoveryResult::Recovered { content, .. }) => content,
+                Ok(RecoveryResult::RecoveredPartial {
+                    content,
+                    expected,
+                    found,
                     ..
                 }) => {
-                    let name = original_path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy();
-                    tracing::warn!("{} changed on disk; unsaved changes not restored", name);
-                    self.set_status_message(format!(
-                        "{} changed on disk; unsaved changes not restored",
-                        name
-                    ));
-                }
-                Ok(_) => {} // Corrupted, NotFound — skip
-                Err(e) => {
-                    tracing::debug!(
-                        "Failed to load hot exit recovery for {:?}: {}",
-                        file_path,
-                        e
+                    // Short, but it is the only copy there is — this buffer
+                    // has no file to fall back on — so it comes back. Never
+                    // quietly, though: the user has to know the tail is
+                    // missing before they save it anywhere.
+                    tracing::warn!(
+                        "Unnamed buffer {} recovered partially: {found} of {expected} \
+                         bytes were on disk",
+                        unnamed_ref.recovery_id
                     );
+                    self.recovery_notices.push(format!(
+                        "Recovered '{}' incompletely: {found} of {expected} bytes. \
+                         The end is missing — check before saving.",
+                        unnamed_ref.display_name
+                    ));
+                    content
                 }
-            }
+                // Kept for a later look, and said out loud: dropping it
+                // quietly would look like the work was lost.
+                other => {
+                    tracing::warn!(
+                        "Unnamed buffer {} could not be recovered: {:?}",
+                        unnamed_ref.recovery_id,
+                        other
+                    );
+                    if let Err(e) = service.lock().unwrap().give_back(&entry.id) {
+                        tracing::warn!("Failed to put back recovery entry {}: {e}", entry.id);
+                    }
+                    self.recovery_notices.push(format!(
+                        "Unsaved buffer '{}' could not be read from the recovery store; \
+                         it is kept there.",
+                        unnamed_ref.display_name
+                    ));
+                    continue;
+                }
+            };
+            let text = String::from_utf8_lossy(&content).into_owned();
+            let buffer_id = self.create_unnamed_recovery_buffer(
+                &text,
+                &entry,
+                unnamed_ref.display_name.clone(),
+            );
+            unnamed_buffer_map.insert(unnamed_ref.recovery_id.clone(), buffer_id);
+            tracing::info!(
+                "Restored unnamed buffer '{}' (recovery_id={})",
+                unnamed_ref.display_name,
+                unnamed_ref.recovery_id
+            );
         }
+        unnamed_buffer_map
     }
 
     /// Apply a loaded workspace's layout onto this window — now fully
@@ -2491,6 +2593,10 @@ impl crate::app::window::Window {
             workspace.split_states.len()
         );
 
+        // This window now continues an on-disk workspace, which is what
+        // licenses a later all-virtual save to overwrite it.
+        self.workspace_restored = true;
+
         // Adopt the snapshot's durable identity: the window continues the
         // persisted workspace rather than starting a new one, so saves keep
         // landing in the same id-keyed file instead of minting a sibling on
@@ -2498,6 +2604,15 @@ impl crate::app::window::Window {
         // minted one — the next save re-keys the file under it.
         if let Some(id) = &workspace.stable_id {
             self.stable_id = id.clone();
+        }
+
+        // Same reasoning for when it was last focused: the window continues
+        // the persisted workspace, so it inherits that workspace's place in
+        // the recency order rather than the "now" its construction seeded.
+        // A legacy snapshot without the field keeps the seed, which is the
+        // right answer too — it is being materialized, so it is current.
+        if let Some(focused) = workspace.last_focused_at {
+            self.last_focused_at = focused;
         }
 
         // Window-local config override (the rest of the overrides mutate
@@ -2511,7 +2626,15 @@ impl crate::app::window::Window {
                 .store(mouse_enabled, std::sync::atomic::Ordering::Relaxed);
         }
 
-        self.restore_search_options(&workspace.search_options);
+        // A workspace with nothing of its own to say keeps the window on
+        // the `editor.search` preset it was constructed with (issue
+        // #3212). An old file speaks through the superseded key instead,
+        // and only for the toggles it can prove the user set.
+        if let Some(overrides) = &workspace.search_overrides {
+            self.apply_search_overrides(overrides);
+        } else if let Some(legacy) = &workspace.legacy_search_options {
+            self.apply_search_overrides(&legacy.legacy_overrides());
+        }
         self.restore_prompt_histories(&workspace.histories);
         self.restore_file_explorer_settings(&workspace.file_explorer);
 
@@ -2553,11 +2676,14 @@ impl crate::app::window::Window {
         }
 
         self.restore_bookmarks_from_workspace(&workspace.bookmarks, &path_to_buffer);
+        self.closed_files = crate::app::closed_files::ClosedFiles::from_paths(
+            workspace.closed_files.iter().map(|p| self.root.join(p)),
+        );
         self.clean_orphaned_buffers();
         self.log_restore_summary(session_name);
-
-        // Replay hot-exit changes onto the file-backed buffers we opened.
-        self.restore_hot_exit_changes(&path_to_buffer);
+        // The opened files' unsaved changes are replayed by the caller
+        // (`Editor::restore_workspace_for`), with the rest of this
+        // workspace's unsaved work.
     }
 
     /// Build a `Window` directly from a persisted `Workspace`: construct
@@ -2569,11 +2695,11 @@ impl crate::app::window::Window {
         id: fresh_core::WindowId,
         label: impl Into<String>,
         root: PathBuf,
-        authority: crate::services::authority::Authority,
+        connection: std::sync::Arc<crate::services::authority::Connection>,
         resources: crate::app::window_resources::WindowResources,
         workspace: &Workspace,
     ) -> Self {
-        let mut window = Self::new(id, label, root, authority, resources);
+        let mut window = Self::new(id, label, root, connection, resources);
         window.seed_initial_layout();
         window.apply_workspace_layout(workspace, None);
         window
@@ -2609,7 +2735,9 @@ impl crate::app::window::Window {
                 let (cols, rows) = handle
                     .map(|h| h.size())
                     .unwrap_or((self.terminal_width, self.terminal_height));
-                let cwd = handle.and_then(|h| h.cwd());
+                // Where the shell is *now*, not where it was spawned: a
+                // terminal the user `cd`'d elsewhere must come back there.
+                let cwd = handle.and_then(|h| h.current_working_dir());
                 let shell = handle
                     .map(|h| h.shell().to_string())
                     .unwrap_or_else(crate::services::terminal::detect_shell);
@@ -2657,6 +2785,10 @@ impl crate::app::window::Window {
                     agent_resume,
                     exited: None,
                     title,
+                    // A live terminal is respawned by restore, so its
+                    // auto-named tab re-derives the name from the reborn
+                    // process — there is nothing to carry.
+                    auto_title: None,
                     script_access: self.terminal_has_script_access(terminal_id),
                 });
             }
@@ -2706,6 +2838,10 @@ impl crate::app::window::Window {
                 // The pre-exit tab title, not the "(exited)" form the tab is
                 // showing now — restore re-applies the marker itself.
                 title: exited.title.clone(),
+                // Same, for a tab that was auto-named: this terminal comes
+                // back dead, with no foreground process to re-derive a name
+                // from (#3074).
+                auto_title: exited.auto_title.clone(),
                 script_access: exited.script_access,
             });
         }
@@ -2736,12 +2872,8 @@ impl crate::app::window::Window {
             mgr.labels(),
         );
 
-        let active_buffers: HashMap<LeafId, BufferId> = mgr
-            .root()
-            .get_leaves_with_rects(ratatui::layout::Rect::default())
-            .into_iter()
-            .map(|(leaf_id, buffer_id, _)| (leaf_id, buffer_id))
-            .collect();
+        let active_buffers: HashMap<LeafId, BufferId> =
+            mgr.root().visible_leaves().into_iter().collect();
 
         let mut split_states = HashMap::new();
         for (leaf_id, view_state) in view_states {
@@ -2758,29 +2890,40 @@ impl crate::app::window::Window {
             );
             split_states.insert(leaf_id.0 .0, serialized);
         }
+        let active_split = SplitId::from(mgr.active_split()).0;
+        hold_unopened_files_in_states(&self.unopened_files, &mut split_states, active_split);
 
         let file_explorer = if let Some(explorer) = self.file_explorer.as_ref() {
             let expanded_dirs = get_expanded_dirs(explorer, &self.root);
             FileExplorerState {
                 visible: self.file_explorer_visible,
+                closed_by_user: self.file_explorer_closed_by_user && !self.file_explorer_visible,
                 width: self.file_explorer_width,
                 side: self.file_explorer_side,
                 expanded_dirs,
-                scroll_offset: explorer.get_scroll_offset(),
-                show_hidden: explorer.ignore_patterns().show_hidden(),
-                show_gitignored: explorer.ignore_patterns().show_gitignored(),
+                scroll_offset: explorer.window_top(),
+                show_hidden_files: Some(explorer.ignore_patterns().show_hidden()),
+                show_gitignored_files: Some(explorer.ignore_patterns().show_gitignored()),
+                sections: Vec::new(),
+                ..FileExplorerState::default()
             }
         } else {
             FileExplorerState {
                 visible: self.file_explorer_visible,
+                closed_by_user: self.file_explorer_closed_by_user && !self.file_explorer_visible,
                 width: self.file_explorer_width,
                 side: self.file_explorer_side,
                 expanded_dirs: Vec::new(),
                 scroll_offset: 0,
-                show_hidden: false,
-                show_gitignored: false,
+                // An explorer never built this session still owes the window
+                // what the workspace restored for it.
+                show_hidden_files: self.pending_file_explorer_show_hidden,
+                show_gitignored_files: self.pending_file_explorer_show_gitignored,
+                sections: Vec::new(),
+                ..FileExplorerState::default()
             }
-        };
+        }
+        .with_legacy_keys();
 
         let cfg = &self.resources.config.editor;
         let config_overrides = WorkspaceConfigOverrides {
@@ -2827,29 +2970,55 @@ impl crate::app::window::Window {
             open_file: Vec::new(),
         };
 
-        let search_options = SearchOptions {
+        // Per field: each option that differs from the `editor.search`
+        // preset is this workspace's to remember, and each option that
+        // matches it has nothing to remember, so the preset keeps
+        // applying there. Writing all four the moment one of them
+        // diverges would freeze the other three against every future
+        // config change — silently, with nothing in the UI to explain it
+        // — which is the trap the superseded `search_options` key fell
+        // into. Query Replace setting `confirm_each` programmatically
+        // makes that easy to hit by accident, which is why the split
+        // matters rather than being a nicety.
+        let preset = &self.config().editor.search;
+        let live = SearchOptions {
             case_sensitive: self.search_case_sensitive,
             whole_word: self.search_whole_word,
             use_regex: self.search_use_regex,
             confirm_each: self.search_confirm_each,
         };
+        let overrides = crate::workspace::SearchOverrides::between(preset, &live);
+        let search_overrides = (!overrides.is_empty()).then_some(overrides);
 
         let bookmarks = serialize_bookmarks(&self.bookmarks, &self.buffer_metadata, &self.root);
+        let closed_files = self
+            .closed_files
+            .relative_to(&*self.authority().filesystem, &self.root);
 
-        let external_files: Vec<PathBuf> = self
+        let mut external_files: Vec<PathBuf> = self
             .buffer_metadata
             .values()
             .filter(|meta| !meta.hidden_from_tabs && !meta.is_virtual())
             .filter_map(|meta| meta.file_path())
+            // Unnamed buffers are saved in `unnamed_buffers`.
+            .filter(|abs_path| !abs_path.as_os_str().is_empty())
             .filter(|abs_path| abs_path.strip_prefix(&self.root).is_err())
             .cloned()
             .collect();
+        // Files the restore could not open keep their place (#3532).
+        for held in self.unopened_files.iter().filter(|f| f.external) {
+            if !external_files.contains(&held.path) {
+                external_files.push(held.path.clone());
+            }
+        }
 
         let read_only_files: Vec<PathBuf> = self
             .buffer_metadata
             .values()
             .filter(|meta| !meta.hidden_from_tabs && !meta.is_virtual())
-            .filter(|meta| meta.read_only)
+            // Read-only because another editor has it open is not a lock
+            // the user put on it
+            .filter(|meta| meta.open_elsewhere.unwrap_or(meta.read_only))
             .filter_map(|meta| meta.file_path().cloned())
             .filter(|p| !p.as_os_str().is_empty())
             .map(|p| {
@@ -2859,31 +3028,36 @@ impl crate::app::window::Window {
             })
             .collect();
 
-        let unnamed_buffers: Vec<UnnamedBufferRef> = if self.resources.config.editor.hot_exit {
-            self.buffer_metadata
-                .iter()
-                .filter_map(|(buffer_id, meta)| {
-                    let path = meta.file_path()?;
-                    if !path.as_os_str().is_empty() {
-                        return None;
-                    }
-                    if meta.hidden_from_tabs || meta.is_virtual() {
-                        return None;
-                    }
-                    let state = self.buffers.get(buffer_id)?;
-                    if state.buffer.total_bytes() == 0 {
-                        return None;
-                    }
-                    let recovery_id = meta.recovery_id.clone()?;
-                    Some(UnnamedBufferRef {
-                        recovery_id,
-                        display_name: meta.display_name.clone(),
-                    })
+        // Layout only, whatever `hot_exit` says: where the tab goes. Whether
+        // there is content for it is the recovery store's to say, and a
+        // reference to work that was saved or discarded is dropped on restore.
+        let mut unnamed_buffers: Vec<UnnamedBufferRef> = self
+            .buffer_metadata
+            .iter()
+            .filter_map(|(buffer_id, meta)| {
+                let path = meta.file_path()?;
+                if !path.as_os_str().is_empty() {
+                    return None;
+                }
+                if meta.hidden_from_tabs || meta.is_virtual() {
+                    return None;
+                }
+                let state = self.buffers.get(buffer_id)?;
+                if state.buffer.total_bytes() == 0 {
+                    return None;
+                }
+                let recovery_id = meta.recovery_id.clone()?;
+                Some(UnnamedBufferRef {
+                    recovery_id,
+                    display_name: meta.display_name.clone(),
                 })
-                .collect()
-        } else {
-            Vec::new()
-        };
+            })
+            .collect();
+        // One record per recovery entry. A buffer adopted twice was saved
+        // twice, and the list grew by one on every switch back to this
+        // workspace (issue #3476). A list already duplicated heals here.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        unnamed_buffers.retain(|r| seen.insert(r.recovery_id.clone()));
 
         Workspace {
             version: WORKSPACE_VERSION,
@@ -2894,8 +3068,10 @@ impl crate::app::window::Window {
             config_overrides,
             file_explorer,
             histories,
-            search_options,
+            search_overrides,
+            legacy_search_options: None,
             bookmarks,
+            closed_files,
             terminals,
             external_files,
             read_only_files,
@@ -2905,6 +3081,12 @@ impl crate::app::window::Window {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            // Carried through from the window rather than stamped here: this
+            // records when the workspace was last *focused*, and a save is
+            // not a focus. At quit every materialized window is captured in
+            // the same instant, so stamping here would make them all equally
+            // recent and the "reopen where I was" pick meaningless.
+            last_focused_at: Some(self.last_focused_at),
             // Workspace identity (windows.json is gone — the per-dir
             // workspace file is the sole record).
             label: Some(self.label.clone()),
@@ -3176,7 +3358,7 @@ fn serialize_split_view_state(
 
     // Serialize file states for ALL buffers in keyed_states (not just the active one)
     let mut file_states = HashMap::new();
-    for (buffer_id, buf_state) in &view_state.keyed_states {
+    for (buffer_id, buf_state) in view_state.buffer_states() {
         let Some(meta) = buffer_metadata.get(buffer_id) else {
             continue;
         };
@@ -3278,27 +3460,12 @@ fn serialize_split_view_state(
         );
     }
 
-    // Active buffer's view_mode/compose_width for the split-level fields (backward compat)
-    let active_view_mode = active_buffer
-        .and_then(|id| view_state.keyed_states.get(&id))
-        .map(|bs| match bs.view_mode {
-            ViewMode::Source => SerializedViewMode::Source,
-            ViewMode::PageView => SerializedViewMode::PageView,
-        })
-        .unwrap_or(SerializedViewMode::Source);
-    let active_compose_width = active_buffer
-        .and_then(|id| view_state.keyed_states.get(&id))
-        .and_then(|bs| bs.compose_width);
-
     SerializedSplitViewState {
         open_tabs,
         active_tab_index,
         open_files,
         active_file_index,
         file_states,
-        tab_scroll_offset: view_state.tab_scroll_offset,
-        view_mode: active_view_mode,
-        compose_width: active_compose_width,
     }
 }
 
@@ -3326,6 +3493,38 @@ fn serialize_bookmarks(
                 })
         })
         .collect()
+}
+
+/// Write the files a restore could not open back into the captured split
+/// states (#3532), each as a tab at the end of the active split — its exact
+/// split may be gone — with its saved cursor state. A file the window has
+/// since opened is already in some split and is left where it is.
+fn hold_unopened_files_in_states(
+    unopened: &[crate::app::window::UnopenedFile],
+    split_states: &mut HashMap<usize, SerializedSplitViewState>,
+    active_split: usize,
+) {
+    for file in unopened.iter().filter(|f| f.in_tabs) {
+        let already_listed = split_states.values().any(|s| {
+            s.open_tabs
+                .iter()
+                .any(|t| matches!(t, SerializedTabRef::File(p) if *p == file.path))
+        });
+        if already_listed {
+            continue;
+        }
+        let Some(state) = split_states.get_mut(&active_split) else {
+            continue;
+        };
+        state
+            .open_tabs
+            .push(SerializedTabRef::File(file.path.clone()));
+        if let Some(file_state) = &file.state {
+            state
+                .file_states
+                .insert(file.path.clone(), file_state.clone());
+        }
+    }
 }
 
 /// Collect all unique file paths from split_states
@@ -3365,7 +3564,7 @@ fn get_expanded_dirs(
     for node in tree.all_nodes() {
         if node.is_expanded() && node.is_dir() {
             // Get the path and make it relative to working_dir
-            if let Ok(rel_path) = node.entry.path.strip_prefix(working_dir) {
+            if let Ok(rel_path) = node.entry.path.as_path().strip_prefix(working_dir) {
                 expanded.push(rel_path.to_path_buf());
             }
         }

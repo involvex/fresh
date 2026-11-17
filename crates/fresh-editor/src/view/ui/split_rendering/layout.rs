@@ -1,21 +1,17 @@
 //! Layout & geometry helpers for split panes.
 //!
 //! Everything in this module deals with rectangles, view anchors, viewport
-//! bounds, view preferences, and per-split tab configuration. Nothing here
+//! bounds and view preferences. Nothing here
 //! depends on any shared render-time "mega struct".
 
 use crate::model::buffer::Buffer;
 use crate::model::cursor::Cursors;
-use crate::model::event::{BufferId, LeafId, SplitDirection};
+use crate::model::event::LeafId;
 use crate::state::{EditorState, ViewMode};
-use crate::view::split::{SplitViewState, TabTarget};
-use crate::view::theme::Theme;
+use crate::view::split::SplitViewState;
 use crate::view::ui::view_pipeline::ViewLine;
 use crate::view::viewport::Viewport;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
-use ratatui::widgets::Paragraph;
-use ratatui::widgets::Widget;
 use std::collections::HashMap;
 
 /// Anchor describing where to start rendering within a slice of view lines.
@@ -25,19 +21,10 @@ pub(super) struct ViewAnchor {
 
 /// Layout for compose (centered page) mode: the effective render area and
 /// the side paddings.
-pub(super) struct ComposeLayout {
+pub(crate) struct ComposeLayout {
     pub render_area: Rect,
     pub left_pad: u16,
     pub right_pad: u16,
-}
-
-/// Rectangle partitioning for one split: tabs, content, vertical scrollbar,
-/// horizontal scrollbar.
-pub(super) struct SplitLayout {
-    pub tabs_rect: Rect,
-    pub content_rect: Rect,
-    pub scrollbar_rect: Rect,
-    pub horizontal_scrollbar_rect: Rect,
 }
 
 /// View-level preferences resolved from `SplitViewState` (with fallback
@@ -51,72 +38,6 @@ pub(super) struct ViewPreferences {
     pub show_line_numbers: bool,
     /// Per-split current line highlight visibility (from BufferViewState).
     pub highlight_current_line: bool,
-}
-
-/// Partition a split area into tabs / content / scrollbar rectangles.
-pub(super) fn split_layout(
-    split_area: Rect,
-    tab_bar_visible: bool,
-    show_vertical_scrollbar: bool,
-    show_horizontal_scrollbar: bool,
-) -> SplitLayout {
-    let tabs_height = if tab_bar_visible { 1u16 } else { 0u16 };
-    let scrollbar_width = if show_vertical_scrollbar { 1u16 } else { 0u16 };
-    let hscrollbar_height = if show_horizontal_scrollbar {
-        1u16
-    } else {
-        0u16
-    };
-
-    let tabs_rect = Rect::new(split_area.x, split_area.y, split_area.width, tabs_height);
-    let content_rect = Rect::new(
-        split_area.x,
-        split_area.y + tabs_height,
-        split_area.width.saturating_sub(scrollbar_width),
-        split_area
-            .height
-            .saturating_sub(tabs_height)
-            .saturating_sub(hscrollbar_height),
-    );
-    let scrollbar_rect = Rect::new(
-        split_area.x + split_area.width.saturating_sub(scrollbar_width),
-        split_area.y + tabs_height,
-        scrollbar_width,
-        split_area
-            .height
-            .saturating_sub(tabs_height)
-            .saturating_sub(hscrollbar_height),
-    );
-    let horizontal_scrollbar_rect = Rect::new(
-        split_area.x,
-        split_area.y + split_area.height.saturating_sub(hscrollbar_height),
-        split_area.width.saturating_sub(scrollbar_width),
-        hscrollbar_height,
-    );
-
-    SplitLayout {
-        tabs_rect,
-        content_rect,
-        scrollbar_rect,
-        horizontal_scrollbar_rect,
-    }
-}
-
-/// Return the open-buffer list and tab scroll offset for a split.
-pub(super) fn split_buffers_for_tabs(
-    split_view_states: Option<&HashMap<LeafId, SplitViewState>>,
-    split_id: LeafId,
-    buffer_id: BufferId,
-) -> (Vec<TabTarget>, usize) {
-    if let Some(view_states) = split_view_states {
-        if let Some(view_state) = view_states.get(&split_id) {
-            return (
-                view_state.open_buffers.clone(),
-                view_state.tab_scroll_offset,
-            );
-        }
-    }
-    (vec![TabTarget::Buffer(buffer_id)], 0)
 }
 
 /// Sync viewport width/height to `content_rect`, and ensure the primary
@@ -178,12 +99,12 @@ pub(super) fn resolve_view_preferences(
     if let Some(view_states) = split_view_states {
         if let Some(view_state) = view_states.get(&split_id) {
             return ViewPreferences {
-                view_mode: view_state.view_mode.clone(),
-                compose_width: view_state.compose_width,
-                compose_column_guides: view_state.compose_column_guides.clone(),
-                rulers: view_state.rulers.clone(),
-                show_line_numbers: view_state.show_line_numbers,
-                highlight_current_line: view_state.highlight_current_line,
+                view_mode: view_state.buffer_tab_state().view_mode.clone(),
+                compose_width: view_state.buffer_tab_state().compose_width,
+                compose_column_guides: view_state.buffer_tab_state().compose_column_guides.clone(),
+                rulers: view_state.buffer_tab_state().rulers.clone(),
+                show_line_numbers: view_state.buffer_tab_state().show_line_numbers,
+                highlight_current_line: view_state.buffer_tab_state().highlight_current_line,
             };
         }
     }
@@ -265,13 +186,15 @@ pub(super) fn calculate_compose_layout(
     }
 }
 
-/// A line whose content reaches this many bytes is treated as "over-long": it
-/// already fills (far past) the visible row, and with horizontal scrolling
-/// (line-wrap off) it occupies a single screen row. `LineIterator` also splits
-/// such lines into chunks of `MAX_LINE_BYTES` (100 KB) and yields each chunk as
-/// a separate "line", so without a guard `calculate_viewport_end` would walk
-/// chunk-by-chunk hundreds of KB into the line. Kept in step with that limit.
-const OVERLONG_LINE_BYTES: usize = 100_000;
+/// How far [`calculate_viewport_end`] scans for one line's end.
+///
+/// It needs the end only to clamp a window that the byte budget already caps at
+/// a few screenfuls, so a line whose end is further away than this is treated
+/// as running to the end of the buffer — which, for the files where that
+/// happens, it does. It is also where the walk stops: a line this long already
+/// fills (far past) its single unwrapped row, and there is nothing below it on
+/// screen to walk to.
+const VIEWPORT_END_SCAN_BYTES: usize = 64 * 1024;
 
 /// Compute the byte offset just past the last visible line of the viewport.
 ///
@@ -300,29 +223,39 @@ pub(super) fn calculate_viewport_end(
     // clamp so we keep the previous full-line behavior.
     let visible_byte_budget = left_column.saturating_add(viewport_width).saturating_mul(4);
 
-    let mut iter_temp = state
-        .buffer
-        .line_iterator(viewport_start, estimated_line_length);
+    // Line *starts* walked, not lines read: the window's end only needs each
+    // line's position and the byte budget above. Reading the lines meant
+    // pulling a 100 KB piece per row of a file that is one long line, every
+    // frame, to compute a bound the budget already caps.
+    let _ = estimated_line_length;
     let mut viewport_end = viewport_start;
+    let mut line_start = viewport_start;
+    let buffer_len = state.buffer.len();
     for _ in 0..visible_count {
-        let Some((line_start, line_content)) = iter_temp.next_line() else {
-            break;
+        let next = state
+            .buffer
+            .next_line_start_within(line_start, VIEWPORT_END_SCAN_BYTES);
+        let line_end = match next {
+            // The next line starts where this one ends — after its terminator,
+            // which is what the reader's own `line_start + content.len()` gave.
+            Some(next) => next,
+            None => buffer_len,
         };
-        let line_len = line_content.len();
-        let line_end = line_start + line_len;
 
         if visible_byte_budget == 0 {
             viewport_end = line_end;
-            continue;
+        } else {
+            viewport_end = line_end.min(line_start.saturating_add(visible_byte_budget));
         }
 
-        let clamped_end = line_end.min(line_start.saturating_add(visible_byte_budget));
-        viewport_end = clamped_end;
-
-        // An over-long line fills its single (unwrapped) screen row and may be
-        // yielded as multiple 100 KB chunks; the clamp above already covers the
-        // visible window, so stop rather than walking the rest of the line.
-        if line_len >= OVERLONG_LINE_BYTES {
+        // No line break within reach is the over-long line this walk used to
+        // guard against by measuring: the clamp above already covers the
+        // visible window, and there is nothing below such a line to walk to.
+        let Some(next) = next else {
+            break;
+        };
+        line_start = next;
+        if line_start >= buffer_len {
             break;
         }
     }
@@ -358,33 +291,4 @@ pub(super) fn visible_source_span(rows: &[ViewLine]) -> Option<(usize, usize)> {
         }
     }
     span
-}
-
-/// Draw the separator line between two splits.
-pub(super) fn render_separator(
-    buf: &mut ratatui::buffer::Buffer,
-    direction: SplitDirection,
-    x: u16,
-    y: u16,
-    length: u16,
-    theme: &Theme,
-) {
-    let style = Style::default()
-        .fg(theme.split_separator_fg)
-        .bg(theme.editor_bg);
-    match direction {
-        SplitDirection::Horizontal => {
-            let line_area = Rect::new(x, y, length, 1);
-            let line_text = "─".repeat(length as usize);
-            let paragraph = Paragraph::new(line_text).style(style);
-            paragraph.render(line_area, buf);
-        }
-        SplitDirection::Vertical => {
-            for offset in 0..length {
-                let cell_area = Rect::new(x, y + offset, 1, 1);
-                let paragraph = Paragraph::new("│").style(style);
-                paragraph.render(cell_area, buf);
-            }
-        }
-    }
 }

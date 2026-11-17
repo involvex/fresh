@@ -15,7 +15,7 @@ use std::rc::Rc;
 use crate::ambient::{Ambient, AmbientNode};
 use crate::behavior::Behavior;
 use crate::desc::{Event, Handler, Node};
-use crate::element::{Arena, ElementId, Txn};
+use crate::element::{Arena, ElementId, Txn, Undo};
 use crate::render::geom::{Point, Rect, Size};
 use crate::render::spec::LayoutSpec;
 
@@ -289,6 +289,7 @@ impl<'a, M: 'static> InitCx<'a, M> {
                 scope: f.scope,
                 focus_within: f.focus_within,
                 autofocus: f.autofocus,
+                entry: f.entry.clone(),
             },
         ));
         self.register(f)
@@ -309,12 +310,6 @@ impl<'a, M: 'static> InitCx<'a, M> {
     /// rather than by the borrow.
     pub fn geometry(&mut self) -> crate::services::GeomHandle {
         crate::services::GeomHandle::new(self.geom_store.clone(), self.sched.clone(), self.id)
-    }
-
-    /// A handle to another element's geometry, addressed by the element id an
-    /// owner already holds.
-    pub fn geometry_of(&mut self, id: ElementId) -> crate::services::GeomHandle {
-        crate::services::GeomHandle::new(self.geom_store.clone(), self.sched.clone(), id)
     }
 
     /// Read an ambient as a snapshot. This does **not** create a dependency:
@@ -437,6 +432,16 @@ pub struct Ui<M> {
     pub(crate) renderer: Box<dyn Renderer>,
     pub(crate) pending_dispose: Vec<ElementId>,
     pub(crate) txn: Option<Txn<M>>,
+    /// The last transaction's journal, emptied and kept for the next one.
+    ///
+    /// A journal is per-transaction and dropped at commit, so it used to grow
+    /// from nothing on every reconcile: a dhat profile put 22 MB of a
+    /// two-minute session in 318 reallocations of this vector, averaging 71 KB
+    /// each, which is a `Vec` repeatedly doubling its way back to the size it
+    /// had last frame. Handing the emptied allocation to the next transaction
+    /// keeps the capacity and drops the regrowth; the entries themselves are
+    /// still dropped at commit, as before.
+    pub(crate) spare_undo: Vec<Undo<M>>,
     pub(crate) trace: bool,
     pub(crate) build_log: Vec<ElementId>,
 
@@ -450,10 +455,34 @@ pub struct Ui<M> {
     /// Set while a render object is being measured, so a second measurement of
     /// the same subtree in one frame can be counted.
     pub(crate) measuring: bool,
+    /// Set while a [`Ui::layout_only`] pass runs, so the passes below can tell
+    /// "compute this layout" from "a frame happened".
+    ///
+    /// It changes nothing about the geometry — the same build, the same
+    /// measure, the same arrange. What it changes is that the things a frame
+    /// *owes the application* are not owed to a question: an arrival handed
+    /// over, a queued scroll applied. Those are reactions to a frame having
+    /// happened, and a caller that fires them to ask where something is
+    /// changes the thing it is asking about.
+    pub(crate) geometry_pass: bool,
     pub(crate) frame_no: u64,
     pub(crate) frame_size: Size,
     /// Relayout boundaries awaiting a measure pass.
     pub(crate) layout_dirty: Vec<crate::render::object::RenderId>,
+    /// Rectangles the host supplied for keys no element carries.
+    ///
+    /// An [`Anchor::Node`] names a thing; usually that thing is an element and
+    /// the tree knows where it is. Sometimes it is a point *inside* a host leaf
+    /// — a text caret, a terminal's cursor — and the tree hands that leaf a
+    /// rectangle and knows nothing about what is in it. The owner of the space
+    /// supplies the rectangle instead, and the anchor is still a name rather
+    /// than a number in a description.
+    ///
+    /// The web platform calls this an anchor element with a virtual reference;
+    /// the rule here is the same one: whoever owns the space answers where the
+    /// thing is. Cleared at the start of every frame, because a stale caret is
+    /// worse than none.
+    pub(crate) host_anchors: std::collections::HashMap<crate::key::Key, Rect>,
     /// Out-of-flow layers found by the last arrange walk, with their parents.
     pub(crate) pending_layers: Vec<(
         crate::render::object::RenderId,
@@ -463,14 +492,35 @@ pub struct Ui<M> {
 
     /// Pointer state.
     pub(crate) hover: Vec<ElementId>,
+    /// Where the pointer last was, or `None` once it has left. Read at paint
+    /// by nodes that draw their own affordance — see [`Geom::pointer`].
+    pub(crate) pointer: Option<Point>,
     pub(crate) captured: Option<ElementId>,
-    pub(crate) press: Option<(Vec<ElementId>, crate::event::MouseButton)>,
+    /// The drag the capture is, if it is one ([`crate::Event::start_drag`]).
+    pub(crate) drag: Option<crate::hit::Drag>,
+    /// The elements a press landed on, which button it was, and which press
+    /// of a run it was — the last so the `Click` it completes can report it.
+    pub(crate) press: Option<(Vec<ElementId>, crate::event::MouseButton, u8)>,
 
     /// Focus state. Neither the application nor the component declares it.
     pub(crate) focus: Option<ElementId>,
     pub(crate) focus_selection: crate::event::SelectionOnFocus,
     /// Where focus was before a modal took it.
     pub(crate) focus_restore: Option<ElementId>,
+    /// The confinement that held [`Self::focus_restore`] when it was saved.
+    /// A restore into a subtree a layer confined is void once that layer is
+    /// gone — see [`Ui::apply_autofocus`].
+    pub(crate) focus_restore_scope: Option<ElementId>,
+    /// Per scope, what its `autofocus` mark named the last time a settle
+    /// looked. See [`Ui::apply_autofocus`]: a mark that *moved* since then is
+    /// a decision the description made, and focus follows it; a mark that
+    /// merely disagrees with focus is the ring having moved on its own.
+    pub(crate) settled_marks: std::collections::HashMap<ElementId, Option<crate::focus::MarkId>>,
+    /// The confinement focus was inside at the last settle, if any. A
+    /// confinement that is gone on the next settle while focus is still
+    /// within its element has *released* that focus — see
+    /// `follow_moved_mark`.
+    pub(crate) settled_scope: Option<ElementId>,
     pub(crate) traversal: Box<dyn crate::focus::TraversalPolicy>,
     pub(crate) shortcuts: Vec<crate::focus::Shortcut>,
     /// Messages produced outside a dispatch call, delivered with the next one.
@@ -486,6 +536,15 @@ pub struct Ui<M> {
     pub(crate) geom_store: Rc<RefCell<crate::services::GeomStore>>,
     /// The viewport whose scrollbar is being dragged, between press and release.
     pub(crate) scrollbar_drag: Option<crate::render::object::RenderId>,
+    /// Where in the thumb the drag was grabbed, in rows from its top.
+    ///
+    /// **A press on the thumb picks it up; a press on the track jumps to it.**
+    /// Without this every press put the thumb's *top* under the pointer, so
+    /// grabbing a thumb anywhere but its first row shifted it up by however
+    /// far down it had been grabbed — a press that moved the viewport without
+    /// the pointer moving at all. Zero for a press on the bare track, which is
+    /// the jump.
+    pub(crate) scrollbar_grab: i32,
 }
 
 impl<M: 'static> Default for Ui<M> {
@@ -507,6 +566,7 @@ impl<M: 'static> Ui<M> {
             renderer,
             pending_dispose: Vec::new(),
             txn: None,
+            spare_undo: Vec::new(),
             trace: false,
             build_log: Vec::new(),
             render: Default::default(),
@@ -514,17 +574,24 @@ impl<M: 'static> Ui<M> {
             focus_tree: Default::default(),
             focus_roots: Vec::new(),
             measuring: false,
+            geometry_pass: false,
             frame_no: 0,
             frame_size: Size::ZERO,
             layout_dirty: Vec::new(),
+            host_anchors: std::collections::HashMap::new(),
             pending_layers: Vec::new(),
             spec: LayoutSpec::default(),
             hover: Vec::new(),
+            pointer: None,
             captured: None,
+            drag: None,
             press: None,
             focus: None,
             focus_selection: crate::event::SelectionOnFocus::None,
             focus_restore: None,
+            focus_restore_scope: None,
+            settled_marks: std::collections::HashMap::new(),
+            settled_scope: None,
             traversal: Box::new(crate::focus::ReadingOrder),
             shortcuts: crate::focus::default_shortcuts(),
             pending_messages: Vec::new(),
@@ -533,29 +600,146 @@ impl<M: 'static> Ui<M> {
             anchored: Vec::new(),
             geom_store: Rc::new(RefCell::new(crate::services::GeomStore::default())),
             scrollbar_drag: None,
+            scrollbar_grab: 0,
         }
     }
 
     /// One frame: take a freshly built root description, reconcile it, lay it
     /// out for a terminal of `size`, and return the display list.
+    ///
+    /// [`Self::lay_out`] followed by [`Self::paint`]; a host with a pass of
+    /// its own to run between the two calls them itself.
     pub fn frame(&mut self, root: Node<M>, size: Size) -> &LayoutSpec {
+        self.lay_out(root, size);
+        self.paint()
+    }
+
+    /// The first half of a frame: reconcile `root`, lay it out for a
+    /// terminal of `size`, and settle what a laid-out tree decides — focus
+    /// moving to an autofocused element, a queued reveal, a builder that ran
+    /// during layout.
+    ///
+    /// **Why a frame has two halves.** A host leaf's paint may depend on
+    /// work the application does over the *laid-out* geometry: a text pane
+    /// formats its rows for the rectangle layout gave it, and where its
+    /// caret lands is an answer of that pass. Painting in the same call as
+    /// layout would put that leaf's paint a frame behind its own geometry.
+    /// So a host lays the tree out, runs its pass at the rectangles the tree
+    /// reports, and then asks for the display list — which paints the leaf
+    /// from what the pass settled.
+    ///
+    /// Unlike [`Self::layout_only`] this is a frame's own first half, so the
+    /// reactions to it happen; only the display list is deferred to
+    /// [`Self::paint`].
+    pub fn lay_out(&mut self, root: Node<M>, size: Size) {
+        self.host_anchors.clear();
         self.run_flush(Some(root));
         self.flush_layout(size);
         self.settle(size);
+    }
+
+    /// The second half of a frame: the display list of the tree as
+    /// [`Self::lay_out`] left it.
+    pub fn paint(&mut self) -> &LayoutSpec {
+        self.flush_paint(self.frame_size);
+        &self.spec
+    }
+
+    /// The geometry a frame would produce, without the frame.
+    ///
+    /// A host that needs a rectangle out of a description it has just built —
+    /// how tall a region came out, where a row landed — needs the build and
+    /// the layout: a description *states* its geometry, and measuring it is
+    /// the only thing that answers. It does not need what a frame additionally
+    /// *does*. Focus moving to an autofocused element and the application
+    /// being told so, a queued reveal scrolling a viewport, a ticker
+    /// advancing, a display list nothing will draw: those happen because a
+    /// frame was shown. A caller that fires them in order to ask a question
+    /// changes the thing it is measuring — once per question asked.
+    ///
+    /// Reconciliation is *not* one of them, and still runs: an element that
+    /// does not exist has no rectangle, so a new description has to be mounted
+    /// before it can be measured. That is also why this is a query against the
+    /// live tree rather than a scratch copy of it — a description carries
+    /// handles ([`Anchor`](crate::behavior::Anchor)) that bind to whichever
+    /// tree reconciles them, so laying the same description out in a second
+    /// tree would take the binding away from the first.
+    ///
+    /// Read the answer with [`Ui::rect_of`] and its neighbours. There is no
+    /// display list to return, because nothing was painted; the one from the
+    /// last real frame is left alone, which is what is on the screen. The next
+    /// [`Ui::frame`] is unaffected — it reconciles whatever description it is
+    /// given, over this one.
+    pub fn layout_only(&mut self, root: Node<M>, size: Size) {
+        // Host anchors are neither cleared nor published here: they are the
+        // host's answer for what lives inside its own leaves, `frame` clears
+        // them because it is about to collect a fresh set, and a query has no
+        // fresh set to collect.
+        let was = std::mem::replace(&mut self.geometry_pass, true);
+        self.run_flush(Some(root));
+        self.flush_layout(size);
+        // The half of `settle` that is part of computing a layout rather than
+        // a reaction to one. A builder that runs *during* the layout pass — a
+        // `layout_reader`, or the `Component` inside one that fills a windowed
+        // list's rows — raises its dirt after the layout drain has finished
+        // its own loop, and geometry read without draining it is the geometry
+        // of the description *before* that build. Autofocus is the other half,
+        // and is the reaction.
+        self.flush_layout_dirt(size);
+        self.geometry_pass = was;
+    }
+
+    /// Tell the tree where something inside a host leaf is, so an
+    /// [`Anchor::Node`] naming it can resolve.
+    ///
+    /// The tree gives a host a rectangle and knows nothing about its interior,
+    /// so a layer anchored to a text caret names something only the host can
+    /// locate. This is how the host answers. See [`Ui::host_anchors`].
+    ///
+    /// An element carrying the key always wins: this fills a gap, it cannot
+    /// shadow a real node. Anchors are per-frame and [`Ui::frame`] clears them.
+    /// Call [`Ui::place_layers`] afterwards to put the layers where the new
+    /// anchors say.
+    pub fn set_host_anchor(&mut self, key: crate::key::Key, rect: Rect) {
+        self.host_anchors.insert(key, rect);
+    }
+
+    /// Place every layer again, against the anchors as they now stand, and
+    /// repaint.
+    ///
+    /// For a host whose own pipeline is interleaved with the tree's: it needs
+    /// the frame laid out before it can work out where its caret is, and the
+    /// caret before a layer hanging off it can be placed. Re-running the frame
+    /// would reconcile a description that has not changed and pump every
+    /// behaviour a second time; this re-walks the arrangement and repaints,
+    /// which is what actually has to happen.
+    pub fn place_layers(&mut self, size: Size) -> &LayoutSpec {
+        self.replace_layers(size);
         self.flush_paint(size);
         &self.spec
     }
 
     /// Whether a `frame` or `tick` would change anything: a dirty element, a
-    /// state mutation waiting to apply, a message produced out of band, or a
-    /// behavior with something to deliver or a ticker running.
+    /// re-layout waiting to run, a state mutation waiting to apply, a message
+    /// produced out of band, or a behavior with something to deliver or a
+    /// ticker running.
     ///
     /// This surfaces the mark-and-flush state the scheduler already keeps; it
     /// is a whole-frame yes/no, not per-cell damage tracking. A host loop reads
     /// it to skip quiet frames entirely — compute and paint — instead of
     /// redrawing at a fixed rate.
+    ///
+    /// **`layout_dirty` counts, and used not to.** Not every change goes
+    /// through an element: a pointer landing on an overflow cap, a wheel
+    /// moving a window, anything that marks retained geometry rather than a
+    /// description. `flush_layout_dirt` has always treated that queue as work
+    /// to do; a host asking whether a frame is owed was told "no" and the cap
+    /// stayed dark until something else happened to ask for one.
     pub fn needs_frame(&self) -> bool {
-        if self.sched.borrow().has_pending() || !self.pending_messages.is_empty() {
+        if self.sched.borrow().has_pending()
+            || !self.pending_messages.is_empty()
+            || !self.layout_dirty.is_empty()
+        {
             return true;
         }
         self.behaviour_hosts.iter().any(|id| {
@@ -622,6 +806,16 @@ impl<M: 'static> Ui<M> {
     /// inert, and a leaf that is inert takes no raw input. A leaf *inside* the
     /// exclusive layer still does. This is what replaces a
     /// `blocks_terminal_input` flag.
+    ///
+    /// **And raw input is the keyboard's.** A leaf takes it only while the
+    /// keyboard is its own: focus is on its focus holder or inside it, or
+    /// nothing holds focus at all. A leaf's holder is the nearest element at
+    /// or above it that registers for focus — a leaf wrapped in a
+    /// `focusable` is that focusable's content, and focus on the wrapper is
+    /// focus on the leaf — or the leaf itself when nothing above it does. A
+    /// popup or a panel that holds the keyboard above a terminal takes the
+    /// keys the terminal would have taken raw, and the gate says so without
+    /// a list of which layers block a PTY.
     pub fn raw_input_leaves(&self) -> impl Iterator<Item = ElementId> + '_ {
         let exclusive: Vec<ElementId> = self
             .pending_layers
@@ -641,6 +835,24 @@ impl<M: 'static> Ui<M> {
             .filter(move |e| {
                 exclusive.is_empty() || exclusive.iter().any(|x| self.is_ancestor(*x, *e))
             })
+            .filter(move |e| {
+                let holder = self.focus_holder_of(*e);
+                self.focus.is_none_or(|f| self.is_within(f, holder))
+            })
+    }
+
+    /// The element whose focus is `e`'s keyboard: the nearest at or above it
+    /// with a focus registration, or `e` itself when none has one.
+    fn focus_holder_of(&self, e: ElementId) -> ElementId {
+        let mut cur = Some(e);
+        while let Some(x) = cur {
+            let Some(el) = self.arena.get(x) else { break };
+            if el.focus.is_some() {
+                return x;
+            }
+            cur = el.parent;
+        }
+        e
     }
 
     /// Whether `anc` is `e` or one of its ancestors.
@@ -734,12 +946,177 @@ impl<M: 'static> Ui<M> {
             .unwrap_or(0)
     }
 
+    /// The rows the keyed **wrapped text run** was shaped into, and the string
+    /// they index: `text[indent..] == whole[src]` for each, and the gaps
+    /// between them are what the wrap dropped.
+    ///
+    /// **The third piece of L5, beside a byte caret and a byte press.** Those
+    /// two answer at paint time and at press time; a key handler asking
+    /// "which byte is one rendered row below this one" is at neither, has no
+    /// width, and has no tree — so a surface whose `Up`/`Down` mean *rendered*
+    /// rows had to keep a second, shadow wrap of the text just to have rows to
+    /// count. This hands back the wrap layout already did, at the width layout
+    /// settled on, and [`cell_of`](crate::render::prim::cell_of) /
+    /// [`byte_of`](crate::render::prim::byte_of) turn it into the answer.
+    ///
+    /// `None` where the key names nothing, or names something that is not a
+    /// text run. Frame-wide, so it is right where the key is unique — the same
+    /// standing as [`Ui::item_window`].
+    ///
+    /// Takes `&mut self` because a render object is owned by its node: it is
+    /// taken out to be asked and put straight back, exactly as layout takes it.
+    /// [`Self::text_rows`], searched from `root` rather than the frame — the
+    /// same standing as [`Self::item_window_in`]. A widget's key is unique
+    /// only inside the panel that owns it, so a host asking on behalf of one
+    /// panel names that panel's subtree, and two panels holding a run under
+    /// the same key each get their own rows.
+    pub fn text_rows_in(
+        &mut self,
+        root: ElementId,
+        key: &crate::key::Key,
+    ) -> Option<(String, Vec<crate::render::prim::Row>)> {
+        let el = self.find_by_key_in(root, key)?;
+        self.text_rows_of(el)
+    }
+
+    pub fn text_rows(
+        &mut self,
+        key: &crate::key::Key,
+    ) -> Option<(String, Vec<crate::render::prim::Row>)> {
+        let el = self.find_by_key(key)?;
+        self.text_rows_of(el)
+    }
+
+    fn text_rows_of(&mut self, el: ElementId) -> Option<(String, Vec<crate::render::prim::Row>)> {
+        let r = self.render_for(el)?;
+        let mut obj = self.render.get_mut(r)?.obj.take()?;
+        let out = obj
+            .as_any_mut()
+            .downcast_ref::<crate::render::prim::TextRender>()
+            .map(|t| {
+                let (whole, rows) = t.shaped_rows();
+                (whole.to_string(), rows.to_vec())
+            });
+        self.render.get_mut(r).expect("live render node").obj = Some(obj);
+        out
+    }
+
     /// A viewport's scroll offset and the size of the content behind it.
+    ///
+    /// Both are in the unit that viewport's offset counts, which only
+    /// [`Ui::band`] says. See [`Ui::window`].
     pub fn scroll(&self, id: ElementId) -> (Point, Size) {
         self.render_for(id)
             .and_then(|r| self.render.get(r))
             .map(|n| (n.data.scroll, n.data.content))
             .unwrap_or_default()
+    }
+
+    /// A viewport's window, **in the unit its offset counts**. `None` for an
+    /// element that is not scrolling anything.
+    ///
+    /// The unit is not the rectangle's. A cell-scrolling window's offset is a
+    /// row and its window is its own height, so `window.h == rect_of(id).h`;
+    /// an item-scrolling one's offset is an index and `window.h` is *how many
+    /// items* fit, which is that height divided by the band — four, not
+    /// twelve, for three-row cards in a twelve-row box. [`Ui::band`] is what
+    /// tells them apart: `Some(_)` means items, `None` means cells. Reading
+    /// the height for both put a list of three-row cards eleven items down
+    /// inside a "fifteen-row" window, and drew a thumb that filled its own
+    /// track.
+    ///
+    /// The horizontal axis is cells either way: an item-scrolled window counts
+    /// items down and cells across.
+    pub fn window(&self, id: ElementId) -> Option<Rect> {
+        self.render_for(id)
+            .and_then(|r| self.render.get(r))
+            .and_then(|n| n.data.window)
+    }
+
+    /// The band a viewport's items sit in, when its offset counts items.
+    /// `None` where it counts cells — there an item is not a thing.
+    ///
+    /// This is the unit tag for [`Ui::window`] and [`Ui::scroll`], and for
+    /// [`Band::Cells`](crate::render::object::Band::Cells) it is also the
+    /// number that converts between them: one item is that many cells tall.
+    pub fn band(&self, id: ElementId) -> Option<crate::render::object::Band> {
+        self.render_for(id)
+            .and_then(|r| self.render.get(r))
+            .and_then(|n| n.data.band)
+    }
+
+    /// How many items a keyed widget is showing, and which — the window of the
+    /// nearest item-scrolling viewport at or under the element carrying `key`,
+    /// **in items**: `window.y` is the first item on screen and `window.h` is
+    /// how many of them fit. (Across, it is still cells: an item-scrolled
+    /// window scrolls only down.)
+    ///
+    /// **The descend is the contract, not an implementation detail.** A key
+    /// belongs to whoever wrote it, and what they wrote it on is a widget: a
+    /// [`List`](crate::widgets::List) keyed by its owner carries that key on
+    /// the component element, while the viewport that owns the window is one
+    /// or two elements inside it — under the focus wrapper, when the list
+    /// takes focus. So this searches at and under the key rather than only at
+    /// it, nearest first, and the first window found is the answer.
+    ///
+    /// `None` where the key names nothing, where nothing under it scrolls, or
+    /// where what scrolls counts *cells* — a text area has no items, and
+    /// answering with its height in rows would be the units conflated again,
+    /// under a name that promises they are not. [`Ui::window`] is the way to
+    /// ask that one.
+    ///
+    /// Same standing as [`Ui::rect_of`]: an outside caller reading what the
+    /// last layout decided, from the tree that decided it.
+    ///
+    /// This searches the whole frame, so it is right only where the key is
+    /// unique frame-wide; [`Ui::item_window_in`] scopes the search to one
+    /// subtree, and also reports the window's height in cells.
+    pub fn item_window(&self, key: &crate::key::Key) -> Option<Rect> {
+        let root = self.root?;
+        Some(self.item_window_in(root, key)?.0)
+    }
+
+    /// [`Ui::item_window`] searched inside one subtree, with the window's own
+    /// height **in cells** beside it.
+    ///
+    /// Two answers because they are two units and neither derives the other
+    /// without the band. `Rect::h` is items; the `u16` is how many cells those
+    /// items occupy, which is the viewport's own laid-out height. A caller
+    /// that needs both — a widget whose selection steps items while its scroll
+    /// offset counts rows — would otherwise have to multiply by a band it
+    /// cannot see, and §6i of the retained-mode plan is the record of what
+    /// guessing that number costs.
+    ///
+    /// The root is the scope, for the reason [`Ui::find_by_key_in`] states: a
+    /// key is unique only where its owner says it is, and two panels in one
+    /// frame can each key a list `"items"`. `item_window` is this from the
+    /// tree's root, which is right only when the caller knows the key is
+    /// unique frame-wide.
+    pub fn item_window_in(&self, root: ElementId, key: &crate::key::Key) -> Option<(Rect, u16)> {
+        let el = self.find_by_key_in(root, key)?;
+        let r = self.viewport_at_or_under(el)?;
+        let n = self.render.get(r)?;
+        let window = n.data.band.is_some().then_some(n.data.window).flatten()?;
+        Some((window, n.data.rect.h))
+    }
+
+    /// The nearest scrolling render node at or under `el`, breadth-first, so
+    /// that a viewport nested inside one of the key's own rows never wins over
+    /// the widget's own.
+    fn viewport_at_or_under(&self, el: ElementId) -> Option<crate::render::object::RenderId> {
+        let mut queue = std::collections::VecDeque::from([el]);
+        while let Some(e) = queue.pop_front() {
+            let Some(node) = self.arena.get(e) else {
+                continue;
+            };
+            if let Some(r) = node.render {
+                if self.render.get(r).is_some_and(|n| n.data.window.is_some()) {
+                    return Some(r);
+                }
+            }
+            queue.extend(node.children.iter().copied());
+        }
+        None
     }
 
     /// Move a viewport's window. Framework-owned state: it survives rebuilds
@@ -768,7 +1145,15 @@ impl<M: 'static> Ui<M> {
 
         // 0. Hand over anything that arrived from elsewhere since the last
         //    frame. Between frames, never during build, layout or paint.
-        self.pump_behaviors();
+        //
+        //    Not on a geometry pass. That is between frames too, but it is not
+        //    one: delivering here would put an arrival into the tree earlier
+        //    for having been asked a question, and would advance every ticker
+        //    once per question — making how often the host asks where
+        //    something is visible in what the tree does.
+        if !self.geometry_pass {
+            self.pump_behaviors();
+        }
 
         // 1. Apply queued state mutations, then mark their elements for build.
         //    A mutation aimed at an element that has since been disposed is
@@ -840,15 +1225,45 @@ impl<M: 'static> Ui<M> {
         self.process_disposals();
     }
 
-    /// Settle focus, and rebuild once more if doing so changed anything.
+    /// Settle focus and layout, and rebuild once more if either moved, so
+    /// paint sees a tree that has finished moving.
     ///
     /// Autofocus happens after layout, because which scope is active depends on
     /// which layers resolved. A widget that mirrors focus reacts by marking
     /// itself, so without this second pass a focus ring would appear one frame
     /// late.
+    ///
+    /// **There are two kinds of dirt here and both have to be asked about.**
+    /// The scheduler knows what still needs *building*; the render tree knows
+    /// what still needs *measuring*, and that list can be non-empty while the
+    /// scheduler's is clear. A `layout_reader` rebuilds during the layout pass
+    /// — and so does a `Component` inside one, which is how a windowed
+    /// [`List`](crate::widgets::List) fills its rows — so the dirt its
+    /// reconcile raises arrives after `drain_layout` has finished its own
+    /// loop. Asking only the scheduler carried that dirt into the next frame
+    /// and painted the subtree one frame behind the description it was built
+    /// from: the editor's settings dialog kept the previous category selected
+    /// until some later, unrelated event drew again.
+    ///
+    /// **And the dirt is flushed on both sides of the settle.** A builder that
+    /// runs during the layout pass raises its dirt after the drain has
+    /// finished its own loop, so before this runs there can be elements the
+    /// description has stated and the tree has not yet built — a footer row's
+    /// buttons inside a dialog's box, both of them readers. Settling focus
+    /// over that tree finds no mark where the description put one, rests
+    /// focus on the scope, and follows the mark a frame late. So what the
+    /// layout pass raised is built first, focus settles over the tree that
+    /// will be painted, and what settling itself dirtied is built after.
     fn settle(&mut self, size: Size) {
+        self.flush_layout_dirt(size);
         self.apply_autofocus();
-        if self.sched.borrow().has_pending() {
+        self.flush_layout_dirt(size);
+    }
+
+    /// Build and measure what a layout-pass builder left pending — see
+    /// [`Self::settle`] and [`Self::layout_only`].
+    fn flush_layout_dirt(&mut self, size: Size) {
+        if self.sched.borrow().has_pending() || !self.layout_dirty.is_empty() {
             self.run_flush(None);
             self.flush_layout(size);
         }

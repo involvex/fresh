@@ -245,14 +245,35 @@ fn test_zero_width_block_selection_keeps_word_highlight() {
     harness
         .send_key(KeyCode::Down, KeyModifiers::ALT | KeyModifiers::SHIFT)
         .unwrap();
-    harness.render().unwrap();
-    harness.render().unwrap();
 
-    assert_eq!(
-        bg(&harness, col(1), line2),
-        word_bg,
-        "a zero-width block selection paints nothing, so it must not drop the word highlight"
-    );
+    // The move carries the one cursor down — a block selection is a single
+    // cursor with a `block_anchor`, not a second one — so it lands at line 2
+    // column 7, inside "alpha". The surviving highlight is therefore
+    // "alpha"'s, on both its occurrences (line 1 columns 0..5, line 2 columns
+    // 5..10), in the same background the "beta" pair had.
+    //
+    // Waited for, because the overlay pass debounces the target by 150 ms of
+    // *wall clock* (`ReferenceHighlightOverlay::update`, `Instant::now()`)
+    // and only advances that clock inside a render. Two bare `render()` calls
+    // after the key would read the frame where the target has changed but the
+    // debounce has not yet elapsed — the previous word's overlays, still on
+    // screen. That is what this test used to assert, and it held only while
+    // the two renders stayed within 150 ms of each other: on a loaded runner
+    // they straddle the debounce, the highlight has already moved to the word
+    // actually under the cursor, and the assertion fails. It failed exactly
+    // that way on the Windows and macOS legs while passing on Linux.
+    //
+    // Waiting for the settled state tests the behaviour instead of the
+    // timing, and it cannot pass vacuously: while "beta" is still the target,
+    // neither cell below carries the highlight, and before the fix — where
+    // the block's linear anchor counted as a selection — the word overlays
+    // were cleared outright and the multi-line range matched nothing, so
+    // nothing was ever highlighted again and this wait never resolves.
+    harness
+        .wait_until(|h| bg(h, col(1), line1) == word_bg && bg(h, col(6), line2) == word_bg)
+        .expect(
+            "a zero-width block selection paints nothing, so it must not drop the word highlight",
+        );
 }
 
 /// A single-line block selection is one contiguous run of text, so its
@@ -303,5 +324,54 @@ fn test_single_line_block_selection_highlights_its_matches() {
         bg(&harness, col(3), line2),
         bg(&harness, col(9), line2),
         "the match stops at \"bet\""
+    );
+}
+
+/// A debounced highlight has to ask for the frame it needs.
+///
+/// `ReferenceHighlightOverlay::update` runs *inside* a render and does
+/// nothing until its 150 ms delay has elapsed, so the highlight lands only on
+/// a frame something else causes. An editor sitting still after a cursor move
+/// causes none: the update stayed armed, the word under the cursor kept the
+/// previous word's highlight, and the next keystroke — the first thing to
+/// force a frame — made it jump. That is the flicker people see while typing,
+/// and in a daemon, whose loop renders only on events, it is every time.
+///
+/// The invariant is that the arming itself is visible to the event loop:
+/// `next_periodic_redraw_deadline` is where the LSP spinner, the animations
+/// and the paste fallback declare the same thing, and it is what the TUI, the
+/// web loop and now the daemon wait on. Before the fix this returned `None`
+/// with an update armed, and nothing woke to apply it.
+#[test]
+fn test_an_armed_occurrence_highlight_asks_for_its_frame() {
+    let mut harness = EditorTestHarness::new(80, 24).unwrap();
+    harness
+        .load_buffer_from_text("alpha beta gamma\nbeta alpha delta\n")
+        .unwrap();
+    harness.render().unwrap();
+
+    // Land the cursor on "beta" and render once, which is what arms the
+    // debounce. Deliberately not `wait_until`: waiting drives renders of its
+    // own, which is exactly the accident this test says the editor must not
+    // depend on.
+    for _ in 0..6 {
+        harness
+            .send_key(KeyCode::Right, KeyModifiers::NONE)
+            .unwrap();
+    }
+    harness.render().unwrap();
+
+    let deadline = harness.editor().next_periodic_redraw_deadline();
+    let deadline = deadline.expect(
+        "an armed occurrence highlight must publish a redraw deadline, or nothing \
+         wakes the loop to apply it",
+    );
+    assert!(
+        deadline
+            <= std::time::Instant::now()
+                + std::time::Duration::from_millis(
+                    fresh::view::reference_highlight_overlay::DEFAULT_DEBOUNCE_MS,
+                ),
+        "the deadline must be the debounce's own, not something further out"
     );
 }

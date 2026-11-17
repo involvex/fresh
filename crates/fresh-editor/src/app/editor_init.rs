@@ -87,6 +87,42 @@ fn set_dot_path(root: &mut serde_json::Value, path: &str, value: serde_json::Val
     cur.as_object_mut().unwrap().insert(last.to_string(), value);
 }
 
+/// Translate a `setSetting`-style dot path into an RFC 6901 JSON pointer.
+///
+/// `~` and `/` are escaped because a pointer says so; no config key contains
+/// either today, and a silently mangled pointer is worse than a pedantic one.
+fn json_pointer_for_dot_path(path: &str) -> String {
+    let mut pointer = String::new();
+    for segment in path.split('.').filter(|s| !s.is_empty()) {
+        pointer.push('/');
+        pointer.push_str(&segment.replace('~', "~0").replace('/', "~1"));
+    }
+    pointer
+}
+
+/// Whether `pointer` names a setting the config write path will actually
+/// keep, holding a value of the shape that setting expects.
+///
+/// The runtime twin of the `config_keys` validator: build a document holding
+/// only this pointer, push it through `PartialConfig` — the shape
+/// `save_changes_to_layer` validates writes against — and check the value
+/// survives unchanged. An unknown key is dropped by serde on the way through
+/// and fails here; so does a real key given the wrong type.
+fn pointer_is_a_real_setting(path: &str, pointer: &str, value: &serde_json::Value) -> bool {
+    if pointer.is_empty() {
+        return false;
+    }
+    let mut doc = serde_json::Value::Object(Default::default());
+    set_dot_path(&mut doc, path, value.clone());
+    let Ok(partial) = serde_json::from_value::<crate::partial_config::PartialConfig>(doc) else {
+        return false;
+    };
+    let Ok(round) = serde_json::to_value(&partial) else {
+        return false;
+    };
+    round.pointer(pointer) == Some(value)
+}
+
 /// Discover startup plugin directories and load every plugin found in them.
 ///
 /// Extracted from `Editor::with_options` to keep the constructor readable:
@@ -102,7 +138,9 @@ fn set_dot_path(root: &mut serde_json::Value, path: &str, value: serde_json::Val
 ///   discovered plugin configs back into `config`, and write the aggregate
 ///   `.d.ts` declarations.
 ///
-/// No-op when the plugin manager is inactive.
+/// Returns the enabled plugins' manifests (`services::plugins::manifest`),
+/// read synchronously on both load paths so the host can lay out for them
+/// before the first frame. No-op when the plugin manager is inactive.
 #[allow(clippy::too_many_arguments)]
 fn load_startup_plugins(
     plugin_manager: &std::rc::Rc<RwLock<PluginManager>>,
@@ -114,9 +152,9 @@ fn load_startup_plugins(
     #[cfg_attr(not(feature = "embed-plugins"), allow(unused_variables))]
     enable_embedded_plugins: bool,
     defer_plugin_load: bool,
-) {
+) -> HashMap<String, crate::services::plugins::manifest::PluginManifest> {
     if !plugin_manager.read().unwrap().is_active() {
-        return;
+        return HashMap::new();
     }
     let mut plugin_dirs: Vec<std::path::PathBuf> = vec![];
 
@@ -169,6 +207,13 @@ fn load_startup_plugins(
             working_dir
         );
     }
+
+    // Before any plugin (or a TypeScript server for an opened file) runs,
+    // so the declarations file written after loading is never new to it.
+    crate::init_script::ensure_plugin_declarations(&dir_context.config_dir);
+
+    let manifests =
+        crate::services::plugins::manifest::read_manifests(&plugin_dirs, &config.plugins);
 
     if defer_plugin_load {
         // Async startup path: hand each dir + a trailing
@@ -314,6 +359,7 @@ fn load_startup_plugins(
         let declarations = plugin_manager.read().unwrap().plugin_declarations();
         crate::init_script::write_plugin_declarations(&dir_context.config_dir, &declarations);
     }
+    manifests
 }
 
 /// Pre-built non-trivial inputs handed to [`Editor::from_parts`].
@@ -352,6 +398,7 @@ pub(super) struct EditorParts {
     // Keybindings + buffer-id allocation
     pub(super) keybindings: Arc<RwLock<KeybindingResolver>>,
     pub(super) buffer_id_alloc: crate::app::window_resources::BufferIdAllocator,
+    pub(super) terminal_id_alloc: crate::services::terminal::TerminalIdAllocator,
     pub(super) next_buffer_id: usize,
 
     // Terminal
@@ -360,7 +407,7 @@ pub(super) struct EditorParts {
     pub(super) color_capability: crate::view::color_support::ColorCapability,
 
     // Async / IO
-    pub(super) tokio_runtime: Option<Arc<tokio::runtime::Runtime>>,
+    pub(super) tokio_runtime: Option<crate::services::runtime::LiveRuntime>,
     pub(super) async_bridge: AsyncBridge,
     pub(super) local_filesystem: Arc<dyn FileSystem + Send + Sync>,
 
@@ -402,6 +449,17 @@ pub(super) struct EditorParts {
 
     /// Editor-wide event broadcaster, shared with every WindowResources.
     pub(super) event_broadcaster: crate::model::control_event::EventBroadcaster,
+
+    /// This editor is the one a bare `fresh` launched into. See
+    /// [`Editor::orchestrator_mode`] for what it changes.
+    pub(super) orchestrator_mode: bool,
+
+    /// See [`Editor::file_launch`].
+    pub(super) file_launch: bool,
+
+    /// Whether every persisted workspace is already in `windows` (see
+    /// [`Editor::ensure_all_workspaces_loaded`]).
+    pub(super) all_workspaces_loaded: bool,
 }
 
 /// Load the per-window prompt-history rings (search / replace / goto-line)
@@ -411,7 +469,7 @@ fn load_prompt_histories(
     dir_context: &DirectoryContext,
 ) -> HashMap<String, crate::input::input_history::InputHistory> {
     let mut histories = HashMap::new();
-    for history_name in ["search", "replace", "goto_line"] {
+    for history_name in super::workspace::GLOBAL_PROMPT_HISTORIES {
         let path = dir_context.prompt_history_path(history_name);
         let history = crate::input::input_history::InputHistory::load_from_file(&path)
             .unwrap_or_else(|e| {
@@ -439,7 +497,7 @@ fn load_prompt_histories(
 ///
 /// Each shell's `splits` stays `None`; the first dive into it re-warms exactly
 /// like a freshly created window.
-fn build_persisted_window_shells(
+pub(super) fn build_persisted_window_shells(
     persisted_env: Option<&crate::app::orchestrator_persistence::PersistedWindows>,
     active_came_from_pick: bool,
     active_window_id: fresh_core::WindowId,
@@ -526,7 +584,9 @@ fn build_persisted_window_shells(
             id,
             ps.label.clone(),
             ps.root.clone(),
-            shell_authority,
+            std::sync::Arc::new(crate::services::authority::Connection::plain(
+                shell_authority,
+            )),
             shell_resources.clone(),
         );
         shell.terminal_width = width;
@@ -548,6 +608,11 @@ fn build_persisted_window_shells(
     (windows, dormant_remote)
 }
 
+/// The longest a `--diff` launch holds back the editor's frames waiting for
+/// its view (see [`Editor::holds_launch_frames`]): past it, a plugin that
+/// failed without saying so leaves the editor usable rather than blank.
+pub const DIFF_LAUNCH_HOLD: std::time::Duration = std::time::Duration::from_secs(3);
+
 impl Editor {
     /// Lightweight constructor. Takes the non-trivial editor-global
     /// resources via [`EditorParts`] and fills in every other field
@@ -562,11 +627,23 @@ impl Editor {
     /// than capturing a new clock — so two editors built from the
     /// same parts agree on "now".
     pub(super) fn from_parts(parts: EditorParts) -> Self {
+        // Held twice on purpose: the `Ui` reads and writes through it, and the
+        // editor keeps a handle so it can forget a closed window's scope. See
+        // `Editor::shell_store`.
+        let shell_store = std::rc::Rc::new(fresh_ui::behavior::MemStore::new());
         let editor = Editor {
+            seat_focus_depth: 0,
             perf_counters: Default::default(),
+            #[cfg(feature = "plugins")]
+            plugin_snapshot_dirty: true,
+            #[cfg(feature = "plugins")]
+            plugin_snapshot_liveness: 0,
+            #[cfg(feature = "plugins")]
+            detected_env_cache: None,
             // From parts (non-trivial):
             next_buffer_id: parts.next_buffer_id,
             buffer_id_alloc: parts.buffer_id_alloc,
+            terminal_id_alloc: parts.terminal_id_alloc,
             config: parts.config,
             config_snapshot_anchor: parts.config_snapshot_anchor,
             config_cached_json: parts.config_cached_json,
@@ -576,24 +653,30 @@ impl Editor {
             pending_grammars: parts.pending_grammars,
             needs_full_grammar_build: parts.needs_full_grammar_build,
             theme: parts.theme,
+            theme_before_preview: None,
             theme_registry: parts.theme_registry,
             theme_cache: parts.theme_cache,
             keybindings: parts.keybindings,
             terminal_width: parts.terminal_width,
             terminal_height: parts.terminal_height,
             last_layout_signature: None,
+            last_announced_focus: None,
+            last_announced_chrome: None,
+            connections: crate::services::authority::ConnectionRegistry::new(),
+            open_machines: std::collections::HashMap::new(),
+            next_machine_id: 1,
             tokio_runtime: parts.tokio_runtime,
             async_bridge: Some(parts.async_bridge),
             paste_pending: std::collections::HashMap::new(),
             paste_slow_path_just_armed: false,
             paste_render_suppress_until: None,
             system_clipboard_reader: None,
+            system_clipboard_probe: None,
             local_filesystem: parts.local_filesystem,
             menu_state: crate::view::ui::MenuState::new(parts.dir_context.themes_dir()),
             windows: parts.windows,
             dormant_remote: parts.dormant_remote,
             preparing_windows: std::collections::HashMap::new(),
-            session_keepalives: HashMap::new(),
             remote_attach_inflight: std::collections::HashSet::new(),
             remote_attach_cancelled: std::collections::HashSet::new(),
             remote_attach_cancels: std::collections::HashMap::new(),
@@ -608,6 +691,7 @@ impl Editor {
             mouse_capture: parts.mouse_capture,
             time_source: parts.time_source,
             color_capability: parts.color_capability,
+            linux_console: false,
             update_checker: parts.update_checker,
             key_translator: parts.key_translator,
 
@@ -627,18 +711,17 @@ impl Editor {
             should_quit: false,
             workspace_trust_prompt_cancellable: false,
             workspace_trust_markers: Vec::new(),
-            workspace_trust_scroll: 0,
             should_detach: false,
+            adopting_recovery: false,
+            last_lock_sync: None,
             session_mode: false,
             software_cursor_only: false,
             session_name: None,
             session_display_name: None,
             pending_escape_sequences: Vec::new(),
-            restart_with_dir: None,
             last_window_title: None,
+            pending_window_title: None,
             mode_registry: ModeRegistry::new(),
-            pending_authority: None,
-            pending_keepalive: None,
             remote_indicator_override: None,
             menus: crate::config::MenuConfig::translated(),
             background_process_handles: HashMap::new(),
@@ -646,19 +729,31 @@ impl Editor {
             status_bar_token_registry: Mutex::new(HashMap::new()),
             plugin_schemas: std::sync::Arc::new(std::sync::RwLock::new(parts.plugin_schemas)),
             event_broadcaster: parts.event_broadcaster,
+            orchestrator_mode: parts.orchestrator_mode,
+            file_launch: parts.file_launch,
+            diff_launch: None,
+            diff_launch_hold: None,
+            all_workspaces_loaded: parts.all_workspaces_loaded,
             #[cfg(feature = "plugins")]
             line_targets: std::collections::HashMap::new(),
             #[cfg(feature = "plugins")]
             pending_plugin_actions: Vec::new(),
             #[cfg(feature = "plugins")]
             plugin_render_requested: false,
+            frame_requested: false,
             last_rendered_frame: None,
             #[cfg(feature = "plugins")]
             plugin_command_backlog: std::collections::VecDeque::new(),
             #[cfg(feature = "plugins")]
             grep_project_cancel: std::collections::HashMap::new(),
+            open_buffer_searches: Vec::new(),
             #[cfg(feature = "plugins")]
             plugin_timers: Vec::new(),
+            macro_replay: None,
+            #[cfg(feature = "plugins")]
+            deferred_replay_input: std::collections::VecDeque::new(),
+            #[cfg(feature = "plugins")]
+            suppress_macro_recording: false,
             #[cfg(feature = "plugins")]
             diff_baselines: crate::app::diff_baselines::BaselineStore::default(),
             #[cfg(feature = "plugins")]
@@ -666,6 +761,26 @@ impl Editor {
             async_message_backlog: std::collections::VecDeque::new(),
             full_redraw_requested: false,
             suppress_chrome_cells: false,
+            shell_frame_status_bar: None,
+            shell_hover: None,
+            shell_store: shell_store.clone(),
+            shell_ui: Some({
+                let mut ui = fresh_ui::Ui::new();
+                // The host's half of `Persisted`. Without a store the values
+                // are per-element defaults and a window switch loses them,
+                // which is the whole reason the window subtree is a scope.
+                ui.set_store(shell_store);
+                ui
+            }),
+            // Never laid out: the first input lays the tree out from the
+            // description before it is routed (`lay_out_shell_if_stale`).
+            shell_description_stale: true,
+            shell_pointer_event: None,
+            shell_key_event: None,
+            page_anchors: HashMap::new(),
+            page_reading: HashMap::new(),
+            pane_mirrors: HashMap::new(),
+            input_mode: None,
             suspend_requested: false,
             plugin_global_state: parts.plugin_global_state,
             // Boot-loaded state came *from* disk — nothing is dirty yet.
@@ -688,21 +803,30 @@ impl Editor {
             global_popups: crate::view::popup::PopupManager::new(),
             previous_cursor_screen_pos: None,
             cursor_jump_animation: None,
+            pending_wheel_scroll: None,
+            drag_autoscroll: None,
             pending_vb_animations: Vec::new(),
             widget_registry: crate::widgets::WidgetRegistry::new(),
             floating_widget_panel: None,
+            dock_covered: false,
+            dock_passed_key_pending: false,
             dock: None,
-            ui_gen: 0,
-            chrome_tree_memo: std::cell::RefCell::new(None),
-            ui_tree_seq: std::cell::Cell::new(0),
-            hover_cell_memo: std::cell::Cell::new(None),
-            dock_width: None,
+            dock_reserved: false,
+            dock_width_percent: None,
+            dock_width_rule: crate::view::shell::frame::DockWidthRule::default(),
             dock_resizing: false,
-            widget_text_drag: None,
-            split_widget_scrollbar_tracks: Vec::new(),
-            split_widget_scrollbar_mouse: Default::default(),
-            split_widget_scrollbar_drag: None,
-            widget_panel_render_heights: std::collections::HashMap::new(),
+            sidebar_sections: vec![sidebar::SidebarSection::explorer()],
+            parked_sidebar_sections: Vec::new(),
+            sidebar_placeholder_expiry: None,
+            sidebar_layout_hints: std::collections::HashMap::new(),
+            sidebar_drag: None,
+            prose_drag: None,
+            widget_drag: None,
+            explorer_drag: None,
+            explorer_move_preview: None,
+            tree_move_previews: Vec::new(),
+            prose_reveal: std::cell::RefCell::new(HashMap::new()),
+            tree_projections: std::cell::RefCell::new(HashMap::new()),
         };
 
         // The plugin per-window filesystem registry is populated on the first
@@ -752,7 +876,9 @@ impl Editor {
         // constructed with the authority it runs under — production callers
         // that own a non-local authority pass it straight to
         // `with_working_dir_opts` instead.
-        let authority = Self::local_authority_with_filesystem(filesystem);
+        let connection = std::sync::Arc::new(crate::services::authority::Connection::plain(
+            Self::local_authority_with_filesystem(filesystem),
+        ));
         Self::with_working_dir_opts(
             config,
             width,
@@ -761,7 +887,9 @@ impl Editor {
             dir_context,
             plugins_enabled,
             color_capability,
-            authority,
+            connection,
+            false,
+            false,
             false,
         )
     }
@@ -773,6 +901,17 @@ impl Editor {
     /// `PluginDeclarationsReady` and are applied in `process_async_messages`.
     /// Used by the TUI startup path so the first frame draws without
     /// waiting on TS parse/transpile/register.
+    ///
+    /// `orchestrator_mode` says this editor is the one a bare `fresh`
+    /// launched into (see [`crate::config::Config::auto_attach`]).
+    /// It has to be a parameter rather than a read of `config`: the config
+    /// field is the user's *preference*, while this is a property of the
+    /// invocation — the preference can be on while the launch named a file,
+    /// which is an ordinary launch.
+    ///
+    /// `file_launch` is the same kind of invocation property: the launch opens
+    /// the files on its command line rather than a session (see
+    /// [`Editor::file_launch`]).
     #[allow(clippy::too_many_arguments)]
     pub fn with_working_dir_opts(
         config: Config,
@@ -782,8 +921,10 @@ impl Editor {
         dir_context: DirectoryContext,
         plugins_enabled: bool,
         color_capability: crate::view::color_support::ColorCapability,
-        authority: crate::services::authority::Authority,
+        connection: std::sync::Arc<crate::services::authority::Connection>,
         defer_plugin_load: bool,
+        orchestrator_mode: bool,
+        file_launch: bool,
     ) -> AnyhowResult<Self> {
         tracing::info!("Building default grammar registry...");
         let start = std::time::Instant::now();
@@ -808,7 +949,7 @@ impl Editor {
             width,
             height,
             working_dir,
-            authority,
+            connection,
             plugins_enabled,
             true, // enable_embedded_plugins (production: always allow embedded fallback)
             dir_context,
@@ -816,6 +957,8 @@ impl Editor {
             color_capability,
             grammar_registry,
             defer_plugin_load,
+            orchestrator_mode,
+            file_launch,
         )
     }
 
@@ -842,6 +985,8 @@ impl Editor {
         grammar_registry: Option<Arc<crate::primitives::grammar::GrammarRegistry>>,
         enable_plugins: bool,
         enable_embedded_plugins: bool,
+        // A construction-time flag (see `Editor::orchestrator_mode`).
+        orchestrator_mode: bool,
     ) -> AnyhowResult<Self> {
         let mut grammar_registry =
             grammar_registry.unwrap_or_else(crate::primitives::grammar::GrammarRegistry::empty);
@@ -856,19 +1001,23 @@ impl Editor {
             &config.languages,
         );
         crate::config::reload_indent_overrides(&config.languages);
-        let authority = Self::local_authority_with_filesystem(filesystem);
+        let connection = std::sync::Arc::new(crate::services::authority::Connection::plain(
+            Self::local_authority_with_filesystem(filesystem),
+        ));
         let mut editor = Self::with_options(
             config,
             width,
             height,
             working_dir,
-            authority,
+            connection,
             enable_plugins,
             enable_embedded_plugins,
             dir_context,
             time_source,
             color_capability,
             grammar_registry,
+            false,
+            orchestrator_mode,
             false,
         )?;
         // Tests typically have no async_bridge, so the deferred grammar build
@@ -907,7 +1056,7 @@ impl Editor {
         width: u16,
         height: u16,
         working_dir: Option<PathBuf>,
-        authority: crate::services::authority::Authority,
+        connection: std::sync::Arc<crate::services::authority::Connection>,
         enable_plugins: bool,
         #[cfg_attr(not(feature = "embed-plugins"), allow(unused_variables))]
         enable_embedded_plugins: bool,
@@ -916,6 +1065,8 @@ impl Editor {
         color_capability: crate::view::color_support::ColorCapability,
         grammar_registry: Arc<crate::primitives::grammar::GrammarRegistry>,
         defer_plugin_load: bool,
+        orchestrator_mode: bool,
+        file_launch: bool,
     ) -> AnyhowResult<Self> {
         let mut t = InitTimer::start("Editor::with_options");
         // The editor is constructed with the *real* authority it will run
@@ -924,7 +1075,7 @@ impl Editor {
         // the local spawner while the filesystem was already remote). The
         // filesystem is derived from it; the spawner/long-running/terminal
         // ride along on `self.authority`.
-        let filesystem = std::sync::Arc::clone(&authority.filesystem);
+        let filesystem = std::sync::Arc::clone(&connection.authority.filesystem);
         // Use provided time_source or default to RealTimeSource
         let time_source = time_source.unwrap_or_else(RealTimeSource::shared);
         tracing::info!("Editor::new called with width={}, height={}", width, height);
@@ -982,8 +1133,6 @@ impl Editor {
                 .expect("Default theme must exist")
         });
 
-        // Set terminal cursor color to match theme
-        theme_inner.set_terminal_cursor_color();
         let theme = Arc::new(RwLock::new(theme_inner));
 
         t.phase("theme_setup");
@@ -1006,10 +1155,7 @@ impl Editor {
             Arc::clone(&filesystem),
         );
         // Configure initial buffer settings from config
-        state
-            .margins
-            .configure_for_line_numbers(config.editor.line_numbers);
-        state.apply_buffer_config(&config);
+        state.apply_unnamed_buffer_config(&config);
         // Note: line_wrap_enabled is now stored in SplitViewState.viewport
         tracing::info!("EditorState created for buffer {:?}", buffer_id);
         buffers.insert(buffer_id, state);
@@ -1047,10 +1193,21 @@ impl Editor {
             data_dir = %dir_context.data_dir.display(),
             "editor_init: reading persisted windows env"
         );
-        let persisted_env = crate::app::orchestrator_persistence::read_persisted_windows_env(
+        // The workspace registry is read only as far as this launch uses it:
+        // every launch, Orchestrator mode included, reads just its own
+        // directory's — the files named for it, so the cost does not grow
+        // with the registry. A file launch restores
+        // none of it, but its window still takes that workspace's identity,
+        // so the dock never lists the directory twice. The rest is read the
+        // first time something uses it (`Editor::ensure_all_workspaces_loaded`)
+        // — with hundreds of workspace files, reading them all was most of a
+        // plain `fresh FILE`'s startup.
+        use crate::app::orchestrator_persistence::WorkspaceScope;
+        let persisted_env = crate::app::orchestrator_persistence::read_persisted_windows(
             orchestrator_filesystem.as_ref(),
             &dir_context.data_dir,
             &working_dir,
+            WorkspaceScope::LaunchDir,
         );
         tracing::debug!("editor_init: reading persisted plugin state");
         let plugin_global_state = crate::app::orchestrator_persistence::read_persisted_plugin_state(
@@ -1070,6 +1227,11 @@ impl Editor {
         // base window (id 1) at the launch cwd. This also keeps the LSP
         // / Open-Terminal default pointed at the launch cwd (issue
         // #2026).
+        //
+        // Orchestrator mode follows the same rule: a bare `fresh` opens the
+        // directory you typed it in. It used to reopen the workspace used
+        // last wherever that was, which with the dock closed left nothing on
+        // screen to say you were somewhere else.
         let picked_active = crate::app::orchestrator_persistence::pick_active_window_for_cwd(
             persisted_env.as_ref(),
             &working_dir,
@@ -1080,13 +1242,14 @@ impl Editor {
 
         t.phase("buffer_state");
         // Create Tokio runtime for async I/O (LSP, file watching, git, etc.)
-        let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2) // Small pool for I/O tasks
-            .thread_name("editor-async")
-            .enable_all()
-            .build()
-            .ok()
-            .map(Arc::new);
+        // Owned, not a bare `Handle`: everything that puts work on this
+        // runtime holds a clone, so the runtime cannot go away underneath it
+        // (see `services::runtime::LiveRuntime`).
+        let tokio_runtime = crate::services::runtime::LiveRuntime::multi_thread(
+            "editor-async",
+            2, // Small pool for I/O tasks
+        )
+        .ok();
         t.phase("tokio_runtime");
 
         // Create editor-global async bridge for editor-scoped async
@@ -1114,15 +1277,11 @@ impl Editor {
         let mut split_view_states = HashMap::new();
         let initial_split_id = split_manager.active_split();
         let mut initial_view_state = SplitViewState::with_buffer(width, height, buffer_id);
-        initial_view_state.apply_config_defaults(crate::view::split::ViewConfigDefaults {
-            line_numbers: config.editor.line_numbers,
-            highlight_current_line: config.editor.highlight_current_line,
-            line_wrap: config.editor.line_wrap,
-            wrap_indent: config.editor.wrap_indent,
-            wrap_column: config.editor.wrap_column,
-            rulers: config.editor.rulers.clone(),
-            scroll_offset: config.editor.scroll_offset,
-        });
+        initial_view_state
+            .buffer_tab_state_mut()
+            .apply_config_defaults(crate::view::split::ViewConfigDefaults::from_editor_config(
+                &config.editor,
+            ));
         split_view_states.insert(initial_split_id, initial_view_state);
 
         // Initialize filesystem manager for file explorer
@@ -1140,16 +1299,21 @@ impl Editor {
         // already remote. Runtime authority transitions still go through the
         // destructive `install_authority` restart (principle 7), which
         // rebuilds the editor with the next authority via this same path.
-        let process_spawner = Arc::clone(&authority.process_spawner);
+        let process_spawner = Arc::clone(&connection.authority.process_spawner);
 
         // Initialize Quick Open registry with all providers
         let mut quick_open_registry = QuickOpenRegistry::new();
         quick_open_registry.register(Box::new(FileProvider::new(
             Arc::clone(&filesystem),
             Arc::clone(&process_spawner),
-            tokio_runtime.as_ref().map(|rt| rt.handle().clone()),
+            tokio_runtime.clone(),
             Some(async_bridge.sender()),
         )));
+        quick_open_registry.set_file_visibility(config.file_explorer.show_hidden);
+        quick_open_registry.set_file_include_gitignored(
+            config.file_explorer.show_gitignored || !config.file_explorer.respect_gitignore,
+        );
+        quick_open_registry.set_file_ignore_patterns(&config.file_explorer.custom_ignore_patterns);
         quick_open_registry.register(Box::new(CommandProvider::new(
             Arc::clone(&command_registry),
             Arc::clone(&keybindings),
@@ -1211,7 +1375,7 @@ impl Editor {
 
         // Discover plugin directories and load every plugin (see the helper for
         // the discovery order and the async-vs-sync load paths).
-        load_startup_plugins(
+        let plugin_manifests = load_startup_plugins(
             &plugin_manager,
             &dir_context,
             &scan_result.bundle_plugin_dirs,
@@ -1264,6 +1428,10 @@ impl Editor {
         // is what gets cloned into every `Window` so handlers on
         // `impl Window` can mint ids without an `Editor` reference.
         let buffer_id_alloc = crate::app::window_resources::BufferIdAllocator::new(2);
+        // One terminal-id sequence for the whole editor, shared into every
+        // window's `TerminalManager`, so a bare `TerminalId` can't name a
+        // terminal in two windows at once.
+        let terminal_id_alloc = crate::services::terminal::TerminalIdAllocator::new();
 
         // The local-host filesystem handle, shared with the base window's
         // `WindowResources` and the editor. Same `Arc` the orchestrator
@@ -1276,22 +1444,12 @@ impl Editor {
         let recovery_service = {
             let recovery_config = RecoveryConfig {
                 enabled: recovery_enabled,
-                ..RecoveryConfig::default()
             };
-            // Default to a CWD-scoped recovery directory so each working
-            // directory keeps its own hot-exit recovery files. If this
-            // editor is later promoted to session mode, `set_session_name`
-            // re-creates the service with `RecoveryScope::Session`.
-            // Issue #1550: without per-CWD scoping, opening Fresh in a
-            // second folder would clobber the first folder's unsaved
-            // unnamed buffers on shutdown.
-            let scope = crate::services::recovery::RecoveryScope::Standalone {
-                working_dir: working_dir.clone(),
-            };
-            std::sync::Arc::new(std::sync::Mutex::new(RecoveryService::with_scope(
+            // One store whatever the launch mode, filed by each workspace's
+            // root (see `services::recovery::store`).
+            std::sync::Arc::new(std::sync::Mutex::new(RecoveryService::new(
                 recovery_config,
                 &dir_context.recovery_dir(),
-                &scope,
             )))
         };
 
@@ -1318,6 +1476,7 @@ impl Editor {
             fs_manager: Arc::clone(&fs_manager),
             local_filesystem: Arc::clone(&local_filesystem),
             buffer_id_alloc: buffer_id_alloc.clone(),
+            terminal_id_alloc: terminal_id_alloc.clone(),
             time_source: Arc::clone(&time_source),
             dir_context: dir_context.clone(),
             tokio_runtime: tokio_runtime.clone(),
@@ -1364,17 +1523,18 @@ impl Editor {
         // downgrades an already-remote spec (e.g. a restored dormant session
         // booted on a local placeholder), since that path is `RemoteAgent` here.
         let active_authority_spec = match active_authority_spec {
-            crate::services::authority::SessionAuthoritySpec::Local => authority.session_spec(),
+            crate::services::authority::SessionAuthoritySpec::Local => {
+                connection.authority.session_spec()
+            }
             spec => spec,
         };
 
-        // The active window owns the editor's boot authority outright — moved
-        // in, not cloned (there is no editor-wide copy).
+        // The active window references the editor's boot connection.
         let mut active_win = crate::app::window::Window::new(
             active_window_id,
             active_label,
             active_root,
-            authority,
+            connection,
             base_resources.clone(),
         );
         // Seed the window's terminal dimensions from the editor's
@@ -1481,6 +1641,7 @@ impl Editor {
             needs_full_grammar_build: true,
             keybindings,
             buffer_id_alloc: buffer_id_alloc.clone(),
+            terminal_id_alloc: terminal_id_alloc.clone(),
             next_buffer_id: 2,
             terminal_width: width,
             terminal_height: height,
@@ -1503,11 +1664,18 @@ impl Editor {
             plugin_global_state,
             plugin_schemas,
             event_broadcaster: event_broadcaster.clone(),
+            orchestrator_mode,
+            file_launch,
+            // Only the launch directory's workspaces were read; the rest are
+            // added the first time the dock or the picker lists workspaces
+            // (`Editor::ensure_all_workspaces_loaded`).
+            all_workspaces_loaded: false,
         };
 
         let mut editor = Editor::from_parts(parts);
 
         t.phase("editor_struct_assembly");
+        editor.apply_startup_dock_chrome(&plugin_manifests);
         // Apply clipboard configuration
         editor.clipboard.apply_config(&editor.config.clipboard);
 
@@ -1549,6 +1717,15 @@ impl Editor {
             .filter(|id| *id != editor.active_window)
             .collect();
 
+        // Windows built before the registry existed hold connections it has not seen.
+        editor.adopt_existing_window_connections();
+
+        // Where the panes are, before anything asks: a terminal opened before
+        // the first frame is sized to its pane, and the snapshot below
+        // carries the panes' rects. One `layout_only` of the frame, the
+        // same pass the layout funnel runs.
+        editor.refresh_pane_rects();
+
         #[cfg(feature = "plugins")]
         {
             editor.update_plugin_state_snapshot();
@@ -1567,6 +1744,81 @@ impl Editor {
     /// Get a reference to the event broadcaster
     pub fn event_broadcaster(&self) -> &crate::model::control_event::EventBroadcaster {
         &self.event_broadcaster
+    }
+
+    /// Whether this editor was launched by a bare `fresh` in Orchestrator
+    /// mode.
+    ///
+    /// Nothing in the editor depends on it: that launch is a daemon, and
+    /// the workspace, dock, file explorer and empty-workspace rules are the
+    /// same as for any launch. Kept for plugins (`editor.orchestratorMode()`).
+    pub fn orchestrator_mode(&self) -> bool {
+        self.orchestrator_mode
+    }
+
+    /// Whether this editor was launched to open the files on its command
+    /// line — `fresh FILE…` with `editor.skip_session_restore_when_files_passed`
+    /// on (the default) and no `--restore`, or `fresh --simple` with or without
+    /// files — rather than a session (a bare `fresh`, `fresh DIR`, a daemon). Decided by the invocation alone,
+    /// like [`Editor::orchestrator_mode`].
+    ///
+    /// Such a launch is about those files: it neither reads nor writes the
+    /// workspace or prompt history, brings back no other buffer's hot-exit
+    /// content (the named files' own still comes back), and does not open
+    /// the dock on its own. Hot exit, crash recovery and per-file cursor
+    /// positions work as in any launch.
+    pub fn file_launch(&self) -> bool {
+        self.file_launch
+    }
+
+    /// The two files of a `fresh --diff LEFT RIGHT` launch, if this is one.
+    ///
+    /// The editor doesn't open them: showing them side by side is a plugin's
+    /// job (`compare_files.ts` reads this at `ready` through
+    /// `editor.diffLaunch()` and opens both into the panels of one tab), so
+    /// the view can be replaced without touching the command line.
+    pub fn diff_launch(&self) -> Option<(&std::path::Path, &std::path::Path)> {
+        self.diff_launch
+            .as_ref()
+            .map(|(left, right)| (left.as_path(), right.as_path()))
+    }
+
+    /// Record the files of a `--diff` launch. Call before
+    /// [`Editor::fire_ready_hook`], which is when plugins look.
+    ///
+    /// Refreshes the plugin state snapshot so a `ready` handler reading
+    /// `editor.diffLaunch()` sees the pair: the hook runs on the plugin
+    /// thread and could otherwise beat the next frame's refresh.
+    ///
+    /// Also holds back the editor's frames until the plugin has the files on
+    /// screen ([`Editor::holds_launch_frames`]).
+    pub fn set_diff_launch(&mut self, left: std::path::PathBuf, right: std::path::PathBuf) {
+        self.diff_launch = Some((left, right));
+        self.diff_launch_hold = Some(std::time::Instant::now() + DIFF_LAUNCH_HOLD);
+        #[cfg(feature = "plugins")]
+        self.update_plugin_state_snapshot();
+    }
+
+    /// Whether the main loop should draw nothing yet: a `--diff` launch whose
+    /// view isn't on screen.
+    ///
+    /// The editor starts with an empty buffer and the comparison replaces it
+    /// once the plugins have loaded and the plugin showing it has opened and
+    /// diffed both files — over half a second in which the first frames
+    /// showed that empty buffer, then the files without their highlights.
+    /// Holding the frames until the plugin says the view is complete
+    /// (`editor.diffLaunchShown()`) makes the comparison the first thing
+    /// drawn. A plugin that never says so holds them for at most
+    /// [`DIFF_LAUNCH_HOLD`].
+    pub fn holds_launch_frames(&self) -> bool {
+        self.diff_launch_hold
+            .is_some_and(|until| std::time::Instant::now() < until)
+    }
+
+    /// The `--diff` launch's view is on screen, or won't be: stop holding
+    /// back frames.
+    pub(crate) fn diff_launch_shown(&mut self) {
+        self.diff_launch_hold = None;
     }
 
     /// Spawn a background thread to build the full grammar registry
@@ -1819,7 +2071,10 @@ impl Editor {
         match serde_json::from_value::<crate::config::Config>(json) {
             Ok(new_config) => {
                 let old_theme = self.config.theme.clone();
-                self.config = Arc::new(new_config);
+                // Through `set_config`, not a bare assignment: windows read a
+                // copy of the config of their own (terminal shell, LSP, …),
+                // and only `set_config` hands them the new one (#3712).
+                self.set_config(new_config);
                 if old_theme != self.config.theme {
                     if let Some(theme) = self.theme_registry.get_cloned(&self.config.theme) {
                         *self.theme.write().unwrap() = theme;
@@ -1847,6 +2102,39 @@ impl Editor {
                 self.set_status_message(format!("setSetting({path}): {e}"));
             }
         }
+    }
+
+    /// Handle `saveSetting(path, value)`: apply it now *and* write it to the
+    /// user's config file.
+    ///
+    /// The path arrives from a plugin as a dot string, so unlike every
+    /// in-editor toggle (which names a CI-validated
+    /// [`SettingKey`](crate::config_keys::SettingKey)) there is nothing to
+    /// vouch for it at compile time. This does at runtime what the key's
+    /// generated test does at build time: a document containing only this
+    /// pointer must survive a round trip through
+    /// [`PartialConfig`](crate::partial_config::PartialConfig), which is what
+    /// the write path validates against. Without that check a typo'd path
+    /// would write a key serde silently drops on the next load — the setting
+    /// would appear to work until you restarted, which is the exact failure
+    /// `config_keys` was built to kill.
+    ///
+    /// A refused write says so in the status bar rather than failing quietly:
+    /// the plugin drew a control, the user clicked it, and "nothing happened"
+    /// is the one outcome that teaches nothing.
+    pub fn handle_save_setting(&mut self, path: String, value: serde_json::Value) {
+        let pointer = json_pointer_for_dot_path(&path);
+        if !pointer_is_a_real_setting(&path, &pointer, &value) {
+            self.set_status_message(format!("saveSetting({path}): not a config setting"));
+            return;
+        }
+        // In-memory first, so the caller's next `getConfig()` agrees with the
+        // file whether or not the disk write succeeds. `handle_set_setting`
+        // owns every consequence of a live config change (theme swap,
+        // keybinding reload, chrome flags, plugin snapshot); duplicating any
+        // of that here is how the two drift.
+        self.handle_set_setting(path, value.clone());
+        self.persist_config_pointer(&pointer, value);
     }
 
     /// Append a single config field to a plugin's accumulated schema and
@@ -2007,7 +2295,7 @@ impl Editor {
     }
 
     /// Fire the `ready` hook (design M2, §3.3 phase 3).
-    pub fn fire_ready_hook(&self) {
+    pub fn fire_ready_hook(&mut self) {
         #[cfg(feature = "plugins")]
         if self.plugin_manager.read().unwrap().is_active() {
             self.plugin_manager
@@ -2015,6 +2303,11 @@ impl Editor {
                 .unwrap()
                 .run_hook("ready", crate::services::plugins::hooks::HookArgs::Ready {});
         }
+        // `chrome_focus_changed` fires on change, and the first change was
+        // announced before any plugin had loaded to hear it. Forgetting it
+        // makes the next frame say again which region holds the keyboard,
+        // so a plugin that starts with a guess ("editor") is corrected.
+        self.last_announced_chrome = None;
     }
 
     /// Fire the `config_changed` hook after the effective config has
@@ -2064,32 +2357,11 @@ impl Editor {
         self.keybindings.clone()
     }
 
-    /// Test-only accessor for the Live Grep Resume cache (issue #1796).
-    #[doc(hidden)]
-    pub fn live_grep_last_state_for_tests(
-        &self,
-    ) -> Option<&crate::services::live_grep_state::LiveGrepLastState> {
-        self.active_window().live_grep_last_state.as_ref()
-    }
-
-    /// Test-only setter for the Live Grep Resume cache.
-    #[doc(hidden)]
-    pub fn set_live_grep_last_state_for_tests(
-        &mut self,
-        state: Option<crate::services::live_grep_state::LiveGrepLastState>,
-    ) {
-        self.active_window_mut().live_grep_last_state = state;
-    }
-
     /// Test-only accessor for the split tree, so layout-shape
     /// regression tests can assert on the structure directly.
     #[doc(hidden)]
     pub fn split_manager_for_tests(&self) -> &crate::view::split::SplitManager {
-        self.windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
+        self.active_window().split_manager()
     }
 
     /// Test-only accessor for a leaf's `SplitViewState`, so tab-list
@@ -2101,12 +2373,7 @@ impl Editor {
         &self,
         leaf: crate::model::event::LeafId,
     ) -> Option<&crate::view::split::SplitViewState> {
-        self.windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
-            .get(&leaf)
+        self.active_window().split_view_states().get(&leaf)
     }
 
     /// Refresh the plugin-readable keybinding-label snapshot from

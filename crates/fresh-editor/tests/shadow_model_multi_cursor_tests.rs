@@ -12,9 +12,7 @@
 //   4. After each operation verify: buffer content == shadow content,
 //      and every cursor position matches
 
-mod common;
-
-use common::harness::EditorTestHarness;
+use crate::common::harness::EditorTestHarness;
 use crossterm::event::{KeyCode, KeyModifiers};
 use proptest::prelude::*;
 
@@ -101,7 +99,7 @@ impl MultiCursorShadow {
         let mut new_content = String::new();
         let mut read_pos = 0;
 
-        for &(ref edit_pos, ref del_len, ref ins_text, _) in &sorted_asc {
+        for (edit_pos, del_len, ins_text, _) in &sorted_asc {
             // Copy unmodified content before this edit
             if *edit_pos > read_pos {
                 new_content.push_str(&self.content[read_pos..*edit_pos]);
@@ -644,15 +642,13 @@ fn test_debug_proptest_regression() {
 fn test_debug_proptest_regression_2() {
     let (mut harness, mut shadow) = setup_multi_cursor_editor("aaa\nbbb\nccc", 1).unwrap();
 
-    let ops = vec![
-        MultiCursorOp::SelectLeft,
+    let ops = [MultiCursorOp::SelectLeft,
         MultiCursorOp::SelectLeft,
         MultiCursorOp::Left,
         MultiCursorOp::TypeChar(' '),
         MultiCursorOp::Delete,
         MultiCursorOp::Right,
-        MultiCursorOp::Backspace,
-    ];
+        MultiCursorOp::Backspace];
 
     for (i, op) in ops.iter().enumerate() {
         op.apply_to_editor(&mut harness).unwrap();
@@ -795,8 +791,14 @@ fn verify_step(
 // ============================================================================
 
 proptest! {
+    // 64 cases, not 200: each case builds an editor and renders after
+    // every key (~0.25s a case on a quiet Linux box). 200 cases took
+    // 50-160s on CI and crossed nextest's 180s kill on a loaded macOS
+    // runner. The op alphabet is eight keys, and the deterministic tests
+    // above pin the select-then-edit and enter-then-type interactions the
+    // earlier regressions came from.
     #![proptest_config(ProptestConfig {
-        cases: 200,
+        cases: 64,
         max_shrink_iters: 5000,
         ..ProptestConfig::default()
     })]

@@ -39,12 +39,16 @@ rule; the older highlighter-preference API has been removed. **[impl]**
 - **Bundled tree-sitter set** (the `bundled-languages` feature backing the
   editor's `tree-sitter` feature): **JavaScript, TypeScript, JSON (also serving
   JSONC), Templ, and Go** (Go only because Templ's grammar extends it). Reasons:
-  - **TypeScript**: syntect ships no TS grammar → tree-sitter only.
-  - **JavaScript**: syntect's JS grammar leaks template-literal state past the
-    closing backtick and paints the rest of the file as a string; JS is routed
-    through tree-sitter by *skipping* the syntect "JavaScript" entry when
-    building the catalog. (syntect's JS grammar is still reachable by name for
-    markdown-popup code highlighting.)
+  - **JavaScript / TypeScript**: kept for AST indentation only. Highlighting
+    uses `grammars/typescript.sublime-syntax`, written for syntect's cost
+    model (few rules per context, ambiguity settled by pushed contexts rather
+    than long lookaheads). build.rs derives `typescriptreact` (a dialect of the
+    TypeScript catalog entry, picked for `.tsx`) and `javascript` from it by
+    swapping `<T>` casts for JSX; `javascript` shadows syntect's bundled JS
+    grammar, which leaked template-literal state past the closing backtick.
+    It parses about 4x faster than the VS Code (TypeScript-TmLanguage) grammar
+    and agrees with that grammar's highlight categories on 99% of the bytes
+    of the bundled plugins' TypeScript.
   - **JSONC**: no JSONC tree-sitter crate exists; the JSON grammar recovers past
     comments/trailing commas well enough.
   - **Templ**: Go + components/HTML/CSS.
@@ -63,8 +67,7 @@ The oxc-based parser crate (`oxc_parser`, `oxc_allocator`, `oxc_span`,
 is the plugin toolchain: TypeScript→JS transpile, `.d.ts` emission, plugin
 dependency extraction + topological load ordering, and ES-module bundling so
 plugin source (incl. config-as-code `init.ts`) can run in the QuickJS plugin
-runtime. JS/TS *buffers* are highlighted by the tree-sitter grammars in the
-languages crate. The only editor-side caller is a CLI plugin-check helper; the
+runtime. JS/TS *buffers* are highlighted by the TextMate grammars above. The only editor-side caller is a CLI plugin-check helper; the
 real consumer is the plugin runtime. The oxc deps in the editor crate are pulled
 by the `plugins` feature to syntax-check `init.ts`, not for highlighting.
 **[impl]** **[flag]**: the oxc deps may *look* highlighting-related but are not.
@@ -92,6 +95,87 @@ startup. A fast path uses the dump directly when there are no user / language-
 pack / bundle / plugin grammars; otherwise those layers are added on and the set
 is rebuilt. Grammar provenance is tracked (user, language pack, bundle, plugin).
 **[impl]**
+
+Most embedded grammars fill a gap syntect has no grammar for. **Rust, C#, Bash
+and JavaScript (above) are the exceptions: they replace one.** syntect bundles a
+years-old Rust grammar that read an unspaced `<` before a string literal as the
+start of a generic argument list and then *consumed* the string's opening quote recovering from it, inverting
+quote parity for the rest of the buffer (#3325). Fresh vendors current
+sublimehq/Packages instead, at a pinned commit, in
+`src/grammars/rust.sublime-syntax` (MIT — the package ships its own
+`Rust/LICENSE.txt`, vendored alongside as `rust.sublime-syntax.LICENSE.txt`,
+which MIT requires us to keep). Measured against upstream's own syntax test
+suite (`Rust/tests`, 12117 assertions), syntect's bundled grammar fails 4904 of
+them; the vendored one fails 5. **[impl]**
+
+**Bash replaces one too, but with syntect's own grammar.**
+`src/grammars/bash.sublime-syntax` is `ShellScript/Bash.sublime-syntax` from
+sublimehq/Packages at fa6b8629c95041bf262d4c1dab95c456a0530122 — the revision
+syntect 5.3's `testdata/Packages` submodule pins, i.e. exactly what syntect
+bundles — plus one local fix marked `# FRESH:`. Upstream read the `(` of a
+subshell function body, `f() ( … )`, as a second parameter list and then waited
+for a `{` that never came, so highlighting died from there to the end of the
+file (#3473, #3201). The body is now chosen after the (empty, optional)
+parameter list: a brace group, a subshell, or any other compound command, which
+is left to `main`. Keeping the bundled revision rather than current upstream
+keeps every other Bash scope unchanged; refreshing to current Packages is a
+separate, larger change. **[impl]**
+
+The shadowing reaches lookups by name and extension, not the links syntect
+resolved when it built its defaults. The bundled `commands-builtin-shell-bash`
+grammar, which the vendored one includes for builtins like `echo`, includes
+`scope:source.shell.bash#…` for those commands' arguments, and those links still
+point at syntect's own Bash. So a subshell function defined *inside* a builtin's
+argument — `echo "$(f() ( … ); f)"` — is still read by the old rules. The damage
+stays inside that argument: the next line highlights normally. Vendoring that
+grammar too (1,223 lines) would close it, if it ever matters in practice.
+
+Because both grammars live in the set, the catalog keeps only the **last**
+syntax of any given name, matching syntect's own lookups, which scan in reverse
+and so already resolve a name or extension to the last definition. That is what
+makes an embedded grammar shadow a syntect default rather than double up in the
+language picker.
+
+Two syntect-versus-Sublime differences are worth knowing before refreshing this
+grammar, because neither shows up as a load error — syntect accepts unknown keys
+silently and compiles regexes lazily:
+
+- **Empty leading alternatives.** `prelude_types` and `std_traits` upstream open
+  their alternation with a bare `|`, so the interpolated `\b(?x:|Box|…)\b` has an
+  empty first branch. Sublime tolerates it; under the Oniguruma build syntect
+  drives it matches zero-width at any word boundary, so the rule consumes
+  nothing and the next one claims the identifier — putting every prelude type on
+  `storage.type` (which Fresh maps to Keyword) instead of `support.type` (Type).
+  Our only local change deletes those two `|`, marked `# FRESH:` in the file.
+- **`embed` plus `pop` on one rule.** syntect's parser checks `pop` first and
+  drops the embed, so a cargo-script TOML frontmatter block highlights as Rust
+  rather than TOML. This is the remaining 5 test failures, and degrades quietly.
+
+When refreshing, re-run upstream's `Rust/tests` through a syntect-backed runner
+(syntect ships `examples/syntest.rs`) rather than trusting a clean load.
+
+**C#** (`src/grammars/csharp.sublime-syntax`, MIT, notice vendored alongside as
+`csharp.sublime-syntax.LICENSE.txt`) is *the same* grammar syntect bundles —
+sublimehq/Packages at syntect's pinned commit — with one regex rewritten
+(marked `# FRESH:`). The rule flagging an interpolation's format spec as
+unclosed, `([^}"\\]+(\\.)*)+(?="(?!"))`, nests a quantifier inside a
+quantifier, and syntect searches each candidate pattern from the cursor to the
+end of the line, so a line like
+`$"{v:F2} {F(v):F2} {G(v):F2}"` cost ~300 ms (release) to highlight and every
+keystroke on or above it stalled (#3667). The replacement
+`[^}"\\](?:[^}"\\]|\\.)*` matches the same strings with no nested quantifier,
+so each match attempt is linear (a search over a line can still be quadratic
+in the length of one format spec, as for any unanchored pattern); upstream's
+C# syntax tests parse to identical scope operations with either. A `# FRESH:`
+variable, `fresh_vendored`, marks the file so tests can check that `.cs`
+resolves to it rather than to the bundled grammar. **[impl]**
+
+`test_csharp_grammar_has_no_catastrophic_backtracking` guards this without
+timing anything: it runs every `match:` regex of the grammar through Oniguruma
+with a cap on backtracking steps per search
+(`MatchParam::set_retry_limit_in_match`). A healthy regex needs a few hundred steps on the
+test lines; the original rule needed over ten million. The same check is a
+cheap way to vet any other grammar suspected of a stall.
 
 ### `DetectedLanguage` — the per-buffer source of truth
 

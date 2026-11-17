@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use fresh_ui::Axis;
 use fresh_ui::{
-    col, gesture, stack, text, viewport, BuildCx, Component, ComponentExt, Event, GestureKind,
+    col, gesture, row, stack, text, viewport, BuildCx, Component, ComponentExt, Event, GestureKind,
     Input, Mods, MouseButton, Node, Point, PointerMode, Size, Sizing, Ui,
 };
 
@@ -35,19 +35,11 @@ fn traced(name: &'static str, log: &Log, child: Node<()>) -> Node<()> {
 fn click(ui: &mut Ui<()>, x: i32, y: i32) -> Vec<()> {
     let pos = Point::new(x, y);
     let mut out = ui
-        .dispatch(Input::Press {
-            pos,
-            button: MouseButton::Left,
-            mods: Mods::NONE,
-        })
+        .dispatch(Input::press(pos, MouseButton::Left, Mods::NONE))
         .msgs;
     out.extend(
-        ui.dispatch(Input::Release {
-            pos,
-            button: MouseButton::Left,
-            mods: Mods::NONE,
-        })
-        .msgs,
+        ui.dispatch(Input::release(pos, MouseButton::Left, Mods::NONE))
+            .msgs,
     );
     out
 }
@@ -181,6 +173,48 @@ fn a_transparent_region_runs_its_handlers_then_lets_the_hit_continue() {
     );
 }
 
+/// **An observer above a transparent region hears the event once.**
+///
+/// Stacked paths share their upper reaches. Walking each in full offered the
+/// event to those shared ancestors once per path, so a capture-phase observer
+/// near the root — the way an application watches a channel without claiming
+/// it — fired two, three, however many times the point happened to stack. The
+/// extra paths exist for the elements *behind* the transparent one; the ones
+/// above it are the same elements either way.
+#[test]
+fn an_observer_above_a_transparent_region_hears_one_event_once() {
+    let log: Log = Rc::default();
+    let mut ui: Ui<()> = Ui::new();
+    let l = log.clone();
+    ui.frame(
+        gesture(
+            stack().children([
+                traced("behind", &log, text("xxxxxxxx"))
+                    .w(Sizing::Cells(8))
+                    .h(Sizing::Cells(1)),
+                gesture(Node::nil())
+                    .pointer_mode(PointerMode::Transparent)
+                    .w(Sizing::Cells(8))
+                    .h(Sizing::Cells(1)),
+            ]),
+        )
+        .on_capture(
+            GestureKind::Click,
+            Rc::new(move |_: &Event| note(&l, "observer".into())),
+        ),
+        FRAME,
+    );
+    click(&mut ui, 2, 0);
+    assert_eq!(
+        log.borrow().iter().filter(|s| *s == "observer").count(),
+        1,
+        "one click, one call: {:?}",
+        log.borrow()
+    );
+    // And what the extra path is for still happens.
+    assert!(log.borrow().iter().any(|s| s.starts_with("behind")));
+}
+
 #[test]
 fn capture_survives_the_pointer_leaving_the_rectangle() {
     let moves: Rc<RefCell<Vec<Point>>> = Rc::default();
@@ -208,11 +242,11 @@ fn capture_survives_the_pointer_leaving_the_rectangle() {
         FRAME,
     );
 
-    ui.dispatch(Input::Press {
-        pos: Point::new(1, 0),
-        button: MouseButton::Left,
-        mods: Mods::NONE,
-    });
+    ui.dispatch(Input::press(
+        Point::new(1, 0),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
     assert!(ui.captured().is_some());
 
     // Far outside the grip's own rectangle, and on top of another element.
@@ -222,12 +256,117 @@ fn capture_survives_the_pointer_leaving_the_rectangle() {
     });
     assert_eq!(*moves.borrow(), vec![Point::new(5, 6)]);
 
-    ui.dispatch(Input::Release {
-        pos: Point::new(5, 6),
-        button: MouseButton::Left,
+    ui.dispatch(Input::release(
+        Point::new(5, 6),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    assert!(ui.captured().is_none(), "release ends the drag");
+}
+
+/// **A move says whether it came by capture.** A bare motion over an element
+/// is a hover, and the same element's move while it holds the pointer is a
+/// drag; a listener that returned a fact for both would ask for a frame per
+/// pointer sample over ground that changes nothing.
+#[test]
+fn a_move_reports_whether_it_came_by_capture() {
+    let seen: Rc<RefCell<Vec<bool>>> = Rc::default();
+    let s = seen.clone();
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(
+        col().children([
+            gesture(text("grip"))
+                .on(
+                    GestureKind::Press,
+                    Rc::new(|e: &Event| {
+                        e.capture_pointer();
+                        None
+                    }),
+                )
+                .on(
+                    GestureKind::Move,
+                    Rc::new(move |e: &Event| {
+                        s.borrow_mut().push(e.captured);
+                        None
+                    }),
+                ),
+            text("elsewhere"),
+        ]),
+        FRAME,
+    );
+    // A bare move over the grip: a hover.
+    ui.dispatch(Input::Move {
+        pos: Point::new(1, 0),
         mods: Mods::NONE,
     });
-    assert!(ui.captured().is_none(), "release ends the drag");
+    // Pressed, then moved: a drag, wherever the pointer is.
+    ui.dispatch(Input::press(
+        Point::new(1, 0),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    ui.dispatch(Input::Move {
+        pos: Point::new(2, 0),
+        mods: Mods::NONE,
+    });
+    ui.dispatch(Input::Move {
+        pos: Point::new(5, 6),
+        mods: Mods::NONE,
+    });
+    ui.dispatch(Input::release(
+        Point::new(5, 6),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    // Released: a move over the grip is a hover again.
+    ui.dispatch(Input::Move {
+        pos: Point::new(1, 0),
+        mods: Mods::NONE,
+    });
+    assert_eq!(*seen.borrow(), vec![false, true, true, false]);
+}
+
+/// **A press is a new gesture, and ends a capture whose release never
+/// came.** A host that reports presses without releases — a test harness, a
+/// lost event between hosts — must not leave every later press routed to the
+/// element that captured the first one: a press on a second pane went to the
+/// first pane's content, forever, and the second pane could never be focused
+/// by the pointer.
+#[test]
+fn a_press_ends_a_stale_capture_and_is_routed_by_the_pointer() {
+    let pressed: Rc<RefCell<Vec<&'static str>>> = Rc::default();
+    let grip = |name: &'static str| {
+        let p = pressed.clone();
+        gesture(text(name)).on(
+            GestureKind::Press,
+            Rc::new(move |e: &Event| {
+                e.capture_pointer();
+                p.borrow_mut().push(name);
+                None
+            }),
+        )
+    };
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(col().children([grip("first"), grip("second")]), FRAME);
+
+    ui.dispatch(Input::press(
+        Point::new(1, 0),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    assert!(ui.captured().is_some(), "the first press captures");
+
+    // No release. The next press lands on the other element.
+    ui.dispatch(Input::press(
+        Point::new(1, 1),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    assert_eq!(
+        *pressed.borrow(),
+        vec!["first", "second"],
+        "the second press is the second element's, not the captor's"
+    );
 }
 
 #[test]
@@ -415,11 +554,11 @@ fn pressing_and_dragging_the_scrollbar_gutter_scrolls_the_viewport() {
 
     let gutter = FRAME.w as i32 - 1;
     // Press near the bottom of the track: the window jumps toward the end.
-    ui.dispatch(Input::Press {
-        pos: Point::new(gutter, FRAME.h as i32 - 1),
-        button: MouseButton::Left,
-        mods: Mods::NONE,
-    });
+    ui.dispatch(Input::press(
+        Point::new(gutter, FRAME.h as i32 - 1),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
     ui.tick();
     let jumped = ui.scroll(vp).0.y;
     assert!(jumped > 0, "a press on the gutter scrolled ({jumped})");
@@ -433,11 +572,11 @@ fn pressing_and_dragging_the_scrollbar_gutter_scrolls_the_viewport() {
     assert_eq!(ui.scroll(vp).0.y, 0, "dragging to the top scrolled back");
 
     // After release the gutter no longer drives scrolling.
-    ui.dispatch(Input::Release {
-        pos: Point::new(gutter, 0),
-        button: MouseButton::Left,
-        mods: Mods::NONE,
-    });
+    ui.dispatch(Input::release(
+        Point::new(gutter, 0),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
     ui.dispatch(Input::Move {
         pos: Point::new(gutter, FRAME.h as i32 - 1),
         mods: Mods::NONE,
@@ -447,6 +586,68 @@ fn pressing_and_dragging_the_scrollbar_gutter_scrolls_the_viewport() {
         ui.scroll(vp).0.y,
         0,
         "a bare move after release does not scroll"
+    );
+}
+
+/// **A card list's track is grabbable along its whole length.**
+///
+/// An item-scrolling viewport counts its offset, its content and its window in
+/// *items*, while the bar beside it is measured in cells. The two agree only
+/// when an item is one cell tall, and the hit path read the track's height as
+/// the window — so for a list of five-row cards the thumb it computed was
+/// twice the length of the one painted, and a press in the top two-thirds of
+/// the track read as landing *inside* it. A press inside the thumb picks it up
+/// where it was touched and moves nothing, so clicking the track did nothing
+/// at all.
+#[test]
+fn pressing_the_track_of_an_item_scrolling_viewport_scrolls_it() {
+    // Eight five-cell items in a ten-cell frame: a window of two items, and
+    // six items of travel behind it.
+    let built = || {
+        let rows: Vec<Node<()>> = (0..2).map(|i| text(format!("item {i}"))).collect();
+        viewport(col().children(rows))
+            .items(8)
+            .item_rows(5)
+            .scrollbar()
+    };
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(built(), FRAME);
+
+    // The painted thumb is the window's share of the track, not the track.
+    let bar = ui
+        .spec()
+        .items
+        .iter()
+        .find_map(|i| match i.draw {
+            fresh_ui::Draw::Scrollbar {
+                offset,
+                content,
+                window,
+                ..
+            } => Some((offset, content, u32::from(window), i.rect.h)),
+            _ => None,
+        })
+        .expect("eight items in a window of two overflow");
+    let (_, len) = fresh_ui::Draw::scrollbar_thumb(bar.0, bar.1, bar.2, bar.3);
+    assert!(
+        len < FRAME.h,
+        "a thumb that fills its track cannot be dragged ({len} of {})",
+        FRAME.h
+    );
+
+    // And a press on the bare track below it jumps the window.
+    let vp = ui.root().unwrap();
+    assert_eq!(ui.scroll(vp).0.y, 0);
+    ui.dispatch(Input::press(
+        Point::new(FRAME.w as i32 - 1, len as i32),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    ui.tick();
+    assert!(
+        ui.scroll(vp).0.y > 0,
+        "a press on the track scrolled ({})",
+        ui.scroll(vp).0.y
     );
 }
 
@@ -568,11 +769,11 @@ fn a_claim_is_reported_separately_from_the_messages() {
         ),
         FRAME,
     );
-    let d = ui.dispatch(Input::Press {
-        pos: Point::new(1, 0),
-        button: MouseButton::Left,
-        mods: Mods::NONE,
-    });
+    let d = ui.dispatch(Input::press(
+        Point::new(1, 0),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
     assert!(d.msgs.is_empty(), "the handler returned no message");
     assert!(d.claimed, "but it claimed the press");
 }
@@ -585,11 +786,1371 @@ fn a_message_without_a_claim_is_reported_as_unclaimed() {
         gesture(text("row")).on(GestureKind::Press, Rc::new(|_: &Event| Some(()))),
         FRAME,
     );
-    let d = ui.dispatch(Input::Press {
-        pos: Point::new(1, 0),
-        button: MouseButton::Left,
-        mods: Mods::NONE,
-    });
+    let d = ui.dispatch(Input::press(
+        Point::new(1, 0),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
     assert_eq!(d.msgs.len(), 1);
     assert!(!d.claimed, "producing a message is not claiming the event");
+}
+
+// ---------------------------------------------------------------------------
+// A pointer mode on any node, not only a gesture
+// ---------------------------------------------------------------------------
+
+/// A container that draws nothing still absorbs a press by default — "a region
+/// that draws is a region that hits" describes the intent, not the mechanism,
+/// and the mechanism has always been "everything hits unless it says
+/// otherwise". This pins the default so the opt-out below is meaningful.
+#[test]
+fn a_plain_container_over_a_target_absorbs_the_press() {
+    let log: Log = Rc::default();
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(
+        stack().children([
+            traced("behind", &log, text("xxxxxxxx"))
+                .w(Sizing::Cells(8))
+                .h(Sizing::Cells(1)),
+            // No theme, no listeners, nothing drawn: still a surface.
+            col().w(Sizing::Cells(5)).h(Sizing::Cells(1)),
+        ]),
+        FRAME,
+    );
+    click(&mut ui, 2, 0);
+    assert!(
+        !log.borrow().iter().any(|s| s.starts_with("behind")),
+        "the plain container absorbed it: {:?}",
+        log.borrow()
+    );
+    // …and the target really is reachable, so the assertion above is about the
+    // container and not about a click that landed on nothing.
+    log.borrow_mut().clear();
+    click(&mut ui, 6, 0);
+    assert!(
+        log.borrow().iter().any(|s| s.starts_with("behind")),
+        "past the container, the target answers: {:?}",
+        log.borrow()
+    );
+}
+
+/// …and the opt-out reaches an ordinary container, not just a `Gesture`.
+///
+/// This is the shape every overlay strip takes: a full-size column positioning
+/// a one-row band over content that must stay reachable. Before `pointer_mode`
+/// applied to any node it could not be written — wrapping the column in a
+/// transparent gesture made the *wrapper* transparent and left the column
+/// itself absorbing everything.
+#[test]
+fn a_transparent_container_lets_the_press_reach_what_is_behind() {
+    let log: Log = Rc::default();
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(
+        stack().children([
+            traced("behind", &log, text("xxxxx"))
+                .w(Sizing::Cells(5))
+                .h(Sizing::Cells(1)),
+            col()
+                .pointer_mode(PointerMode::Transparent)
+                .w(Sizing::Cells(5))
+                .h(Sizing::Cells(1)),
+        ]),
+        FRAME,
+    );
+    click(&mut ui, 2, 0);
+    assert!(
+        log.borrow().iter().any(|s| s.starts_with("behind")),
+        "got {:?}",
+        log.borrow()
+    );
+}
+
+/// Transparency is per node, not inherited: a strip can pass presses through
+/// while one control inside it still takes them. That is the whole point — an
+/// overlay is mostly decoration with a button in it.
+#[test]
+fn an_opaque_child_of_a_transparent_strip_still_absorbs() {
+    let log: Log = Rc::default();
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(
+        stack().children([
+            traced("behind", &log, text("xxxxxxxx"))
+                .w(Sizing::Cells(8))
+                .h(Sizing::Cells(1)),
+            col()
+                .pointer_mode(PointerMode::Transparent)
+                .w(Sizing::Cells(8))
+                .h(Sizing::Cells(1))
+                .children([fresh_ui::row()
+                    .pointer_mode(PointerMode::Transparent)
+                    .h(Sizing::Cells(1))
+                    .children([
+                        // The spacer has to say so too — transparency is a
+                        // property of a node, not something its parent grants
+                        // it. Leave this opaque and the strip swallows its own
+                        // left half.
+                        fresh_ui::row()
+                            .pointer_mode(PointerMode::Transparent)
+                            .w(Sizing::Cells(4)),
+                        traced("button", &log, text("ok")).w(Sizing::Cells(2)),
+                    ])]),
+        ]),
+        FRAME,
+    );
+    click(&mut ui, 1, 0);
+    assert!(
+        log.borrow().iter().any(|s| s.starts_with("behind"))
+            && !log.borrow().iter().any(|s| s.starts_with("button")),
+        "off the button: {:?}",
+        log.borrow()
+    );
+    log.borrow_mut().clear();
+    click(&mut ui, 5, 0);
+    assert!(
+        log.borrow().iter().any(|s| s.starts_with("button")),
+        "on the button: {:?}",
+        log.borrow()
+    );
+}
+
+/// A bound is a statement about input as well as paint. The same over-constrained
+/// row as in `paint.rs`: the status slot is placed on the frame's own column, so
+/// without a bound a press there reaches the slot instead of the box that drew
+/// the frame — a resize grip losing its column to a one-cell label.
+#[test]
+fn a_bound_keeps_a_press_from_reaching_what_was_clipped_away() {
+    let log: Log = Rc::default();
+    let mut ui: Ui<()> = Ui::new();
+    let build =
+        |log: &Log, clip: bool| {
+            col().w(Sizing::Cells(10)).border().clip(clip).child(
+                row().h(Sizing::Cells(1)).children([
+                    text("a-name!").w(Sizing::Cells(7)),
+                    row().flex(1).min_w(1),
+                    traced("slot", log, text("M").w(Sizing::Cells(1))),
+                ]),
+            )
+        };
+
+    // Unbounded, x=9 is the slot's.
+    ui.frame(build(&log, false), FRAME);
+    click(&mut ui, 9, 1);
+    assert!(
+        log.borrow().iter().any(|s| s.starts_with("slot")),
+        "without a bound the escaped cell is the slot's"
+    );
+
+    // Bounded — the default under `border()` — it is not.
+    log.borrow_mut().clear();
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(build(&log, true), FRAME);
+    click(&mut ui, 9, 1);
+    assert!(
+        log.borrow().is_empty(),
+        "a bounded child takes no input outside the bound: {:?}",
+        log.borrow()
+    );
+
+    // And the cells it legitimately occupies still answer.
+    log.borrow_mut().clear();
+    click(&mut ui, 3, 1);
+    assert!(
+        log.borrow().is_empty(),
+        "the name's cells are not the slot's"
+    );
+}
+
+/// **The thumb's top lands on the row pressed.**
+///
+/// Its travel is the part of the track it can reach — `track - len`, not the
+/// whole track — and dividing by the track instead leaves the thumb short of
+/// the row by up to `len` cells and the last row of the track unable to reach
+/// the end of the content. A one-cell thumb hides the bug (`track - 1` and
+/// `track - len` agree there), so this uses a window big enough for a thumb
+/// several rows tall.
+#[test]
+fn pressing_a_track_row_puts_the_thumb_on_that_row() {
+    let mut ui: Ui<()> = Ui::new();
+    // Twice the window's height of content: the thumb is half the track.
+    let rows: Vec<Node<()>> = (0..(FRAME.h as usize * 2))
+        .map(|i| text(format!("row {i}")))
+        .collect();
+    ui.frame(viewport(col().children(rows)).scrollbar(), FRAME);
+
+    let thumb = |ui: &Ui<()>| -> (u16, u16) {
+        let bar = ui
+            .spec()
+            .items
+            .iter()
+            .find_map(|i| match i.draw {
+                fresh_ui::Draw::Scrollbar {
+                    offset,
+                    content,
+                    window,
+                    ..
+                } => Some((offset, content, u32::from(window), i.rect.h)),
+                _ => None,
+            })
+            .expect("an overflowing viewport shows a bar");
+        fresh_ui::Draw::scrollbar_thumb(bar.0, bar.1, bar.2, bar.3)
+    };
+
+    let (_, len) = thumb(&ui);
+    assert!(
+        len > 1,
+        "the thumb must be taller than one cell to be a test"
+    );
+    let gutter = FRAME.w as i32 - 1;
+    let press_at = |ui: &mut Ui<()>, row: u16| {
+        ui.dispatch(Input::press(
+            Point::new(gutter, row as i32),
+            MouseButton::Left,
+            Mods::NONE,
+        ));
+        ui.dispatch(Input::release(
+            Point::new(gutter, row as i32),
+            MouseButton::Left,
+            Mods::NONE,
+        ));
+        ui.tick();
+    };
+    // **Bare track only.** A press that lands *on* the thumb picks it up
+    // where it was touched and moves nothing — see
+    // `a_press_inside_the_thumb_grabs_it_rather_than_jumping` — so the rows
+    // the resting thumb covers are not track presses and cannot be asserted
+    // about here. Row 0 is inside it, and doubles as the reset: from anywhere
+    // else it is bare track, and jumping there returns the thumb to the top.
+    for target in len..=(FRAME.h - len) {
+        press_at(&mut ui, 0);
+        assert_eq!(thumb(&ui).0, 0, "row 0 is bare track once scrolled away");
+        press_at(&mut ui, target);
+        assert_eq!(
+            thumb(&ui).0,
+            target,
+            "pressing track row {target} must put the thumb there"
+        );
+    }
+}
+
+/// **Closing a layer is not always the whole gesture.**
+///
+/// A click outside a menu is spent closing it — the menu was in the way. A
+/// tooltip is in the way of nothing: clicking into the document while one is
+/// showing should hide it *and* put the caret where the click landed, or the
+/// tooltip has charged the user a click to get rid of it.
+#[test]
+fn a_pass_through_dismissal_leaves_the_press_for_what_it_was_aimed_at() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let build = |pass: bool, log: &Log| -> Node<()> {
+        let l = log.clone();
+        let d = match pass {
+            true => fresh_ui::Dismiss::OUTSIDE_POINTER.passing_through(),
+            false => fresh_ui::Dismiss::OUTSIDE_POINTER,
+        };
+        let ll = log.clone();
+        stack().children([
+            // What the press was aimed at, behind the layer.
+            gesture(col().theme("doc")).on(
+                GestureKind::Press,
+                Rc::new(move |_: &Event| note(&ll, "document".into())),
+            ),
+            fresh_ui::layer()
+                .anchor(fresh_ui::Anchor::Point(0, 0))
+                .place(fresh_ui::Place::Over)
+                .dismiss(d)
+                .on_dismiss_handler(Rc::new(move |_: &Event| note(&l, "dismissed".into())))
+                .child(col().w(Sizing::Cells(4)).h(Sizing::Cells(2)).theme("pop")),
+        ])
+    };
+
+    // The claim is what the *host* is told — a host with its own pipeline
+    // behind this tree reads it to decide whether the press is still going.
+    // The tree's own handlers run either way, which is why the document's
+    // press is logged in both.
+    let press = |ui: &mut Ui<()>| {
+        ui.dispatch(Input::press(
+            Point::new(10, 6),
+            MouseButton::Left,
+            Mods::NONE,
+        ))
+        .claimed
+    };
+
+    // Spending the press: the host is told it is gone.
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(build(false, &log), FRAME);
+    assert!(press(&mut ui), "closing the layer was the whole gesture");
+    assert_eq!(*log.borrow(), vec!["dismissed", "document"]);
+
+    // Passing it through: dismissed, and the host still has the press.
+    log.borrow_mut().clear();
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(build(true, &log), FRAME);
+    assert!(!press(&mut ui), "the press is still going somewhere");
+    assert_eq!(*log.borrow(), vec!["dismissed", "document"]);
+}
+
+/// **And the same rule for the key that dismissed it.**
+///
+/// `pass_through` said "the input that dismissed this layer goes on to whatever
+/// it was aimed at", and the pointer honoured it while the keyboard did not:
+/// any dismissal at all reported the key as claimed. So a tooltip that hides on
+/// the next keystroke ate that keystroke — the tooltip charging the user a key
+/// to get rid of it, which is exactly the case the flag exists for.
+#[test]
+fn a_pass_through_dismissal_leaves_the_key_for_what_it_was_aimed_at() {
+    let build = |pass: bool| -> Node<()> {
+        let d = match pass {
+            true => fresh_ui::Dismiss::ANY_KEY.passing_through(),
+            false => fresh_ui::Dismiss::ANY_KEY,
+        };
+        stack().children([
+            col().theme("doc"),
+            fresh_ui::layer()
+                .anchor(fresh_ui::Anchor::Point(0, 0))
+                .place(fresh_ui::Place::Over)
+                .dismiss(d)
+                .on_dismiss_handler(Rc::new(|_: &Event| None))
+                .child(col().w(Sizing::Cells(4)).h(Sizing::Cells(2)).theme("pop")),
+        ])
+    };
+    let typed = |ui: &mut Ui<()>| {
+        ui.dispatch(Input::Key(fresh_ui::KeyPress::with(
+            fresh_ui::KeyCode::Char('j'),
+            Mods::NONE,
+        )))
+        .claimed
+    };
+
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(build(false), FRAME);
+    assert!(typed(&mut ui), "closing the layer was the whole keystroke");
+
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(build(true), FRAME);
+    assert!(!typed(&mut ui), "the key is still going somewhere");
+}
+
+/// **The thing a menu hangs off is not outside it.**
+///
+/// A press on the trigger that opened a list is one gesture — close it — and
+/// every menu on every platform reads it that way. Counting the trigger as
+/// outside makes the press do two things: the dismissal closes the layer, and
+/// the trigger's own press, which runs immediately after, toggles it straight
+/// back open. The list never closes.
+///
+/// Only [`Anchor::Node`] is honoured, because a parent is wherever the caller
+/// happened to attach the layer — as often a whole panel body as a single row
+/// — and suppressing the dismissal over a body would leave no outside at all.
+#[test]
+fn a_press_on_the_node_a_layer_is_anchored_to_does_not_dismiss_it() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let anchor = fresh_ui::Key::Str("trigger-row".into());
+    let build = |log: &Log, anchor: &fresh_ui::Key| -> Node<()> {
+        let l = log.clone();
+        let t = log.clone();
+        stack().children([
+            // Somewhere barren, to prove the dismissal still works at all.
+            col().theme("doc"),
+            // The trigger and its list, under one named row — which is what
+            // the editor's dropdown pop-over does.
+            row().key(anchor.clone()).h(Sizing::Cells(1)).children([
+                gesture(text("[value]")).on(
+                    GestureKind::Press,
+                    Rc::new(move |_: &Event| note(&t, "trigger".into())),
+                ),
+                fresh_ui::layer()
+                    .anchor(fresh_ui::Anchor::Node(anchor.clone()))
+                    .place(fresh_ui::Place::Below)
+                    .dismiss(fresh_ui::Dismiss::OUTSIDE_POINTER)
+                    .on_dismiss_handler(Rc::new(move |_: &Event| note(&l, "dismissed".into())))
+                    .child(col().w(Sizing::Cells(6)).h(Sizing::Cells(3)).theme("pop")),
+            ]),
+        ])
+    };
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(build(&log, &anchor), FRAME);
+
+    // The trigger sits at row 0; pressing it reaches the trigger and does not
+    // dismiss, so the host's own toggle closes the list exactly once.
+    ui.dispatch(Input::press(
+        Point::new(2, 0),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    assert!(
+        log.borrow().contains(&"trigger".to_string()),
+        "the trigger saw its own press: {:?}",
+        log.borrow()
+    );
+    assert!(
+        !log.borrow().contains(&"dismissed".to_string()),
+        "and the layer did not also dismiss itself: {:?}",
+        log.borrow()
+    );
+
+    // Somewhere barren still dismisses — the exclusion is the anchor, not the
+    // whole frame.
+    log.borrow_mut().clear();
+    ui.dispatch(Input::press(
+        Point::new(18, 8),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    assert!(
+        log.borrow().contains(&"dismissed".to_string()),
+        "a press away from both closes it: {:?}",
+        log.borrow()
+    );
+}
+
+/// **The exemption is the trigger, not the row it sits in.** The editor's
+/// dropdown names its whole row as the anchor — label, `[value ▼]` button and
+/// the blank run after it — and only the button answers a press. A press on
+/// the label or the blank run reaches no handler, so if the dismissal stood
+/// aside for the whole row the list would stay up for a click right beside
+/// its trigger. It stands aside only for a press something in the anchor
+/// will act on.
+#[test]
+fn a_press_on_the_anchored_row_beside_its_trigger_dismisses() {
+    let log: Log = Rc::new(RefCell::new(Vec::new()));
+    let anchor = fresh_ui::Key::Str("trigger-row".into());
+    let build = |log: &Log, anchor: &fresh_ui::Key| -> Node<()> {
+        let l = log.clone();
+        let t = log.clone();
+        stack().children([
+            col().theme("doc"),
+            row().key(anchor.clone()).h(Sizing::Cells(1)).children([
+                // The label: no handler.
+                text("Host:  ").w(Sizing::Cells(7)),
+                // The trigger: the one piece that acts on a press.
+                gesture(text("[value]")).on(
+                    GestureKind::Press,
+                    Rc::new(move |_: &Event| note(&t, "trigger".into())),
+                ),
+                fresh_ui::layer()
+                    .anchor(fresh_ui::Anchor::Node(anchor.clone()))
+                    .place(fresh_ui::Place::Below)
+                    .dismiss(fresh_ui::Dismiss::OUTSIDE_POINTER)
+                    .on_dismiss_handler(Rc::new(move |_: &Event| note(&l, "dismissed".into())))
+                    .child(col().w(Sizing::Cells(6)).h(Sizing::Cells(3)).theme("pop")),
+            ]),
+        ])
+    };
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(build(&log, &anchor), FRAME);
+
+    // On the label, in the anchored row but off the trigger: dismissed.
+    ui.dispatch(Input::press(
+        Point::new(1, 0),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    assert!(
+        log.borrow().contains(&"dismissed".to_string()),
+        "a press on the row beside the trigger closes the list: {:?}",
+        log.borrow()
+    );
+    assert!(
+        !log.borrow().contains(&"trigger".to_string()),
+        "and the trigger did not see it: {:?}",
+        log.borrow()
+    );
+
+    // On the trigger itself: its own press, and no dismissal.
+    log.borrow_mut().clear();
+    ui.frame(build(&log, &anchor), FRAME);
+    ui.dispatch(Input::press(
+        Point::new(8, 0),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    assert!(
+        log.borrow().contains(&"trigger".to_string()),
+        "the trigger saw its own press: {:?}",
+        log.borrow()
+    );
+    assert!(
+        !log.borrow().contains(&"dismissed".to_string()),
+        "and the layer did not also dismiss itself: {:?}",
+        log.borrow()
+    );
+}
+
+// -- Event::text_byte ---------------------------------------------------------
+
+/// A press on text reports the byte, not the column.
+///
+/// The two are the same number only while every character is one byte and one
+/// cell. `名前` is two characters, six bytes and four cells, so a caller that
+/// used the column would be three bytes out by the fourth cell — which is
+/// exactly the arithmetic this field exists to remove from callers.
+#[test]
+fn a_press_on_text_reports_the_byte_under_it() {
+    let seen: Rc<RefCell<Vec<Option<usize>>>> = Rc::new(RefCell::new(Vec::new()));
+    let sink = seen.clone();
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(
+        col().child(gesture(text("名前: value")).on(
+            GestureKind::Press,
+            Rc::new(move |e: &Event| {
+                sink.borrow_mut().push(e.text_byte);
+                None
+            }),
+        )),
+        FRAME,
+    );
+    // Cells:  0,1 = 名   2,3 = 前   4 = ':'  5 = ' '  6.. = "value"
+    // Bytes:  0    = 名   3    = 前   6 = ':'  7 = ' '  8.. = "value"
+    for (col, want) in [(0, 0), (1, 0), (2, 3), (3, 3), (4, 6), (6, 8), (8, 10)] {
+        ui.dispatch(Input::press(
+            Point::new(col, 0),
+            MouseButton::Left,
+            Mods::NONE,
+        ));
+        assert_eq!(
+            seen.borrow().last().copied().flatten(),
+            Some(want),
+            "column {col} should be byte {want}"
+        );
+    }
+}
+
+/// Past the end of the run is the end of the run, and a press on something
+/// that is not text has no byte at all.
+#[test]
+fn text_byte_is_absent_where_there_is_no_text() {
+    let seen: Rc<RefCell<Vec<Option<usize>>>> = Rc::new(RefCell::new(Vec::new()));
+    let sink = seen.clone();
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(
+        col()
+            .child(gesture(text("ab")).w(Sizing::Cells(10)).on(
+                GestureKind::Press,
+                Rc::new({
+                    let sink = sink.clone();
+                    move |e: &Event| {
+                        sink.borrow_mut().push(e.text_byte);
+                        None
+                    }
+                }),
+            ))
+            .child(
+                gesture(col().w(Sizing::Cells(10)).h(Sizing::Cells(1)))
+                    .on(
+                        GestureKind::Press,
+                        Rc::new(move |e: &Event| {
+                            sink.borrow_mut().push(e.text_byte);
+                            None
+                        }),
+                    )
+                    .h(Sizing::Cells(1)),
+            ),
+        FRAME,
+    );
+    ui.dispatch(Input::press(
+        Point::new(7, 0),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    assert_eq!(
+        seen.borrow().last().copied().flatten(),
+        Some(2),
+        "a press past the last character is the end of the string"
+    );
+    ui.dispatch(Input::press(
+        Point::new(3, 1),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    assert_eq!(
+        seen.borrow().last().copied().flatten(),
+        None,
+        "a box is not text and has no byte"
+    );
+}
+
+/// **A press on wrapped text reports a byte too.**
+///
+/// A row of wrapped text is not a slice of the source — the break ate the
+/// space between "world" and "here" — so the byte under a press is not the
+/// column plus the bytes of the rows above it. The run says which bytes each
+/// row is, and the press resolves against the row it landed on; the caller
+/// never has to know a wrap happened.
+#[test]
+fn a_press_on_a_wrapped_run_reports_the_byte_on_the_row_it_landed_on() {
+    let seen: Rc<RefCell<Vec<Option<usize>>>> = Rc::new(RefCell::new(Vec::new()));
+    let sink = seen.clone();
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(
+        col().child(
+            gesture(text("hello world here").wrap().w(Sizing::Cells(11)))
+                .on(
+                    GestureKind::Press,
+                    Rc::new(move |e: &Event| {
+                        sink.borrow_mut().push(e.text_byte);
+                        None
+                    }),
+                )
+                .h(Sizing::Cells(2)),
+        ),
+        FRAME,
+    );
+    // Rows: "hello world" (bytes 0..11) and "here" (bytes 12..16). Byte 11 is
+    // the space the break ate and no row shows it.
+    for (at, want) in [
+        (Point::new(0, 0), 0),
+        (Point::new(6, 0), 6),
+        (Point::new(10, 0), 10),
+        (Point::new(0, 1), 12),
+        (Point::new(3, 1), 15),
+        (Point::new(4, 1), 16),
+    ] {
+        ui.dispatch(Input::press(at, MouseButton::Left, Mods::NONE));
+        assert_eq!(
+            seen.borrow().last().copied().flatten(),
+            Some(want),
+            "a press at {at:?} should be byte {want}"
+        );
+    }
+}
+
+/// **A pointer event a pointer-blocking modal let nothing answer is the
+/// modal's.** The row behind the layer never sees a press beside the layer's
+/// box, and the dispatch says so: `claimed`, with no message. A host with its
+/// own pointer pipeline behind the tree reads that word and stops; reported
+/// unclaimed, the press would have gone on to the surface the modal covers.
+/// The wheel likewise: the modal's slack scrolls nothing, and the buffer
+/// under the dim must not scroll in its place.
+#[test]
+fn a_pointer_modal_claims_what_it_lets_nothing_answer() {
+    use fresh_ui::{layer, Align, Anchor, Modality, Place};
+    let pressed = Rc::new(std::cell::Cell::new(0));
+    let mk = {
+        let pressed = pressed.clone();
+        move || {
+            stack().children([
+                gesture(row().w(Sizing::Cells(20)).h(Sizing::Cells(10))).on(
+                    GestureKind::Press,
+                    Rc::new({
+                        let p = pressed.clone();
+                        move |_: &Event| {
+                            p.set(p.get() + 1);
+                            None
+                        }
+                    }),
+                ),
+                layer()
+                    .modality(Modality::Pointer)
+                    .anchor(Anchor::Screen(Align::Start))
+                    .place(Place::Over)
+                    .child(text("box").w(Sizing::Cells(6)).h(Sizing::Cells(3))),
+            ])
+        }
+    };
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(mk(), FRAME);
+    let beside = Point::new(15, 8);
+    let got = ui.dispatch(Input::press(beside, MouseButton::Left, Mods::NONE));
+    assert_eq!(pressed.get(), 0, "the row behind the modal never sees it");
+    assert!(got.claimed, "and the modal claims it");
+    assert!(got.msgs.is_empty());
+    let got = ui.dispatch(Input::Wheel {
+        pos: beside,
+        delta: 3,
+        axis: Axis::Vertical,
+        mods: Mods::NONE,
+    });
+    assert!(got.claimed, "the wheel is the modal's too");
+    let got = ui.dispatch(Input::Move {
+        pos: beside,
+        mods: Mods::NONE,
+    });
+    assert!(got.claimed, "and so is a move across the dim");
+    // Inside the box, the same: a press on its slack reaches no handler and
+    // is still the modal's.
+    let got = ui.dispatch(Input::press(
+        Point::new(2, 1),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    assert!(got.claimed);
+    assert_eq!(pressed.get(), 0);
+}
+
+/// **A captured move still reports the byte under the pointer.** The gesture
+/// that took the press is the capturer, and it has no text — the run inside
+/// it does. A drag across a wrapped run extends by byte the way its press
+/// placed by byte, or a selection could start but never grow.
+#[test]
+fn a_captured_move_reports_the_byte_under_it() {
+    use fresh_ui::{
+        gesture, text, viewport, Event, GestureKind, Input, Mods, MouseButton, Point, Size, Ui,
+    };
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let seen: Rc<RefCell<Vec<Option<usize>>>> = Rc::new(RefCell::new(Vec::new()));
+    let (s1, s2) = (seen.clone(), seen.clone());
+    let doc = "alpha bravo charlie delta echo foxtrot golf";
+    let tree = viewport(
+        gesture(text(doc).wrap())
+            .on(
+                GestureKind::Press,
+                Rc::new(move |e: &Event| {
+                    s1.borrow_mut().push(e.text_byte);
+                    e.capture_pointer();
+                    e.stop();
+                    None
+                }),
+            )
+            .on(
+                GestureKind::Move,
+                Rc::new(move |e: &Event| {
+                    s2.borrow_mut().push(e.text_byte);
+                    None
+                }),
+            ),
+    )
+    .h(fresh_ui::Sizing::Cells(4));
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(tree, Size::new(12, 4));
+    ui.dispatch(Input::press(
+        Point::new(1, 0),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    ui.dispatch(Input::Move {
+        pos: Point::new(3, 1),
+        mods: Mods::NONE,
+    });
+    let got = seen.borrow().clone();
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0], Some(1), "the press: byte 1 of the first row");
+    assert!(
+        matches!(got[1], Some(b) if b > 1),
+        "the captured move: a byte on the second row, not None: {:?}",
+        got[1]
+    );
+}
+
+// -- controlled offsets ------------------------------------------------------
+
+/// Forty one-cell rows in a ten-row frame, the offset held by the owner at
+/// `at`, reporting every move as the new offset.
+fn held_window(at: u32) -> Node<u32> {
+    let rows: Vec<Node<u32>> = (0..40).map(|i| text(format!("row {i}"))).collect();
+    viewport(col().children(rows))
+        .scroll(at)
+        .on_scroll(|y| y)
+        .scrollbar()
+}
+
+/// **A held window reports the wheel and then stands where its owner put
+/// it.** The framework moves its own copy so a run of notches between frames
+/// composes, and says where it went; the next layout re-applies the owner's
+/// value, which is the same one if the owner took the report and the old one
+/// if it did not. The window's position is the owner's fact, not the
+/// framework's — the same terms a list's controlled selection has.
+#[test]
+fn a_held_window_reports_the_wheel_and_stands_where_its_owner_put_it() {
+    let mut ui: Ui<u32> = Ui::new();
+    ui.frame(held_window(5), FRAME);
+    let vp = ui.root().unwrap();
+    assert_eq!(ui.scroll(vp).0.y, 5, "the owner's offset, at every layout");
+
+    let got = ui.dispatch(Input::Wheel {
+        pos: Point::new(2, 2),
+        delta: 3,
+        axis: Axis::Vertical,
+        mods: Mods::NONE,
+    });
+    assert!(got.claimed, "a wheel that moved a window is claimed");
+    assert_eq!(got.msgs, vec![8], "reported as the offset it moved to");
+    assert_eq!(
+        ui.scroll(vp).0.y,
+        8,
+        "between frames the framework's copy has moved, so a second notch \
+         composes with the first"
+    );
+    let got = ui.dispatch(Input::Wheel {
+        pos: Point::new(2, 2),
+        delta: 1,
+        axis: Axis::Vertical,
+        mods: Mods::NONE,
+    });
+    assert_eq!(got.msgs, vec![9]);
+
+    // The owner declined (kept 5): the next layout puts the window back.
+    ui.tick();
+    assert_eq!(ui.scroll(vp).0.y, 5, "the owner's value replaces the copy");
+
+    // The owner took the report: the window is where it said.
+    ui.frame(held_window(9), FRAME);
+    assert_eq!(ui.scroll(vp).0.y, 9);
+}
+
+/// And the bar: a press on the track reports the jump rather than keeping it.
+#[test]
+fn a_press_on_a_held_windows_track_reports_the_jump() {
+    let mut ui: Ui<u32> = Ui::new();
+    ui.frame(held_window(0), FRAME);
+    let vp = ui.root().unwrap();
+    let gutter = FRAME.w as i32 - 1;
+    let got = ui.dispatch(Input::press(
+        Point::new(gutter, FRAME.h as i32 - 1),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    assert!(got.claimed);
+    assert_eq!(got.msgs.len(), 1, "one report per move: {:?}", got.msgs);
+    assert!(got.msgs[0] > 0, "toward the end");
+    // Dragging back to the top reports again, once, and a move that lands on
+    // the same offset reports nothing.
+    let got = ui.dispatch(Input::Move {
+        pos: Point::new(gutter, 0),
+        mods: Mods::NONE,
+    });
+    assert_eq!(got.msgs, vec![0]);
+    let got = ui.dispatch(Input::Move {
+        pos: Point::new(gutter, 0),
+        mods: Mods::NONE,
+    });
+    assert!(got.msgs.is_empty(), "no move, no report: {:?}", got.msgs);
+    ui.dispatch(Input::release(
+        Point::new(gutter, 0),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    ui.tick();
+    assert_eq!(ui.scroll(vp).0.y, 0, "the owner still says 0");
+}
+
+/// **The owner's offset is never clamped.** Which offsets are reachable can
+/// depend on facts only the owner can evaluate (which rows it pins at an
+/// offset the window is not at), so an offset past the framework's own
+/// ceiling is taken as given, and the ceiling the bar reads rises to meet it
+/// — the thumb says "at the end" rather than pretending the window is
+/// somewhere it is not.
+#[test]
+fn a_held_offset_past_the_ceiling_is_kept_and_the_bar_agrees() {
+    let mut ui: Ui<u32> = Ui::new();
+    // 40 rows, a 10-row window: the framework's ceiling is 30.
+    ui.frame(held_window(33), FRAME);
+    let vp = ui.root().unwrap();
+    assert_eq!(ui.scroll(vp).0.y, 33, "kept, not pulled back to 30");
+    let bar = ui
+        .spec()
+        .items
+        .iter()
+        .find_map(|i| match i.draw {
+            fresh_ui::Draw::Scrollbar {
+                offset,
+                content,
+                window,
+                ..
+            } => Some((offset, content, u32::from(window), i.rect.h)),
+            _ => None,
+        })
+        .expect("a bar");
+    let (top, len) = fresh_ui::Draw::scrollbar_thumb(bar.0, bar.1, bar.2, bar.3);
+    assert_eq!(top + len, bar.3, "the thumb is flush with the track's end");
+    // And the wheel has nowhere further to go: not claimed, nothing reported.
+    let got = ui.dispatch(Input::Wheel {
+        pos: Point::new(2, 2),
+        delta: 1,
+        axis: Axis::Vertical,
+        mods: Mods::NONE,
+    });
+    assert!(!got.claimed && got.msgs.is_empty(), "{got:?}");
+}
+
+/// A window the framework owns can still report — an owner that only wants
+/// to *know* where the window is listens without holding the offset, and the
+/// window keeps what it reported.
+#[test]
+fn an_owned_window_reports_and_keeps_its_moves() {
+    let mut ui: Ui<u32> = Ui::new();
+    let rows: Vec<Node<u32>> = (0..40).map(|i| text(format!("row {i}"))).collect();
+    ui.frame(viewport(col().children(rows)).on_scroll(|y| y), FRAME);
+    let vp = ui.root().unwrap();
+    let got = ui.dispatch(Input::Wheel {
+        pos: Point::new(2, 2),
+        delta: 4,
+        axis: Axis::Vertical,
+        mods: Mods::NONE,
+    });
+    assert_eq!(got.msgs, vec![4]);
+    ui.tick();
+    assert_eq!(ui.scroll(vp).0.y, 4, "framework-owned: the move stands");
+}
+
+/// A row that logs what a drag does to it. `source` rows start a drag on a
+/// press (or only capture, when `drag` is false); every row is a drop target.
+fn drag_row(name: &'static str, log: &Log, source: bool, drag: bool) -> Node<()> {
+    let l = |kind: &'static str| {
+        let log = log.clone();
+        Rc::new(move |_: &Event| note(&log, format!("{kind} {name}"))) as fresh_ui::Handler<()>
+    };
+    let g = gesture(text(name))
+        .on(GestureKind::DragEnter, l("enter"))
+        .on(GestureKind::DragLeave, l("leave"))
+        .on(GestureKind::Drop, l("drop"));
+    match source {
+        false => g,
+        true => g
+            .on(
+                GestureKind::Press,
+                Rc::new(move |e: &Event| {
+                    match drag {
+                        true => e.start_drag(),
+                        false => e.capture_pointer(),
+                    }
+                    None
+                }),
+            )
+            .on(GestureKind::Release, l("release")),
+    }
+}
+
+fn move_to(ui: &mut Ui<()>, x: i32, y: i32) {
+    ui.dispatch(Input::Move {
+        pos: Point::new(x, y),
+        mods: Mods::NONE,
+    });
+}
+
+/// **A drag sees what is under the pointer; a capture alone does not.** While
+/// a drag holds the pointer, the drop target under it hears `DragEnter` and
+/// `DragLeave` as the pointer crosses it — ground that is no target ends the
+/// last one — and the release is that target's `Drop`, heard before the
+/// captor's own `Release` ends the drag.
+#[test]
+fn a_drag_tells_the_targets_it_crosses_and_drops_on_the_one_under_the_release() {
+    let log: Log = Rc::default();
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(
+        col().children([
+            drag_row("a", &log, true, true),
+            drag_row("b", &log, false, false),
+            text("plain"),
+        ]),
+        FRAME,
+    );
+    ui.dispatch(Input::press(
+        Point::new(0, 0),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    move_to(&mut ui, 0, 1);
+    move_to(&mut ui, 0, 2);
+    move_to(&mut ui, 0, 1);
+    ui.dispatch(Input::release(
+        Point::new(0, 1),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    assert_eq!(
+        *log.borrow(),
+        vec!["enter b", "leave b", "enter b", "drop b", "release a"]
+    );
+    assert!(ui.captured().is_none(), "the release ends the drag");
+
+    // Over, the drag offers nothing: a bare move is not one.
+    log.borrow_mut().clear();
+    move_to(&mut ui, 0, 0);
+    move_to(&mut ui, 0, 1);
+    assert!(log.borrow().is_empty(), "{:?}", log.borrow());
+}
+
+/// **Released where it was pressed is a drop on the source**, when the source
+/// is a target too; the owner of the drag decides that it was a click.
+#[test]
+fn a_drag_released_on_its_own_row_drops_there() {
+    let log: Log = Rc::default();
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(
+        col().children([
+            drag_row("a", &log, true, true),
+            drag_row("b", &log, false, false),
+        ]),
+        FRAME,
+    );
+    click(&mut ui, 0, 0);
+    assert_eq!(*log.borrow(), vec!["drop a", "release a"]);
+}
+
+/// **A release off every target drops nothing**, and the target the drag
+/// was last over is told it has gone.
+#[test]
+fn a_drag_released_off_every_target_only_leaves() {
+    let log: Log = Rc::default();
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(
+        col().children([
+            drag_row("a", &log, true, true),
+            drag_row("b", &log, false, false),
+            text("plain"),
+        ]),
+        FRAME,
+    );
+    ui.dispatch(Input::press(
+        Point::new(0, 0),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    move_to(&mut ui, 0, 1);
+    ui.dispatch(Input::release(
+        Point::new(0, 2),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    assert_eq!(*log.borrow(), vec!["enter b", "leave b", "release a"]);
+}
+
+/// **A capture that is not a drag is exactly what it was.** The scrollbars,
+/// the grips and a text selection capture the pointer too; a drop target
+/// under one of those drags hears nothing.
+#[test]
+fn a_plain_capture_offers_nothing_to_drop_targets() {
+    let log: Log = Rc::default();
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(
+        col().children([
+            drag_row("a", &log, true, false),
+            drag_row("b", &log, false, false),
+        ]),
+        FRAME,
+    );
+    ui.dispatch(Input::press(
+        Point::new(0, 0),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    move_to(&mut ui, 0, 1);
+    ui.dispatch(Input::release(
+        Point::new(0, 1),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    assert_eq!(*log.borrow(), vec!["release a"]);
+}
+
+/// A five-row window over twenty draggable rows, between a line above it and
+/// a line below it, reporting every move of the window as its offset.
+fn drag_window() -> Node<u32> {
+    let rows: Vec<Node<u32>> = (0..20)
+        .map(|i| {
+            gesture(text(format!("row {i}"))).on(
+                GestureKind::Press,
+                Rc::new(|e: &Event| {
+                    e.start_drag();
+                    None
+                }),
+            )
+        })
+        .collect();
+    col().children([
+        text("above"),
+        viewport(col().children(rows))
+            .h(Sizing::Cells(5))
+            .on_scroll(|y| y),
+        text("below"),
+    ])
+}
+
+fn drag_move(ui: &mut Ui<u32>, y: i32) -> Vec<u32> {
+    ui.dispatch(Input::Move {
+        pos: Point::new(1, y),
+        mods: Mods::NONE,
+    })
+    .msgs
+}
+
+/// **A drag past the edge of its window scrolls the window toward it**, a
+/// step per move, bigger the farther out; on the edge row and inside the
+/// window it scrolls nothing — a drop on the first or last row in sight must
+/// not have it scrolled away. The tree says while a repeat would still move
+/// something.
+#[test]
+fn a_drag_past_its_windows_edge_scrolls_the_window() {
+    let mut ui: Ui<u32> = Ui::new();
+    ui.frame(drag_window(), FRAME);
+    // The window is rows 1..6 of the frame, with a line above and below it.
+    ui.dispatch(Input::press(
+        Point::new(1, 3),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    assert!(drag_move(&mut ui, 4).is_empty(), "inside: no scroll");
+    assert!(
+        drag_move(&mut ui, 5).is_empty(),
+        "on the edge row: no scroll"
+    );
+    assert_eq!(ui.drag_autoscroll(), None);
+
+    assert_eq!(drag_move(&mut ui, 6), vec![1], "one past: one row");
+    assert_eq!(ui.drag_autoscroll(), Some(Point::new(1, 6)));
+    assert_eq!(drag_move(&mut ui, 8), vec![4], "three past: three rows");
+    assert_eq!(drag_move(&mut ui, 9), vec![8], "capped at the fastest step");
+
+    // Held there, the repeats run the window to its end, and then there is
+    // nothing more to ask for.
+    let mut last = 8;
+    while ui.drag_autoscroll().is_some() {
+        ui.tick();
+        if let Some(&o) = drag_move(&mut ui, 9).last() {
+            last = o;
+        }
+    }
+    assert_eq!(last, 15, "twenty rows in a five-row window end at fifteen");
+
+    // One past the top, back up.
+    assert_eq!(drag_move(&mut ui, 0), vec![14]);
+
+    // Released, a move past the edge is only a move.
+    ui.dispatch(Input::release(
+        Point::new(1, 0),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    assert!(drag_move(&mut ui, 0).is_empty());
+    assert_eq!(ui.drag_autoscroll(), None);
+}
+
+/// **A window flush with the frame's edge scrolls from its edge row**: there
+/// is no cell past it to point at. At the end of the content that row is an
+/// ordinary row again.
+#[test]
+fn a_window_flush_with_the_frames_edge_scrolls_from_its_edge_row() {
+    let rows: Vec<Node<u32>> = (0..20)
+        .map(|i| {
+            gesture(text(format!("row {i}"))).on(
+                GestureKind::Press,
+                Rc::new(|e: &Event| {
+                    e.start_drag();
+                    None
+                }),
+            )
+        })
+        .collect();
+    let mut ui: Ui<u32> = Ui::new();
+    // Rows 1..10: the window runs to the frame's last row.
+    ui.frame(
+        col().children([
+            text("above"),
+            viewport(col().children(rows))
+                .h(Sizing::Cells(9))
+                .on_scroll(|y| y),
+        ]),
+        FRAME,
+    );
+    ui.dispatch(Input::press(
+        Point::new(1, 3),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    assert_eq!(
+        drag_move(&mut ui, 9),
+        vec![1],
+        "the last row, flush: a step"
+    );
+    while ui.drag_autoscroll().is_some() {
+        ui.tick();
+        drag_move(&mut ui, 9);
+    }
+    ui.tick();
+    assert!(
+        drag_move(&mut ui, 9).is_empty(),
+        "at the end: an ordinary row"
+    );
+}
+
+/// **After the last step, the drag's hover names the row really under the
+/// pointer.** A scroll moves rows under a resting pointer without laying them
+/// out; the tree asks for one more move after the frame that does, so the
+/// row the drag is shown over is the row a release there drops on.
+#[test]
+fn after_scrolling_the_drag_is_over_the_row_under_the_pointer() {
+    let entered: Rc<RefCell<Vec<String>>> = Rc::default();
+    let rows: Vec<Node<u32>> = (0..20)
+        .map(|i| {
+            let e = entered.clone();
+            gesture(text(format!("row {i}")))
+                .on(
+                    GestureKind::Press,
+                    Rc::new(|e: &Event| {
+                        e.start_drag();
+                        None
+                    }),
+                )
+                .on(
+                    GestureKind::DragEnter,
+                    Rc::new(move |_: &Event| {
+                        e.borrow_mut().push(format!("row {i}"));
+                        None
+                    }),
+                )
+        })
+        .collect();
+    let mut ui: Ui<u32> = Ui::new();
+    ui.frame(
+        col().children([
+            text("above"),
+            viewport(col().children(rows))
+                .h(Sizing::Cells(9))
+                .on_scroll(|y| y),
+        ]),
+        FRAME,
+    );
+    ui.dispatch(Input::press(
+        Point::new(1, 3),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    // Held on the last row, as the host holds it: a move per frame for as
+    // long as the tree asks for one.
+    drag_move(&mut ui, 9);
+    while ui.drag_autoscroll().is_some() {
+        ui.tick();
+        drag_move(&mut ui, 9);
+    }
+    assert_eq!(
+        entered.borrow().last().map(String::as_str),
+        Some("row 19"),
+        "the window ends on row 19 under the pointer: {:?}",
+        entered.borrow()
+    );
+}
+
+/// **Only a drag scrolls.** A plain capture — a grip, a text selection — past
+/// the same edge leaves the window where it is.
+#[test]
+fn a_plain_capture_past_the_edge_scrolls_nothing() {
+    let rows: Vec<Node<u32>> = (0..20)
+        .map(|i| {
+            gesture(text(format!("row {i}"))).on(
+                GestureKind::Press,
+                Rc::new(|e: &Event| {
+                    e.capture_pointer();
+                    None
+                }),
+            )
+        })
+        .collect();
+    let mut ui: Ui<u32> = Ui::new();
+    ui.frame(
+        col().children([
+            text("above"),
+            viewport(col().children(rows))
+                .h(Sizing::Cells(5))
+                .on_scroll(|y| y),
+            text("below"),
+        ]),
+        FRAME,
+    );
+    ui.dispatch(Input::press(
+        Point::new(1, 2),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    assert!(drag_move(&mut ui, 9).is_empty());
+    assert_eq!(ui.drag_autoscroll(), None);
+}
+
+/// **A drag outlives the row it lifted.** Dragged out of a virtual list's
+/// window, the row's element goes away, and the capture with it — an id is
+/// recycled — but the drag is still in hand: the target under the pointer
+/// still hears it, and the release still drops there.
+#[test]
+fn a_drag_survives_its_source_going_away() {
+    let log: Log = Rc::default();
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(
+        col().children([
+            drag_row("a", &log, true, true).key("a"),
+            drag_row("b", &log, false, false).key("b"),
+        ]),
+        FRAME,
+    );
+    ui.dispatch(Input::press(
+        Point::new(0, 0),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    // The source scrolls out of the window: only "b" is described now.
+    ui.frame(
+        col().children([drag_row("b", &log, false, false).key("b")]),
+        FRAME,
+    );
+    assert!(ui.captured().is_none(), "the capture went with its element");
+    move_to(&mut ui, 0, 0);
+    ui.dispatch(Input::release(
+        Point::new(0, 0),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    assert_eq!(*log.borrow(), vec!["enter b", "drop b"]);
+}
+
+/// **A drag's hover is every node under the pointer**, as the pointer's hover
+/// is — not only the drop target — so a container around a target (a list's
+/// row, around the piece that takes the drop) can show where the drag is.
+#[test]
+fn a_drags_hover_reaches_what_is_around_the_target() {
+    let log: Log = Rc::default();
+    let l = |kind: &'static str, name: &'static str| {
+        let log = log.clone();
+        Rc::new(move |_: &Event| note(&log, format!("{kind} {name}"))) as fresh_ui::Handler<()>
+    };
+    let row_b = gesture(drag_row("b", &log, false, false))
+        .on(GestureKind::DragEnter, l("enter", "row"))
+        .on(GestureKind::DragLeave, l("leave", "row"));
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(
+        col().children([drag_row("a", &log, true, true), row_b, text("plain")]),
+        FRAME,
+    );
+    ui.dispatch(Input::press(
+        Point::new(0, 0),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    move_to(&mut ui, 0, 1);
+    move_to(&mut ui, 0, 2);
+    assert_eq!(
+        *log.borrow(),
+        vec!["enter row", "enter b", "leave b", "leave row"],
+        "outermost enters first and leaves last, as hover does"
+    );
+}
+
+/// **A press ends a drag whose release never came, and tells what it was
+/// over.** Otherwise a row the drag lit stays lit: nothing else would tell it
+/// the drag has gone.
+#[test]
+fn a_press_ends_a_lost_drag_and_leaves_what_it_was_over() {
+    let log: Log = Rc::default();
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(
+        col().children([
+            drag_row("a", &log, true, true),
+            drag_row("b", &log, false, false),
+            text("plain"),
+        ]),
+        FRAME,
+    );
+    ui.dispatch(Input::press(
+        Point::new(0, 0),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    move_to(&mut ui, 0, 1);
+    // The release is lost; the next press lands elsewhere.
+    ui.dispatch(Input::press(
+        Point::new(0, 2),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    assert_eq!(*log.borrow(), vec!["enter b", "leave b"]);
+    assert!(!ui.dragging(), "the press ended the drag");
 }

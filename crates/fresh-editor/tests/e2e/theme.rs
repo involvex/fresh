@@ -59,6 +59,22 @@ fn test_theme_loading_from_config_light() {
     // The pre-fix value `[0, 16, 128]` reads as near-black; the replacement
     // is a more saturated teal that actually stands out as a syntax color.
     assert_eq!(theme.syntax_variable, Color::Rgb(0, 90, 140));
+
+    // **`editor.cursor` is an accent, not ink.** The terminal draws the
+    // primary caret by its own rule and the editor no longer overrides its
+    // colour, so what this key still paints is everything the editor draws
+    // itself: the inactive split's cursor cell, the cursor-jump animation's
+    // head, and the border a focused dock or file explorer wears. `[0, 0, 0]`
+    // served none of them — a focus ring the same black as the body text
+    // reads as ink, not as focus, and it was also the colour that made the
+    // old themed block cursor swallow the character under it. The
+    // replacement is this theme's own steel-blue accent, shared with
+    // `ui.status_palette_bg` and `ui.split_separator_hover_fg`.
+    assert_eq!(theme.cursor, Color::Rgb(70, 130, 180));
+    assert_ne!(
+        theme.cursor, theme.editor_fg,
+        "an accent the colour of the body text cannot read as an accent"
+    );
 }
 
 #[test]
@@ -224,7 +240,11 @@ fn test_bracket_highlight_uses_theme_colors() {
 
     let theme = harness.editor().theme();
     let buffer = &harness.editor().active_state().buffer;
-    let gutter_width = harness.editor().active_viewport().gutter_width(buffer) as u16;
+    let gutter_width = harness
+        .editor()
+        .active_window()
+        .active_viewport()
+        .gutter_width(buffer) as u16;
     let (content_first_row, _) = harness.content_area_rows();
 
     // Verify we are looking at the opening bracket cell
@@ -257,7 +277,11 @@ fn test_rainbow_bracket_colorization() {
 
     let theme = harness.editor().theme();
     let buffer = &harness.editor().active_state().buffer;
-    let gutter_width = harness.editor().active_viewport().gutter_width(buffer) as u16;
+    let gutter_width = harness
+        .editor()
+        .active_window()
+        .active_viewport()
+        .gutter_width(buffer) as u16;
     let (content_first_row, _) = harness.content_area_rows();
 
     let expected_colors = [
@@ -349,11 +373,12 @@ fn test_markdown_popup_body_text_has_explicit_popup_text_fg() {
     let popup_text_fg = {
         let editor = harness.editor_mut();
         let theme = editor.theme().clone();
-        let popup = Popup::markdown("Create a new string object.", &theme, None)
-            .with_position(PopupPosition::Fixed { x: 10, y: 5 })
-            .with_width(50)
-            .with_max_height(10)
-            .with_transient(true);
+        // Built the way the hover and signature-help paths build theirs.
+        let mut popup = Popup::markdown("Create a new string object.", &theme, None);
+        popup.position = PopupPosition::Fixed { x: 10, y: 5 };
+        popup.width = 50;
+        popup.max_height = 10;
+        popup.transient = true;
         editor.active_state_mut().popups.show(popup);
         theme.popup_text_fg
     };
@@ -756,12 +781,17 @@ fn test_diagnostic_overlay_colors_update_on_theme_change() -> anyhow::Result<()>
         "fn main() {\n    let x: i32 = \"hello\";\n    println!(\"{}\", x);\n}\n",
     )?;
 
-    let mut config = Config::default();
-    config.theme = "dark".into();
-    // The theme switch below kicks off a color-transition crossfade; the
-    // assertions check settled colors, so disable animations (the harness
-    // only does this automatically when no custom config is passed).
-    config.editor.animations = false;
+    let mut config = Config {
+        theme: "dark".into(),
+        // The theme switch below kicks off a color-transition crossfade; the
+        // assertions check settled colors, so disable animations (the harness
+        // only does this automatically when no custom config is passed).
+        editor: fresh::config::EditorConfig {
+            animations: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     config.lsp.insert(
         "rust".to_string(),
         fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {

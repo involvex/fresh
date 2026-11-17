@@ -5,6 +5,8 @@
 #[cfg(all(windows, feature = "gui"))]
 use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
 
+use fresh_editor_core::model::host_path::AsHostPath;
+
 use anyhow::{Context, Result as AnyhowResult};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use crossterm::event::{poll as event_poll, read as event_read};
@@ -52,9 +54,20 @@ const BEFORE_HELP_EN: &str =
 #[command(before_help = BEFORE_HELP_EN)]
 struct Cli {
     /// Run a command instead of opening files
-    /// Commands: daemon (list|attach|new|kill|open-file), config (show|paths), grammar (list), init, update, script (api|check|run|types), help (tour|script)
+    /// Commands: daemon (list|attach|new|kill|open-file), config (show|paths), grammar (list), init, update, script (api|check|run|types), workspace (list), agent (list|get|explain|wait|start), help (tour|script)
     #[arg(long, num_args = 1.., value_name = "COMMAND", allow_hyphen_values = true)]
     cmd: Vec<String>,
+
+    /// Update fresh to the latest release; same as `--cmd update`, and takes
+    /// the same flags (`fresh --update --yes`, `fresh --update --check`)
+    #[arg(
+        long,
+        num_args = 0..,
+        value_name = "FLAGS",
+        allow_hyphen_values = true,
+        conflicts_with_all = ["cmd", "files"]
+    )]
+    update: Option<Vec<String>>,
 
     /// Print the guide for driving this editor from a shell
     /// The one entry point an agent needs; defaults to the scripting guide.
@@ -113,6 +126,28 @@ struct Cli {
     #[arg(long, alias = "no-session", conflicts_with = "restore")]
     no_restore: bool,
 
+    /// Accepted for `$EDITOR` / `git config core.editor "fresh --wait"`. Fresh
+    /// already returns only once you quit, so there is nothing to wait for
+    #[arg(long)]
+    wait: bool,
+
+    /// Open just what is named (or an empty buffer), here in this terminal: no
+    /// session restored or saved, no dock, no daemon — what `fresh FILE` does,
+    /// without needing a file
+    #[arg(long, conflicts_with = "restore")]
+    simple: bool,
+
+    /// Compare two files side by side, both editable, in one tab: the
+    /// differences aligned and highlighted, as `git difftool` expects of a
+    /// diff tool
+    #[arg(
+        long,
+        num_args = 2,
+        value_names = ["LEFT", "RIGHT"],
+        conflicts_with_all = ["files", "attach", "stdin", "web", "cmd"]
+    )]
+    diff: Option<Vec<PathBuf>>,
+
     /// Force restore of previous workspace, overriding
     /// `editor.restore_previous_session = false` in the config.  Cannot be
     /// combined with `--no-restore`.
@@ -135,6 +170,12 @@ struct Cli {
     /// Session name for server mode (internal, used by spawn_server_detached)
     #[arg(long, hide = true, value_name = "NAME")]
     session_name: Option<String>,
+
+    /// Boot the daemon as the one a bare `fresh` auto-attaches to (internal,
+    /// used by spawn_server_detached). The client knows the launch was a bare
+    /// `fresh`; the daemon is a different process and cannot see that.
+    #[arg(long, hide = true)]
+    orchestrator_mode: bool,
 
     /// Remote SSH URL for server mode (internal, used by spawn_server_detached
     /// when the client was launched with `ssh://…` or `user@host:path`).  The
@@ -173,6 +214,15 @@ struct Cli {
     #[cfg(feature = "web")]
     #[arg(long, value_name = "ADDR", num_args = 0..=1, default_missing_value = "127.0.0.1:8137")]
     web: Option<String>,
+
+    /// Accepted but unavailable: this build was compiled without the `web`
+    /// feature. Hidden from `--help` (advertising a flag that cannot work
+    /// would be worse than not listing it) and taken only so `--web` fails
+    /// with `web_unavailable()`'s explanation of what is missing instead of
+    /// clap's bare "unexpected argument '--web' found".
+    #[cfg(not(feature = "web"))]
+    #[arg(long, value_name = "ADDR", num_args = 0..=1, default_missing_value = "127.0.0.1:8137", hide = true)]
+    web: Option<String>,
 }
 
 // Internal Args struct - maps from new Cli to format used by rest of codebase
@@ -188,6 +238,11 @@ struct Args {
     log_file: Option<PathBuf>,
     event_log: Option<PathBuf>,
     no_session: bool,
+    /// `--simple`: a file launch (see `is_file_launch`) whatever is named.
+    simple: bool,
+    /// `--diff LEFT RIGHT`: a file launch of those two files, shown side by
+    /// side (see `Editor::diff_launch`).
+    diff: Option<(PathBuf, PathBuf)>,
     /// Force workspace restore even if `editor.restore_previous_session`
     /// is disabled in the config.
     force_restore: bool,
@@ -201,6 +256,7 @@ struct Args {
     update_yes: bool,
     update_allow_downgrade: bool,
     update_pre: bool,
+    update_skip_attestation: bool,
     update_print_command: bool,
     update_download_only: bool,
     update_force: bool,
@@ -214,6 +270,10 @@ struct Args {
     /// when the client saw an `ssh://` / scp-style remote in
     /// `files`.  Populated only for the daemon side.
     ssh_url: Option<String>,
+    /// Forwarded to the detached daemon by `spawn_server_detached` when the
+    /// client was a bare `fresh` and `auto_attach` was on.  Populated
+    /// only for the daemon side.
+    orchestrator_mode: bool,
     // Daemon-related fields (set via subcommands or -a shortcut)
     attach: bool,
     list_sessions: bool,
@@ -227,10 +287,19 @@ struct Args {
     /// Serve the web UI on this bind address (`--web [ADDR]`)
     #[cfg(feature = "web")]
     web: Option<String>,
+    /// `--web [ADDR]` on a build without the web UI — carried only so the
+    /// failure can explain itself.
+    #[cfg(not(feature = "web"))]
+    web: Option<String>,
 }
 
 impl From<Cli> for Args {
-    fn from(cli: Cli) -> Self {
+    fn from(mut cli: Cli) -> Self {
+        // `--update [FLAGS]` is `--cmd update [FLAGS]`.
+        if let Some(flags) = cli.update.take() {
+            cli.cmd = std::iter::once("update".to_string()).chain(flags).collect();
+        }
+
         // Check for grammar list command before the main tuple parsing
         let list_grammars = if !cli.cmd.is_empty() {
             let cmd_args: Vec<&str> = cli.cmd.iter().map(|s| s.as_str()).collect();
@@ -243,7 +312,9 @@ impl From<Cli> for Args {
         };
 
         // `fresh --cmd update [--check] [--yes] [--allow-downgrade] [--force]
-        //                     [--print-command] [--releases-url U] [--download-base U]`
+        //  (or `fresh --update ...`)
+        //                     [--print-command] [--skip-attestation]
+        //                     [--releases-url U] [--download-base U]`
         let update = cli.cmd.first().map(String::as_str) == Some("update");
         let update_check = update && cli.cmd.iter().any(|a| a == "--check");
         let update_yes = update && cli.cmd.iter().any(|a| a == "--yes" || a == "-y");
@@ -252,6 +323,15 @@ impl From<Cli> for Args {
         let update_download_only = update && cli.cmd.iter().any(|a| a == "--download-only");
         let update_force = update && cli.cmd.iter().any(|a| a == "--force");
         let update_pre = update && cli.cmd.iter().any(|a| a == "--pre");
+        // Verification down to the checksum alone — what `install.sh` does.
+        // Only useful when the attestation lookup itself is refused (GitHub's
+        // API rate limit), which is why the failure names it and nothing else
+        // advertises it.
+        let update_skip_attestation = update
+            && cli
+                .cmd
+                .iter()
+                .any(|a| a == fresh_update::SKIP_ATTESTATION_FLAG);
         // Value flags: `--flag VALUE`. Point the update at a mirror of the
         // release feed — an air-gapped/enterprise mirror in production, and the
         // way the packaging containers exercise the real install flow in tests.
@@ -480,7 +560,7 @@ impl From<Cli> for Args {
                 // Unknown command
                 _ => {
                     eprintln!("Unknown command: {}", cli.cmd.join(" "));
-                    eprintln!("Available commands: daemon (list|attach|new|kill|info|open-file), config (show|paths), grammar (list), init, update");
+                    eprintln!("Available commands: daemon (list|attach|new|kill|info|open-file), config (show|paths), grammar (list), init, update, script, command, workspace, agent");
                     std::process::exit(1);
                 }
             }
@@ -527,6 +607,11 @@ impl From<Cli> for Args {
             log_file: cli.log_file,
             event_log: cli.event_log,
             no_session: cli.no_restore,
+            simple: cli.simple,
+            diff: cli.diff.and_then(|pair| match pair.as_slice() {
+                [left, right] => Some((left.clone(), right.clone())),
+                _ => None,
+            }),
             force_restore: cli.restore,
             no_upgrade_check: cli.no_upgrade_check,
             dump_config,
@@ -537,6 +622,7 @@ impl From<Cli> for Args {
             update_yes,
             update_allow_downgrade,
             update_pre,
+            update_skip_attestation,
             update_print_command,
             update_download_only,
             update_force,
@@ -547,6 +633,7 @@ impl From<Cli> for Args {
             init,
             server: cli.server,
             ssh_url: cli.ssh_url,
+            orchestrator_mode: cli.orchestrator_mode,
             attach,
             list_sessions,
             session_name,
@@ -555,6 +642,8 @@ impl From<Cli> for Args {
             #[cfg(feature = "gui")]
             gui: cli.gui,
             #[cfg(feature = "web")]
+            web: cli.web,
+            #[cfg(not(feature = "web"))]
             web: cli.web,
         }
     }
@@ -603,7 +692,6 @@ enum ParsedLocation {
 struct IterationOutcome {
     loop_result: AnyhowResult<()>,
     update_result: Option<release_checker::ReleaseCheckResult>,
-    restart_dir: Option<PathBuf>,
 }
 
 struct SetupState {
@@ -640,62 +728,58 @@ struct SetupState {
     terminal_modes: TerminalModes,
 }
 
-/// State for stdin streaming in background
-#[cfg(unix)]
+/// State for stdin streaming in background.
+///
+/// The spool the pipe is drained into has no name — see
+/// `services::stdin_spool` — so this is the only handle on it, and the
+/// filesystem the buffer must use to read it back travels with it.
 pub struct StdinStreamState {
-    /// Path to temp file where stdin is being written
-    pub temp_path: PathBuf,
+    /// The nameless spool, and the filesystem view that can read it.
+    pub spool: std::sync::Arc<fresh::services::stdin_spool::StdinSpool>,
     /// Handle to background thread (None if completed)
     pub thread_handle: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
 }
 
-/// Start streaming stdin to temp file in background.
-/// Returns immediately with streaming state. Editor can start while data streams in.
-/// Must be called BEFORE enabling raw terminal mode.
-#[cfg(unix)]
+/// Start streaming stdin to the spool in the background.
+///
+/// Returns immediately; the editor starts while data is still arriving.
+/// Must be called BEFORE enabling raw terminal mode, because it reopens
+/// stdin from `/dev/tty` once the pipe has been handed to the drain thread.
 fn start_stdin_streaming() -> AnyhowResult<StdinStreamState> {
-    use std::fs::File;
-    use std::os::unix::io::{AsRawFd, FromRawFd};
+    use std::sync::Arc;
 
-    // Duplicate stdin fd BEFORE reopening it as TTY
-    // This preserves access to the pipe for background reading
-    let stdin_fd = io::stdin().as_raw_fd();
-    let pipe_fd = unsafe { libc::dup(stdin_fd) };
-    if pipe_fd == -1 {
-        anyhow::bail!("Failed to dup stdin: {}", io::Error::last_os_error());
-    }
+    // Take the pipe before stdin is reopened as the terminal, so the drain
+    // thread keeps reading what was piped in.
+    let pipe = take_stdin_pipe()?;
 
-    // Create empty temp file
-    let temp_dir = std::env::temp_dir();
-    let temp_path = temp_dir.join(format!("fresh-stdin-{}.tmp", std::process::id()));
-    File::create(&temp_path)?;
+    let (spool, mut writer) = fresh::services::stdin_spool::StdinSpool::create()
+        .context("Failed to create the stdin spool")?;
+    let spool = Arc::new(spool);
 
-    // Reopen stdin from /dev/tty so crossterm can use it for keyboard input
+    // Reopen stdin from the terminal so crossterm can read keys from it.
     reopen_stdin_from_tty()?;
     tracing::info!("Reopened stdin from /dev/tty for terminal input");
 
-    // Spawn background thread to drain pipe into temp file
-    let temp_path_clone = temp_path.clone();
-    let thread_handle = std::thread::spawn(move || {
+    let thread_handle = std::thread::spawn(move || -> anyhow::Result<()> {
         use std::io::{Read, Write};
 
-        // SAFETY: pipe_fd is a valid duplicated file descriptor
-        let mut pipe_file = unsafe { File::from_raw_fd(pipe_fd) };
-        let mut temp_file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&temp_path_clone)?;
-
+        let mut pipe = pipe;
         const CHUNK_SIZE: usize = 64 * 1024;
         let mut buffer = vec![0u8; CHUNK_SIZE];
 
         loop {
-            let bytes_read = pipe_file.read(&mut buffer)?;
-            if bytes_read == 0 {
-                break; // EOF
-            }
-            temp_file.write_all(&buffer[..bytes_read])?;
-            // Flush each chunk so main thread can see progress
-            temp_file.flush()?;
+            let bytes_read = match pipe.read(&mut buffer) {
+                Ok(0) => break, // EOF
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                // A closed pipe is an ordinary end of input, not a failure.
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => break,
+                Err(e) => return Err(e.into()),
+            };
+            writer.write_all(&buffer[..bytes_read])?;
+            // Flush each chunk so the editor can show progress while the
+            // rest is still arriving.
+            writer.flush()?;
         }
 
         tracing::info!("Stdin streaming complete");
@@ -703,111 +787,82 @@ fn start_stdin_streaming() -> AnyhowResult<StdinStreamState> {
     });
 
     Ok(StdinStreamState {
-        temp_path,
+        spool,
         thread_handle: Some(thread_handle),
     })
 }
 
-/// Windows stdin stream state
-#[cfg(windows)]
-pub struct StdinStreamState {
-    pub temp_path: PathBuf,
-    pub thread_handle: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+/// Hand back the piped stdin as an owned reader, so it survives stdin being
+/// reopened as the terminal.
+#[cfg(unix)]
+fn take_stdin_pipe() -> AnyhowResult<std::fs::File> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    let stdin_fd = io::stdin().as_raw_fd();
+    // SAFETY: `dup` returns a fresh descriptor for the same pipe, which the
+    // `File` below then owns; the original fd is left for `reopen_stdin_from_tty`.
+    let pipe_fd = unsafe { libc::dup(stdin_fd) };
+    if pipe_fd == -1 {
+        anyhow::bail!("Failed to dup stdin: {}", io::Error::last_os_error());
+    }
+    // SAFETY: `pipe_fd` is a valid descriptor this function just created and
+    // hands sole ownership of to the returned `File`.
+    Ok(unsafe { std::fs::File::from_raw_fd(pipe_fd) })
 }
 
-/// Stream stdin content to a temp file on Windows.
-/// This is called when stdin is a pipe (e.g., `cat file.txt | fresh`).
-/// We duplicate the stdin handle, spawn a thread to read from it,
-/// and then reopen stdin from CONIN$ for keyboard input.
+/// Windows counterpart of [`take_stdin_pipe`].
 #[cfg(windows)]
-fn start_stdin_streaming() -> AnyhowResult<StdinStreamState> {
-    use std::fs::File;
-    use std::io::{Read, Write};
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+fn take_stdin_pipe() -> AnyhowResult<std::fs::File> {
+    use std::os::windows::io::FromRawHandle;
     use windows_sys::Win32::Foundation::{
         DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, INVALID_HANDLE_VALUE,
     };
-    use windows_sys::Win32::System::Console::GetStdHandle;
-    use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-    // Get the current stdin handle (which is a pipe)
+    // SAFETY: plain console/handle queries; every failure is checked below.
     let stdin_handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
     if stdin_handle == INVALID_HANDLE_VALUE || stdin_handle.is_null() {
         anyhow::bail!("Failed to get stdin handle");
     }
 
-    // Duplicate the handle so we can read from it in a background thread
-    // while we replace stdin with CONIN$ for keyboard input
-    let mut duplicated_handle: HANDLE = std::ptr::null_mut();
-    let current_process = unsafe { GetCurrentProcess() };
-    let success = unsafe {
+    let mut duplicated: HANDLE = std::ptr::null_mut();
+    // SAFETY: duplicating a handle this process owns into this process; the
+    // result is checked and then owned by the `File` below.
+    let ok = unsafe {
+        let me = GetCurrentProcess();
         DuplicateHandle(
-            current_process,
+            me,
             stdin_handle,
-            current_process,
-            &mut duplicated_handle,
+            me,
+            &mut duplicated,
             0,
             0, // not inheritable
             DUPLICATE_SAME_ACCESS,
         )
     };
-
-    if success == 0 {
+    if ok == 0 {
         anyhow::bail!(
             "Failed to duplicate stdin handle: {}",
             io::Error::last_os_error()
         );
     }
 
-    // Create a temp file to store the piped content
-    let temp_dir = std::env::temp_dir();
-    let temp_path = temp_dir.join(format!("fresh-stdin-{}.txt", std::process::id()));
-
-    let temp_path_clone = temp_path.clone();
-
-    // Cast handle to usize for Send across thread boundary
-    // SAFETY: HANDLE is a pointer-sized value, usize preserves it exactly
-    let handle_as_usize = duplicated_handle as usize;
-
-    // Spawn a thread to read from the duplicated pipe handle
-    let thread_handle = std::thread::spawn(move || -> AnyhowResult<()> {
-        // SAFETY: We own this duplicated handle and will close it when done
-        // Cast back from usize to raw handle
-        let raw_handle = handle_as_usize as *mut std::ffi::c_void;
-        let owned_handle = unsafe { OwnedHandle::from_raw_handle(raw_handle) };
-        let mut pipe_reader = unsafe { File::from_raw_handle(owned_handle.as_raw_handle()) };
-        // Forget the OwnedHandle since File now owns it
-        std::mem::forget(owned_handle);
-
-        let mut temp_file = File::create(&temp_path_clone)?;
-        let mut buffer = [0u8; 8192];
-
-        loop {
-            match pipe_reader.read(&mut buffer) {
-                Ok(0) => break, // EOF
-                Ok(n) => {
-                    temp_file.write_all(&buffer[..n])?;
-                }
-                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => break,
-                Err(e) => return Err(e.into()),
-            }
-        }
-
-        temp_file.flush()?;
-        Ok(())
-    });
-
-    Ok(StdinStreamState {
-        temp_path,
-        thread_handle: Some(thread_handle),
-    })
+    // SAFETY: `duplicated` is a valid handle this function just created and
+    // hands sole ownership of to the returned `File`.
+    Ok(unsafe { std::fs::File::from_raw_handle(duplicated.cast()) })
 }
 
-/// Check if stdin has data available (is a pipe or redirect, not a TTY)
-fn stdin_has_data() -> bool {
+/// Whether stdin is the terminal.
+///
+/// The only question anything here can actually answer. Its opposite is not
+/// "there is a pipe with data on it" — a redirect from a file, `/dev/null`,
+/// an inherited socket and a closed descriptor all answer the same way — so
+/// nothing downstream may assume more than "these bytes, whatever they are,
+/// are not keystrokes".
+fn stdin_is_terminal() -> bool {
     use std::io::IsTerminal;
-    !io::stdin().is_terminal()
+    io::stdin().is_terminal()
 }
 
 /// Reopen stdin from /dev/tty after reading piped content.
@@ -818,8 +873,23 @@ fn reopen_stdin_from_tty() -> AnyhowResult<()> {
     use std::fs::File;
     use std::os::unix::io::AsRawFd;
 
-    // Open /dev/tty - the controlling terminal
-    let tty = File::open("/dev/tty")?;
+    // Open /dev/tty - the controlling terminal. A process without one (a
+    // daemon, a `setsid` child, a cron job) cannot get keys from anywhere,
+    // so say which device is missing rather than coming up unusable.
+    let tty = File::open("/dev/tty").map_err(|e| {
+        anyhow::anyhow!("Failed to open /dev/tty (no controlling terminal to read keys from): {e}")
+    })?;
+
+    // With fd 0 closed on entry (`fresh file 0<&-`), the open above is handed
+    // fd 0 itself. `dup2(0, 0)` is then a no-op that *succeeds*, and dropping
+    // `tty` closes fd 0 again — leaving stdin closed while reporting success,
+    // which is the same dead descriptor this function exists to replace. There
+    // is nothing to duplicate in that case; the terminal is already fd 0 and
+    // only has to stop being owned by a `File` that will close it.
+    if tty.as_raw_fd() == libc::STDIN_FILENO {
+        std::mem::forget(tty);
+        return Ok(());
+    }
 
     // Duplicate /dev/tty to stdin (fd 0) using libc
     // SAFETY: dup2 is safe to call with valid file descriptors
@@ -874,6 +944,32 @@ fn reopen_stdin_from_tty() -> AnyhowResult<()> {
     Ok(())
 }
 
+/// Refuse to start the terminal UI from mintty (Git Bash, MSYS2, Cygwin).
+///
+/// mintty hands a native program MSYS pty pipes instead of a console. Rust's
+/// `IsTerminal` calls those terminals, so the launch went ahead and the first
+/// console call on stdin failed with a bare "os error 6" (#3547). Keys typed
+/// into mintty only reach that pipe, so no console handle would get them
+/// either: say what is wrong and how to run fresh instead, before any
+/// terminal setup happens. Printed and exited like `web_unavailable`: a
+/// user error deserves a clean line, not `real_main`'s backtrace.
+#[cfg(windows)]
+fn require_windows_console() {
+    let Some(stream) = fresh_winterm::msys_pty_stream() else {
+        return;
+    };
+    eprintln!(
+        "Error: fresh cannot run directly in mintty (the Git Bash / MSYS2 / Cygwin terminal)."
+    );
+    eprintln!(
+        "Its {stream} is an MSYS pty pipe, not a Windows console, so fresh has no console to use."
+    );
+    eprintln!("Instead, either:");
+    eprintln!("  - start it through winpty: winpty fresh ... (keyboard only, no mouse)");
+    eprintln!("  - run it in Windows Terminal, PowerShell or cmd (Git Bash works inside Windows Terminal)");
+    std::process::exit(1);
+}
+
 fn handle_first_run_setup(
     editor: &mut Editor,
     args: &Args,
@@ -888,22 +984,16 @@ fn handle_first_run_setup(
             .active_window_mut()
             .enable_event_streaming(log_path)?;
     }
-    // The warning-log channel and status-log path used to be wired up
-    // here from `tracing_handles`; that wiring now lives in the main
-    // loop so it survives editor restarts (e.g. devcontainer attach).
+    // The warning-log channel and status-log path are wired up in main.
 
     // If the user passed any file argument on the command line and the
-    // `skip_session_restore_when_files_passed` option is on (default), treat
-    // the launch as a focused "open these files" invocation: skip the full
-    // session restore but still recover hot-exit content. `--restore` (force)
-    // is a deliberate user override that wins.
-    let cli_has_file_args = file_locations.iter().any(|loc| !loc.path.is_dir());
-    let cli_overrides_restore = cli_has_file_args
-        && editor
-            .config()
-            .editor
-            .skip_session_restore_when_files_passed
-        && !args.force_restore;
+    // `skip_session_restore_when_files_passed` option is on (default), the
+    // launch is a focused "open these files" invocation (`Editor::file_launch`):
+    // skip the session restore and recover only those files' hot-exit
+    // content. `--restore` (force) is a deliberate user override that wins.
+    let cli_overrides_restore = editor.file_launch();
+    let explorer =
+        fresh::app::workspace::ExplorerOnEntry::for_launch(args.simple, show_file_explorer);
 
     let restore_full_session = workspace_enabled
         && !cli_overrides_restore
@@ -912,12 +1002,13 @@ fn handle_first_run_setup(
     if restore_full_session {
         // Shared window-restore flow — the same `restore_window` the
         // orchestrator dock's `materialize_window` uses — so the
-        // foreground directory applies its persisted explorer visibility,
-        // or the fresh-session default, exactly as a dock switch would. A
-        // bare single-directory launch (`show_file_explorer`) defaults to
-        // the tree only when nothing was restored, which keeps a
-        // deliberately-closed explorer closed across relaunches.
-        match editor.restore_active_window_on_launch(!show_file_explorer) {
+        // foreground directory applies its persisted explorer visibility.
+        // A bare single-directory launch (`show_file_explorer`) then shows
+        // the tree unless the user closed it in that directory, which keeps
+        // a deliberately-closed explorer closed across relaunches.
+        let restored = editor.restore_active_window_on_launch(explorer);
+        editor.mark_active_window_focused();
+        match restored {
             Ok(true) => {
                 tracing::info!("Workspace restored successfully");
             }
@@ -936,12 +1027,12 @@ fn handle_first_run_setup(
         // startup build exactly one window — deterministic and cheap
         // regardless of how many sessions exist.
     } else {
-        if !workspace_enabled {
-            tracing::info!("Skipping workspace restore: --no-restore was specified");
-        } else if cli_overrides_restore {
+        if cli_overrides_restore {
             tracing::info!(
-                "Skipping workspace restore: file arguments passed on the command line (editor.skip_session_restore_when_files_passed)"
+                "Skipping workspace restore: file launch (--simple, or files passed with editor.skip_session_restore_when_files_passed)"
             );
+        } else if !workspace_enabled {
+            tracing::info!("Skipping workspace restore: --no-restore was specified");
         } else {
             tracing::info!(
                 "Skipping workspace restore: editor.restore_previous_session is disabled"
@@ -950,7 +1041,17 @@ fn handle_first_run_setup(
         // Session restore opted out, but hot-exit content (unsaved
         // modified files + unnamed buffers with content) is still
         // restored so the user does not lose in-progress work.
-        match editor.try_restore_hot_exit_buffers() {
+        //
+        // Not on a file launch: `fresh FILE` (git's `core.editor`, say) is
+        // about that file, so it gets that file's own hot-exit content (see
+        // `schedule_hot_exit_recovery` below) and no other buffer's. The rest
+        // stays stashed for the next session launch to bring back.
+        let restored = if cli_overrides_restore {
+            Ok(0)
+        } else {
+            editor.try_restore_hot_exit_buffers()
+        };
+        match restored {
             Ok(n) if n > 0 => {
                 tracing::info!(
                     "Restored {} hot-exit buffer(s) despite skipping session restore",
@@ -963,16 +1064,23 @@ fn handle_first_run_setup(
             }
         }
         // No workspace was restored, so the persisted explorer visibility
-        // never loaded — apply the same fresh-session default the restore
-        // flow would, so a bare directory launch still opens the tree.
-        editor.apply_active_window_explorer_default(!show_file_explorer, false);
+        // never loaded — apply the same default the restore flow would, so
+        // a bare directory launch still opens the tree (and `--simple`
+        // keeps it closed).
+        editor.apply_active_window_explorer_default(explorer, false);
     }
 
     // Handle stdin streaming (takes priority over files)
     // Opens with empty/partial buffer, content streams in background
     if let Some(mut stream_state) = stdin_stream.take() {
-        tracing::info!("Opening stdin buffer from: {:?}", stream_state.temp_path);
-        editor.open_stdin_buffer(&stream_state.temp_path, stream_state.thread_handle.take())?;
+        tracing::info!(
+            "Opening stdin buffer from spool {:?}",
+            stream_state.spool.path()
+        );
+        editor.open_stdin_buffer(
+            std::sync::Arc::clone(&stream_state.spool),
+            stream_state.thread_handle.take(),
+        )?;
     }
 
     // Queue CLI files to be opened after the TUI starts
@@ -1005,21 +1113,6 @@ fn handle_first_run_setup(
     // branches above (via `restore_window` / `apply_active_window_explorer_default`),
     // which respect a deliberately-closed explorer rather than re-opening
     // it unconditionally on every relaunch.
-
-    if editor.has_recovery_files().unwrap_or(false) {
-        tracing::info!("Recovery files found from previous session, recovering...");
-        match editor.recover_all_buffers() {
-            Ok(count) if count > 0 => {
-                tracing::info!("Recovered {} buffer(s)", count);
-            }
-            Ok(_) => {
-                tracing::info!("No buffers to recover");
-            }
-            Err(e) => {
-                tracing::warn!("Failed to recover buffers: {}", e);
-            }
-        }
-    }
 
     Ok(())
 }
@@ -1692,6 +1785,20 @@ fn connect_remote(
     })
 }
 
+/// Which locale the UI should use: CLI `--locale` first, then `locale` from
+/// the config, then `None` — which leaves `i18n::init_with_config` to detect
+/// from `LC_ALL`/`LC_MESSAGES`/`LANG`.
+///
+/// One function rather than the expression written out per entry point.
+/// Every process that renders the UI has to make this decision — the
+/// standalone editor in `initialize_app`, the daemon in
+/// `run_server_command` — and #3149 was precisely a path that reached the
+/// UI without making it. Anything new that boots an editor should call this
+/// rather than re-derive the precedence.
+fn resolve_locale_override<'a>(args: &'a Args, config: &'a config::Config) -> Option<&'a str> {
+    args.locale.as_deref().or(config.locale.as_option())
+}
+
 fn initialize_app(args: &Args) -> AnyhowResult<SetupState> {
     let log_file = args
         .log_file
@@ -1717,37 +1824,66 @@ fn initialize_app(args: &Args) -> AnyhowResult<SetupState> {
         original_hook(panic);
     }));
 
-    // Check if we should read from stdin
-    // This can be triggered by --stdin flag or by using "-" as a file argument
-    let stdin_requested = args.stdin || args.files.iter().any(|f| f == "-");
-
-    // Start stdin streaming in background BEFORE entering raw mode
-    // This is critical - once raw mode is enabled, stdin is used for terminal events
-    // Background thread streams pipe → temp file while editor runs
-    let stdin_stream = if stdin_requested {
-        if stdin_has_data() {
-            tracing::info!("Starting background stdin streaming");
-            match start_stdin_streaming() {
-                Ok(stream_state) => {
-                    tracing::info!(
-                        "Stdin streaming started, temp file: {:?}",
-                        stream_state.temp_path
-                    );
-                    Some(stream_state)
-                }
-                Err(e) => {
-                    eprintln!("Error: Failed to start stdin streaming: {}", e);
-                    return Err(e);
-                }
-            }
-        } else {
+    // **Whatever is on stdin is input, never keystrokes.** `--stdin` and a
+    // `-` among the files ask for it explicitly; a bare `fresh` with stdin
+    // redirected means the same thing (#3252), since it is the only input
+    // there is. That launch used to fall between the cases — `fresh -` reads
+    // stdin, a bare `fresh` on a terminal goes to the orchestrator — and kept
+    // the redirect on fd 0: its bytes reached the key decoder as keystrokes,
+    // and once a pipe's writer closed, `poll` reported `POLLHUP` immediately
+    // and forever, without `POLLIN`, which `services::tty_input::poll_readable`
+    // reads as a timeout. The editor spun on a full core and never saw another
+    // key, Ctrl+Q included.
+    //
+    // File arguments say what to open, so they leave stdin unread — but that
+    // launch had the same dead fd 0 and spun the same way, so it still has to
+    // take the terminal; it just has no buffer to make of stdin. Replacing
+    // fd 0 drops the last read end, so a writer still filling the pipe gets
+    // SIGPIPE rather than blocking on a pipe nobody will read.
+    //
+    // Only "is stdin the terminal" is asked, so a redirect from a file or
+    // `/dev/null` counts too: each left the same unreadable fd 0, and none is
+    // a source of keys.
+    //
+    // All of this runs BEFORE raw mode is enabled: once it is, stdin is the
+    // editor's source of terminal events. The reading path streams stdin into
+    // the spool on a background thread, so the editor starts while data is
+    // still arriving.
+    let stdin_asked_for = args.stdin || args.files.iter().any(|f| f == "-");
+    let stdin_stream = if stdin_is_terminal() {
+        if stdin_asked_for {
             eprintln!("Error: --stdin or \"-\" specified but stdin is a terminal (no piped data)");
             anyhow::bail!(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "No data piped to stdin",
             ));
         }
+        None
+    } else if stdin_asked_for || args.files.is_empty() {
+        tracing::info!("Starting background stdin streaming");
+        match start_stdin_streaming() {
+            Ok(stream_state) => {
+                tracing::info!(
+                    "Stdin streaming started, spool: {:?}",
+                    stream_state.spool.path()
+                );
+                Some(stream_state)
+            }
+            Err(e) => {
+                eprintln!("Error: Failed to start stdin streaming: {}", e);
+                return Err(e);
+            }
+        }
     } else {
+        // Nothing reads stdin here, so it is simply replaced. This fails the
+        // launch exactly as the reading path does, and for the same reason:
+        // with no controlling terminal there is nowhere to read keys from.
+        // Reporting it here is what makes the failure legible — crossterm
+        // opens `/dev/tty` itself a moment later in `TerminalModes`, so a
+        // launch that carried on regardless still died, just with a bare
+        // "No such device or address" naming nothing.
+        reopen_stdin_from_tty()?;
+        tracing::info!("Reopened stdin from the terminal (file arguments given)");
         None
     };
 
@@ -1851,12 +1987,24 @@ fn initialize_app(args: &Args) -> AnyhowResult<SetupState> {
             // This works for both local and remote paths
             let is_directory = authority
                 .filesystem
-                .is_dir(&first_loc.path)
+                .is_dir(first_loc.path.as_host())
                 .unwrap_or(false);
             if is_directory {
                 working_dir = Some(first_loc.path.clone());
                 show_file_explorer = true;
             }
+        }
+    }
+    // A bare `fresh` that did not go to the daemon opens where the daemon
+    // would have: see `bare_launch_dir`.
+    if remote_info.is_none() && is_bare_terminal_launch() {
+        let cwd = std::env::current_dir()?;
+        let dir = bare_launch_dir(
+            &fresh::config_io::DirectoryContext::from_system()?,
+            cwd.clone(),
+        );
+        if dir != cwd {
+            working_dir = Some(dir);
         }
     }
 
@@ -1921,17 +2069,11 @@ fn initialize_app(args: &Args) -> AnyhowResult<SetupState> {
 
     // Initialize i18n with locale: CLI arg > config > environment
     // This ensures menu defaults are created with the correct translations
-    let locale_override = args.locale.as_deref().or(config.locale.as_option());
-    fresh::i18n::init_with_config(locale_override);
+    fresh::i18n::init_with_config(resolve_locale_override(args, &config));
 
     // Enable terminal modes (raw mode, alternate screen, mouse capture, etc.)
     // This checks support for each mode and tracks what was enabled
-    let keyboard_config = KeyboardConfig {
-        disambiguate_escape_codes: config.editor.keyboard_disambiguate_escape_codes,
-        report_event_types: config.editor.keyboard_report_event_types,
-        report_alternate_keys: config.editor.keyboard_report_alternate_keys,
-        report_all_keys_as_escape_codes: config.editor.keyboard_report_all_keys_as_escape_codes,
-    };
+    let keyboard_config = KeyboardConfig::from_editor_config(&config.editor);
     tracing::info!("Enabling terminal modes...");
     let terminal_modes = TerminalModes::enable(Some(&keyboard_config))?;
     tracing::info!("Terminal modes enabled");
@@ -2037,19 +2179,19 @@ fn run_editor_iteration(
     }
 
     let update_result = editor.get_update_result().cloned();
-    let restart_dir = editor.take_restart_dir();
 
     Ok(IterationOutcome {
         loop_result,
         update_result,
-        restart_dir,
     })
 }
 
 /// Check a plugin by bundling it and printing the output
 #[cfg(feature = "plugins")]
 fn check_plugin_bundle(plugin_path: &std::path::Path) -> AnyhowResult<()> {
-    use fresh_parser_js::{bundle_module, has_es_module_syntax, transpile_typescript};
+    use fresh_plugin_runtime::fresh_parser_js::{
+        bundle_module, has_es_module_syntax, transpile_typescript,
+    };
 
     eprintln!("Checking plugin: {}", plugin_path.display());
 
@@ -2242,13 +2384,22 @@ fn init_package_command(package_type: Option<String>) -> AnyhowResult<()> {
     }
 
     println!("\nPackage '{}' created successfully!", name);
+    if pkg_type == "plugin" {
+        println!();
+        for line in set_up_plugin_dev(&pkg_dir) {
+            println!("  {line}");
+        }
+    }
     println!("\nNext steps:");
     println!("  1. cd {}", name);
     match pkg_type {
         "plugin" => {
-            println!("  2. Edit plugin.ts to add your functionality");
-            println!("  3. Test locally: fresh --check-plugin .");
-            println!("  4. Validate manifest: ./validate.sh");
+            println!("  2. fresh {name}.ts");
+            println!("  3. Ctrl+P, run \"Load Plugin from Buffer\"");
+            println!("  4. Ctrl+P, run \"{name}: Say Hello\"");
+            println!("  5. Edit, save, and run \"Load Plugin from Buffer\" again to reload");
+            println!("  6. Type-check from the shell: npx tsc -p .");
+            println!("\nGuide: https://getfresh.dev/docs/plugins/development/setup");
         }
         "theme" => {
             println!("  2. Edit theme.json to customize colors");
@@ -2374,6 +2525,10 @@ fn create_plugin_package(
     description: &str,
     author: &str,
 ) -> AnyhowResult<()> {
+    // The runtime names a plugin after its entry file, so name the file after
+    // the package: every scaffold writing `plugin.ts` would make them all
+    // "plugin".
+    let entry = format!("{name}.ts");
     write_package_json(
         dir,
         name,
@@ -2381,46 +2536,45 @@ fn create_plugin_package(
         author,
         "plugin",
         "A Fresh plugin",
-        r#"{
-    "entry": "plugin.ts"
-  }"#,
+        &format!(
+            r#"{{
+    "entry": "{entry}"
+  }}"#
+        ),
     )?;
+    add_typescript_dev_dependency(dir)?;
 
     // validate.sh
     write_validate_script(dir)?;
 
-    // plugin.ts
-    let plugin_ts = r#"// Fresh Plugin
-// Documentation: https://github.com/user/fresh/blob/main/docs/plugins.md
+    let handler = name.replace('-', "_");
+    let plugin_ts = format!(
+        r#"// Fresh plugin. Guide: https://getfresh.dev/docs/plugins/development/setup
 
 const editor = getEditor();
 
-// Define a command handler and register it
-function hello(): void {
-  editor.setStatus("Hello from your plugin!");
-}
-registerHandler("hello", hello);
-editor.registerCommand("hello", "Say Hello", "hello");
+// A command. Run it from the command palette (Ctrl+P).
+registerHandler("{handler}_hello", () => {{
+  editor.setStatus("Hello from {name}!");
+}});
+editor.registerCommand("{name}: Say Hello", "Show a greeting in the status bar", "{handler}_hello");
 
-// React to editor events
-function onBufferOpened(): void {
-  const bufferId = editor.getActiveBufferId();
-  const info = editor.getBufferInfo(bufferId);
-  if (info) {
-    editor.debug(`Opened: ${info.path}`);
-  }
-}
-registerHandler("on_buffer_opened", onBufferOpened);
-editor.on("buffer_opened", "on_buffer_opened");
+// An event handler. `args` is typed from the event name.
+editor.on("buffer_activated", (args) => {{
+  editor.debug(`{name}: switched to buffer ${{args.buffer_id}}`);
+}});
+"#
+    );
+    std::fs::write(dir.join(&entry), plugin_ts)?;
 
-// Example: Add a keybinding in your Fresh config:
-// {
-//   "keyBindings": {
-//     "ctrl+alt+h": "command:hello"
-//   }
-// }
-"#;
-    std::fs::write(dir.join("plugin.ts"), plugin_ts)?;
+    std::fs::write(dir.join("tsconfig.json"), PLUGIN_TSCONFIG)?;
+    std::fs::write(dir.join(".gitignore"), "node_modules/\ntypes\n")?;
+    // Project settings: start the TypeScript language server on open.
+    std::fs::create_dir_all(dir.join(".fresh"))?;
+    std::fs::write(
+        dir.join(".fresh").join("config.json"),
+        "{\n  \"lsp\": { \"typescript\": { \"auto_start\": true } }\n}\n",
+    )?;
 
     // README.md
     let readme = format!(
@@ -2443,7 +2597,7 @@ Or install from this repository:
 ## Usage
 
 This plugin adds the following commands:
-- `hello` - Say Hello
+- `{}: Say Hello` - Show a greeting in the status bar
 
 ## License
 
@@ -2456,11 +2610,133 @@ MIT
             description
         },
         name,
+        name,
         name
     );
     std::fs::write(dir.join("README.md"), readme)?;
 
     Ok(())
+}
+
+/// `tsconfig.json` for a plugin package. Matches the plugin runtime (QuickJS:
+/// no DOM, no Node types) and the bundled plugins' `.ts` import style.
+/// `moduleResolution` must be `bundler`: TypeScript 7 removed `node` (#2872).
+const PLUGIN_TSCONFIG: &str = r#"{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ES2020",
+    "moduleResolution": "bundler",
+    "moduleDetection": "force",
+    "allowImportingTsExtensions": true,
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "lib": ["ES2020"],
+    "types": []
+  },
+  "include": ["*.ts", "lib/**/*.ts", "types/fresh.d.ts", "types/plugins.d.ts"]
+}
+"#;
+
+/// Add `typescript` as a dev dependency so `npx tsc` and
+/// typescript-language-server find a local copy. Pinned to 6: TypeScript 7
+/// ships no `tsserver`, which the language server needs.
+fn add_typescript_dev_dependency(dir: &Path) -> AnyhowResult<()> {
+    let path = dir.join("package.json");
+    let text = std::fs::read_to_string(&path)?;
+    let text = text
+        .trim_end()
+        .strip_suffix('}')
+        .unwrap_or(&text)
+        .trim_end();
+    std::fs::write(
+        &path,
+        format!("{text},\n  \"devDependencies\": {{\n    \"typescript\": \"^6.0.0\"\n  }}\n}}\n"),
+    )?;
+    Ok(())
+}
+
+/// Make a new plugin package ready to develop: link the API types, install
+/// TypeScript and trust its folder. It is not installed: the author loads it
+/// with "Load Plugin from Buffer". Each step is best-effort; returns one line
+/// per step for the summary.
+fn set_up_plugin_dev(dir: &Path) -> Vec<String> {
+    let mut report = Vec::new();
+    let abs_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let dir_context = match fresh::config_io::DirectoryContext::from_system() {
+        Ok(d) => d,
+        Err(e) => {
+            report.push(format!("✗ Could not find the Fresh config folder: {e}"));
+            return report;
+        }
+    };
+    let config_dir = &dir_context.config_dir;
+
+    // Types: the same files the editor refreshes on every start, linked so
+    // they track the installed Fresh version.
+    fresh::init_script::refresh_types_scaffolding(config_dir);
+    let types_dir = config_dir.join("types");
+    report.push(match link_dir(&types_dir, &dir.join("types")) {
+        Ok(()) => format!("✓ Linked API types: types -> {}", types_dir.display()),
+        Err(e) => format!(
+            "✗ Could not link API types from {}: {e}",
+            types_dir.display()
+        ),
+    });
+
+    // TypeScript, for `npx tsc` and the language server.
+    let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
+    let install = std::process::Command::new(npm)
+        .args(["install", "--no-audit", "--no-fund"])
+        .current_dir(dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    report.push(match install {
+        Ok(status) if status.success() => "✓ Installed TypeScript (npm install)".to_string(),
+        Ok(_) => "✗ npm install failed. Run it again in the plugin folder.".to_string(),
+        Err(_) => "✗ npm not found. Install Node.js, then run npm install in the plugin folder."
+            .to_string(),
+    });
+    if !fresh::services::lsp::command_exists("typescript-language-server") {
+        report.push(
+            "! For type checking inside Fresh, run: npm install -g typescript-language-server"
+                .to_string(),
+        );
+    }
+
+    // Trust the folder so the TypeScript language server may run. It holds
+    // only what this command just wrote.
+    let store = fresh::services::workspace_trust::TrustStore::for_project_dir(
+        &dir_context.project_state_dir(&abs_dir),
+    );
+    if !store.is_decided() {
+        report.push(
+            match store.record(fresh::services::workspace_trust::TrustLevel::Trusted) {
+                Ok(()) => "✓ Trusted the folder, so the language server can run".to_string(),
+                Err(e) => format!("✗ Could not trust the folder: {e}"),
+            },
+        );
+    }
+
+    report
+}
+
+/// Symlink `link` to the directory `target`.
+fn link_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (target, link);
+        Err(std::io::Error::other("symlinks not supported"))
+    }
 }
 
 fn create_theme_package(
@@ -2896,9 +3172,7 @@ fn kill_session_command(session: Option<&str>, args: &Args) -> AnyhowResult<()> 
 
     // We need to do a minimal handshake first
     use fresh::server::protocol::{ClientHello, TermSize};
-    let hello = ClientHello::new(TermSize::new(80, 24));
-    let hello_json = serde_json::to_string(&ClientControl::Hello(hello))?;
-    conn.write_control(&hello_json)?;
+    conn.send_hello(ClientHello::new(TermSize::new(80, 24)))?;
 
     // Read server response (we don't care about version mismatch here)
     let _ = conn.read_control()?;
@@ -2942,6 +3216,74 @@ fn kill_session_command(session: Option<&str>, args: &Args) -> AnyhowResult<()> 
     Ok(())
 }
 
+/// Point this process's stderr at `fresh-server-<PID>.log`.
+#[cfg(unix)]
+fn redirect_stderr_to_server_log() {
+    use std::os::fd::AsRawFd;
+    let path = fresh::services::log_dirs::server_log_path(std::process::id());
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        // SAFETY: `dup2` onto fd 2 only swaps what stderr refers to; `file`
+        // is open for the duration of the call.
+        Ok(file) => unsafe {
+            libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO);
+        },
+        Err(e) => eprintln!("[server] cannot open log {}: {e}", path.display()),
+    }
+}
+
+/// Wait for a daemon this client just spawned to bind its sockets (the pid
+/// file is written after `bind()`); fail, naming its log, if it exits first.
+///
+/// Any running daemon of the session will do, not only the one spawned
+/// here: when another starts for it at the same time, one of the two stands
+/// down, but only once the other has written its pid.
+fn wait_for_spawned_daemon(socket_paths: &SocketPaths, pid: u32) -> AnyhowResult<()> {
+    use fresh::server::daemon::{is_process_running, spawned_daemon_exited};
+    const STARTUP_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    #[cfg(unix)]
+    let log = format!(
+        "; its log is {}",
+        fresh::services::log_dirs::server_log_path(pid).display()
+    );
+    #[cfg(not(unix))]
+    let log = String::new();
+
+    let deadline = std::time::Instant::now() + STARTUP_LIMIT;
+    loop {
+        // Before reading the pid file: a daemon that stood down did so only
+        // after the one it stood down for wrote it
+        let exited = spawned_daemon_exited(pid);
+        if let Ok(Some(ready)) = socket_paths.read_pid() {
+            if is_process_running(ready) {
+                return Ok(());
+            }
+        }
+        if exited {
+            anyhow::bail!("The daemon exited during startup{log}");
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("The daemon did not start within {STARTUP_LIMIT:?}{log}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Record, in the client's log, where a daemon it just spawned logs.
+fn log_spawned_daemon(pid: u32) {
+    #[cfg(unix)]
+    tracing::info!(
+        "Started daemon {pid}; its log is {}",
+        fresh::services::log_dirs::server_log_path(pid).display()
+    );
+    #[cfg(not(unix))]
+    tracing::info!("Started daemon {pid}");
+}
+
 /// Run as a daemon server
 /// Run the session daemon in this process.
 ///
@@ -2949,17 +3291,17 @@ fn kill_session_command(session: Option<&str>, args: &Args) -> AnyhowResult<()> 
 ///
 ///   - `fresh --server` — the detached process a `fresh -a` client spawns
 ///     when no daemon is live for the working directory. Chatty on stderr,
-///     which the spawner has already redirected into the session log.
+///     which it points at its own log file.
 ///   - `fresh --web [ADDR]` (`web_addr = Some`) — the same daemon in the
 ///     foreground, additionally serving the web UI. Same session, same
 ///     sockets: `fresh -a` in this working directory attaches a terminal to
 ///     the very editor the browser is looking at, and closing either one
 ///     leaves the session (and the other) running.
 ///
-/// `web_addr` also picks the console posture. The detached daemon logs at
-/// `debug` into its log file; a foreground `--web` would flood the user's
-/// terminal with it, so it logs at `warn` and skips the boot chatter.
-/// `RUST_LOG` still overrides either.
+/// `web_addr` also picks the console posture. The detached daemon logs at the
+/// editor's default level into `fresh-server-<PID>.log`; a foreground `--web`
+/// would flood the user's terminal with it, so it logs at `warn` and skips the
+/// boot chatter. `RUST_LOG` still overrides either.
 fn run_server_command(args: &Args, web_addr: Option<String>) -> AnyhowResult<()> {
     use fresh::server::{EditorServer, EditorServerConfig};
 
@@ -2973,11 +3315,22 @@ fn run_server_command(args: &Args, web_addr: Option<String>) -> AnyhowResult<()>
         };
     }
 
-    // Initialize tracing to stderr (will go to log file when spawned detached)
+    // A spawned daemon's stdio is /dev/null; give its stderr (tracing, the
+    // boot lines above, panics) a log file instead.
+    #[cfg(unix)]
+    if detached && !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        redirect_stderr_to_server_log();
+    }
+
+    // Initialize tracing to stderr
     use tracing_subscriber::{fmt, EnvFilter};
-    let default_level = if detached { "debug" } else { "warn" };
+    let default_filter = if detached {
+        fresh::services::tracing_setup::DEFAULT_LOG_FILTER
+    } else {
+        "warn"
+    };
     let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
     fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
@@ -3017,14 +3370,15 @@ fn run_server_command(args: &Args, web_addr: Option<String>) -> AnyhowResult<()>
     // daemon was spawned with an `--ssh-url`.  Config layering is
     // always keyed off the local cwd (the remote host doesn't have
     // our config layout), matching the standalone path.
+    let dir_context = fresh::config_io::DirectoryContext::from_system()?;
+    // A daemon started by a bare `fresh` opens where that `fresh` would.
     let working_dir = match &remote_info {
         Some(remote) => PathBuf::from(&remote.path),
+        None if args.orchestrator_mode => bare_launch_dir(&dir_context, std::env::current_dir()?),
         None => std::env::current_dir()?,
     };
     let config_dir = std::env::current_dir()?;
     boot!("[server] Working directory: {:?}", working_dir);
-
-    let dir_context = fresh::config_io::DirectoryContext::from_system()?;
 
     // Re-anchor trust to this project: its persisted level (if any) is
     // adopted, else the safe Restricted default. `store_for_workspace` keys a
@@ -3054,6 +3408,14 @@ fn run_server_command(args: &Args, web_addr: Option<String>) -> AnyhowResult<()>
         config::Config::load_with_layers(&dir_context, &config_dir)
     };
     boot!("[server] Editor config loaded");
+
+    // Re-init i18n now that the config is known. The only init that has run
+    // so far is the pre-clap one, which consults argv and the environment
+    // but never the config file — so without this the daemon renders its
+    // whole UI in the environment's language and silently ignores `locale`
+    // from `config.json` (#3149).
+    fresh::i18n::init_with_config(resolve_locale_override(args, &editor_config));
+
     // Cell-level (TUI) animations would stream to the browser as bursts of
     // frame diffs, on top of the CSS-level motion the web frontend does for
     // itself — the same reason the standalone bridge forces them off. One
@@ -3077,7 +3439,9 @@ fn run_server_command(args: &Args, web_addr: Option<String>) -> AnyhowResult<()>
     let session_keepalive: Option<Box<dyn std::any::Any + Send>> =
         remote_session.map(|rs| Box::new(rs) as Box<dyn std::any::Any + Send>);
     let startup_authority = if remote_info.is_some() {
-        Some(authority)
+        Some(std::sync::Arc::new(
+            fresh::services::authority::Connection::plain(authority),
+        ))
     } else {
         None
     };
@@ -3085,11 +3449,14 @@ fn run_server_command(args: &Args, web_addr: Option<String>) -> AnyhowResult<()>
     let config = EditorServerConfig {
         working_dir: working_dir.clone(),
         session_name: args.session_name.clone(),
-        idle_timeout: Some(std::time::Duration::from_secs(3600)), // 1 hour default
+        // A daemon runs until it is told to quit: with nothing attached it is
+        // still holding your workspaces, terminals and agents.
+        idle_timeout: None,
         editor_config,
         dir_context,
         plugins_enabled: !args.no_plugins,
         init_enabled: !args.no_init,
+        orchestrator_mode: args.orchestrator_mode,
         startup_authority,
         workspace_trust,
         env_provider,
@@ -3134,6 +3501,22 @@ fn run_server_command(args: &Args, web_addr: Option<String>) -> AnyhowResult<()>
 
     boot!("[server] Server shutting down");
     Ok(())
+}
+
+/// `fresh --web [ADDR]` on a build compiled without the `web` feature.
+///
+/// The web UI is opt-in at compile time (see the `web` feature in Cargo.toml),
+/// so a default build has no bridge to serve. Say that, and say how to get
+/// one, rather than letting clap reject `--web` as an unknown argument —
+/// nothing in that message hints a build feature is missing. Printed and
+/// exited like the "session already running" case in `run_web_command`: a
+/// user error deserves a clean line, not `real_main`'s backtrace.
+#[cfg(not(feature = "web"))]
+fn web_unavailable() -> ! {
+    eprintln!("this build of fresh was compiled without the web UI");
+    eprintln!("rebuild with: cargo build --release --features web");
+    eprintln!("(or install a package that ships it)");
+    std::process::exit(1);
 }
 
 /// `fresh --web [ADDR] [FILES…]` — run the session daemon in the foreground
@@ -3201,8 +3584,9 @@ fn run_open_files_command(
     session_name: Option<&str>,
     files: &[String],
     wait: bool,
+    locale: Option<&str>,
+    config: Option<&Path>,
 ) -> AnyhowResult<()> {
-    use fresh::server::daemon::is_process_running;
     use fresh::server::protocol::{ClientControl, ServerControl};
     use fresh::server::spawn_server_detached;
 
@@ -3247,17 +3631,15 @@ fn run_open_files_command(
 
     // Start server if not running (like nvr does by default)
     let server_was_started = if !socket_paths.is_server_alive() {
-        let _pid = spawn_server_detached(session_name, ssh_url.as_deref())?;
-
-        // Wait for server to be ready
-        loop {
-            if let Ok(Some(pid)) = socket_paths.read_pid() {
-                if is_process_running(pid) {
-                    break;
-                }
-            }
-            std::thread::yield_now();
-        }
+        let pid = spawn_server_detached(&fresh::server::DaemonSpawn {
+            session_name,
+            ssh_url: ssh_url.as_deref(),
+            locale,
+            config,
+            ..Default::default()
+        })?;
+        log_spawned_daemon(pid);
+        wait_for_spawned_daemon(&socket_paths, pid)?;
         true
     } else {
         false
@@ -3286,7 +3668,7 @@ fn run_open_files_command(
         // the files have been queued.
         drop(conn);
         if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-            return run_attach(session_name, &[]);
+            return run_attach(session_name, &[], locale, config, false, false);
         } else {
             eprintln!(
                 "Started a new daemon and opened {} file(s). Attach with: fresh -a{}",
@@ -3304,6 +3686,31 @@ fn run_open_files_command(
                         match msg {
                             ServerControl::WaitComplete => break,
                             ServerControl::Quit { .. } => break,
+                            // Nobody is attached to see the file (a detached
+                            // daemon): waiting would hang the caller on an
+                            // editor no one can reach. Attach this terminal,
+                            // as a freshly started daemon does above, or fail.
+                            ServerControl::NoViewer => {
+                                drop(conn);
+                                if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                                    return run_attach(
+                                        session_name,
+                                        &[],
+                                        locale,
+                                        config,
+                                        false,
+                                        false,
+                                    );
+                                }
+                                anyhow::bail!(
+                                    "the daemon has no terminal attached, so nobody can see {}; \
+                                     attach one with: fresh -a{}",
+                                    file_requests
+                                        .last()
+                                        .map_or(String::new(), |f| f.path.clone()),
+                                    session_name.map_or(String::new(), |n| format!(" {}", n)),
+                                );
+                            }
                             _ => {} // Ignore other messages
                         }
                     }
@@ -3338,13 +3745,10 @@ fn client_handshake_reading<F>(
 where
     F: FnMut() -> AnyhowResult<Option<String>>,
 {
-    use fresh::server::protocol::{
-        ClientControl, ClientHello, ServerControl, TermSize, PROTOCOL_VERSION,
-    };
+    use fresh::server::protocol::{ClientHello, ServerControl, TermSize, PROTOCOL_VERSION};
 
     // Size doesn't matter — these clients never render.
-    let hello = ClientHello::new(TermSize::new(80, 24));
-    conn.write_control(&serde_json::to_string(&ClientControl::Hello(hello))?)?;
+    conn.send_hello(ClientHello::new(TermSize::new(80, 24)))?;
 
     let response = read_reply()?
         .ok_or_else(|| anyhow::anyhow!("Server closed connection during handshake"))?;
@@ -3371,13 +3775,48 @@ where
 
 /// When launched from inside Fresh's own embedded terminal, forward the
 /// file/dir arguments to the parent editor (identified by `FRESH_SESSION`)
-/// instead of starting a second editor in the terminal.
+/// instead of starting a second editor in the terminal; with nothing to
+/// forward, answer "Already in Fresh" (see `already_in_enclosing`).
 ///
 /// Returns:
-/// - `Some(Ok(()))` — forwarded; the caller should exit.
-/// - `None` — not a nested launch, nothing to forward, or the parent
-///   socket is unreachable; the caller should launch inline as usual.
+/// - `Some(Ok(()))` — forwarded, or answered; the caller should exit. A
+///   refused launch exits the process with status 1 instead.
+/// - `None` — not a nested launch, or the parent socket is unreachable; the
+///   caller should launch inline as usual.
 fn try_forward_nested(args: &Args) -> Option<AnyhowResult<()>> {
+    // `--diff` runs here, in this terminal, the way a diff tool is expected
+    // to: `git difftool` deletes its temp files once the tool exits, so
+    // handing the pair to the enclosing editor and returning at once would
+    // pull them out from under the view.
+    if args.diff.is_some() {
+        return None;
+    }
+    // Nothing starts a second editor nested in a Fresh terminal, whatever
+    // Auto Attach says: every such terminal, a direct editor's included, is
+    // inside an editor it can reach. Everything that reaches here without a
+    // file to forward is such a launch: subcommands, `--server`, `-a`,
+    // `--web` and `--gui` have all returned before this.
+    if args.files.iter().all(|f| f == "-") {
+        let session = enclosing_session()?;
+        let asked_for_stdin = args.stdin || args.files.iter().any(|f| f == "-");
+        if asked_for_stdin && stdin_is_terminal() {
+            // Asked for stdin with nothing piped: the ordinary launch reports it.
+            return None;
+        }
+        let nested = if !stdin_is_terminal() {
+            // Not supported yet: the input would have to travel to the
+            // enclosing editor as a new buffer.
+            NestedLaunch::refused("piped input can't be opened in it from here yet")
+        } else if args.simple {
+            NestedLaunch::refused(
+                "`fresh --simple` would start a second editor inside this terminal",
+            )
+        } else {
+            NestedLaunch::Bare
+        };
+        return already_in_enclosing(&session, nested);
+    }
+
     // Only plain interactive file/dir opens are forwarded. Subcommands,
     // --server and --attach are already handled before we get here;
     // --stdin pipes content into a real editor and can't be forwarded.
@@ -3398,6 +3837,119 @@ fn try_forward_nested(args: &Args) -> Option<AnyhowResult<()>> {
             // opening inline, which is exactly the pre-feature behavior.
             tracing::warn!("Nested forward failed ({}); opening inline", e);
             None
+        }
+    }
+}
+
+/// The Fresh editor whose embedded terminal this process runs in, from the
+/// `FRESH_SESSION` every such terminal advertises (see `server::local_control`).
+fn enclosing_session() -> Option<String> {
+    std::env::var("FRESH_SESSION")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// A launch typed in a Fresh terminal that would start a second editor
+/// inside it (see `already_in_enclosing`).
+enum NestedLaunch {
+    /// A bare `fresh`, `fresh -a`, or flags without a file: a request to be
+    /// in Fresh, which you already are. Succeeds.
+    Bare,
+    /// A request for a separate editor (`--simple`, piped input,
+    /// `fresh -a NAME`) that cannot be met without nesting one: why. Fails.
+    /// The hint repeats the command line with `FRESH_SESSION` cleared, unless
+    /// `simple_hint` says that would loop (see `NestedLaunch::with_simple_hint`).
+    Refused {
+        why: &'static str,
+        simple_hint: bool,
+    },
+}
+
+impl NestedLaunch {
+    fn refused(why: &'static str) -> Self {
+        Self::Refused {
+            why,
+            simple_hint: false,
+        }
+    }
+
+    /// Hint `FRESH_SESSION= fresh --simple` instead of the command line: for
+    /// a command that, outside Fresh's reach, would attach the enclosing
+    /// daemon to itself.
+    fn with_simple_hint(self) -> Self {
+        match self {
+            Self::Refused { why, .. } => Self::Refused {
+                why,
+                simple_hint: true,
+            },
+            other => other,
+        }
+    }
+}
+
+/// This command line, as the user would retype it to run it outside the
+/// enclosing editor's reach: with `FRESH_SESSION` cleared, which is how a
+/// `fresh` decides it is inside Fresh.
+fn bypass_command() -> String {
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .map(|arg| {
+            if !arg.is_empty()
+                && arg
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_./=:@%+,".contains(c))
+            {
+                arg
+            } else {
+                format!("'{}'", arg.replace('\'', "'\\''"))
+            }
+        })
+        .collect();
+    let command = format!("FRESH_SESSION= fresh {}", args.join(" "));
+    if stdin_is_terminal() {
+        command.trim_end().to_string()
+    } else {
+        format!("… | {}", command.trim_end())
+    }
+}
+
+/// A launch typed in a Fresh terminal — the daemon's or a direct editor's —
+/// that would start a second editor inside that terminal (see
+/// [`NestedLaunch`]). Rather than
+/// nest one, or move the enclosing editor to another workspace under the
+/// prompt you typed at, it leaves the editor exactly as it is and says how to
+/// act on it: `fresh FILE` and `fresh DIR` still do.
+///
+/// `None` when the enclosing editor cannot be reached: the caller launches as
+/// it would have before.
+fn already_in_enclosing(session: &str, nested: NestedLaunch) -> Option<AnyhowResult<()>> {
+    let socket_paths = resolve_session(Some(session)).ok()?;
+    socket_paths.cleanup_if_stale();
+    if !socket_paths.is_server_alive() {
+        return None;
+    }
+    const HOW: &str = "`fresh FILE` opens a file here, `fresh DIR` opens a workspace.";
+    match nested {
+        NestedLaunch::Bare => {
+            // Not `FRESH_SESSION= fresh` itself: inside the daemon's own
+            // terminal that would auto-attach the daemon to itself.
+            eprintln!("Already in Fresh. {HOW}");
+            eprintln!("To start a separate editor in this terminal: FRESH_SESSION= fresh --simple");
+            Some(Ok(()))
+        }
+        NestedLaunch::Refused { why, simple_hint } => {
+            eprintln!("Already in Fresh: {why}. {HOW}");
+            if simple_hint {
+                eprintln!(
+                    "To start a separate editor in this terminal: FRESH_SESSION= fresh --simple"
+                );
+            } else {
+                eprintln!(
+                    "To run it in a separate editor in this terminal: {}",
+                    bypass_command()
+                );
+            }
+            std::process::exit(1);
         }
     }
 }
@@ -3737,14 +4289,313 @@ fn run_cmd_command(tokens: &[&str]) -> AnyhowResult<()> {
                 std::process::exit(2);
             }
         },
+        Some("workspace") => {
+            match &rest[1..] {
+                ["list", flags @ ..] => orchestrator_list_command(session, flags, false),
+                _ => {
+                    eprintln!("usage: fresh --cmd workspace list [--json]   every workspace the dock tracks");
+                    std::process::exit(2);
+                }
+            }
+        }
+        Some("agent") => match &rest[1..] {
+            ["list", flags @ ..] => orchestrator_list_command(session, flags, true),
+            ["get", id, flags @ ..] => orchestrator_get_command(session, id, flags),
+            ["explain", id, flags @ ..] => orchestrator_explain_command(session, id, flags),
+            ["wait", id, flags @ ..] => orchestrator_wait_command(session, id, flags),
+            ["start", cmd, flags @ ..] => orchestrator_start_command(session, cmd, flags),
+            _ => {
+                eprintln!("usage: fresh --cmd agent list [--json]                          live workspaces and their agent state");
+                eprintln!("       fresh --cmd agent get <ID> [--json]                      one workspace (ID: workspaceId, window number, or dock name)");
+                eprintln!("       fresh --cmd agent explain <ID> [--json]                  why it shows that state: rule, evidence, timing");
+                eprintln!("       fresh --cmd agent wait <ID> [--until STATE[,STATE]] [--timeout SECS] [--json]");
+                eprintln!("                                                                block until the agent is quiet (or in STATE); exit 3 on timeout");
+                eprintln!("       fresh --cmd agent start <CMD> [--prompt TEXT] [--auto] [--no-teach] [--no-wait] [--timeout SECS] [--json]");
+                eprintln!("                                                                launch CMD in this workspace and confirm it came up; exit 1 if not");
+                std::process::exit(2);
+            }
+        },
         _ => {
             eprintln!("Unknown command: {}", rest.join(" "));
             eprintln!("usage: fresh --cmd script <api|check|run|types> ...");
             eprintln!("       fresh --cmd command <run|list> ...");
+            eprintln!("       fresh --cmd workspace list");
+            eprintln!("       fresh --cmd agent <list|get|explain|wait|start> ...");
             eprintln!("       fresh --cmd init reload");
             std::process::exit(2);
         }
     }
+}
+
+// ===========================================================================
+// `fresh --cmd workspace ...` / `fresh --cmd agent ...` — the orchestrator
+// over the control socket.
+//
+// Each verb is a script evaluated against the running editor through the
+// same channel as `script run`, so it carries the same authorization (the
+// workspace's capability token) and the same targeting (`$FRESH_SESSION`
+// or `--session`). The scripts only call the orchestrator plugin's published
+// API (`editor.getPluginApi("orchestrator")`), so what the CLI prints is
+// exactly what a script could see — stable `workspaceId`s included.
+// ===========================================================================
+
+/// `--name VALUE` or `--name=VALUE`; `None` when the flag is absent. A flag
+/// written with nothing usable after it exits 2 rather than falling back to
+/// the default — for a CLI an agent drives, a silently dropped value is the
+/// worst failure it could have.
+///
+/// **"Nothing usable" includes the next flag.** `--prompt --timeout 30` used
+/// to set the prompt to the literal `--timeout` and then read `30` as a stray
+/// argument, which is precisely the silent drop the paragraph above promises
+/// not to do: the agent asked for a prompt and a timeout and got neither,
+/// with a zero exit. A value that begins with `-` is therefore a usage error,
+/// and `--name=-x` is how you pass one on purpose.
+fn flag_value<'a>(flags: &[&'a str], name: &str) -> Option<&'a str> {
+    match flag_value_checked(flags, name) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// [`flag_value`] without the exit, so the rule above can be tested.
+fn flag_value_checked<'a>(flags: &[&'a str], name: &str) -> Result<Option<&'a str>, String> {
+    if let Some(i) = flags.iter().position(|f| *f == name) {
+        return match flags.get(i + 1).copied().filter(|v| !v.starts_with('-')) {
+            Some(v) => Ok(Some(v)),
+            None => Err(format!(
+                "{name} wants a value (use {name}=VALUE for one starting with `-`)"
+            )),
+        };
+    }
+    let prefix = format!("{name}=");
+    Ok(flags.iter().find_map(|f| f.strip_prefix(prefix.as_str())))
+}
+
+/// How a verb's script says "and the outcome was exceptional" through a
+/// channel that only carries the script's return value.
+///
+/// **Record Separator, not a word.** These were `\nTIMED_OUT` and
+/// `\nSTART_FAILED`, matched with `ends_with` and removed with
+/// `trim_end_matches` — so output whose own last line was one of those tokens
+/// set the exit code, and `trim_end_matches` stripped every repetition rather
+/// than the one the script appended. `\x1e` cannot occur in a workspace name,
+/// an agent's error text or a JSON document, and [`strip_sentinel`] removes
+/// exactly one.
+const SENTINEL_TIMED_OUT: &str = "\u{1e}TIMED_OUT";
+const SENTINEL_START_FAILED: &str = "\u{1e}START_FAILED";
+
+/// `(what to print, whether the sentinel was there)`.
+fn strip_sentinel<'a>(text: &'a str, sentinel: &str) -> (&'a str, bool) {
+    match text.strip_suffix(sentinel) {
+        Some(rest) => (rest.trim_end(), true),
+        None => (text.trim_end(), false),
+    }
+}
+
+fn has_flag(flags: &[&str], name: &str) -> bool {
+    flags.contains(&name)
+}
+
+/// `--timeout SECS`, or `default` when absent. A value that is not a number
+/// is a usage error (exit 2), like any other malformed flag.
+fn parse_timeout_flag(flags: &[&str], default: u64) -> u64 {
+    match flag_value(flags, "--timeout") {
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                eprintln!(
+                    "--timeout wants a whole number of seconds, at least 1, got '{}'",
+                    v
+                );
+                std::process::exit(2);
+            }
+        },
+        None => default,
+    }
+}
+
+fn orchestrator_api_prelude() -> &'static str {
+    r#"
+    const api = editor.getPluginApi("orchestrator");
+    if (!api) throw new Error("the orchestrator plugin is not loaded in this editor");
+    await editor.loadWorkspaces();
+    "#
+}
+
+fn orchestrator_list_command(
+    session: Option<&str>,
+    flags: &[&str],
+    agents_only: bool,
+) -> AnyhowResult<()> {
+    let json = has_flag(flags, "--json");
+    let script = format!(
+        r#"{prelude}
+        const rows = api.listWorkspaces().filter(function (w) {{ return {agents_only} ? w.kind === "live" : true; }});
+        if ({json}) return JSON.stringify(rows, null, 2);
+        if (rows.length === 0) return "no workspaces";
+        const id = function (w) {{ return w.workspaceId || String(w.windowId); }};
+        const cols = [["ID", id], ["STATE", function (w) {{ return w.agentState; }}], ["NAME", function (w) {{ return (w.active ? "* " : "  ") + w.name; }}], ["BRANCH", function (w) {{ return w.branch || ""; }}], ["ROOT", function (w) {{ return w.root; }}]];
+        const wide = function (v) {{ return editor.stringWidth(String(v)); }};
+        const widths = cols.map(function (c) {{ return rows.reduce(function (m, w) {{ return Math.max(m, wide(c[1](w))); }}, wide(c[0])); }});
+        const pad = function (v, n) {{ const s = String(v); return s + " ".repeat(Math.max(0, n - wide(s))); }};
+        const line = function (cells) {{ return cells.map(function (v, i) {{ return i === cols.length - 1 ? String(v) : pad(v, widths[i]); }}).join("  "); }};
+        return [line(cols.map(function (c) {{ return c[0]; }}))].concat(rows.map(function (w) {{ return line(cols.map(function (c) {{ return c[1](w); }})); }})).join("\n");
+        "#,
+        prelude = orchestrator_api_prelude(),
+    );
+    submit_orchestrator_script(session, script)
+}
+
+fn orchestrator_get_command(session: Option<&str>, id: &str, flags: &[&str]) -> AnyhowResult<()> {
+    let json = has_flag(flags, "--json");
+    let target = serde_json::to_string(id)?;
+    let script = format!(
+        r#"{prelude}
+        const w = api.getWorkspace({target});
+        if (!w) throw new Error("no such workspace: " + {target});
+        if ({json}) return JSON.stringify(w, null, 2);
+        const out = [];
+        const put = function (k, v) {{ if (v !== undefined && v !== null && v !== "") out.push(k.padEnd(12) + String(v)); }};
+        put("id", w.workspaceId || w.windowId); put("window", w.windowId); put("name", w.name); put("kind", w.kind);
+        put("active", w.active); put("state", w.agentState); put("branch", w.branch); put("root", w.root);
+        put("project", w.projectPath); put("folder", w.folderId); put("title", w.title); put("backend", w.backend);
+        if (w.git) put("git", "dirty " + (w.git.dirty || 0) + "  ahead " + (w.git.ahead || 0) + "  behind " + (w.git.behind || 0));
+        put("why", w.explain.reasons.join("; "));
+        return out.join("\n");
+        "#,
+        prelude = orchestrator_api_prelude(),
+    );
+    submit_orchestrator_script(session, script)
+}
+
+fn orchestrator_explain_command(
+    session: Option<&str>,
+    id: &str,
+    flags: &[&str],
+) -> AnyhowResult<()> {
+    let json = has_flag(flags, "--json");
+    let target = serde_json::to_string(id)?;
+    let script = format!(
+        r#"{prelude}
+        const w = api.getWorkspace({target});
+        if (!w) throw new Error("no such workspace: " + {target});
+        const ex = w.explain;
+        if ({json}) return JSON.stringify(ex, null, 2);
+        const out = [w.name + ": " + ex.state];
+        ex.reasons.forEach(function (r) {{ out.push("  - " + r); }});
+        if (ex.question !== null) out.push("  question: " + JSON.stringify(ex.question));
+        if (ex.rule !== null) out.push("  rule:     /" + ex.rule + "/i");
+        out.push("  rules:    v" + ex.rules.version + " (" + ex.rules.source + ")");
+        if (ex.recentLines.length) out.push("  recent:   " + JSON.stringify(ex.recentLines));
+        return out.join("\n");
+        "#,
+        prelude = orchestrator_api_prelude(),
+    );
+    submit_orchestrator_script(session, script)
+}
+
+fn orchestrator_wait_command(session: Option<&str>, id: &str, flags: &[&str]) -> AnyhowResult<()> {
+    let json = has_flag(flags, "--json");
+    let target = serde_json::to_string(id)?;
+    let until_flag = flag_value(flags, "--until");
+    let until: Vec<String> = until_flag
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if until_flag.is_some() && until.is_empty() {
+        eprintln!("--until wants at least one state");
+        std::process::exit(2);
+    }
+    for st in &until {
+        if !matches!(
+            st.as_str(),
+            "working" | "blocked" | "done" | "idle" | "unknown"
+        ) {
+            eprintln!(
+                "unknown state '{}': expected working, blocked, done, idle or unknown",
+                st
+            );
+            std::process::exit(2);
+        }
+    }
+    let timeout_secs = parse_timeout_flag(flags, 300);
+    let until_js = if until.is_empty() {
+        "undefined".to_string()
+    } else {
+        serde_json::to_string(&until)?
+    };
+    let script = format!(
+        r#"{prelude}
+        const r = await api.waitForState({target}, {{ until: {until_js}, timeoutMs: {timeout_ms} }});
+        const body = ({json}) ? JSON.stringify(r, null, 2)
+            : (r.workspaceId || r.windowId) + " " + r.state + (r.timedOut ? " (timed out after " : " (after ") + (r.elapsedMs / 1000).toFixed(1) + "s)";
+        return body + (r.timedOut ? {sentinel} : "");
+        "#,
+        sentinel = serde_json::to_string(SENTINEL_TIMED_OUT)?,
+        prelude = orchestrator_api_prelude(),
+        timeout_ms = timeout_secs.saturating_mul(1000),
+    );
+    // The editor holds the reply until the wait settles, so read for as long
+    // as the wait may take (plus slack), not the usual build timeout.
+    let read_timeout = std::time::Duration::from_secs(timeout_secs.saturating_add(15));
+    let text = submit_script_capture(session, script, true, read_timeout, true)?;
+    let (shown, timed_out) = strip_sentinel(&text, SENTINEL_TIMED_OUT);
+    if !shown.is_empty() {
+        println!("{}", shown);
+    }
+    if timed_out {
+        std::process::exit(3);
+    }
+    Ok(())
+}
+
+fn orchestrator_start_command(
+    session: Option<&str>,
+    cmd: &str,
+    flags: &[&str],
+) -> AnyhowResult<()> {
+    let json = has_flag(flags, "--json");
+    let timeout_secs = parse_timeout_flag(flags, 15);
+    let script = format!(
+        r#"{prelude}
+        const r = await api.runAgent({{
+            agent: {cmd},
+            prompt: {prompt},
+            auto: {auto},
+            teach: {teach},
+            wait: {wait},
+            readyTimeoutMs: {timeout_ms},
+        }});
+        const body = ({json}) ? JSON.stringify(r, null, 2)
+            : (r.workspaceId || r.windowId) + " " + r.agent + " " + (r.ready ? "ready" : r.error ? "FAILED: " + r.error : "started (not waited for)") + " state=" + r.state;
+        return body + (r.ready || !r.error ? "" : {sentinel});
+        "#,
+        sentinel = serde_json::to_string(SENTINEL_START_FAILED)?,
+        prelude = orchestrator_api_prelude(),
+        cmd = serde_json::to_string(cmd)?,
+        prompt = serde_json::to_string(flag_value(flags, "--prompt").unwrap_or(""))?,
+        auto = has_flag(flags, "--auto"),
+        teach = !has_flag(flags, "--no-teach"),
+        wait = !has_flag(flags, "--no-wait"),
+        timeout_ms = timeout_secs.saturating_mul(1000),
+    );
+    let read_timeout = std::time::Duration::from_secs(timeout_secs.saturating_add(30));
+    let text = submit_script_capture(session, script, true, read_timeout, true)?;
+    let (shown, failed) = strip_sentinel(&text, SENTINEL_START_FAILED);
+    if !shown.is_empty() {
+        println!("{}", shown);
+    }
+    if failed {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 // ===========================================================================
@@ -4039,12 +4890,13 @@ THE RUNTIME, IN FULL
     plugin published with `editor.exportPluginApi(...)` / read back with
     `getPluginApi("...")`. Nothing else crosses between realms.
   - Most `editor.*` calls that ask the host a question are async and return a
-    promise — `getBufferText`, `createVirtualBuffer`, `spawnProcess`,
+    promise — `getBufferText`, `createVirtualBuffer`, `runOnTarget`,
     `listCommands`. Await them.
   - Layout mutations are queued, not immediate. After creating/closing splits
     or buffers, `await editor.flush()` before reading state back, or you will
     read the layout as it was.
-  - `editor.spawnProcess(cmd, args, cwd)` runs the program directly — no
+  - `editor.runOnTarget(cmd, args, cwd)` runs the program directly, on the
+    active window's machine (its SSH host or container, if remote) — no
     shell. No pipes, globs, quoting or $VARS; pass args pre-split. It inherits
     the editor's PATH, so `git` and `gh` resolve by bare name. Do not wrap it
     in `/bin/sh -lc` — that sources the user's profile and can hang.
@@ -4260,31 +5112,69 @@ fn script_run(session: Option<&str>, from: &[&str]) -> AnyhowResult<()> {
 /// caller asked for JSON); the convenience verbs return prose meant to be
 /// read, where the surrounding quotes and `\n` escapes would be noise.
 fn submit_script(session: Option<&str>, source: String, unwrap_string: bool) -> AnyhowResult<()> {
+    let text = submit_script_capture(session, source, unwrap_string, cmd_build_timeout(), false)?;
+    if !text.is_empty() {
+        println!("{}", text);
+    }
+    Ok(())
+}
+
+/// `submit_script` for the orchestrator verbs: same channel, plain error
+/// messages.
+fn submit_orchestrator_script(session: Option<&str>, source: String) -> AnyhowResult<()> {
+    let text = submit_script_capture(session, source, true, cmd_build_timeout(), true)?;
+    if !text.is_empty() {
+        println!("{}", text);
+    }
+    Ok(())
+}
+
+/// Run `source` against the editor and return what it returned as text
+/// (a returned string is unwrapped when `unwrap_string`; anything else is
+/// its JSON). A script that throws prints its error and exits 1 here, the
+/// way every `--cmd` verb reports failure.
+fn submit_script_capture(
+    session: Option<&str>,
+    source: String,
+    unwrap_string: bool,
+    read_timeout: std::time::Duration,
+    terse_errors: bool,
+) -> AnyhowResult<String> {
     use fresh::server::protocol::ClientControl;
 
     let socket = resolve_cmd_socket(session)?;
     let mut conn = connect_cmd(&socket)?;
     conn.send(&ClientControl::RunScript { source })?;
 
-    // A script gets the long wait: it can create a workspace (a git worktree
-    // plus an agent process) before it answers, and timing that out would
-    // report a failure about something that is merely still running.
-    let (ok, error, output) = read_script_result(&mut conn, cmd_build_timeout())?;
-    if let Some(out) = output {
-        let text = if unwrap_string {
-            serde_json::from_str::<String>(&out).unwrap_or(out)
-        } else {
-            out
-        };
+    let (ok, error, output) = read_script_result(&mut conn, read_timeout)?;
+    let text = match output {
+        Some(out) if unwrap_string => serde_json::from_str::<String>(&out).unwrap_or(out),
+        Some(out) => out,
+        None => String::new(),
+    };
+    if !ok {
         if !text.is_empty() {
             println!("{}", text);
         }
-    }
-    if !ok {
-        eprintln!("{}", error.unwrap_or_else(|| "script failed".to_string()));
+        let error = error.unwrap_or_else(|| "script failed".to_string());
+        // The orchestrator verbs throw plain messages ("no such workspace");
+        // the QuickJS stack behind them is noise to a shell user, so print
+        // the message alone. A `script run` author keeps the whole thing.
+        let shown = if terse_errors {
+            error
+                .split("    at ")
+                .next()
+                .unwrap_or(&error)
+                .trim_end()
+                .trim_end_matches(':')
+                .to_string()
+        } else {
+            error
+        };
+        eprintln!("{}", shown);
         std::process::exit(1);
     }
-    Ok(())
+    Ok(text)
 }
 
 /// `fresh --cmd init reload` — re-read and run `~/.config/fresh/init.ts` in
@@ -4424,10 +5314,7 @@ fn parse_dts_entries(text: &str, source: &str) -> Vec<ApiEntry> {
 
         // A declaration we can name: `foo(...)`, `foo: T;`, or `type Foo = {`.
         let name = if let Some(rest) = t.strip_prefix("type ") {
-            rest.split(|c: char| c == ' ' || c == '=' || c == '<')
-                .next()
-                .unwrap_or("")
-                .to_string()
+            rest.split([' ', '=', '<']).next().unwrap_or("").to_string()
         } else {
             let head: String = t
                 .chars()
@@ -4615,7 +5502,9 @@ fn script_check(from: &[&str]) -> AnyhowResult<()> {
     #[cfg(feature = "plugins")]
     {
         let wrapped = format!("(async () => {{\n{}\n}})();", source);
-        if let Err(e) = fresh_parser_js::transpile_typescript(&wrapped, "script.ts") {
+        if let Err(e) =
+            fresh_plugin_runtime::fresh_parser_js::transpile_typescript(&wrapped, "script.ts")
+        {
             eprintln!("{}", e);
             std::process::exit(1);
         }
@@ -4682,16 +5571,298 @@ fn read_script_source(from: &[&str]) -> AnyhowResult<String> {
 }
 
 /// Attach to an existing daemon, starting one if needed
+///
+/// Inside a Fresh terminal — whatever Auto Attach says — `fresh -a` acts on
+/// the editor around it: with files it forwards them, without it does
+/// nothing (see `already_in_enclosing`), and `fresh -a NAME` is refused
+/// rather than nested.
+///
+/// Elsewhere, with Auto Attach on, `fresh -a` with no name is a bare `fresh`:
+/// the one shared daemon, in this directory's workspace (with any files
+/// opened there). `fresh -a NAME`, and `-a` with Auto Attach off, keep their
+/// own daemons.
 fn run_attach_command(args: &Args) -> AnyhowResult<()> {
-    run_attach(args.session_name.as_deref(), &args.files)
+    if let Some(session) = enclosing_session() {
+        // An unreachable enclosing editor (a stale `FRESH_SESSION`) falls
+        // through to the launch below, as if outside Fresh.
+        if let Some(name) = &args.session_name {
+            let refused = NestedLaunch::refused(
+                "`fresh -a NAME` would attach a second editor inside this terminal",
+            );
+            // Attaching to the enclosing daemon itself is the feedback loop
+            // `already_in_enclosing`'s bare hint steers around.
+            let refused = if *name == session || name == fresh::server::ORCHESTRATOR_DAEMON {
+                refused.with_simple_hint()
+            } else {
+                refused
+            };
+            if let Some(result) = already_in_enclosing(&session, refused) {
+                return result;
+            }
+        } else if args.files.is_empty() {
+            if let Some(result) = already_in_enclosing(&session, NestedLaunch::Bare) {
+                return result;
+            }
+        } else {
+            match forward_to_session(&session, &args.files) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(e) => tracing::warn!("Nested forward failed ({}); attaching instead", e),
+            }
+        }
+    }
+    if args.session_name.is_none() && !attaches_elsewhere(&args.files) {
+        if let Some(config) = auto_attach_config() {
+            return run_orchestrator_launch(
+                &config,
+                &args.files,
+                args.locale.as_deref(),
+                args.config.as_deref(),
+            );
+        }
+    }
+    run_attach(
+        args.session_name.as_deref(),
+        &args.files,
+        args.locale.as_deref(),
+        args.config.as_deref(),
+        false,
+        false,
+    )
 }
 
-fn run_attach(session_name: Option<&str>, files: &[String]) -> AnyhowResult<()> {
+/// Whether a `fresh -a` (no name) keeps the daemon it reached before Auto
+/// Attach, rather than taking the shared one:
+///
+///   * a remote spec (`user@host:path`, `ssh://…`) starts a daemon whose
+///     authority is that host — turning the shared daemon, which every later
+///     bare `fresh` joins, into a remote one would be wrong for all of them;
+///   * a per-directory daemon already running for this directory (started by
+///     `fresh -a` before Auto Attach, or with it off) keeps being the one
+///     `fresh -a` here reaches, with its terminals and agents, rather than
+///     being stranded.
+fn attaches_elsewhere(files: &[String]) -> bool {
+    if extract_ssh_url_from_files(files).ok().flatten().is_some() {
+        return true;
+    }
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| fresh::server::ipc::SocketPaths::for_working_dir(&cwd).ok())
+        .is_some_and(|paths| paths.is_server_alive())
+}
+
+/// A bare `fresh` — no files, no flags, nothing — with `auto_attach` left
+/// on.
+///
+/// The whole launch is "attach to the shared daemon, starting it if it isn't
+/// up, in this directory's workspace". When the daemon already runs, this
+/// terminal becomes another view onto the editor that is already there, and
+/// switches it to the workspace for the directory `fresh` was typed in
+/// (see `run_attach`); nothing else is reconfigured.
+///
+/// The daemon it starts is told `--orchestrator-mode` because it is a
+/// separate process: the shape of *this* command line is the only evidence
+/// that auto-attach was chosen, and it does not survive the spawn on
+/// its own (see [`fresh::server::DaemonSpawn`]).
+///
+/// With `open_last_workspace` on, a running daemon is left on the workspace
+/// it shows (the one used last), and one started here opens the workspace
+/// used last itself (see `bare_launch_dir`).
+///
+/// `files`, `locale` and `config_path` are a `fresh -a`'s (see
+/// `run_attach_command`); a bare `fresh` has none.
+fn run_orchestrator_launch(
+    config: &config::Config,
+    files: &[String],
+    locale: Option<&str>,
+    config_path: Option<&Path>,
+) -> AnyhowResult<()> {
+    run_attach(
+        Some(fresh::server::ORCHESTRATOR_DAEMON),
+        files,
+        locale,
+        config_path,
+        true,
+        !config.open_last_workspace,
+    )
+}
+
+/// Whether a bare `fresh` should auto-attach to the shared daemon.
+///
+/// Three conditions, and all of them are about *this* invocation rather than
+/// about the editor:
+///
+///   * the command line is empty (`argv.len() == 1`) — a file or a flag,
+///     any flag, means "just this, here", and is left alone;
+///   * stdin is a terminal — `fresh` under `$GIT_EDITOR`, in a pipe, or as
+///     a subprocess is not someone sitting down to work; and
+///   * we are not already *inside* a Fresh editor's embedded terminal.
+///
+/// That last one is not a nicety. Auto-attach attaches to the shared
+/// daemon, and a terminal buffer inside that very daemon is exactly where
+/// this can be typed: the daemon then renders one shared screen into a
+/// client that lives inside its own output, which is not a second editor
+/// but a feedback loop — the pane fills with shredded frames. Falling
+/// through here reaches `try_forward_nested`, which answers "Already in
+/// Fresh" instead of starting anything. `FRESH_SESSION` is the signal because
+/// it is what every local embedded terminal advertises (see
+/// `server::local_control`); a stale or unreachable value costs nothing,
+/// since the fallback is the ordinary launch either way.
+///
+/// Only then is the config consulted, which is why this loads it rather than
+/// taking the one `initialize_app` builds: on this path we hand off to the
+/// daemon and never build an editor here at all, and on every other path
+/// this function has already answered `false` without reading anything. A
+/// config that cannot be read is not an error — it means the ordinary
+/// launch, which will report the problem properly.
+///
+/// Returns the config it read when the answer is yes.
+fn wants_orchestrator_launch() -> Option<config::Config> {
+    if !is_bare_terminal_launch() {
+        return None;
+    }
+    if enclosing_session().is_some() {
+        return None;
+    }
+    auto_attach_config()
+}
+
+/// The config for this directory, when it has Auto Attach on. A config that
+/// cannot be read is not an error here — it means the ordinary launch, which
+/// will report the problem properly.
+fn auto_attach_config() -> Option<config::Config> {
+    let dir_context = fresh::config_io::DirectoryContext::from_system().ok()?;
+    let working_dir = std::env::current_dir().unwrap_or_default();
+    let config = config::Config::load_with_layers(&dir_context, &working_dir);
+    config.auto_attach.then_some(config)
+}
+
+/// A bare `fresh`: nothing on the command line, and someone at a terminal.
+fn is_bare_terminal_launch() -> bool {
+    std::env::args_os().count() == 1 && std::io::IsTerminal::is_terminal(&std::io::stdin())
+}
+
+/// The directory a bare `fresh` opens: `cwd`, or with `open_last_workspace`
+/// on, the workspace used last, wherever it is
+/// (`Editor::last_used_workspace_root`). Still `cwd` when there is no such
+/// workspace.
+fn bare_launch_dir(dir_context: &fresh::config_io::DirectoryContext, cwd: PathBuf) -> PathBuf {
+    if !config::Config::load_with_layers(dir_context, &cwd).open_last_workspace {
+        return cwd;
+    }
+    Editor::last_used_workspace_root(dir_context).unwrap_or(cwd)
+}
+
+/// Check the two files of `--diff LEFT RIGHT` and return them absolute.
+///
+/// Both must be files that exist, and two different ones: a diff of a
+/// missing file, of a directory, or of a file with itself has nothing to
+/// show, and saying so here beats an editor that opens on nothing. The
+/// editor doesn't open the files itself — the side-by-side view is a
+/// plugin's, which opens them into its panels — so a launch whose plugin
+/// won't run is refused too, rather than opening an empty editor. A refusal
+/// is a usage error, reported on stderr with exit status 2 like clap's own,
+/// not an error with a backtrace.
+fn check_diff_args(args: &Args, left: PathBuf, right: PathBuf) -> (PathBuf, PathBuf) {
+    let refuse = |msg: String| -> ! {
+        eprintln!("fresh: {msg}");
+        std::process::exit(2);
+    };
+    let plugin_off = || {
+        let config = match &args.config {
+            Some(path) => config::Config::load_from_file(path).ok()?,
+            None => {
+                let dir_context = fresh::config_io::DirectoryContext::from_system().ok()?;
+                let working_dir = std::env::current_dir().unwrap_or_default();
+                config::Config::load_with_layers(&dir_context, &working_dir)
+            }
+        };
+        config
+            .plugins
+            .get(DIFF_PLUGIN)
+            .map(|plugin| !plugin.enabled)
+    };
+    if args.no_plugins || plugin_off() == Some(true) {
+        refuse(format!(
+            "--diff shows the files with the bundled {DIFF_PLUGIN} plugin, which \
+             {}",
+            if args.no_plugins {
+                "--no-plugins and --safe turn off"
+            } else {
+                "your config turns off (plugins.compare_files.enabled)"
+            }
+        ));
+    }
+    #[cfg(feature = "gui")]
+    if args.gui {
+        refuse("--diff runs in the terminal; it can't be combined with --gui".to_string());
+    }
+    let resolve = |path: PathBuf| -> PathBuf {
+        if !path.exists() {
+            refuse(format!("--diff: {} does not exist", path.display()));
+        }
+        if path.is_dir() {
+            refuse(format!(
+                "--diff compares two files; {} is a directory",
+                path.display()
+            ));
+        }
+        std::fs::canonicalize(&path).unwrap_or(path)
+    };
+    let (left, right) = (resolve(left), resolve(right));
+    if left == right {
+        refuse(format!(
+            "--diff compares two files; both name {}",
+            left.display()
+        ));
+    }
+    (left, right)
+}
+
+/// The bundled plugin that shows a `--diff` launch (`compare_files.ts`).
+const DIFF_PLUGIN: &str = "compare_files";
+
+/// Whether this launch opens the files on its command line rather than a
+/// session (see `Editor::file_launch`): `--simple` asked for it, or at least
+/// one file (not a directory) was named, `editor.skip_session_restore_when_files_passed`
+/// is on (the default), and `--restore` did not ask for the session anyway.
+/// Decided by the invocation and that setting alone — never by which files
+/// they are.
+fn is_file_launch(args: &Args, cfg: &config::Config, files: &[FileLocation]) -> bool {
+    if args.simple || args.diff.is_some() {
+        return true;
+    }
+    files.iter().any(|loc| !loc.path.is_dir())
+        && cfg.editor.skip_session_restore_when_files_passed
+        && !args.force_restore
+}
+
+/// `locale` and `config` are the client's own `--locale` and `--config`,
+/// forwarded to a daemon we *start* here so those flags survive the hop
+/// into the process that actually renders the UI and reads the config.
+/// Attaching to an already-running daemon leaves both alone: it is someone
+/// else's session, already serving other terminals, the same way an
+/// existing daemon keeps its authority.
+///
+/// `orchestrator_mode` is a bare `fresh` (see `run_orchestrator_launch`):
+/// the daemon is started in that mode. `open_cwd` switches an already
+/// running daemon to the current directory's workspace.
+fn run_attach(
+    session_name: Option<&str>,
+    files: &[String],
+    locale: Option<&str>,
+    config: Option<&Path>,
+    orchestrator_mode: bool,
+    open_cwd: bool,
+) -> AnyhowResult<()> {
     use crossterm::terminal::enable_raw_mode;
     use fresh::server::protocol::{
         ClientControl, ClientHello, ServerControl, TermSize, PROTOCOL_VERSION,
     };
     use fresh::server::spawn_server_detached;
+
+    #[cfg(windows)]
+    require_windows_console();
 
     // Initialize tracing to a file for debugging
     use tracing_subscriber::{fmt, EnvFilter};
@@ -4727,37 +5898,30 @@ fn run_attach(session_name: Option<&str>, files: &[String]) -> AnyhowResult<()> 
     }
 
     // Check if a daemon is running, if not start one
-    let server_was_started = if !socket_paths.is_server_alive() {
+    let spawned = if !socket_paths.is_server_alive() {
         eprintln!("Starting daemon...");
 
         // Spawn server in background
-        let _pid = spawn_server_detached(session_name, ssh_url.as_deref())?;
-        true
+        let pid = spawn_server_detached(&fresh::server::DaemonSpawn {
+            session_name,
+            ssh_url: ssh_url.as_deref(),
+            locale,
+            config,
+            orchestrator_mode,
+        })?;
+        log_spawned_daemon(pid);
+        Some(pid)
     } else {
-        false
+        None
     };
 
     // Get terminal size
     let (cols, rows) = crossterm::terminal::size()?;
 
-    // Wait for server to be ready - the PID file is the semantic signal
-    // that the server has successfully bound and is ready to accept connections.
-    if server_was_started {
-        use fresh::server::daemon::is_process_running;
-
-        // Wait for PID file to appear with a valid running PID
-        // This is the semantic condition: server writes PID after bind() succeeds
-        loop {
-            if let Ok(Some(pid)) = socket_paths.read_pid() {
-                if is_process_running(pid) {
-                    break; // Server is ready
-                }
-            }
-            // Yield to scheduler - we're waiting for an event (PID file creation),
-            // not delaying for time. The yield is just to avoid busy-spinning.
-            std::thread::yield_now();
-        }
+    if let Some(pid) = spawned {
+        wait_for_spawned_daemon(&socket_paths, pid)?;
     }
+    let server_was_started = spawned.is_some();
 
     // Now connect - server is ready
     let conn = fresh::server::ipc::ClientConnection::connect(&socket_paths)?;
@@ -4769,9 +5933,7 @@ fn run_attach(session_name: Option<&str>, files: &[String]) -> AnyhowResult<()> 
     let term_size = TermSize::new(cols, rows);
 
     // Perform handshake
-    let hello = ClientHello::new(term_size);
-    let hello_json = serde_json::to_string(&ClientControl::Hello(hello))?;
-    conn.write_control(&hello_json)?;
+    conn.send_hello(ClientHello::new(term_size))?;
 
     // Read server response
     let response = conn
@@ -4807,6 +5969,19 @@ fn run_attach(session_name: Option<&str>, files: &[String]) -> AnyhowResult<()> 
         _ => {
             return Err(anyhow::anyhow!("Unexpected server response"));
         }
+    }
+
+    // A bare `fresh` opens the directory it was typed in, also when the
+    // daemon is already up and showing another one: switch it to this
+    // directory's workspace (created if there is none). A daemon started
+    // just now booted in this directory already, and is left alone so its
+    // startup does not read the whole workspace registry. Before any files:
+    // they open in whatever workspace is active when they arrive.
+    if open_cwd && !server_was_started {
+        let msg = serde_json::to_string(&ClientControl::OpenWindow {
+            path: working_dir.to_string_lossy().into_owned(),
+        })?;
+        conn.write_control(&msg)?;
     }
 
     // Send file open requests if any files were specified on the
@@ -4846,9 +6021,19 @@ fn run_attach(session_name: Option<&str>, files: &[String]) -> AnyhowResult<()> 
     // Enable raw mode - the server sends terminal setup sequences (alternate screen, etc.)
     // but we need raw mode so key presses are forwarded immediately
     enable_raw_mode()?;
+    // The client draws the server's frames on this tty, and copies to the
+    // host clipboard here too: keep fd 2 writes off the screen (#3662).
+    // `emergency_cleanup` below puts stderr back.
+    fresh::services::stderr_redirect::redirect_to_log();
 
     // Run the client relay loop (handshake already done)
     let result = client::run_client_relay(conn);
+
+    // The server drove mouse reporting through us, so a click we quit on leaves
+    // its release in our stdin. Take it before the modes below go away, or it
+    // surfaces at the shell prompt (#3474).
+    #[cfg(all(unix, feature = "runtime"))]
+    fresh::services::tty_input::drain_pending_mouse_report();
 
     // Best-effort: restore terminal state before printing any messages.
     // The server sends terminal setup sequences (alternate screen, mouse capture, etc.)
@@ -4953,6 +6138,7 @@ fn show_paths_command() -> AnyhowResult<()> {
 
 /// Handle `fresh update [--check] [--yes] [--allow-downgrade] [--force]
 ///                       [--download-only] [--print-command]
+///                       [--skip-attestation]
 ///                       [--releases-url U] [--download-base U]`.
 fn update_command(args: &Args) -> AnyhowResult<()> {
     #[cfg(feature = "self-update")]
@@ -4987,6 +6173,7 @@ fn update_command(args: &Args) -> AnyhowResult<()> {
             yes: args.update_yes,
             allow_downgrade: args.update_allow_downgrade,
             allow_prerelease: args.update_pre,
+            skip_attestation: args.update_skip_attestation,
             // Three rungs, most automatic first. `--print-command` wins if
             // both are given: it is the one that promises to touch nothing,
             // and a promise like that should not be overridden by accident.
@@ -5090,6 +6277,8 @@ fn run_if_subcommand(
             session_name.as_deref(),
             files,
             *wait,
+            args.locale.as_deref(),
+            args.config.as_deref(),
         ));
     }
     if args.attach {
@@ -5104,6 +6293,10 @@ fn run_if_subcommand(
     if let Some(addr) = &args.web {
         return Some(run_web_command(args, addr));
     }
+    #[cfg(not(feature = "web"))]
+    if args.web.is_some() {
+        web_unavailable();
+    }
     #[cfg(feature = "gui")]
     if !console_available || args.gui {
         return Some(fresh::gui::run_gui(
@@ -5117,38 +6310,6 @@ fn run_if_subcommand(
         ));
     }
     None
-}
-
-/// Attempt workspace or hot-exit restore when the editor restarts into a new project.
-fn restore_editor_workspace(editor: &mut Editor, args: &Args) {
-    if args.force_restore || editor.config().editor.restore_previous_session {
-        // Shared restore flow (same as startup / the dock's
-        // `materialize_window`): applies the new project's persisted
-        // explorer visibility, or the fresh-session default when there is
-        // nothing to restore — so a project whose explorer was closed
-        // does not spring back open on a Switch Project restart.
-        match editor.restore_active_window_on_launch(false) {
-            Ok(true) => tracing::info!("Workspace restored successfully"),
-            Ok(false) => tracing::debug!("No previous workspace found"),
-            Err(e) => tracing::warn!("Failed to restore workspace: {}", e),
-        }
-    } else {
-        tracing::info!(
-            "Skipping workspace restore on restart: editor.restore_previous_session is disabled"
-        );
-        // Session restore opted out, but hot-exit content for the newly-switched
-        // project is still restored so in-progress work is not lost.
-        match editor.try_restore_hot_exit_buffers() {
-            Ok(n) if n > 0 => tracing::info!(
-                "Restored {} hot-exit buffer(s) on restart despite skipping session restore",
-                n
-            ),
-            Ok(_) => {}
-            Err(e) => tracing::warn!("Failed to restore hot-exit buffers on restart: {}", e),
-        }
-        // Nothing restored — apply the bare-directory explorer default.
-        editor.apply_active_window_explorer_default(false, false);
-    }
 }
 
 fn main() -> AnyhowResult<()> {
@@ -5350,7 +6511,10 @@ fn build_localized_after_help() -> String {
     out.push_str("    fresh --cmd daemon open-file . 'b.rs:5-20@\"Step 2\"' --wait\n");
     out.push_str("    fresh --cmd daemon open-file . 'c.rs:30@\"Step 3\"'   --wait\n\n");
     out.push_str(&format!("  {}\n", t("cli.guided.git_editor")));
-    out.push_str("    git config core.editor 'fresh --cmd daemon open-file . --wait'\n\n");
+    // A file launch in this terminal, not a daemon: it blocks until quit
+    // (what git needs) and opens just the message — no workspace, dock or
+    // other tabs.
+    out.push_str("    git config --global core.editor fresh\n\n");
 
     out.push_str(&format!(
         "{}: https://getfresh.dev/docs",
@@ -5385,6 +6549,9 @@ fn build_localized_cli_command() -> clap::Command {
         .mut_arg("event_log", |a| a.help(t("cli.arg.event_log")))
         .mut_arg("no_restore", |a| a.help(t("cli.arg.no_restore")))
         .mut_arg("restore", |a| a.help(t("cli.arg.restore")))
+        .mut_arg("wait", |a| a.help(t("cli.arg.wait")))
+        .mut_arg("simple", |a| a.help(t("cli.arg.simple")))
+        .mut_arg("diff", |a| a.help(t("cli.arg.diff")))
         .mut_arg("no_upgrade_check", |a| {
             a.help(t("cli.arg.no_upgrade_check"))
         })
@@ -5425,6 +6592,14 @@ fn real_main() -> AnyhowResult<()> {
     // Print deprecation warnings for old flags
     print_deprecation_warnings(&cli);
 
+    // A bare `fresh` on a terminal, with `auto_attach` on: hand the
+    // whole launch to the shared daemon and relay it. Checked here, after
+    // clap, so `--help` and `--version` still answer for themselves — both
+    // put something on the command line, so neither reaches this.
+    if let Some(config) = wants_orchestrator_launch() {
+        return run_orchestrator_launch(&config, &[], None, None);
+    }
+
     // `--skill` is the shortcut an agent is told to run first: one short,
     // stable flag that resolves to whichever guide is currently the best
     // introduction, so the injected contract never has to name a topic.
@@ -5443,7 +6618,7 @@ fn real_main() -> AnyhowResult<()> {
     if !cli.cmd.is_empty() {
         let cmd_args: Vec<&str> = cli.cmd.iter().map(|s| s.as_str()).collect();
         match cmd_args.as_slice() {
-            ["script", ..] | ["command", ..] => {
+            ["script", ..] | ["command", ..] | ["workspace", ..] | ["agent", ..] => {
                 run_cmd_command(&cmd_args)?;
                 return Ok(());
             }
@@ -5471,6 +6646,9 @@ fn real_main() -> AnyhowResult<()> {
     // consumer (TUI, GUI, web, attach, nested forward) sees it, so
     // `fresh +50 file.txt` == `fresh file.txt:50` everywhere (#1926).
     args.files = apply_plus_line_args(std::mem::take(&mut args.files))?;
+    if let Some((left, right)) = args.diff.take() {
+        args.diff = Some(check_diff_args(&args, left, right));
+    }
     let args = args;
 
     // Expose `FRESH_INTERACTIVE=1` on the editor's process env when Fresh
@@ -5500,6 +6678,9 @@ fn real_main() -> AnyhowResult<()> {
         return result;
     }
 
+    #[cfg(windows)]
+    require_windows_console();
+
     // Save the original console mode BEFORE anything modifies it (raw mode,
     // enable_vt_input, etc.). Restored at the very end after all cleanup.
     #[cfg(windows)]
@@ -5525,47 +6706,31 @@ fn real_main() -> AnyhowResult<()> {
         _remote_session: remote_session,
     } = initialize_app(&args).context("Failed to initialize application")?;
 
-    let mut current_working_dir = initial_working_dir;
+    let current_working_dir = initial_working_dir;
     let (terminal_width, terminal_height) = terminal_size;
 
     // Track whether this is the first run (for session restore, file open, etc.)
-    let mut is_first_run = true;
-
-    // Track whether we should restore workspace on restart (for project switching)
-    let mut restore_workspace_on_restart = false;
 
     // Authority that will drive the next `Editor` constructed in the
     // loop. Starts from the startup authority (local or SSH); when a
     // plugin calls `editor.setAuthority(...)` the previous Editor
     // stashes the new authority in its `pending_authority` slot, which
     // we consume right before dropping it below.
-    let mut current_authority = startup_authority;
+    // The startup session's keepalive travels with its connection.
+    let mut current_authority = std::sync::Arc::new(fresh::services::authority::Connection {
+        authority: startup_authority,
+        keepalive: std::sync::Mutex::new(
+            remote_session.map(|rs| Box::new(rs) as Box<dyn std::any::Any + Send>),
+        ),
+    });
 
-    // Process-lifetime keepalive for a connection-backed authority.
-    // Seeded from the SSH startup session (if any); replaced when a
-    // plugin attaches a remote agent (K8s) mid-session via
-    // `attachRemoteAgent`. Held purely for its `Drop` — replacing it
-    // tears the previous connection down. Boxed opaquely so this loop
-    // never names a backend.
-    let mut current_keepalive: Option<Box<dyn std::any::Any + Send>> =
-        remote_session.map(|rs| Box::new(rs) as Box<dyn std::any::Any + Send>);
-
-    // Status-message log path is just a clone-able path — capture it
-    // once and re-bind to every restarted editor instance. Without
-    // this, the post-`setAuthority` editor has no path to point the
-    // "click status bar to view log" action at, and the user sees
-    // "status log not available" for every status message after the
-    // restart.
+    // The tracing log paths the status bar's and the warning indicator's
+    // clicks open, handed to the editor once it is built.
     let status_log_path: Option<PathBuf> = tracing_handles.as_ref().map(|h| h.status.path.clone());
 
-    // Warning-log channel survives across restarts the same way,
-    // except the `Receiver<()>` is single-consumer and can't be
-    // cloned: lift the whole `(receiver, path)` pair out of the
-    // editor before we drop it, and reinstall it on the next one.
-    // Seeded here from `tracing_handles` (which then no longer carries
-    // the warning slot), and topped up post-iteration via
-    // `editor.take_warning_log()`.
-    let mut warning_log_slot: Option<(std::sync::mpsc::Receiver<()>, PathBuf)> = tracing_handles
+    // The warning log's single-consumer receiver moves out of
+    // `tracing_handles` and into the editor.
+    let warning_log_slot: Option<(std::sync::mpsc::Receiver<()>, PathBuf)> = tracing_handles
         .take()
         .map(|h| (h.warning.receiver, h.warning.path));
 
@@ -5577,14 +6742,21 @@ fn real_main() -> AnyhowResult<()> {
         tracing::warn!("Local control socket unavailable: {}", e);
     }
 
-    // Main editor loop - supports restarting with a new working directory
+    // One editor, built once; nothing rebuilds it.
     // Returns (loop_result, last_update_result) tuple
-    let (result, last_update_result) = loop {
-        let first_run = is_first_run;
-        let workspace_enabled = !args.no_session;
+    let (result, last_update_result) = {
+        // `fresh FILE`: open those files, not the session — no workspace read
+        // or written, no other buffers' hot-exit content. Prompt history is
+        // not session state and is kept as in any launch.
+        let file_launch = is_file_launch(&args, &config, &file_locations);
+        if file_launch {
+            tracing::info!("File launch: opening the named files, not the session");
+        }
+        let workspace_enabled = !args.no_session && !file_launch;
 
         // Detect terminal color capability
         let color_capability = fresh::view::color_support::ColorCapability::detect();
+        let linux_console = std::env::var("TERM").is_ok_and(|t| t == "linux");
 
         // The editor is constructed with the *real* authority it runs
         // under — local or a connected remote — so that every later step
@@ -5606,16 +6778,18 @@ fn real_main() -> AnyhowResult<()> {
             // is what resolves a linked worktree to the repo that owns its
             // trust decision.
             let trust_owner = fresh::services::workspace_trust::trust_owner_root(
-                current_authority.filesystem.as_ref(),
+                current_authority.authority.filesystem.as_ref(),
                 &placeholder_root,
             );
-            let placeholder = fresh::services::authority::Authority::local_scoped(
-                fresh::services::authority::SessionScope::for_root(
-                    &placeholder_root,
-                    &dir_context.project_state_dir(&placeholder_root),
-                    &dir_context.project_state_dir(&trust_owner),
+            let placeholder = std::sync::Arc::new(fresh::services::authority::Connection::plain(
+                fresh::services::authority::Authority::local_scoped(
+                    fresh::services::authority::SessionScope::for_root(
+                        &placeholder_root,
+                        &dir_context.project_state_dir(&placeholder_root),
+                        &dir_context.project_state_dir(&trust_owner),
+                    ),
                 ),
-            );
+            ));
             std::mem::replace(&mut current_authority, placeholder)
         };
         let mut editor = Editor::with_working_dir_opts(
@@ -5628,7 +6802,13 @@ fn real_main() -> AnyhowResult<()> {
             color_capability,
             boot_authority,
             true, // defer_plugin_load: TUI startup; plugin loads run on the
-                  // plugin thread and arrive via AsyncBridge each tick.
+            // plugin thread and arrive via AsyncBridge each tick.
+            //
+            // Never the auto-attach daemon: a bare `fresh` with the setting on
+            // hands off to the daemon long before this loop, so an editor
+            // built here is by construction an ordinary in-terminal launch.
+            false,
+            file_launch,
         )
         .context("Failed to create editor instance")?;
         tracing::info!("Editor instance created");
@@ -5636,7 +6816,11 @@ fn real_main() -> AnyhowResult<()> {
         // The quit-time save below already honors `workspace_enabled`; this
         // extends it to the mid-session checkpoints (window switches,
         // session-identity finalization) that wrote regardless (#2735).
-        editor.set_workspace_persistence(workspace_enabled);
+        //
+        // Only `--no-restore` turns persistence off: a file launch keeps its
+        // prompt history, and `Editor::file_launch` alone keeps it from
+        // writing the workspace.
+        editor.set_workspace_persistence(!args.no_session);
 
         // Orchestrator cross-restart persistence is now loaded by
         // `Editor::with_options` before construction — it reads
@@ -5672,47 +6856,30 @@ fn real_main() -> AnyhowResult<()> {
         // `TerminalModes::enable` turned on above (#2504). Re-applied on every
         // editor instance (authority-swap restarts rebuild the editor).
         editor.set_mouse_capture(terminal_modes.mouse_capture_enabled());
+        editor.set_linux_console(linux_console);
 
-        // Re-wire the tracing log paths into every editor instance,
-        // not just the first. Status-bar click → open log, warning
-        // indicator click → open log all break otherwise after the
-        // first authority swap restart.
-        if let Some(p) = status_log_path.as_ref() {
-            editor.set_status_log_path(p.clone());
+        if let Some(p) = status_log_path {
+            editor.set_status_log_path(p);
         }
-        if let Some((rx, p)) = warning_log_slot.take() {
+        if let Some((rx, p)) = warning_log_slot {
             editor.set_warning_log(rx, p);
         }
 
-        if first_run {
-            tracing::info!("Running first-run setup...");
-            handle_first_run_setup(
-                &mut editor,
-                &args,
-                &file_locations,
-                show_file_explorer,
-                &mut stdin_stream,
-                workspace_enabled,
-            )
-            .context("Failed first run setup")?;
-            tracing::info!("First-run setup complete");
-        } else {
-            if restore_workspace_on_restart {
-                restore_editor_workspace(&mut editor, &args);
-            } else {
-                // Not restoring on this restart at all — still default the
-                // explorer for the freshly-entered directory.
-                editor.apply_active_window_explorer_default(false, false);
-            }
-            // Mid-session restart: reflow so the (possibly toggled) sidebar
-            // and the split/terminal viewports match the new visibility.
-            editor.relayout();
-            let path = current_working_dir
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| ".".to_string());
-            editor.set_status_message(fresh::i18n::switched_to_project_message(&path));
+        if let Some((left, right)) = &args.diff {
+            editor.set_diff_launch(left.clone(), right.clone());
         }
+
+        tracing::info!("Running first-run setup...");
+        handle_first_run_setup(
+            &mut editor,
+            &args,
+            &file_locations,
+            show_file_explorer,
+            &mut stdin_stream,
+            workspace_enabled,
+        )
+        .context("Failed first run setup")?;
+        tracing::info!("First-run setup complete");
 
         if let Err(e) = editor.start_recovery_session() {
             tracing::warn!("Failed to start recovery session: {}", e);
@@ -5750,77 +6917,19 @@ fn real_main() -> AnyhowResult<()> {
         .context("Editor iteration failed")?;
 
         let update_result = iteration.update_result;
-        let restart_dir = iteration.restart_dir;
         let loop_result = iteration.loop_result;
-
-        // If a plugin called `editor.setAuthority(...)` (or cleared it)
-        // during this iteration, the editor parked the replacement in
-        // `pending_authority` and triggered a restart. Move it into
-        // the loop-local var *before* dropping the editor so the next
-        // iteration builds against the new backend.
-        if let Some(new_authority) = editor.take_pending_authority() {
-            tracing::info!("Authority transition queued; restarting editor");
-            current_authority = new_authority;
-            // A connection-backed authority (remote agent / K8s) queues
-            // its keepalive alongside the authority. Adopt it here so the
-            // live carrier + reconnect/heartbeat tasks survive into the
-            // next iteration; the previous keepalive drops (tearing down
-            // the old connection). A plain local/docker transition
-            // carries no keepalive, leaving the slot — and any current
-            // remote session — untouched.
-            if let Some(new_keepalive) = editor.take_pending_keepalive() {
-                // Swap in the new session and drop the previous one,
-                // explicitly tearing the old connection down before the
-                // next iteration builds against the new backend.
-                let previous = current_keepalive.replace(new_keepalive);
-                drop(previous);
-            }
-        } else if restart_dir.is_some() {
-            // Non-transition restart (e.g. change-working-dir, config reload):
-            // carry the *active session's own backend* forward by moving it out
-            // of the editor we're about to drop, rather than booting the next
-            // iteration on the local placeholder. Without this a `fresh
-            // user@host` (or other CLI-remote) session would silently drop to
-            // local on restart — `Authority` is non-`Clone`, so it must be
-            // moved, not copied. Its `current_keepalive` (the carrier) is a
-            // loop-local and already survives the rebuild.
-            current_authority = editor.take_active_authority();
-        }
-
-        // Pluck the warning-log channel back out of the soon-to-be-
-        // dropped editor so the next iteration can re-bind it.
-        warning_log_slot = editor.take_warning_log();
-
-        // Persist every session before a restart rebuilds the editor from
-        // disk. Quit already saves (after the loop); the restart branch did
-        // not, so a session's per-window state — notably its backend
-        // `authority_spec` — would be lost across an `install_authority`
-        // restart and the session would come back local. Only needed when we
-        // are actually restarting; a real quit saves below.
-        if restart_dir.is_some() {
-            if let Err(e) = editor.save_all_windows_workspaces() {
-                tracing::warn!("Failed to save sessions before restart: {e}");
-            }
-        }
 
         drop(editor);
 
-        if let Some(new_dir) = restart_dir {
-            tracing::info!(
-                "Restarting editor with new working directory: {}",
-                new_dir.display()
-            );
-            current_working_dir = Some(new_dir);
-            is_first_run = false;
-            restore_workspace_on_restart = true; // Restore workspace for the new project
-            terminal
-                .clear()
-                .context("Failed to clear terminal for restart")?;
-            continue;
-        }
-
-        break (loop_result, update_result);
+        (loop_result, update_result)
     };
+
+    // Swallow the release of a click we quit on, before mouse reporting and
+    // raw mode go away and it ends up at the shell prompt (#3474).
+    #[cfg(all(unix, feature = "runtime"))]
+    if terminal_modes.mouse_capture_enabled() {
+        fresh::services::tty_input::drain_pending_mouse_report();
+    }
 
     // Restore terminal state
     terminal_modes.undo();
@@ -5849,7 +6958,7 @@ fn real_main() -> AnyhowResult<()> {
                 fresh::services::release_checker::UpdateKind::SelfContained
                     | fresh::services::release_checker::UpdateKind::DownloadPackage
             ) {
-                eprintln!("Update with: fresh --cmd update");
+                eprintln!("Update with: fresh --update");
             } else {
                 eprintln!(
                     "Download from: https://github.com/sinelaw/fresh/releases/tag/v{}",
@@ -5875,24 +6984,16 @@ fn handle_suspend_request(
 ) -> AnyhowResult<()> {
     #[cfg(unix)]
     {
-        let keyboard_config = KeyboardConfig {
-            disambiguate_escape_codes: editor.config().editor.keyboard_disambiguate_escape_codes,
-            report_event_types: editor.config().editor.keyboard_report_event_types,
-            report_alternate_keys: editor.config().editor.keyboard_report_alternate_keys,
-            report_all_keys_as_escape_codes: editor
-                .config()
-                .editor
-                .keyboard_report_all_keys_as_escape_codes,
-        };
+        let keyboard_config = KeyboardConfig::from_editor_config(&editor.config().editor);
         terminal_modes::suspend_and_resume(terminal_modes, Some(&keyboard_config))
             .context("Failed to suspend process")?;
         editor.request_full_redraw();
-        editor.set_status_message(fresh::i18n::resumed_after_suspend_message());
+        editor.set_status_message(fresh_i18n::t!("status.resumed_after_suspend").to_string());
     }
     #[cfg(not(unix))]
     {
         let _ = terminal_modes;
-        editor.set_status_message(fresh::i18n::suspend_unsupported_message());
+        editor.set_status_message(fresh_i18n::t!("status.suspend_unsupported").to_string());
     }
     Ok(())
 }
@@ -5944,6 +7045,9 @@ fn run_event_loop(
         fresh_winterm::MouseMode::CellMotion
     };
     fresh_winterm::enable_mouse_tracking(mouse_mode)?;
+    // Keys as KEY_EVENT records, so ConPTY's VT encoding cannot drop their
+    // modifiers (Ctrl+Tab arriving as Tab).
+    fresh_winterm::enable_win32_input_mode()?;
 
     // Spawn a dedicated reader thread to drain the console buffer as fast
     // as possible. This prevents the Windows console from dropping bytes
@@ -6014,7 +7118,8 @@ fn run_event_loop(
         },
     );
 
-    // Restore mouse tracking and console mode on exit
+    // Restore win32-input-mode, mouse tracking and console mode on exit
+    let _ = fresh_winterm::disable_win32_input_mode();
     let _ = fresh_winterm::disable_mouse_tracking();
     let _ = fresh_winterm::restore_console_mode(old_console_mode);
 
@@ -6103,7 +7208,11 @@ where
     use std::time::Instant;
 
     const FRAME_DURATION: Duration = Duration::from_millis(16); // 60fps
+    const LAUNCH_HOLD_POLL: Duration = Duration::from_millis(1);
     let mut last_render = Instant::now();
+    // When the last frame *began*. A periodic deadline at or before it has
+    // been served: that frame's render already ran past it.
+    let mut last_render_started = last_render;
     let mut needs_render = true;
     let mut pending_event: Option<InputEvent> = None;
     // Time of the last real input event, used to start the wave-animation
@@ -6131,40 +7240,12 @@ where
         }
 
         if editor.should_quit() {
-            // Auto-save file-backed buffers to disk before exiting
-            if editor.config().editor.auto_save_enabled {
-                match editor.save_all_on_exit() {
-                    Ok(count) if count > 0 => {
-                        tracing::info!("Auto-saved {} buffer(s) on exit", count);
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::warn!("Failed to auto-save on exit: {}", e);
-                    }
-                }
+            // The shared quit-time persistence (auto-save, recovery,
+            // workspaces, prompt histories, plugin state, dock chrome).
+            // Each failure is logged inside; none blocks quit.
+            if let Err(e) = editor.persist_on_exit(workspace_enabled) {
+                tracing::debug!("Quit-time persistence incomplete: {e}");
             }
-
-            // End recovery session first (flushes dirty buffers + assigns recovery IDs),
-            // then save workspace (captures those IDs for next session restore).
-            if let Err(e) = editor.end_recovery_session() {
-                tracing::warn!("Failed to end recovery session: {}", e);
-            }
-            if workspace_enabled {
-                // Save every window's workspace, not just the active one,
-                // so a Orchestrator restart paints buffers/splits in every
-                // session's preview pane without diving in.
-                if let Err(e) = editor.save_all_windows_workspaces() {
-                    tracing::warn!("Failed to save workspaces: {}", e);
-                } else {
-                    tracing::debug!("Workspaces saved successfully");
-                }
-            }
-
-            // Orchestrator cross-restart persistence: write
-            // `windows.json` and `state/*.json` under the platform
-            // data dir (see `orchestrator_persistence`). Best-effort;
-            // failures are logged inside, never block quit.
-            editor.save_orchestrator_state();
             break;
         }
 
@@ -6180,9 +7261,37 @@ where
         // spinner is wall-clock-derived (see
         // `lsp_status::compose_lsp_status`) and needs a periodic
         // re-render to advance even when no other event fires.
-        let animations_active = editor.active_window().animations.is_active();
+        // `take_settle_frame` is the frame owed after the last effect retires:
+        // that frame was the effect's own composite (a slide's final position,
+        // a fade's last step), and with `is_active` already false nothing else
+        // would ask for the frame that paints the true content underneath.
+        let animations_active = editor.active_window().animations.is_active()
+            || editor.active_window_mut().animations.take_settle_frame();
         let lsp_progress_active = editor.active_window().has_active_lsp_progress();
-        if animations_active || lsp_progress_active {
+        // Same for a wheel gesture still walking its lines: each frame
+        // hands over the next one.
+        let wheel_scroll_active = editor.has_pending_wheel_scroll() || editor.has_drag_autoscroll();
+        if animations_active || lsp_progress_active || wheel_scroll_active {
+            needs_render = true;
+        }
+
+        // Every other time-driven effect asks for its frame through
+        // `next_periodic_redraw_deadline` (the occurrence highlight's
+        // debounce, the async-paste fallback, a parked macro replay, ...).
+        // A deadline owes exactly one frame: the first one to begin at or
+        // after it. Once that frame has begun the deadline is served, whether
+        // or not its source cleared it — the occurrence-highlight debounce of
+        // a buffer that was switched away from before it fired is cleared
+        // only when that buffer next renders, and treating it as owed until
+        // then redrew every frame.
+        let periodic_deadline = |editor: &Editor, last_render_started: Instant| {
+            editor
+                .next_periodic_redraw_deadline()
+                .filter(|deadline| *deadline > last_render_started)
+        };
+        if periodic_deadline(editor, last_render_started)
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
             needs_render = true;
         }
 
@@ -6196,8 +7305,10 @@ where
         if needs_render
             && last_render.elapsed() >= FRAME_DURATION
             && !editor.should_suppress_render()
+            && !editor.holds_launch_frames()
         {
             let r0 = Instant::now();
+            last_render_started = r0;
             let was_paste_pending = editor.is_paste_pending();
             {
                 let _span = tracing::info_span!("terminal_draw").entered();
@@ -6219,16 +7330,35 @@ where
             } else {
                 Duration::from_millis(50)
             };
-            // Cap the timeout for any time-driven UI element that needs
-            // periodic frames — animations and the LSP status-bar
-            // spinner. `next_periodic_redraw_deadline` rolls both into
-            // one Option<Instant>; when it's `Some`, we also bound the
-            // wait to the next frame so the render budget is respected.
-            if let Some(deadline) = editor.next_periodic_redraw_deadline() {
+            // Wake for the next time-driven frame
+            // (`next_periodic_redraw_deadline`), but never before the frame
+            // budget lets it be drawn. A deadline already due waits out the
+            // budget, not 0: bounding the wait by the time to the next frame
+            // whenever *any* deadline was pending meant that, with no frame
+            // owed and the last one more than a frame ago, the loop polled
+            // with a zero timeout until the deadline arrived — a full core for
+            // the 150 ms of every occurrence-highlight debounce, i.e. after
+            // every cursor move onto a word. Mirrors the daemon loop.
+            if let Some(deadline) = periodic_deadline(editor, last_render_started) {
                 let until_next_frame = FRAME_DURATION.saturating_sub(last_render.elapsed());
-                timeout = timeout.min(until_next_frame);
                 let until_deadline = deadline.saturating_duration_since(Instant::now());
-                timeout = timeout.min(until_deadline);
+                timeout = timeout.min(until_deadline.max(until_next_frame));
+            }
+            // Work the editor finishes on its own ticks rather than in a frame
+            // — draining an async paste, a macro replay parked on a plugin
+            // step — wants the loop back promptly, not at the next frame.
+            // Nothing wakes the wait when its answer arrives, so a short one.
+            if editor.is_paste_pending() || editor.macro_replay_parked() {
+                timeout = timeout.min(LAUNCH_HOLD_POLL);
+            }
+            // A `--diff` launch draws nothing until its plugin has the view up,
+            // and the plugin gets there through a chain of calls the editor
+            // answers on its ticks. Nothing wakes this wait when one arrives,
+            // so at the idle 50 ms each link waited up to that long; and with
+            // a frame owed but held, the frame budget above is spent, which
+            // would spin. A short wait answers each call promptly instead.
+            if editor.holds_launch_frames() {
+                timeout = LAUNCH_HOLD_POLL;
             }
             poll_event(timeout)?
         };
@@ -6265,7 +7395,7 @@ where
                 if fresh::input::is_keystroke(key_event.kind) {
                     editor
                         .active_window_mut()
-                        .handle_event_debug_input(&key_event);
+                        .handle_event_debug_input(key_event);
                     needs_render = true;
                 }
             }
@@ -6353,46 +7483,84 @@ fn poll_with_gpm(
     let gpm_revents = poll_fds[1].revents();
 
     // Check GPM first (mouse events are typically less frequent)
+    //
+    // **Every report GPM has ready, queued through the reader — not the first
+    // one, returned past it.** Returning it directly was the one pointer path
+    // that escaped motion coalescing: the console mouse never touches stdin,
+    // so `push_coalesced` never saw it, and `coalesce_mouse_moves` declines on
+    // unix because the reader owns fd 0. A divider drag on a VT therefore
+    // still arrived one event per cell crossed, each costing a full relayout
+    // and repaint — the very backlog this crate coalesces away everywhere
+    // else. `queue_external` puts them under the same rule.
+    //
+    // Drained in a loop because one `read_event` per wakeup would leave the
+    // rest queued in GPM and hand the flood back a poll at a time. It blocks
+    // when nothing is pending, so the fd is re-polled with a zero timeout
+    // before each further read.
     if gpm_revents.is_some_and(|r| r.contains(PollFlags::POLLIN)) {
-        match gpm.read_event() {
-            Ok(Some(gpm_event)) => {
-                if let Some(mouse_event) = gpm_to_crossterm(&gpm_event) {
-                    return Ok(Some(InputEvent::Mouse(mouse_event)));
-                } else {
-                    tracing::debug!("GPM event could not be converted to crossterm event");
+        loop {
+            match gpm.read_event() {
+                Ok(Some(gpm_event)) => {
+                    if let Some(mouse_event) = gpm_to_crossterm(&gpm_event) {
+                        reader.queue_external(InputEvent::Mouse(mouse_event));
+                    } else {
+                        tracing::debug!("GPM event could not be converted to crossterm event");
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::warn!("GPM poll: read_event error: {}", e);
+                    break;
                 }
             }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::warn!("GPM poll: read_event error: {}", e);
+            let mut ready_again = [PollFd::new(gpm_borrowed, PollFlags::POLLIN)];
+            if poll(&mut ready_again, PollTimeout::from(0u16)).unwrap_or(0) == 0 {
+                break;
             }
         }
     }
 
-    // Then stdin, parsed by fresh's state machine.
+    // Then stdin, parsed by fresh's state machine. Appended after the GPM
+    // reports above, so the queue keeps the precedence this function has
+    // always had; the single drain below serves whichever came first.
     if stdin_revents.is_some_and(|r| r.contains(PollFlags::POLLIN)) {
         reader.drain_stdin();
-        if let Some(ev) = reader.next_buffered() {
-            return Ok(Some(ev));
-        }
     }
 
-    Ok(reader.take_resize())
+    Ok(reader.next_buffered().or_else(|| reader.take_resize()))
 }
 
-/// Skip stale mouse move events, return the latest one.
-/// If we read a non-move event while draining, return it as pending.
+/// Skip stale mouse motion events, return the latest one.
+/// If we read a non-motion event while draining, return it as pending.
+///
+/// "Motion" is both reports a terminal sends as the pointer travels: `Moved`
+/// with no button down, and `Drag(button)` with one held. Only a run of the
+/// *same* report collapses — see [`TtyReader::push_coalesced`], which this
+/// mirrors for the platforms where crossterm still owns stdin.
 fn coalesce_mouse_moves(event: InputEvent) -> AnyhowResult<(InputEvent, Option<InputEvent>)> {
     use crossterm::event::MouseEventKind;
 
-    // Only coalesce mouse moves
-    if !matches!(&event, InputEvent::Mouse(m) if m.kind == MouseEventKind::Moved) {
-        return Ok((event, None));
+    fn motion(ev: &InputEvent) -> Option<(MouseEventKind, crossterm::event::KeyModifiers)> {
+        match ev {
+            InputEvent::Mouse(m)
+                if matches!(m.kind, MouseEventKind::Moved | MouseEventKind::Drag(_)) =>
+            {
+                Some((m.kind, m.modifiers))
+            }
+            _ => None,
+        }
     }
 
+    // Only coalesce motion.
+    let Some(run) = motion(&event) else {
+        return Ok((event, None));
+    };
+
     // On Unix, the TtyReader owns stdin and already coalesces motion floods as
-    // it queues them; draining crossterm here would race the reader on fd 0
-    // (and re-introduce crossterm's fragile mouse parsing). Nothing to do.
+    // it queues them — including the Linux console's, which `poll_with_gpm`
+    // hands it via `queue_external` rather than returning past it. Draining
+    // crossterm here would race the reader on fd 0 (and re-introduce
+    // crossterm's fragile mouse parsing). Nothing to do.
     #[cfg(unix)]
     if fresh::services::tty_input::raw_input_active() {
         return Ok((event, None));
@@ -6403,8 +7571,8 @@ fn coalesce_mouse_moves(event: InputEvent) -> AnyhowResult<(InputEvent, Option<I
         let Some(next) = safe_event_read()? else {
             continue;
         };
-        if matches!(&next, InputEvent::Mouse(m) if m.kind == MouseEventKind::Moved) {
-            latest = next; // Newer move, skip the old one
+        if motion(&next) == Some(run) {
+            latest = next; // Newer report of the same motion, skip the old one
         } else {
             return Ok((latest, Some(next))); // Hit a click/key, save it
         }
@@ -6415,6 +7583,105 @@ fn coalesce_mouse_moves(event: InputEvent) -> AnyhowResult<(InputEvent, Option<I
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A flag with nothing usable after it is a usage error, not a
+    /// default.** The CLI is driven by agents, and `--prompt --timeout 30`
+    /// used to set the prompt to the literal `--timeout` and read `30` as a
+    /// stray argument: the caller asked for two things, got neither, and saw
+    /// a zero exit. `--name=-x` is how a value that really starts with `-` is
+    /// passed.
+    #[test]
+    fn a_flag_swallowing_the_next_flag_is_a_usage_error() {
+        assert_eq!(
+            flag_value_checked(&["--prompt", "hello"], "--prompt"),
+            Ok(Some("hello"))
+        );
+        assert_eq!(
+            flag_value_checked(&["--prompt=hello"], "--prompt"),
+            Ok(Some("hello"))
+        );
+        assert_eq!(flag_value_checked(&["--auto"], "--prompt"), Ok(None));
+
+        assert!(flag_value_checked(&["--prompt"], "--prompt").is_err());
+        assert!(flag_value_checked(&["--prompt", "--timeout", "30"], "--prompt").is_err());
+        assert!(flag_value_checked(&["--prompt", "-x"], "--prompt").is_err());
+
+        // …and the escape hatch still works, so a prompt may begin with a dash.
+        assert_eq!(
+            flag_value_checked(&["--prompt=--not-a-flag"], "--prompt"),
+            Ok(Some("--not-a-flag"))
+        );
+    }
+
+    /// `--timeout` takes a number; anything else is a usage error, and an
+    /// absent flag takes the verb's default.
+    #[test]
+    fn timeout_parses_or_is_a_usage_error() {
+        assert_eq!(parse_timeout_flag(&["--timeout", "30"], 9), 30);
+        assert_eq!(parse_timeout_flag(&["--timeout=30"], 9), 30);
+        assert_eq!(parse_timeout_flag(&[], 9), 9);
+    }
+
+    /// **The sentinel a verb's script appends must not be confusable with the
+    /// output it is appended to.** The tokens were bare words matched with
+    /// `ends_with` and removed with `trim_end_matches`, so a workspace name or
+    /// an agent error ending in one set the exit code, and a body that ended
+    /// in several had them all stripped. The Record Separator cannot occur in
+    /// any of those.
+    #[test]
+    fn a_sentinel_is_stripped_once_and_only_when_the_script_sent_it() {
+        let timed_out = format!("ws-1 idle{SENTINEL_TIMED_OUT}");
+        assert_eq!(
+            strip_sentinel(&timed_out, SENTINEL_TIMED_OUT),
+            ("ws-1 idle", true)
+        );
+
+        // Output that merely *says* the word is output, not a signal.
+        let (shown, hit) = strip_sentinel("ws-1 FAILED: TIMED_OUT", SENTINEL_TIMED_OUT);
+        assert_eq!((shown, hit), ("ws-1 FAILED: TIMED_OUT", false));
+
+        // Exactly one, so a body ending in the token keeps it.
+        let doubled = format!("ws-1 {SENTINEL_TIMED_OUT}{SENTINEL_TIMED_OUT}");
+        let once = format!("ws-1 {SENTINEL_TIMED_OUT}");
+        assert_eq!(
+            strip_sentinel(&doubled, SENTINEL_TIMED_OUT),
+            (once.trim_end(), true)
+        );
+
+        let (shown, hit) = strip_sentinel("{\n  \"ready\": false\n}", SENTINEL_START_FAILED);
+        assert_eq!((shown, hit), ("{\n  \"ready\": false\n}", false));
+    }
+
+    /// Parse `argv` the way `real_main` does: the localized command, then
+    /// `Cli`, then the internal `Args`.
+    fn parse_args(argv: &[&str]) -> Result<Args, clap::Error> {
+        let matches = build_localized_cli_command().try_get_matches_from(argv)?;
+        Ok(Cli::from_arg_matches(&matches)?.into())
+    }
+
+    /// `--diff LEFT RIGHT` takes exactly two paths, as plain paths: a name
+    /// with a colon is a file, not a `file:line` spec, and the launch is a
+    /// file launch whatever the session settings say.
+    #[test]
+    fn diff_takes_two_plain_paths_and_is_a_file_launch() {
+        let args = parse_args(&["fresh", "--diff", "a:3", "b.txt"]).expect("parses");
+        assert_eq!(
+            args.diff,
+            Some((PathBuf::from("a:3"), PathBuf::from("b.txt")))
+        );
+        assert!(args.files.is_empty(), "the pair is not a list of FILES");
+
+        let mut config = config::Config::default();
+        config.editor.skip_session_restore_when_files_passed = false;
+        assert!(is_file_launch(&args, &config, &[]));
+
+        assert!(parse_args(&["fresh", "--diff", "only-one"]).is_err());
+        assert!(
+            parse_args(&["fresh", "--diff", "a", "b", "c"]).is_err(),
+            "a third path is a FILES argument, which --diff refuses"
+        );
+        assert!(parse_args(&["fresh", "--diff", "a", "b", "--stdin"]).is_err());
+    }
 
     /// The scripts the convenience verbs submit must parse, and must call
     /// only API members this build actually has.
@@ -6450,7 +7717,7 @@ mod tests {
         #[cfg(feature = "plugins")]
         for (verb, source) in &sources {
             let wrapped = format!("(async () => {{\n{source}\n}})();");
-            fresh_parser_js::transpile_typescript(&wrapped, "verb.ts")
+            fresh_plugin_runtime::fresh_parser_js::transpile_typescript(&wrapped, "verb.ts")
                 .unwrap_or_else(|e| panic!("`{verb}` submits a script that does not parse: {e}"));
         }
 

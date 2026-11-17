@@ -373,8 +373,10 @@ fn test_session_file_location() {
     // Get expected session path
     let session_path = get_workspace_path(&project_dir).unwrap();
 
-    // Verify XDG location
-    let data_dir = dirs::data_dir().unwrap();
+    // Verify the data directory the path was derived from. `dirs::data_dir()`
+    // is only a guess at it: on macOS an absolute `XDG_DATA_HOME` overrides the
+    // platform directory, which is what the resolver itself decides.
+    let data_dir = fresh::input::input_history::get_data_dir().unwrap();
     assert!(
         session_path.starts_with(&data_dir),
         "Session should be in XDG data directory: {:?}",
@@ -921,7 +923,7 @@ fn test_session_cursor_visible_in_splits_after_restore() {
 
         // Get cursor and scroll BEFORE first render from EditorState
         let cursor_before_render = harness.cursor_position();
-        let viewport_before = harness.editor().active_viewport().clone();
+        let viewport_before = harness.editor().active_window().active_viewport().clone();
         let (line_before, _) = harness
             .editor()
             .active_state()
@@ -940,7 +942,7 @@ fn test_session_cursor_visible_in_splits_after_restore() {
 
         // Get cursor and scroll AFTER render
         let cursor_after_render = harness.cursor_position();
-        let viewport_after = harness.editor().active_viewport().clone();
+        let viewport_after = harness.editor().active_window().active_viewport().clone();
         let (line_after, _) = harness
             .editor()
             .active_state()
@@ -1362,6 +1364,83 @@ fn test_session_restores_file_explorer_hidden_and_gitignored_settings() {
     }
 }
 
+/// A workspace saved with Show Hidden Files turned off restores it off, even
+/// when the config default is on — for the explorer and for Quick Open.
+#[test]
+fn test_session_restores_show_hidden_off_over_config_default() {
+    let temp_dir = TempDir::new().unwrap();
+    let project_dir = temp_dir.path().join("project");
+    std::fs::create_dir(&project_dir).unwrap();
+    std::fs::write(project_dir.join("restored_visible.txt"), "visible").unwrap();
+    std::fs::write(project_dir.join(".restored_dotfile"), "hidden").unwrap();
+
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
+    let mut config = Config::default();
+    config.file_explorer.show_hidden = true;
+    let launch = || {
+        EditorTestHarness::create(
+            100,
+            30,
+            HarnessOptions::new()
+                .with_config(config.clone())
+                .with_working_dir(project_dir.clone())
+                .with_shared_dir_context(dir_context.clone())
+                .without_empty_plugins_dir(),
+        )
+        .unwrap()
+    };
+
+    // First session: the explorer starts with hidden files shown (config),
+    // the user turns them off, and the workspace is saved.
+    {
+        let mut harness = launch();
+        harness.editor_mut().focus_file_explorer();
+        harness.wait_for_file_explorer().unwrap();
+        assert!(harness
+            .editor()
+            .file_explorer()
+            .unwrap()
+            .ignore_patterns()
+            .show_hidden());
+        harness.editor_mut().file_explorer_toggle_hidden();
+        harness.editor_mut().save_workspace().unwrap();
+    }
+
+    // Second session, same config: the saved "off" wins.
+    let mut harness = launch();
+    let restored = harness.editor_mut().try_restore_workspace().unwrap();
+    assert!(restored, "Session should have been restored");
+    harness.wait_for_file_explorer().unwrap();
+    harness
+        .wait_for_file_explorer_item("restored_visible.txt")
+        .unwrap();
+    assert!(
+        !harness
+            .editor()
+            .file_explorer()
+            .unwrap()
+            .ignore_patterns()
+            .show_hidden(),
+        "a saved Show Hidden Files off must override the config default"
+    );
+    harness.assert_screen_not_contains(".restored_dotfile");
+
+    // Hide the explorer so only Quick Open can put the dotfile on screen.
+    harness.editor_mut().toggle_file_explorer();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness
+        .send_key(KeyCode::Backspace, KeyModifiers::NONE)
+        .unwrap();
+    harness.type_text("restored_").unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("restored_visible.txt"))
+        .unwrap();
+    harness.assert_screen_not_contains(".restored_dotfile");
+}
+
 /// Test that each split shows only its own file after restore, not all files in all splits.
 ///
 /// Regression test: the user reported that after workspace restore, all file-backed buffers
@@ -1760,7 +1839,7 @@ fn test_reopen_with_file_arg_restores_session_and_opens_new_file() {
         .unwrap();
 
         // Startup with CLI file arg (mirrors production startup path)
-        let restored = harness.startup(true, &[file3.clone()]).unwrap();
+        let restored = harness.startup(true, std::slice::from_ref(&file3)).unwrap();
         assert!(restored, "Session should have been restored");
 
         // All three files should be visible in tabs
@@ -2406,17 +2485,8 @@ fn test_hidden_from_tabs_external_files_not_persisted() {
             meta.hidden_from_tabs = true;
             meta.auto_revert_enabled = false;
         }
-        let active_split = win
-            .buffers
-            .splits()
-            .map(|(mgr, _)| mgr)
-            .expect("split layout present")
-            .active_split();
-        if let Some(vs) = win
-            .split_view_states_mut()
-            .expect("split view states present")
-            .get_mut(&active_split)
-        {
+        let active_split = win.split_manager().active_split();
+        if let Some(vs) = win.split_view_states_mut().get_mut(&active_split) {
             vs.open_buffers.retain(
                 |t| !matches!(t, fresh::view::split::TabTarget::Buffer(b) if *b == transient_id),
             );
@@ -2576,4 +2646,140 @@ fn test_restore_orphaned_active_unnamed_tab_renders_surviving_tab() {
              (dangling-leaf) state of issue #1939",
         );
     }
+}
+
+/// Issue #3532: a file that exists but cannot be opened on one launch keeps
+/// its place in the workspace, and is back once it can be opened again. Only a
+/// file that is gone from disk is dropped.
+#[test]
+fn test_session_keeps_a_file_that_could_not_be_opened() {
+    let temp_dir = TempDir::new().unwrap();
+    let project_dir = temp_dir.path().join("project");
+    std::fs::create_dir(&project_dir).unwrap();
+
+    let real = project_dir.join("real.txt");
+    let other = project_dir.join("other.txt");
+    std::fs::write(&real, "REAL_FILE_CONTENT").unwrap();
+    std::fs::write(&other, "OTHER_CONTENT").unwrap();
+
+    let launch = || {
+        EditorTestHarness::with_config_and_working_dir(
+            100,
+            24,
+            Config::default(),
+            project_dir.clone(),
+        )
+        .unwrap()
+    };
+
+    {
+        let mut harness = launch();
+        harness.open_file(&real).unwrap();
+        harness.open_file(&other).unwrap();
+        harness.editor_mut().save_workspace().unwrap();
+    }
+
+    // The path exists but can't be opened as a file: a stand-in for any
+    // transient open failure (permissions, I/O error, unmounted share).
+    std::fs::remove_file(&real).unwrap();
+    std::fs::create_dir(&real).unwrap();
+
+    {
+        let mut harness = launch();
+        assert!(harness.editor_mut().try_restore_workspace().unwrap());
+        harness.render().unwrap();
+        harness.assert_screen_contains("Could not open real.txt");
+        harness.editor_mut().save_workspace().unwrap();
+    }
+
+    std::fs::remove_dir(&real).unwrap();
+    std::fs::write(&real, "REAL_FILE_CONTENT").unwrap();
+
+    {
+        let mut harness = launch();
+        assert!(harness.editor_mut().try_restore_workspace().unwrap());
+        harness.render().unwrap();
+        let screen = harness.screen_to_string();
+        assert!(
+            screen.contains("real.txt") && screen.contains("other.txt"),
+            "both tabs should be back once real.txt opens again. Screen:\n{screen}"
+        );
+        harness.editor_mut().save_workspace().unwrap();
+    }
+
+    // Deleted for real: the next launch drops it, as before.
+    std::fs::remove_file(&real).unwrap();
+    {
+        let mut harness = launch();
+        assert!(harness.editor_mut().try_restore_workspace().unwrap());
+        harness.editor_mut().save_workspace().unwrap();
+    }
+    std::fs::write(&real, "REAL_FILE_CONTENT").unwrap();
+    {
+        let mut harness = launch();
+        assert!(harness.editor_mut().try_restore_workspace().unwrap());
+        harness.render().unwrap();
+        let screen = harness.screen_to_string();
+        assert!(
+            !screen.contains("real.txt"),
+            "a file deleted between launches is dropped. Screen:\n{screen}"
+        );
+    }
+}
+
+/// Issue #3532: a file that keeps failing to open stays in the workspace for
+/// as many launches as it fails, and is back once it opens. An external file
+/// — listed both as a tab and under `external_files` — is held, and reported,
+/// once.
+#[test]
+fn test_session_keeps_a_file_that_fails_on_every_launch() {
+    let temp_dir = TempDir::new().unwrap();
+    let project_dir = temp_dir.path().join("project");
+    std::fs::create_dir(&project_dir).unwrap();
+    let outside = temp_dir.path().join("outside.txt");
+    std::fs::write(&outside, "OUTSIDE").unwrap();
+
+    let launch = || {
+        EditorTestHarness::with_config_and_working_dir(
+            300,
+            24,
+            Config::default(),
+            project_dir.clone(),
+        )
+        .unwrap()
+    };
+    {
+        let mut harness = launch();
+        harness.open_file(&outside).unwrap();
+        harness.editor_mut().save_workspace().unwrap();
+    }
+    std::fs::remove_file(&outside).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+
+    for launch_no in 1..=5 {
+        let mut harness = launch();
+        harness.editor_mut().try_restore_workspace().unwrap();
+        harness.render().unwrap();
+        let screen = harness.screen_to_string();
+        assert!(
+            screen.contains("Could not open") && screen.contains("It stays in this workspace"),
+            "launch {launch_no} should say so. Screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("more recovery warning"),
+            "one file, one warning. Screen:\n{screen}"
+        );
+        harness.editor_mut().save_workspace().unwrap();
+    }
+
+    std::fs::remove_dir(&outside).unwrap();
+    std::fs::write(&outside, "OUTSIDE").unwrap();
+    let mut harness = launch();
+    harness.editor_mut().try_restore_workspace().unwrap();
+    harness.render().unwrap();
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("outside.txt"),
+        "back once it opens. Screen:\n{screen}"
+    );
 }

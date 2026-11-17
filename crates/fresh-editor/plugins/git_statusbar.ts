@@ -21,12 +21,12 @@ let ensureWatchInFlight: Promise<void> | null = null;
 
 
 async function discoverHeadPath(cwd: string): Promise<string | null> {
-  const result = await editor.spawnProcess(
+  const result = await editor.runOnTarget(
     "git",
     ["rev-parse", "--git-path", "HEAD"],
     cwd,
   );
-  if (result.exit_code !== 0) return null;
+  if (result.code !== 0) return null;
   const headPath = result.stdout.trim();
   if (!headPath) return null;
   // `--git-path` returns a path relative to cwd unless the git dir is
@@ -69,12 +69,12 @@ async function getCurrentGitBranch(): Promise<string> {
   inFlight = (async () => {
     try {
       const cwd = gitCwdCandidate(editor);
-      const result = await editor.spawnProcess(
+      const result = await editor.runOnTarget(
         "git",
         ["rev-parse", "--abbrev-ref", "HEAD"],
         cwd,
       );
-      if (result.exit_code === 0) {
+      if (result.code === 0) {
         const branch = result.stdout.trim();
         lastDetectedBranch = branch || "HEAD";
       } else {
@@ -114,12 +114,12 @@ editor.registerStatusBarElement(GIT_BRANCH, editor.t("status.git_branch"));
 // cursor_moved, after_insert, after_delete, buffer_deactivated, buffer_closed.
 // None of them can change the current branch, and render_start was being
 // fired ~300/s — see #2009 for the feedback-loop investigation.
-[
+([
   "buffer_activated",
   "after_file_open",
   "after_file_save",
   "focus_gained",
-].forEach((event) => {
+] as const).forEach((event) => {
   editor.on(event, async () => {
     await refreshForActiveBuffer();
   });

@@ -3,27 +3,22 @@
 // Editor library - exposes all core modules for testing
 
 pub mod i18n;
+pub mod release_notes;
 
-// Initialize i18n with empty directory (no compile-time code generation)
-// All translations are provided by the runtime backend
-rust_i18n::i18n!(
-    "locales-empty",
-    fallback = "en",
-    backend = i18n::runtime_backend::RuntimeBackend::new()
-);
-
-// Core types and config are always available (needed for schema generation)
-pub mod config;
-pub mod partial_config;
-pub mod plugin_schemas;
-pub mod types;
-
-// Runtime-only modules (require the "runtime" feature)
+// The data / presentation-primitives layer lives in `fresh-editor-core` and
+// is re-exported here under its original paths, so `fresh::config`,
+// `fresh::model`, `fresh::primitives` and `fresh::widgets` keep resolving for
+// downstream code, plugins and the integration tests.
+pub use fresh_editor_core::config;
 #[cfg(feature = "runtime")]
-pub mod config_io;
-pub mod config_keys;
+pub use fresh_editor_core::config_io;
+pub use fresh_editor_core::config_keys;
+pub use fresh_editor_core::partial_config;
+pub use fresh_editor_core::types;
+
 #[cfg(feature = "runtime")]
 pub mod init_script;
+pub mod plugin_schemas;
 #[cfg(feature = "runtime")]
 pub mod state;
 #[cfg(feature = "runtime")]
@@ -31,8 +26,8 @@ pub mod workspace;
 
 // Core modules - always available (pure Rust, no platform dependencies)
 // Submodules within primitives that need ratatui/syntect are internally gated
-pub mod model;
-pub mod primitives;
+pub use fresh_editor_core::model;
+pub use fresh_editor_core::primitives;
 
 // Runtime-only modules (heavy dependencies, platform-specific)
 #[cfg(feature = "runtime")]
@@ -64,7 +59,7 @@ pub mod view;
 // Plugin widget runtime — declarative widget tree mounted by plugins
 // via MountWidgetPanel/UpdateWidgetPanel/UnmountWidgetPanel. Pure Rust,
 // no UI dependencies, so always available.
-pub mod widgets;
+pub use fresh_editor_core::widgets;
 
 // GUI mode - native window with wgpu rendering
 #[cfg(feature = "gui")]

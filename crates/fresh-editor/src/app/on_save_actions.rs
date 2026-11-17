@@ -5,14 +5,22 @@
 
 use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
+use super::shell_command::shell_command;
 use super::Editor;
 use crate::config::{FormatterConfig, OnSaveAction};
-use crate::model::event::Event;
+use crate::model::cursor::Cursors;
+use crate::model::event::{BufferId, CursorId, Event};
+// Formatter and on-save commands are probed the same way as LSP servers:
+// on PATH, or as an absolute/relative path (resolved against the process
+// working directory). Shelling out to Windows' `where` instead misparsed
+// drive-letter paths such as `D:\tools\ruff.exe` as its `path:pattern`
+// search syntax and reported installed binaries missing (#3281).
+use crate::services::lsp::command_exists;
 use crate::services::process_hidden::HideWindow;
-use rust_i18n::t;
+use fresh_i18n::t;
 
 /// Result of running a formatter or on-save action
 enum ActionResult {
@@ -30,7 +38,19 @@ impl Editor {
     /// Returns Ok(true) if actions ran successfully, Ok(false) if no actions,
     /// or Err with an error message.
     pub fn run_on_save_actions(&mut self) -> Result<bool, String> {
-        let path = match self.active_state().buffer.file_path() {
+        self.run_on_save_actions_for(self.active_buffer())
+    }
+
+    /// [`Self::run_on_save_actions`] for `buffer_id`, which need not be the
+    /// active buffer: a plugin can save any buffer
+    /// (`editor.saveBufferToPath`), and its actions belong to the buffer it
+    /// saved, not to whichever one is in front.
+    pub(crate) fn run_on_save_actions_for(&mut self, buffer_id: BufferId) -> Result<bool, String> {
+        let path = match self
+            .buffers()
+            .get(&buffer_id)
+            .and_then(|state| state.buffer.file_path())
+        {
             Some(p) => p.to_path_buf(),
             None => return Ok(false),
         };
@@ -38,20 +58,23 @@ impl Editor {
         let mut ran_any_action = false;
 
         // Run whitespace cleanup actions first (before formatter)
-        if self.config.editor.trim_trailing_whitespace_on_save && self.trim_trailing_whitespace()? {
+        if self.config.editor.trim_trailing_whitespace_on_save
+            && self.trim_trailing_whitespace_in(buffer_id)?
+        {
             ran_any_action = true;
         }
 
-        if self.config.editor.ensure_final_newline_on_save && self.ensure_final_newline()? {
+        if self.config.editor.ensure_final_newline_on_save
+            && self.ensure_final_newline_in(buffer_id)?
+        {
             ran_any_action = true;
         }
 
         // If whitespace cleanup made changes, re-save
         if ran_any_action {
-            if let Err(e) = self.active_state_mut().buffer.save() {
+            if let Err(e) = self.resave_buffer(buffer_id) {
                 return Err(format!("Failed to re-save after whitespace cleanup: {}", e));
             }
-            self.active_event_log_mut().mark_saved();
             // Refresh the recorded on-disk mtime after our own re-write (see the
             // note on the trailing `watch_file` below). This must happen here —
             // not only at the end of the function — because the language lookup
@@ -61,7 +84,10 @@ impl Editor {
         }
 
         // Get language from buffer's stored state
-        let language = self.active_state().language.clone();
+        let language = match self.buffers().get(&buffer_id) {
+            Some(state) => state.language.clone(),
+            None => return Ok(ran_any_action),
+        };
 
         let lang_config = match self.config.languages.get(&language) {
             Some(lc) => lc.clone(),
@@ -71,14 +97,13 @@ impl Editor {
         // Run formatter if format_on_save is enabled
         if lang_config.format_on_save {
             if let Some(ref formatter) = lang_config.formatter {
-                match self.run_formatter(formatter, &path) {
+                match self.run_formatter(formatter, &path, buffer_id) {
                     ActionResult::Success(output) => {
-                        self.replace_buffer_with_output(&output)?;
+                        self.replace_buffer_content(buffer_id, &output)?;
                         // Re-save after formatting
-                        if let Err(e) = self.active_state_mut().buffer.save() {
+                        if let Err(e) = self.resave_buffer(buffer_id) {
                             return Err(format!("Failed to re-save after format: {}", e));
                         }
-                        self.active_event_log_mut().mark_saved();
                         // Refresh the recorded on-disk mtime after our own write.
                         self.watch_file(&path);
                         ran_any_action = true;
@@ -105,7 +130,7 @@ impl Editor {
                 continue;
             }
 
-            match self.run_on_save_action(action, &path, &project_root) {
+            match self.run_on_save_action(action, &path, &project_root, buffer_id) {
                 ActionResult::Success(_) => {
                     ran_any_action = true;
                 }
@@ -177,7 +202,7 @@ impl Editor {
             }
         };
 
-        match self.run_formatter(&formatter, &path) {
+        match self.run_formatter(&formatter, &path, self.active_buffer()) {
             ActionResult::Success(output) => {
                 self.replace_buffer_with_output(&output)?;
                 self.set_status_message(
@@ -194,8 +219,13 @@ impl Editor {
         }
     }
 
-    /// Run a formatter on the current buffer content.
-    fn run_formatter(&mut self, formatter: &FormatterConfig, file_path: &Path) -> ActionResult {
+    /// Run a formatter on `buffer_id`'s content.
+    fn run_formatter(
+        &mut self,
+        formatter: &FormatterConfig,
+        file_path: &Path,
+        buffer_id: BufferId,
+    ) -> ActionResult {
         let file_path_str = file_path.display().to_string();
 
         // Check if command exists
@@ -219,9 +249,8 @@ impl Editor {
             .unwrap_or_else(|_| file_path.parent().unwrap_or(Path::new(".")).to_path_buf());
 
         // Set up the command
-        let mut cmd = Command::new(&shell);
-        cmd.args(["-c", &full_command])
-            .current_dir(&project_root)
+        let mut cmd = shell_command(&shell, &full_command);
+        cmd.current_dir(&project_root)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .hide_window();
@@ -250,7 +279,7 @@ impl Editor {
         // waiting for `wait_with_output` and produces the "Format Buffer
         // hangs" symptom (issue #1573).
         let stdin_writer = if formatter.stdin {
-            let content = self.active_state().buffer.to_string().unwrap_or_default();
+            let content = self.buffer_text(buffer_id);
             child.stdin.take().map(|mut stdin| {
                 std::thread::spawn(move || -> std::io::Result<()> {
                     stdin.write_all(content.as_bytes())?;
@@ -363,12 +392,13 @@ impl Editor {
         }
     }
 
-    /// Run a single on-save action (linter, etc.).
+    /// Run a single on-save action (linter, etc.) for `buffer_id`.
     fn run_on_save_action(
         &mut self,
         action: &OnSaveAction,
         file_path: &Path,
         project_root: &Path,
+        buffer_id: BufferId,
     ) -> ActionResult {
         let file_path_str = file_path.display().to_string();
 
@@ -404,9 +434,8 @@ impl Editor {
             .unwrap_or_else(|| project_root.to_path_buf());
 
         // Set up the command
-        let mut cmd = Command::new(&shell);
-        cmd.args(["-c", &full_command])
-            .current_dir(&working_dir)
+        let mut cmd = shell_command(&shell, &full_command);
+        cmd.current_dir(&working_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .hide_window();
@@ -427,7 +456,7 @@ impl Editor {
 
         // Write buffer content to stdin if configured
         if action.stdin {
-            let content = self.active_state().buffer.to_string().unwrap_or_default();
+            let content = self.buffer_text(buffer_id);
             if let Some(mut stdin) = child.stdin.take() {
                 if let Err(e) = stdin.write_all(content.as_bytes()) {
                     return ActionResult::Error(format!("Failed to write to stdin: {}", e));
@@ -506,7 +535,15 @@ impl Editor {
             return Ok(());
         }
 
-        let buffer_len = buffer_content.len();
+        // The exact bytes the delete removes, for undo to put back: the
+        // lossy `buffer_content` is only for the comparison and the diff
+        // (#3652). Its length is the buffer's, not the lossy string's.
+        let deleted_text = {
+            let state = self.active_state_mut();
+            let len = state.buffer.len();
+            state.get_edit_text(0, len)
+        };
+        let buffer_len = deleted_text.len();
 
         // Capture cursor position and selection state before replacement
         let old_cursor_pos = self.active_cursors().primary().position;
@@ -525,12 +562,12 @@ impl Editor {
         // Delete all content and insert new
         let delete_event = Event::Delete {
             range: 0..buffer_len,
-            deleted_text: buffer_content,
+            deleted_text,
             cursor_id,
         };
         let insert_event = Event::Insert {
             position: 0,
-            text: output.to_string(),
+            text: output.to_string().into(),
             cursor_id,
         };
 
@@ -586,8 +623,19 @@ impl Editor {
     /// Trim trailing whitespace from all lines in the active buffer.
     /// Returns Ok(true) if any changes were made, Ok(false) if buffer unchanged.
     pub fn trim_trailing_whitespace(&mut self) -> Result<bool, String> {
-        let content = self.active_state().buffer.to_string().unwrap_or_default();
-        let line_ending = self.active_state().buffer.line_ending();
+        self.trim_trailing_whitespace_in(self.active_buffer())
+    }
+
+    /// [`Self::trim_trailing_whitespace`] in `buffer_id`.
+    fn trim_trailing_whitespace_in(&mut self, buffer_id: BufferId) -> Result<bool, String> {
+        let Some(line_ending) = self
+            .buffers()
+            .get(&buffer_id)
+            .map(|state| state.buffer.line_ending())
+        else {
+            return Ok(false);
+        };
+        let content = self.buffer_text(buffer_id);
         let sep = line_ending.as_str();
 
         // Split on the buffer's own line terminator and trim only trailing
@@ -610,14 +658,26 @@ impl Editor {
             return Ok(false);
         }
 
-        self.replace_buffer_with_output(&trimmed)?;
+        self.replace_buffer_content(buffer_id, &trimmed)?;
         Ok(true)
     }
 
     /// Ensure the buffer ends with a newline.
     /// Returns Ok(true) if a newline was added, Ok(false) if already ends with newline.
     pub fn ensure_final_newline(&mut self) -> Result<bool, String> {
-        let content = self.active_state().buffer.to_string().unwrap_or_default();
+        self.ensure_final_newline_in(self.active_buffer())
+    }
+
+    /// [`Self::ensure_final_newline`] in `buffer_id`.
+    fn ensure_final_newline_in(&mut self, buffer_id: BufferId) -> Result<bool, String> {
+        let Some(line_ending) = self
+            .buffers()
+            .get(&buffer_id)
+            .map(|state| state.buffer.line_ending())
+        else {
+            return Ok(false);
+        };
+        let content = self.buffer_text(buffer_id);
 
         // Empty buffers don't need a newline
         if content.is_empty() {
@@ -631,43 +691,99 @@ impl Editor {
 
         // Append the buffer's own line ending so a CRLF buffer's final newline
         // is CRLF, not a hardcoded LF that would corrupt the line-ending mode.
-        let sep = self.active_state().buffer.line_ending().as_str();
-        let with_newline = format!("{}{}", content, sep);
-        self.replace_buffer_with_output(&with_newline)?;
+        let with_newline = format!("{}{}", content, line_ending.as_str());
+        self.replace_buffer_content(buffer_id, &with_newline)?;
         Ok(true)
     }
-}
 
-/// Check if a command exists in the system PATH.
-fn command_exists(command: &str) -> bool {
-    // Use 'which' on Unix or 'where' on Windows to check if command exists
-    #[cfg(unix)]
-    {
-        Command::new("which")
-            .arg(command)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+    /// `buffer_id`'s whole text.
+    fn buffer_text(&self, buffer_id: BufferId) -> String {
+        self.buffers()
+            .get(&buffer_id)
+            .and_then(|state| state.buffer.to_string())
+            .unwrap_or_default()
     }
 
-    #[cfg(windows)]
-    {
-        Command::new("where")
-            .arg(command)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .hide_window()
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+    /// Write `buffer_id` again after an on-save action changed it, and mark
+    /// its undo history saved there.
+    fn resave_buffer(&mut self, buffer_id: BufferId) -> anyhow::Result<()> {
+        let recovery_dir = self.dir_context.recovery_dir();
+        let window = self.active_window_mut();
+        if let Some(state) = window.buffers.get_mut(&buffer_id) {
+            state.buffer.save(&recovery_dir)?;
+        }
+        if let Some(log) = window.event_logs.get_mut(&buffer_id) {
+            log.mark_saved();
+        }
+        Ok(())
     }
 
-    #[cfg(not(any(unix, windows)))]
-    {
-        // On other platforms, assume command exists and let it fail at runtime
-        true
+    /// Replace `buffer_id`'s content with `output`: through the active
+    /// buffer's own edit path when it is the active one, and otherwise as one
+    /// undoable edit that leaves each pane's cursors on the same text.
+    fn replace_buffer_content(&mut self, buffer_id: BufferId, output: &str) -> Result<(), String> {
+        if buffer_id == self.active_buffer() {
+            return self.replace_buffer_with_output(output);
+        }
+        let old = self.buffer_text(buffer_id);
+        if old == output {
+            return Ok(());
+        }
+        // The exact bytes, for undo (#3652); `old` is lossy.
+        let deleted_text = self
+            .buffers_mut()
+            .get_mut(&buffer_id)
+            .map(|state| {
+                let len = state.buffer.len();
+                state.get_edit_text(0, len)
+            })
+            .unwrap_or_default();
+        let removed = deleted_text.len();
+        let batch = Event::Batch {
+            events: vec![
+                Event::Delete {
+                    range: 0..removed,
+                    deleted_text,
+                    cursor_id: CursorId(0),
+                },
+                Event::Insert {
+                    position: 0,
+                    text: output.to_string().into(),
+                    cursor_id: CursorId(0),
+                },
+            ],
+            description: "On-save format".to_string(),
+        };
+        let window = self.active_window_mut();
+        let Some(state) = window.buffer_state_mut(buffer_id) else {
+            return Ok(());
+        };
+        // Its cursors live in the panes below, not in this edit
+        state.apply(&mut Cursors::default(), &batch);
+        if let Some(log) = window.event_logs.get_mut(&buffer_id) {
+            log.append(batch);
+        }
+        // Each pane keeps its cursors on the same text, mapped through a
+        // diff of the old and new content (issue #2777)
+        let map = |offset: usize| fresh_core::diff::map_offset_through_diff(&old, output, offset);
+        window
+            .buffers
+            .with_buffer_and_view_states(buffer_id, |_, view_states| {
+                for vs in view_states.values_mut() {
+                    if let Some(view) = vs.buffer_state_mut(buffer_id) {
+                        view.cursors.map(|cursor| {
+                            cursor.position = map(cursor.position);
+                            cursor.anchor = cursor.anchor.map(map);
+                        });
+                    }
+                }
+            });
+        // Plugin edits and this one bypass `apply_event_to_active_buffer`,
+        // so the plugin markers are shifted here, as for a plugin's edit
+        #[cfg(feature = "plugins")]
+        self.shift_plugin_markers_for_edit(buffer_id, 0, removed, output.len());
+        self.sync_lsp_after_recovery_replay(buffer_id);
+        Ok(())
     }
 }
 
@@ -701,4 +817,24 @@ fn detect_shell() -> String {
 
     // Last resort
     "sh".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_exists_accepts_an_absolute_path() {
+        // The test binary's own path. On Windows it is a drive-letter path
+        // (`C:\...\fresh-*.exe`), the shape `where.exe` used to reject (#3281).
+        let exe = std::env::current_exe().unwrap();
+        assert!(exe.is_absolute());
+        assert!(command_exists(exe.to_str().unwrap()));
+    }
+
+    #[test]
+    fn command_exists_rejects_missing_and_empty_commands() {
+        assert!(!command_exists("fresh-unlikely-formatter-name-q8v3z"));
+        assert!(!command_exists(""));
+    }
 }

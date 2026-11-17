@@ -2,9 +2,11 @@
 
 use anyhow::Result as AnyhowResult;
 
-// Common initialization (non-plugin related)
+// Common initialization (non-plugin related). An `unsafe fn` is the form both
+// ctor 0.6 and 1.x (which Debian ships) accept: 1.x requires the ctor to be
+// marked unsafe, and 0.6 rejects its `#[ctor(unsafe)]` spelling.
 #[ctor::ctor]
-fn init_test_environment() {
+unsafe fn init_test_environment() {
     // Force Linux-style keybindings (Ctrl/Alt/Shift instead of ⌘/⌥/⇧)
     // to ensure consistent visual test output across platforms
     fresh::input::keybindings::set_force_linux_keybindings(true);
@@ -97,12 +99,14 @@ pub fn copy_plugin(plugins_dir: &Path, plugin_name: &str) {
     fs::copy(&ts_src, &ts_dest)
         .unwrap_or_else(|e| panic!("Failed to copy {}.ts: {}", plugin_name, e));
 
-    // Copy the .i18n.json file if it exists
-    let i18n_src = source_dir.join(format!("{}.i18n.json", plugin_name));
-    if i18n_src.exists() {
-        let i18n_dest = plugins_dir.join(format!("{}.i18n.json", plugin_name));
-        fs::copy(&i18n_src, &i18n_dest)
-            .unwrap_or_else(|e| panic!("Failed to copy {}.i18n.json: {}", plugin_name, e));
+    // Copy the sidecars that exist.
+    for sidecar in ["i18n.json", "manifest.json"] {
+        let src = source_dir.join(format!("{plugin_name}.{sidecar}"));
+        if src.exists() {
+            let dest = plugins_dir.join(format!("{plugin_name}.{sidecar}"));
+            fs::copy(&src, &dest)
+                .unwrap_or_else(|e| panic!("Failed to copy {plugin_name}.{sidecar}: {e}"));
+        }
     }
 }
 
@@ -117,6 +121,119 @@ pub fn copy_plugin_lib(plugins_dir: &Path) {
             let entry = entry.unwrap();
             let dest_path = lib_dest.join(entry.file_name());
             fs::copy(entry.path(), dest_path).unwrap();
+        }
+    }
+}
+
+/// Put this test process in a job that kills whatever is left in it when the
+/// process exits, so the editor's child processes end with the test.
+///
+/// The editor starts children for plugins and features (`git`, `dotnet`, an
+/// LSP server, …) that a short test can return before they finish, and
+/// Windows hands every child the test's inheritable stdout/stderr pipes. A
+/// child still running after the test keeps those pipes open, which nextest
+/// reports as a LEAK. As a member of a kill-on-close job, the whole tree goes
+/// when the test process does. The job handle is never closed and is not
+/// inheritable: the process exiting is what closes it.
+#[cfg(windows)]
+fn end_children_with_test_process() {
+    use std::sync::Once;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    static JOIN: Once = Once::new();
+    JOIN.call_once(|| {
+        // SAFETY: plain Win32 calls on a handle this function owns; `info` is
+        // a zeroed plain-data struct whose size is passed alongside it.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                eprintln!(
+                    "harness: could not create a kill-on-close job: {}",
+                    std::io::Error::last_os_error()
+                );
+                return;
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let joined = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&info).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) != 0
+                && AssignProcessToJobObject(job, GetCurrentProcess()) != 0;
+            if !joined {
+                eprintln!(
+                    "harness: could not join a kill-on-close job: {}",
+                    std::io::Error::last_os_error()
+                );
+                CloseHandle(job);
+            }
+        }
+    });
+}
+
+/// While alive, has a watchdog name the wait it marks on stderr every
+/// [`StallReport::INTERVAL`] — for a harness wait that blocks inside the
+/// editor and so cannot report itself.
+///
+/// A test stuck there is killed by nextest's slow-timeout with nothing in its
+/// output to say where, and on Windows there is no stack dump either. One
+/// watchdog thread per process serves every live report; entries are keyed by
+/// thread, since plain `cargo test` runs tests side by side in one process.
+struct StallReport {
+    thread: std::thread::ThreadId,
+}
+
+type StallEntries = Vec<(std::thread::ThreadId, &'static str, std::time::Instant)>;
+
+impl StallReport {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn entries() -> &'static std::sync::Mutex<StallEntries> {
+        static ENTRIES: std::sync::OnceLock<std::sync::Mutex<StallEntries>> =
+            std::sync::OnceLock::new();
+        ENTRIES.get_or_init(|| {
+            std::thread::Builder::new()
+                .name("harness-stall-watchdog".into())
+                .spawn(|| loop {
+                    std::thread::sleep(Self::INTERVAL);
+                    let entries = Self::entries().lock().unwrap_or_else(|e| e.into_inner());
+                    for (_, what, since) in entries.iter() {
+                        if since.elapsed() >= Self::INTERVAL {
+                            eprintln!(
+                                "{what}: still waiting after {:.1}s",
+                                since.elapsed().as_secs_f64()
+                            );
+                        }
+                    }
+                })
+                .expect("spawn the harness stall watchdog");
+            std::sync::Mutex::new(Vec::new())
+        })
+    }
+
+    fn start(what: &'static str) -> Self {
+        let thread = std::thread::current().id();
+        Self::entries()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((thread, what, std::time::Instant::now()));
+        Self { thread }
+    }
+}
+
+impl Drop for StallReport {
+    fn drop(&mut self) {
+        let mut entries = Self::entries().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = entries.iter().rposition(|(t, ..)| *t == self.thread) {
+            entries.remove(i);
         }
     }
 }
@@ -190,6 +307,13 @@ pub struct HarnessOptions {
     /// the #1722 regression test) need to override it to match
     /// production semantics. Defaults to false.
     pub force_embedded_plugins: bool,
+    /// Build the editor in Orchestrator mode (a bare `fresh`). Defaults to false.
+    pub orchestrator_mode: bool,
+    /// Keep the dock column the host holds open at startup for the plugin's
+    /// `ready` mount (`Editor::dock_reserved`). Off by default: the harness
+    /// fires no startup hooks, so the column would otherwise sit empty for
+    /// the test's whole life. A test that fires `ready` itself turns it on.
+    pub startup_chrome: bool,
     /// Per-test fake-devcontainer state. Set by [`HarnessOptions::with_fake_devcontainer`];
     /// moved into the harness on `create()` so the lock + tempdir live as long as the test.
     /// Unix-only: the fake CLI is a bash script that doesn't run on Windows.
@@ -213,6 +337,8 @@ impl HarnessOptions {
             preserve_keybinding_map: false,
             use_full_grammar_registry: false,
             force_embedded_plugins: false,
+            orchestrator_mode: false,
+            startup_chrome: false,
             #[cfg(unix)]
             fake_devcontainer: None,
         }
@@ -224,6 +350,18 @@ impl HarnessOptions {
     /// regression).
     pub fn with_forced_embedded_plugins(mut self) -> Self {
         self.force_embedded_plugins = true;
+        self
+    }
+
+    /// Build the editor in Orchestrator mode (a bare `fresh`).
+    pub fn with_orchestrator_mode(mut self) -> Self {
+        self.orchestrator_mode = true;
+        self
+    }
+
+    /// See [`HarnessOptions::startup_chrome`].
+    pub fn with_startup_chrome(mut self) -> Self {
+        self.startup_chrome = true;
         self
     }
 
@@ -304,8 +442,8 @@ impl HarnessOptions {
     /// Wire the test process so that `devcontainer` and `docker` resolve
     /// to the in-tree fake CLIs at `scripts/fake-devcontainer/bin`. The
     /// returned `HarnessOptions` carries a per-test state directory and
-    /// a process-global mutex guard so concurrent harness instances
-    /// don't clobber each other's `FAKE_DEVCONTAINER_STATE`.
+    /// a [`PathPin`](super::global_state::PathPin), so concurrent tests
+    /// don't clobber each other's `$PATH` or `FAKE_DEVCONTAINER_STATE`.
     ///
     /// The fake state path is reachable via
     /// [`EditorTestHarness::fake_devcontainer_state`].
@@ -331,26 +469,18 @@ impl HarnessOptions {
         let temp = TempDir::new().expect("tempdir for fake-devcontainer state");
         let state_path = temp.path().to_path_buf();
 
-        // Serialize against other harness instances using the fake CLI:
-        // FAKE_DEVCONTAINER_STATE is process-global env, so a parallel
-        // test setting its own state would steal ours mid-run.
-        let guard = fake_devcontainer_lock()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-
-        // PATH prepend is idempotent — every harness call points at the
-        // same in-tree fake bin dir, so racing threads only ever
-        // converge on the same prefix.
-        let path = std::env::var("PATH").unwrap_or_default();
-        let already_on_path = path.split(':').any(|p| std::path::Path::new(p) == fake_bin);
-        if !already_on_path {
-            std::env::set_var("PATH", format!("{}:{}", fake_bin.display(), path));
-        }
-        std::env::set_var("FAKE_DEVCONTAINER_STATE", &state_path);
-        std::env::set_var("FAKE_DC_UP_DELAY_MS", "0");
+        // `$PATH` and `FAKE_DEVCONTAINER_STATE` are process-global, so this
+        // takes the same pin as every other test that shadows a binary on
+        // `$PATH`: one at a time, and both restored when the harness drops.
+        // (With a lock of its own, a test pinning `$PATH` concurrently could
+        // restore the `$PATH` it saw before the fake was prepended, and the
+        // attach would find no `devcontainer`.)
+        let mut pin = super::global_state::pin_path_with_dir_first(&fake_bin);
+        pin.set_env("FAKE_DEVCONTAINER_STATE", &state_path);
+        pin.set_env("FAKE_DC_UP_DELAY_MS", "0");
 
         self.fake_devcontainer = Some(FakeDevcontainerHandle {
-            _guard: guard,
+            _pin: pin,
             _temp: temp,
             state_path,
         });
@@ -358,23 +488,15 @@ impl HarnessOptions {
     }
 }
 
-/// Lock that serializes harness instances using the fake devcontainer CLI.
-/// Held in `FakeDevcontainerHandle::_guard` for the lifetime of the test.
-#[cfg(unix)]
-fn fake_devcontainer_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-}
-
-/// State directory + lock guard for a single harness's fake-devcontainer
+/// State directory + `$PATH` pin for a single harness's fake-devcontainer
 /// session. Kept inside `EditorTestHarness` so dropping the harness
-/// drops the guard (releasing the lock for the next test) and the
-/// tempdir (cleaning up state files).
+/// drops the pin (restoring `$PATH` and the fake's variables, and letting
+/// the next test pin them) and the tempdir (cleaning up state files).
 #[cfg(unix)]
 pub struct FakeDevcontainerHandle {
     /// Held for the harness's lifetime so concurrent tests can't race
-    /// on the global `FAKE_DEVCONTAINER_STATE` env var.
-    _guard: std::sync::MutexGuard<'static, ()>,
+    /// on `$PATH` or the global `FAKE_DEVCONTAINER_STATE` env var.
+    _pin: super::global_state::PathPin,
     /// Tempdir kept alive for the harness's lifetime.
     _temp: TempDir,
     /// Path to the fake's state directory (`<temp>/`).
@@ -470,8 +592,10 @@ pub fn find_text_in_row<'a, I: IntoIterator<Item = &'a str>>(
 /// Virtual editor environment for testing
 /// Captures all rendering output without displaying to actual terminal
 pub struct EditorTestHarness {
-    /// The editor instance
-    editor: Editor,
+    /// The editor instance. Dropped by hand in `Drop`, so a stalled
+    /// teardown can say whether it was the editor (plugin thread, async
+    /// runtime) or the temp dir that hung.
+    editor: std::mem::ManuallyDrop<Editor>,
 
     /// Virtual terminal backend
     terminal: Terminal<TestBackend>,
@@ -522,9 +646,101 @@ pub struct EditorTestHarness {
     /// Terminal dimensions for vt100
     term_width: u16,
     term_height: u16,
+
+    /// Reports a teardown that stalls after the editor is gone. Armed by
+    /// `Drop`, and declared after `_temp_dir` so it is still registered
+    /// while that drops.
+    _teardown_stall: Option<StallReport>,
+
+    /// This harness's share of the config-globals read side, so a locale
+    /// pin cannot change what this editor renders. Declared last: it is
+    /// released only once the editor is gone.
+    _globals_lease: Option<crate::common::global_state::HarnessLease>,
+}
+
+impl Drop for EditorTestHarness {
+    fn drop(&mut self) {
+        // Windows CI hangs here now and then until the 180s kill, in tests
+        // that have nothing in common; name the phase so the next one says
+        // which half it was.
+        {
+            let _stall = StallReport::start(
+                "EditorTestHarness teardown: dropping the editor (plugin thread join, async runtime shutdown)",
+            );
+            // SAFETY: `editor` is not used again: this is `drop`, and no
+            // field's own drop reaches it.
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.editor) };
+        }
+        // The temp dir is this test's scratch space, not its subject, and
+        // on Windows CI its removal is where the teardown hangs: observed
+        // still waiting at 157s and 167s, past nextest's 180s kill. Every
+        // harness has one, which is why the casualties have nothing in
+        // common — a test whose assertions have all passed is reported as a
+        // timeout, with no failure of its own to point at, and the rest of
+        // the shard's output goes down with it.
+        //
+        // So the removal gets a thread and a bounded wait. The directory is
+        // still removed, and waited for, in the normal case (milliseconds
+        // everywhere this has been measured). When it stalls we say what was
+        // left behind and carry on, rather than let a finished test's
+        // verdict depend on how long the OS takes to unlink scratch files.
+        //
+        // This bounds the symptom. It is not the cause: on Windows a
+        // directory cannot be removed while a handle inside it is open, so a
+        // stall here means something outlived the editor that was dropped
+        // just above — a child process that was not stopped, most likely
+        // (CONTRIBUTING.md Code Guidelines §14). The message names the path
+        // so that can be chased rather than forgotten.
+        if let Some(dir) = self._temp_dir.take() {
+            let _stall = StallReport::start("EditorTestHarness teardown: removing the temp dir");
+            let path = dir.path().to_path_buf();
+            let (done, finished) = std::sync::mpsc::channel();
+            // Detached deliberately: if the removal is wedged in the kernel
+            // there is nothing to join, and process exit reclaims it.
+            let spawned = std::thread::Builder::new()
+                .name("harness-temp-dir-removal".into())
+                .spawn(move || {
+                    drop(dir);
+                    let _ = done.send(());
+                });
+            match spawned {
+                Ok(_) => {
+                    if finished
+                        .recv_timeout(Self::TEMP_DIR_REMOVAL_BUDGET)
+                        .is_err()
+                    {
+                        eprintln!(
+                            "EditorTestHarness teardown: gave up removing {} after {:.0}s and \
+                             left it behind. On Windows that means a handle inside it is still \
+                             open, so something outlived the editor.",
+                            path.display(),
+                            Self::TEMP_DIR_REMOVAL_BUDGET.as_secs_f64()
+                        );
+                    }
+                }
+                // No thread to be had: fall back to removing it here.
+                Err(e) => eprintln!(
+                    "EditorTestHarness teardown: could not spawn the removal thread ({e}); \
+                     leaving {} behind.",
+                    path.display()
+                ),
+            }
+        }
+        self._teardown_stall = Some(StallReport::start(
+            "EditorTestHarness teardown: releasing the config-globals lease",
+        ));
+    }
 }
 
 impl EditorTestHarness {
+    /// How long [`Drop`] waits for the temp dir to be removed before
+    /// leaving it behind and saying so.
+    ///
+    /// Generous next to the milliseconds the removal actually takes, and
+    /// well short of the 60s at which nextest calls a test slow — a stall
+    /// here should be reported as one, not grow into a killed run.
+    const TEMP_DIR_REMOVAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
     // =========================================================================
     // Unified constructor
     // =========================================================================
@@ -549,6 +765,12 @@ impl EditorTestHarness {
         // timeouts (a wait that never resolves killed externally by the
         // nextest 180s slow-timeout) undebuggable from the logs alone.
         crate::common::tracing::init_tracing_from_env();
+        #[cfg(windows)]
+        end_children_with_test_process();
+        // Construction waits inside the editor (the plugin thread's first
+        // round trip, the project root's file watch) and cannot report a
+        // stall itself; Windows CI has hung here until the 180s kill.
+        let _stall = StallReport::start("EditorTestHarness::create");
         let mut t = crate::common::timing::Timer::start("harness::create");
         // Create temp directory if we don't have a shared dir_context
         let temp_dir = if options.dir_context.is_none() || options.create_project_root {
@@ -636,6 +858,12 @@ impl EditorTestHarness {
         if !config_was_provided {
             config.editor.auto_indent = false; // Disable for simpler testing
             config.editor.auto_close = false; // Disable for simpler testing
+                                              // Auto-surround is a distinct behaviour (typing a delimiter over a
+                                              // selection wraps it) and has to be turned off explicitly. It used
+                                              // to be disabled as a side effect of `auto_close = false`, because
+                                              // the surround path resolved its pair through the auto-close
+                                              // table; it no longer does.
+            config.editor.auto_surround = false; // Disable for simpler testing
             config.editor.animations = false;
         }
         // Always force the prompt line to be visible in tests so layout-
@@ -660,25 +888,30 @@ impl EditorTestHarness {
         }
         config.check_for_updates = false; // Disable update checking in tests
 
+        // From here to `Editor::for_test` below we write the two
+        // *process-global* registries the editor derives from config — the
+        // i18n locale (`fresh_i18n::set_locale`) and the user indentation
+        // rules (`config::reload_indent_overrides`, which clears
+        // `indent_rules::USER_RULES` before re-registering its own). Cargo
+        // runs the test functions of one binary in parallel threads, so
+        // without a discipline around them a harness built here flips the
+        // locale out from under a test asserting on Spanish UI, or wipes
+        // the `[languages.<id>.indent]` rule a config-indent test just
+        // registered — both intermittent, both depending only on when some
+        // unrelated test happens to build its editor.
+        //
+        // The read side is what every harness takes, and it keeps it for as
+        // long as it lives: the locale is read on every frame, so a pin
+        // taken after construction would still change what this editor
+        // renders. Tests that need one of those globals to hold still take
+        // the write side for their whole body
+        // (`common::global_state::pin_config_globals`). Readers do not
+        // exclude each other, so ordinary tests still build editors in
+        // parallel.
+        let globals_lease = crate::common::global_state::lease_config_globals();
+
         // Initialize i18n with the config's locale before creating the editor
         // This ensures menu defaults are created with the correct translations.
-        //
-        // TODO(flakiness): this mutates a *process-global* locale
-        // (`rust_i18n::set_locale`). Cargo runs all test functions in one
-        // process in parallel, so harness-created tests can race each other:
-        // a German-locale harness can flip the global to `de` while an
-        // unrelated test is asserting on English UI strings, producing
-        // intermittent failures like
-        // `e2e::locale::test_default_locale_shows_english_search_options`
-        // when the full suite is run in parallel. (The tests in
-        // `tests/e2e/locale.rs` use a module-local mutex, which serializes
-        // them against each other but not against the rest of the suite.)
-        //
-        // Pre-exists this branch; see master for identical parallel-run
-        // failures. A robust fix means either moving rust_i18n locale into
-        // a thread-local, or holding a *global* (process-wide) test lock
-        // around every harness-driven render. Not worth the scope creep
-        // from this perf fix; flagging here so the next reader knows.
         fresh::i18n::init_with_config(config.locale.as_option());
         config.editor.double_click_time_ms = 10; // Fast double-click for faster tests
         t.phase("config_and_i18n");
@@ -749,16 +982,33 @@ impl EditorTestHarness {
             grammar_registry,
             enable_plugins_for_editor,
             enable_embedded_plugins,
+            options.orchestrator_mode,
         )?;
 
         t.phase("Editor::for_test");
+
+        // No `ready` fires unless the test fires it, so the startup column
+        // is handed back now unless the test asked to keep it.
+        if !options.startup_chrome {
+            editor.release_startup_dock_reservation();
+        }
 
         // Process any pending plugin commands
         editor.process_async_messages();
         t.phase("process_async_messages");
 
+        // A slow filesystem's tests count its calls: let startup's workspace
+        // environment probe (a few root `exists` checks) finish first.
+        if fs_metrics.is_some() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while editor.env_probe_pending() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                editor.process_async_messages();
+            }
+        }
+
         let h = EditorTestHarness {
-            editor,
+            editor: std::mem::ManuallyDrop::new(editor),
             terminal,
             _temp_dir: temp_dir,
             #[cfg(unix)]
@@ -774,6 +1024,8 @@ impl EditorTestHarness {
             vt100_parser: vt100::Parser::new(height, width, 0),
             term_width: width,
             term_height: height,
+            _teardown_stall: None,
+            _globals_lease: globals_lease,
         };
         t.finish();
         Ok(h)
@@ -983,19 +1235,31 @@ impl EditorTestHarness {
             .map(|h| h.state_path.as_path())
     }
 
-    /// Get the recovery directory path for this test harness.
+    /// The `$PATH` pin [`HarnessOptions::with_fake_devcontainer`] holds, for
+    /// a test that sets one of the fake's knobs (`FAKE_DC_*`) or puts another
+    /// shim on `$PATH`. Whatever is set through it is undone when the harness
+    /// drops, including when the test panics, so a failed test cannot hand
+    /// its knobs to the next one.
     ///
-    /// Returns the *scoped* directory where the editor actually writes
-    /// recovery files. In standalone mode (no `set_session_name`) the path
-    /// is `<base>/default/<encoded_working_dir>/`, so each working directory
-    /// keeps its own recovery files (issue #1550).
+    /// Panics for a harness that didn't opt into the fake CLI.
+    /// Unix-only: see [`HarnessOptions::with_fake_devcontainer`].
+    #[cfg(unix)]
+    pub fn fake_devcontainer_env(&mut self) -> &mut super::global_state::PathPin {
+        &mut self
+            .fake_devcontainer
+            .as_mut()
+            .expect("harness created without with_fake_devcontainer()")
+            ._pin
+    }
+
+    /// Get the recovery directory path for this test harness: the one store
+    /// every editor writes, whatever its project (list it with
+    /// `fresh::services::recovery::all_entries`, or one project's with
+    /// `entries_for_root`).
     pub fn recovery_dir(&self) -> Option<PathBuf> {
-        let base = self
-            ._temp_dir
+        self._temp_dir
             .as_ref()
-            .map(|d| d.path().join("data").join("recovery"))?;
-        let hash = fresh::workspace::encode_path_for_filename(self.editor.working_dir());
-        Some(base.join("default").join(hash))
+            .map(|d| d.path().join("data").join("recovery"))
     }
 
     /// Take ownership of the temp directory, preventing it from being cleaned up
@@ -1202,12 +1466,16 @@ impl EditorTestHarness {
     /// printable chars) with keys handled synchronously by a
     /// host-side bypass (e.g. `Shift+arrow`, `Ctrl+C/V`).
     ///
-    /// We need both:
+    /// We need all three:
     ///  (1) `pending_plugin_actions` to be empty — the plugin
-    ///      thread has finished every action queued by this
+    ///      thread has started every action queued by this
     ///      keypress and any follow-on dispatch the action
     ///      itself triggered.
-    ///  (2) the async bridge to be quiet for one extra
+    ///  (2) the plugin runtime to be at rest — see
+    ///      `Editor::sync_plugin_runtime`. (1) alone is not it:
+    ///      it only means the handler was called, not that it
+    ///      finished.
+    ///  (3) the async bridge to be quiet for one extra
     ///      iteration — to catch the `WidgetCommand` that a
     ///      completed plugin action just pushed.
     ///
@@ -1230,7 +1498,14 @@ impl EditorTestHarness {
     /// survives into a killed test's output. That is a loud, correct
     /// failure in place of a quiet, wrong assertion.
     ///
-    /// (2) keeps a short bound of its own, and that one is not a
+    /// (2) asks the plugin thread rather than sampling the channel. (3)
+    /// used to carry that on its own, and could not: two quiet iterations a
+    /// millisecond apart is a timer — the plugin thread had to turn a
+    /// round-trip around in 2 ms — and on a loaded runner it lost, so
+    /// `send_key` returned mid-handler and the test delivered the next key
+    /// into a half-applied state.
+    ///
+    /// (3) keeps a short bound of its own, and that one is not a
     /// timeout: legitimately continuous message sources — PTY output,
     /// timer-driven plugin polls — never go quiet, so it bounds a wait
     /// for silence that may never come rather than one for a state
@@ -1239,7 +1514,7 @@ impl EditorTestHarness {
         const SLEEP_PER_ITER: std::time::Duration = std::time::Duration::from_millis(1);
         /// How often an in-flight action reports itself while (1) waits.
         const STUCK_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-        /// Iterations of (2) to tolerate before concluding the source is
+        /// Iterations of (3) to tolerate before concluding the source is
         /// continuous rather than settling.
         const TAIL_ITERS: usize = 200;
         const QUIET_ITERS: usize = 2;
@@ -1249,7 +1524,7 @@ impl EditorTestHarness {
         let mut quiet_iters = 0;
         let mut tail_iters = 0;
         loop {
-            let had_messages = self.editor.process_async_messages();
+            let mut had_messages = self.editor.process_async_messages();
 
             if !self.editor.pending_plugin_actions_is_empty() {
                 quiet_iters = 0;
@@ -1277,6 +1552,19 @@ impl EditorTestHarness {
                 continue;
             }
 
+            // (2) The pass above may have answered a host call the plugin
+            //     was waiting on; whatever its continuation asks for next
+            //     only arrives afterwards, so an empty command channel
+            //     right now means nothing. A handler parked on
+            //     `editor.getNextKey()` counts as at rest, so this never
+            //     waits for a key the test has not sent.
+            had_messages |= {
+                // Spins inside the editor until the plugin thread answers,
+                // so it cannot report a stall the way (1) does.
+                let _stall = StallReport::start("drain_async_work: syncing the plugin runtime");
+                self.editor.sync_plugin_runtime()
+            };
+
             if had_messages {
                 // Messages are still flowing: keep draining at full
                 // speed rather than pacing, so a terminal's PTY output
@@ -1303,6 +1591,42 @@ impl EditorTestHarness {
         Ok(())
     }
 
+    /// Send a mouse event and report **whether the editor asked for a
+    /// frame** — without drawing one.
+    ///
+    /// Every other input helper on this harness ends in `self.render()`, and
+    /// that is a lie the real editor never tells. `main.rs` repaints only when
+    /// `Editor::handle_mouse` returns `true`; a frame nobody asked for is a
+    /// frame that never happens. Because the suite always renders, it can
+    /// assert what a frame *contains* and is structurally blind to the whole
+    /// class of "the state changed and nothing requested a repaint" — the bug
+    /// where the pixels are right in the test and stale on the user's screen.
+    ///
+    /// Three of those have shipped on the retained-UI migration alone: a
+    /// described panel's hover, a `widgets::List`'s own hover write (which
+    /// produces no message, so `Dispatched::changed` computed from
+    /// `!msgs.is_empty()` missed it), and `update_lsp_hover_state` dismissing
+    /// a tooltip and reporting nothing. Every one of them passed the suite.
+    ///
+    /// So this helper deliberately does **not** render: the answer is the
+    /// assertion. Existing helpers keep their `render()` — a test that wants
+    /// the screen should keep using them.
+    pub fn send_mouse_reporting_render(&mut self, mouse_event: MouseEvent) -> anyhow::Result<bool> {
+        self.editor.handle_mouse(mouse_event)
+    }
+
+    /// [`Self::send_mouse_reporting_render`] for a bare pointer motion — the
+    /// gesture that carries hover, and therefore the one the missing-repaint
+    /// bugs all hid in.
+    pub fn mouse_move_reporting_render(&mut self, col: u16, row: u16) -> anyhow::Result<bool> {
+        self.send_mouse_reporting_render(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        })
+    }
+
     /// Simulate a mouse click at specific coordinates
     pub fn mouse_click(&mut self, col: u16, row: u16) -> anyhow::Result<()> {
         let mouse_event = MouseEvent {
@@ -1323,6 +1647,34 @@ impl EditorTestHarness {
         self.send_mouse(mouse_up)?;
         // Drain async plugin actions kicked off by the click —
         // same rationale as `send_key`'s drain.
+        self.drain_async_work();
+        self.render()?;
+        Ok(())
+    }
+
+    /// A click with a frame drawn between the press and the release, as the
+    /// real loop does.
+    ///
+    /// `mouse_click` sends both halves back to back, which no running editor
+    /// ever does — the main loop repaints whenever a press changed anything.
+    /// That gap matters for any surface whose press and release are handled
+    /// separately: the tree is rebuilt in between, so a handler closing over
+    /// state from the frame the press landed on is holding a stale answer by
+    /// the time the release arrives. Use this to test such a pair.
+    pub fn mouse_click_with_repaint(&mut self, col: u16, row: u16) -> anyhow::Result<()> {
+        self.send_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        })?;
+        self.render()?;
+        self.send_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        })?;
         self.drain_async_work();
         self.render()?;
         Ok(())
@@ -1366,6 +1718,26 @@ impl EditorTestHarness {
             modifiers: KeyModifiers::empty(),
         };
         self.send_mouse(mouse_up)?;
+        self.render()?;
+        Ok(())
+    }
+
+    /// Simulate a middle-click at specific coordinates
+    pub fn mouse_middle_click(&mut self, col: u16, row: u16) -> anyhow::Result<()> {
+        self.send_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Middle),
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        })?;
+        self.send_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Middle),
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        })?;
+        // Same drain as `mouse_click`: a close can kick off async work.
+        self.drain_async_work();
         self.render()?;
         Ok(())
     }
@@ -1507,9 +1879,34 @@ impl EditorTestHarness {
 
     /// Force a render cycle and capture output
     pub fn render(&mut self) -> anyhow::Result<()> {
+        let before = fresh::test_api::frame_counters();
         self.terminal.draw(|frame| {
             self.editor.render(frame);
         })?;
+        // A visible text pane is placed once, formatted once, and has its
+        // rows built once per frame — the invariant the retained-mode
+        // migration rests on (`split_rendering::instrument`). Asserted on
+        // every frame the corpus renders.
+        let frame = fresh::test_api::frame_counters().since(before);
+        assert_eq!(
+            frame.view_data_builds,
+            frame.buffer_layouts + frame.composite_builds,
+            "a frame built a pane's rows more than once: {frame:?}"
+        );
+        assert_eq!(
+            frame.buffer_layouts, frame.pane_placements,
+            "a frame formatted a pane it did not place, or placed one it did not format: {frame:?}"
+        );
+        // **The provenance gate** (design §3.7.9): the only painter-written
+        // cells are inside host leaves. Asserted on every frame the corpus
+        // renders, so a painter that is not a leaf's cannot come back.
+        let provenance = self.editor.cells_provenance();
+        assert!(
+            provenance.painter_outside_hosts.is_empty(),
+            "a painter wrote cells outside every host leaf: {:?}; the frame's hosts were {:?}",
+            &provenance.painter_outside_hosts[..provenance.painter_outside_hosts.len().min(8)],
+            provenance.hosts
+        );
         Ok(())
     }
 
@@ -1604,7 +2001,7 @@ impl EditorTestHarness {
             for col in 0..self.term_width {
                 let cell = screen.cell(row, col);
                 if let Some(cell) = cell {
-                    result.push_str(&cell.contents());
+                    result.push_str(cell.contents());
                 } else {
                     result.push(' ');
                 }
@@ -1717,7 +2114,7 @@ impl EditorTestHarness {
     /// Get text at specific cell position
     pub fn get_cell(&self, x: u16, y: u16) -> Option<String> {
         let buffer = self.buffer();
-        let pos = buffer.index_of(x, y);
+        let pos = Self::cell_index(buffer, x, y)?;
         buffer
             .content
             .get(pos)
@@ -1727,8 +2124,31 @@ impl EditorTestHarness {
     /// Get the style (color, modifiers) of a specific cell
     pub fn get_cell_style(&self, x: u16, y: u16) -> Option<ratatui::style::Style> {
         let buffer = self.buffer();
-        let pos = buffer.index_of(x, y);
+        let pos = Self::cell_index(buffer, x, y)?;
         buffer.content.get(pos).map(|cell| cell.style())
+    }
+
+    /// The buffer offset of a cell, or `None` when the cell is off screen.
+    ///
+    /// **`Buffer::index_of` panics off the area**, so the two accessors above
+    /// could not answer `None` for a cell outside the screen even though their
+    /// signatures promise to: they reached the `content.get(pos)` that would
+    /// have said so only for coordinates that were already in range. A test
+    /// walking outward from a border it found on screen — "the cells just past
+    /// the panel's right edge" — therefore aborted with a ratatui panic
+    /// instead of reading the one cell that was actually there
+    /// (`code_tour_dock::test_selection_highlight_stays_inside_the_panel`).
+    ///
+    /// Off-screen is a real answer here, not an error: a cell the terminal
+    /// does not have cannot carry a style, and `is_scrollbar_thumb_at` and its
+    /// siblings already read that `None` as "no".
+    fn cell_index(buffer: &ratatui::buffer::Buffer, x: u16, y: u16) -> Option<usize> {
+        let area = buffer.area;
+        let inside = x >= area.x
+            && y >= area.y
+            && x < area.x.saturating_add(area.width)
+            && y < area.y.saturating_add(area.height);
+        inside.then(|| buffer.index_of(x, y))
     }
 
     /// Check if a cell at the given position is a scrollbar thumb.
@@ -1896,11 +2316,6 @@ impl EditorTestHarness {
         self.editor.get_plugin_errors()
     }
 
-    /// Clear accumulated plugin errors (useful if testing error handling)
-    pub fn clear_plugin_errors(&mut self) {
-        self.editor.clear_plugin_errors();
-    }
-
     /// Get the buffer content (not screen, actual buffer text)
     /// Returns None for large files with unloaded regions (lazy loading)
     pub fn get_buffer_content(&self) -> Option<String> {
@@ -1946,7 +2361,7 @@ impl EditorTestHarness {
     /// `editor_mut()` or any other internal accessor — see
     /// `docs/internal/e2e-test-migration-design.md` §2.1.
     pub fn api_mut(&mut self) -> &mut dyn fresh::test_api::EditorTestApi {
-        &mut self.editor
+        &mut *self.editor
     }
 
     /// Check if editor wants to quit
@@ -1959,19 +2374,11 @@ impl EditorTestHarness {
     // in main.rs so tests exercise the actual production code paths.
     // =========================================================================
 
-    /// Perform a clean shutdown, mirroring `run_event_loop_common` exit path.
-    ///
-    /// Calls auto-save (if enabled), `end_recovery_session`, and `save_workspace`
-    /// in the same order as the production shutdown code.
+    /// Perform a clean shutdown through [`Editor::persist_on_exit`] — the
+    /// same call the `run_event_loop_common` quit path makes, so the harness
+    /// cannot drift from production.
     pub fn shutdown(&mut self, workspace_enabled: bool) -> anyhow::Result<()> {
-        if self.editor.config().editor.auto_save_enabled {
-            self.editor.save_all_on_exit()?;
-        }
-        self.editor.end_recovery_session()?;
-        if workspace_enabled {
-            self.editor.save_workspace()?;
-        }
-        Ok(())
+        self.editor.persist_on_exit(workspace_enabled)
     }
 
     /// Perform startup, mirroring `handle_first_run_setup` in main.rs.
@@ -2021,10 +2428,6 @@ impl EditorTestHarness {
         // Process pending file opens (in production this happens on first
         // iteration of the event loop).
         self.editor.process_pending_file_opens();
-
-        if self.editor.has_recovery_files().unwrap_or(false) {
-            let _ = self.editor.recover_all_buffers();
-        }
 
         self.editor.start_recovery_session()?;
 
@@ -2223,60 +2626,50 @@ impl EditorTestHarness {
                 self.shadow_string.insert(self.shadow_cursor, ch);
                 self.shadow_cursor = redo_cursor;
             }
-            KeyCode::Backspace => {
-                if self.shadow_cursor > 0 {
-                    // Smart backspace dedent: if cursor is preceded only by whitespace
-                    // on the current line, remove up to tab_size spaces at once.
-                    let line_start = self.shadow_string[..self.shadow_cursor]
-                        .rfind('\n')
-                        .map(|pos| pos + 1)
-                        .unwrap_or(0);
-                    let prefix = &self.shadow_string[line_start..self.shadow_cursor];
-                    let all_whitespace =
-                        !prefix.is_empty() && prefix.bytes().all(|b| b == b' ' || b == b'\t');
+            KeyCode::Backspace if self.shadow_cursor > 0 => {
+                // Smart backspace dedent: if cursor is preceded only by whitespace
+                // on the current line, remove up to tab_size spaces at once.
+                let line_start = self.shadow_string[..self.shadow_cursor]
+                    .rfind('\n')
+                    .map(|pos| pos + 1)
+                    .unwrap_or(0);
+                let prefix = &self.shadow_string[line_start..self.shadow_cursor];
+                let all_whitespace =
+                    !prefix.is_empty() && prefix.bytes().all(|b| b == b' ' || b == b'\t');
 
-                    let chars_to_remove = if all_whitespace {
-                        let last_byte = prefix.as_bytes()[prefix.len() - 1];
-                        if last_byte == b'\t' {
-                            1
-                        } else {
-                            let trailing_spaces =
-                                prefix.bytes().rev().take_while(|&b| b == b' ').count();
-                            let tab_size = 4; // default tab_size
-                            trailing_spaces.min(tab_size)
-                        }
-                    } else {
+                let chars_to_remove = if all_whitespace {
+                    let last_byte = prefix.as_bytes()[prefix.len() - 1];
+                    if last_byte == b'\t' {
                         1
-                    };
+                    } else {
+                        let trailing_spaces =
+                            prefix.bytes().rev().take_while(|&b| b == b' ').count();
+                        let tab_size = 4; // default tab_size
+                        trailing_spaces.min(tab_size)
+                    }
+                } else {
+                    1
+                };
 
-                    let undo_cursor = self.shadow_cursor;
-                    let redo_cursor = self.shadow_cursor - chars_to_remove;
-                    self.shadow_undo_stack.push((
-                        self.shadow_string.clone(),
-                        undo_cursor,
-                        redo_cursor,
-                    ));
-                    self.shadow_redo_stack.clear();
-                    // Remove chars_to_remove characters before cursor
-                    self.shadow_string.drain(redo_cursor..self.shadow_cursor);
-                    self.shadow_cursor = redo_cursor;
-                }
+                let undo_cursor = self.shadow_cursor;
+                let redo_cursor = self.shadow_cursor - chars_to_remove;
+                self.shadow_undo_stack
+                    .push((self.shadow_string.clone(), undo_cursor, redo_cursor));
+                self.shadow_redo_stack.clear();
+                // Remove chars_to_remove characters before cursor
+                self.shadow_string.drain(redo_cursor..self.shadow_cursor);
+                self.shadow_cursor = redo_cursor;
             }
-            KeyCode::Delete => {
-                if self.shadow_cursor < self.shadow_string.len() {
-                    // Forward delete: undo inserts text back, which shifts cursor right
-                    // undo_cursor = P + 1 (adjust_for_edit shifts cursor on undo-insert)
-                    // redo_cursor = P (cursor stays on forward delete)
-                    let undo_cursor = self.shadow_cursor + 1;
-                    let redo_cursor = self.shadow_cursor;
-                    self.shadow_undo_stack.push((
-                        self.shadow_string.clone(),
-                        undo_cursor,
-                        redo_cursor,
-                    ));
-                    self.shadow_redo_stack.clear();
-                    self.shadow_string.remove(self.shadow_cursor);
-                }
+            KeyCode::Delete if self.shadow_cursor < self.shadow_string.len() => {
+                // Forward delete: undo inserts text back, which shifts cursor right
+                // undo_cursor = P + 1 (adjust_for_edit shifts cursor on undo-insert)
+                // redo_cursor = P (cursor stays on forward delete)
+                let undo_cursor = self.shadow_cursor + 1;
+                let redo_cursor = self.shadow_cursor;
+                self.shadow_undo_stack
+                    .push((self.shadow_string.clone(), undo_cursor, redo_cursor));
+                self.shadow_redo_stack.clear();
+                self.shadow_string.remove(self.shadow_cursor);
             }
             KeyCode::Enter => {
                 // Enter (insert newline): undo_cursor = pre-action, redo_cursor = post-action
@@ -2288,15 +2681,11 @@ impl EditorTestHarness {
                 self.shadow_string.insert(self.shadow_cursor, '\n');
                 self.shadow_cursor = redo_cursor;
             }
-            KeyCode::Left => {
-                if self.shadow_cursor > 0 {
-                    self.shadow_cursor -= 1;
-                }
+            KeyCode::Left if self.shadow_cursor > 0 => {
+                self.shadow_cursor -= 1;
             }
-            KeyCode::Right => {
-                if self.shadow_cursor < self.shadow_string.len() {
-                    self.shadow_cursor += 1;
-                }
+            KeyCode::Right if self.shadow_cursor < self.shadow_string.len() => {
+                self.shadow_cursor += 1;
             }
             KeyCode::Home => {
                 // Smart home: toggle between first non-whitespace and line start
@@ -2535,7 +2924,7 @@ impl EditorTestHarness {
 
     /// Get the top line number currently visible in the viewport
     pub fn top_line_number(&mut self) -> usize {
-        let top_byte = self.editor.active_viewport().top_byte();
+        let top_byte = self.editor.active_window().active_viewport().top_byte();
         self.editor
             .active_state_mut()
             .buffer
@@ -2544,17 +2933,25 @@ impl EditorTestHarness {
 
     /// Get the top byte position of the viewport
     pub fn top_byte(&self) -> usize {
-        self.editor.active_viewport().top_byte()
+        self.editor.active_window().active_viewport().top_byte()
     }
 
     /// Get the top view line offset (number of view lines to skip)
     pub fn top_view_line_offset(&self) -> usize {
-        self.editor.active_viewport().top_view_line_offset()
+        self.editor
+            .active_window()
+            .active_viewport()
+            .top_view_line_offset()
+    }
+
+    /// The viewport's horizontal scroll offset, in columns.
+    pub fn left_column(&self) -> usize {
+        self.editor.active_window().active_viewport().left_column
     }
 
     /// Get the viewport height (number of content lines that can be displayed)
     pub fn viewport_height(&self) -> usize {
-        self.editor.active_viewport().height as usize
+        self.editor.active_window().active_viewport().height as usize
     }
 
     /// Get the content area row range on screen (start_row, end_row inclusive)
@@ -2659,13 +3056,23 @@ impl EditorTestHarness {
         self.render()?;
         Ok(())
     }
-    /// Wait indefinitely for async operations until condition is met.
+    /// Wait for async operations until the condition is met.
     /// Runs a full editor tick each iteration — the same work the real event
     /// loop performs between frames — so that hover timers, debounced requests,
     /// diagnostic pulls, and all other periodic checks fire naturally.
     ///
     /// Note: Uses a short real wall-clock sleep between iterations to allow
     /// async I/O operations (running on tokio runtime) time to complete.
+    ///
+    /// The condition is one that *must* arrive, so the wait is generous — but
+    /// it is not unbounded, because "must arrive" is exactly the assumption
+    /// that breaks. Past [`WAIT_DEADLINE`] it gives up out loud, the way
+    /// [`EditorTestHarness::wait_for_async_quiescence`] does: a caller that
+    /// waited for something that never came should see a named failure with
+    /// the screen it was waiting on, in the test that did the waiting.
+    /// Without the bound the test simply hung until nextest killed the run
+    /// three slow-timeout periods later (180s), which reads as a broken build
+    /// rather than as this one test's unmet condition.
     pub fn wait_until<F>(&mut self, mut condition: F) -> anyhow::Result<()>
     where
         F: FnMut(&Self) -> bool,
@@ -2673,6 +3080,11 @@ impl EditorTestHarness {
         const WAIT_SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
         // Dump the screen periodically so CI logs show what the test sees while stuck
         const SCREEN_DUMP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+        // Twice `.config/nextest.toml`'s 60s slow-timeout period, and well
+        // inside the 180s at which it terminates the test: long enough that no
+        // healthy wait reaches it, early enough to fail as a test rather than
+        // as a killed run.
+        const WAIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
         tracing::info!("waiting...");
         let start = std::time::Instant::now();
@@ -2699,6 +3111,13 @@ impl EditorTestHarness {
                     elapsed.as_secs_f64()
                 );
                 last_dump = now;
+            }
+            if now.duration_since(start) >= WAIT_DEADLINE {
+                anyhow::bail!(
+                    "wait_until gave up after {:.0}s — the condition never became true. Screen:\n{}",
+                    WAIT_DEADLINE.as_secs_f64(),
+                    self.screen_to_string()
+                );
             }
             // Sleep for real wall-clock time to allow async I/O operations to complete
             // These run on the tokio runtime and need actual time, not logical time
@@ -2932,6 +3351,34 @@ impl EditorTestHarness {
         self.render()?;
 
         Ok(())
+    }
+
+    /// With the settings dialog open and its category tree focused, walk the
+    /// tree down until the category row named `name` is under the cursor
+    /// (the row carrying the `>` marker a few columns before the name).
+    pub fn select_settings_category(&mut self, name: &str) -> anyhow::Result<()> {
+        // Look back from the name for the marker: a `>` further left on the
+        // line belongs to whatever is drawn behind the dialog.
+        let selected = |screen: &str| {
+            screen.lines().any(|l| {
+                l.find(name).is_some_and(|n| {
+                    l[..n]
+                        .rfind('>')
+                        .is_some_and(|m| l[m..n].chars().count() <= 8)
+                })
+            })
+        };
+        for _ in 0..60 {
+            if selected(&self.screen_to_string()) {
+                return Ok(());
+            }
+            self.send_key(KeyCode::Down, KeyModifiers::NONE)?;
+            self.render()?;
+        }
+        anyhow::bail!(
+            "settings category {name:?} never became selected. Screen:\n{}",
+            self.screen_to_string()
+        )
     }
 
     /// Wait for screen to contain specific text

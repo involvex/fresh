@@ -317,7 +317,7 @@ fn test_review_comment_from_header_opens_prompt() {
         .unwrap();
 }
 
-/// §5.13 — "Review Stash" reviews a git stash entry: the stashed file and
+/// §5.13 — "Review Diff: Stash" reviews a git stash entry: the stashed file and
 /// the stash ref show up in the review.
 #[test]
 fn test_review_stash_shows_stashed_diff() {
@@ -343,12 +343,12 @@ fn test_review_stash_shows_stashed_diff() {
     );
 
     let mut harness = harness_for(&repo);
-    // Run the "Review Stash" command, then accept the default stash@{0}.
+    // Run the "Review Diff: Stash" command, then accept the default stash@{0}.
     harness
         .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
         .unwrap();
     harness.wait_for_prompt().unwrap();
-    harness.type_text("Review Stash").unwrap();
+    harness.type_text("Review Diff: Stash").unwrap();
     harness.render().unwrap();
     harness
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
@@ -402,7 +402,10 @@ fn test_review_comments_panel_wraps_full_note() {
         .unwrap();
 }
 
-/// §5.12 — `W` toggles watch (auto-reload on save) and reports its state.
+/// §5.12 — `W` toggles watch (auto-refresh on changes) and reports its
+/// state. The watch is on when a review opens (#3126: a panel that does not
+/// follow the working tree is a panel quietly disagreeing with the repo), so
+/// the first press is the one that turns it *off*.
 #[test]
 fn test_review_watch_toggle_status() {
     init_tracing_from_env();
@@ -414,14 +417,14 @@ fn test_review_watch_toggle_status() {
         .send_key(KeyCode::Char('W'), KeyModifiers::SHIFT)
         .unwrap();
     harness
-        .wait_until(|h| h.screen_to_string().contains("Watching for changes"))
+        .wait_until(|h| h.screen_to_string().contains("Watch off"))
         .unwrap();
 
     harness
         .send_key(KeyCode::Char('W'), KeyModifiers::SHIFT)
         .unwrap();
     harness
-        .wait_until(|h| h.screen_to_string().contains("Watch off"))
+        .wait_until(|h| h.screen_to_string().contains("Watching for changes"))
         .unwrap();
 }
 

@@ -155,24 +155,30 @@ impl FrameEffect for SlideIn {
     }
 
     fn apply(&mut self, buf: &mut Buffer, area: Rect, elapsed: Duration) -> EffectStatus {
-        // First apply captures the post-paint "after" snapshot. The
-        // "before" snapshot, if any, was captured at the top of this
-        // render pass via the trait hook.
-        if self.after.is_none() {
-            self.after = Some(Self::snapshot_area(buf, area));
+        // The "after" snapshot is taken from `buf` on *every* apply. By the
+        // time the runner reaches this effect the frame's content pass has
+        // already painted the incoming pane into `buf`, so what is read here
+        // is the pane as it is *now* — which is the only thing a slide may
+        // show shifted. It used to be captured once, on the first apply, and
+        // held for the slide's whole duration: a pane whose content changed
+        // mid-slide (a plugin panel catching up to a new width on
+        // `buffer_activated`, ~100ms in) kept showing the first frame's
+        // cells, and because the slide's final frame is its own composite
+        // and the runner asked for no frame after it, the stale picture
+        // outlived the slide until the next input. A snapshot is 69×37 cells
+        // for a pane; copying it per frame for 260ms costs nothing worth
+        // a stale screen.
+        //
+        // The "before" snapshot, if any, was captured at the top of this
+        // render pass via the trait hook; it is dropped if the area moved
+        // under it (a resize mid-slide), which falls back to the
+        // slide-in-with-blanks path.
+        let area_changed = self.after.as_ref().is_some_and(|s| s.area != area);
+        if area_changed {
+            self.before = None;
         }
-        let after = match &self.after {
-            Some(s) if s.area == area => s,
-            Some(_) => {
-                // Area changed mid-animation (resize) — re-snapshot the
-                // after, and drop the before whose dimensions no longer
-                // match. Falls back to the slide-in-with-blanks path.
-                self.after = Some(Self::snapshot_area(buf, area));
-                self.before = None;
-                self.after.as_ref().unwrap()
-            }
-            None => unreachable!(),
-        };
+        self.after = Some(Self::snapshot_area(buf, area));
+        let after = self.after.as_ref().expect("snapshot just taken");
         let before = self.before.as_ref().filter(|b| b.area == area);
 
         let t = if self.duration.is_zero() {
@@ -972,6 +978,39 @@ fn blend_rgb(fg: (u8, u8, u8), bg: (u8, u8, u8), alpha: f32) -> Color {
     Color::Rgb(mix(fg.0, bg.0), mix(fg.1, bg.1), mix(fg.2, bg.2))
 }
 
+/// Shade one row of `area` toward its own background: `level` is how
+/// much of each cell's painted foreground survives, 0.0 leaving it on
+/// the background and 1.0 leaving it untouched.
+///
+/// Each cell fades toward the background it is actually sitting on,
+/// falling back to `editor_bg` where that can't be resolved to RGB — so
+/// text on a selection or the current-line highlight fades into that
+/// band rather than into the editor background it isn't on.
+pub fn shade_row_toward_background(
+    buf: &mut Buffer,
+    area: Rect,
+    row: u16,
+    level: f32,
+    editor_bg: Color,
+) {
+    if level >= 1.0 || row >= area.height {
+        return;
+    }
+    let fallback = color_to_rgb(editor_bg);
+    for dx in 0..area.width {
+        let Some(cell) = buf.cell_mut((area.x + dx, area.y + row)) else {
+            continue;
+        };
+        let Some(bg) = color_to_rgb(cell.bg).or(fallback) else {
+            continue;
+        };
+        let Some(fg) = color_to_rgb(cell.fg) else {
+            continue;
+        };
+        cell.set_fg(blend_rgb(fg, bg, level));
+    }
+}
+
 fn color_to_rgb(color: Color) -> Option<(u8, u8, u8)> {
     match color {
         Color::Rgb(r, g, b) => Some((r, g, b)),
@@ -1016,6 +1055,13 @@ struct ActiveEffect {
 pub struct AnimationRunner {
     next_id: u64,
     active: Vec<ActiveEffect>,
+    /// An effect finished during the last `apply_all`, so the frame it
+    /// finished on is its own composite and one more frame is owed to
+    /// paint the true content. Read once by the frame loop through
+    /// [`Self::take_settle_frame`]; without it the loop's "animations are
+    /// active" test is already false when it next asks, and the screen
+    /// is left showing whatever the effect's last frame drew.
+    settle_owed: bool,
     /// Cumulative count of effects accepted by either `start` or
     /// `start_with_id`. Monotonic; increments before the effect is
     /// pushed so a sample taken any time after the call sees the
@@ -1037,6 +1083,7 @@ impl AnimationRunner {
             next_id: 1,
             active: Vec::new(),
             total_started: 0,
+            settle_owed: false,
         }
     }
 
@@ -1119,8 +1166,19 @@ impl AnimationRunner {
     }
 
     /// Tear down any interactive, dismiss-on-input effect (the wave).
+    ///
+    /// The frame on screen right now is the effect's own composite, so
+    /// removing it owes one more frame to paint the true content
+    /// underneath — the same debt `apply_all` records when an effect
+    /// finishes on its own. Without it a dismissal that the frontend does
+    /// not separately mark as needing a redraw (the daemon loop's focus
+    /// path) leaves the last wave frame frozen on screen.
     pub fn cancel_dismissable(&mut self) {
+        let before = self.active.len();
         self.active.retain(|e| !e.dismissable);
+        if self.active.len() != before {
+            self.settle_owed = true;
+        }
     }
 
     /// Let each active effect snapshot the "before" state of its Rect
@@ -1167,8 +1225,19 @@ impl AnimationRunner {
             }
             let elapsed = now - effective_start;
             e.status = e.effect.apply(buf, e.area, elapsed);
+            if e.status == EffectStatus::Done {
+                self.settle_owed = true;
+            }
         }
         self.active.retain(|e| e.status == EffectStatus::Running);
+    }
+
+    /// Whether an effect finished on the last frame, so one more frame is
+    /// owed to paint the content it was drawn over. Clears on read: the
+    /// frame loop asks once per iteration and the debt is paid by the frame
+    /// that follows.
+    pub fn take_settle_frame(&mut self) -> bool {
+        std::mem::take(&mut self.settle_owed)
     }
 
     pub fn is_active(&self) -> bool {
@@ -1189,22 +1258,45 @@ impl AnimationRunner {
     pub fn next_deadline(&self) -> Option<Instant> {
         self.active.iter().map(|e| e.deadline).min()
     }
-
-    /// True if `(col, row)` falls inside the area of any running effect.
-    /// Use this to suppress click routing during an animation.
-    pub fn is_animating_at(&self, col: u16, row: u16) -> bool {
-        self.active.iter().any(|e| {
-            e.status == EffectStatus::Running
-                && col >= e.area.x
-                && col < e.area.x.saturating_add(e.area.width)
-                && row >= e.area.y
-                && row < e.area.y.saturating_add(e.area.height)
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    /// The frame an effect finishes on is its own composite, so the runner
+    /// owes one more frame to paint the content underneath. `is_active` is
+    /// already false by the time the loop asks; this is the signal that
+    /// carries the debt across, and it is paid exactly once.
+    #[test]
+    fn a_finished_effect_owes_exactly_one_settle_frame() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let area = Rect::new(0, 0, 8, 2);
+        let mut runner = super::AnimationRunner::new();
+        assert!(
+            !runner.take_settle_frame(),
+            "nothing owed before any effect"
+        );
+        runner.start(
+            area,
+            super::AnimationKind::SlideIn {
+                from: super::Edge::Right,
+                duration: std::time::Duration::ZERO,
+                delay: std::time::Duration::ZERO,
+            },
+        );
+        let mut buf = Buffer::empty(area);
+        runner.apply_all(&mut buf);
+        assert!(
+            !runner.is_active(),
+            "a zero-duration slide finishes on its first apply"
+        );
+        assert!(
+            runner.take_settle_frame(),
+            "the finishing frame owes a settle frame"
+        );
+        assert!(!runner.take_settle_frame(), "the debt is paid once");
+    }
+
     use super::*;
     use ratatui::style::Color;
 
@@ -1257,9 +1349,16 @@ mod tests {
 
         // Construct SlideIn directly so we can drive its clock.
         let mut effect = SlideIn::new(Edge::Bottom, Duration::from_millis(100));
-        // First apply at t=0 snapshots the buffer.
+        // Frame 1, t=0: the content pass has painted the pane; the slide
+        // shifts it fully off the bottom edge.
         effect.apply(&mut buf, area, Duration::ZERO);
-        // Now drive it to t=duration: result should equal the original painted content.
+        // Frame 2, t=duration. The runner only ever applies to a buffer the
+        // content pass has just repainted — that is what lets the effect
+        // snapshot the pane as it is *now* on every apply, which is how a
+        // pane that changed mid-slide gets shown (see `SlideIn::apply`). A
+        // test that skipped the repaint would hand the effect its own
+        // previous composite, a frame that never happens.
+        paint(&mut buf, area, 'X', Color::Red);
         let status = effect.apply(&mut buf, area, Duration::from_millis(100));
         assert_eq!(status, EffectStatus::Done);
         for dy in 0..area.height {
@@ -1301,7 +1400,10 @@ mod tests {
                 );
             }
         }
-        // And: at t=duration, the AFTER content is fully in place.
+        // And: at t=duration, the AFTER content is fully in place. The next
+        // frame's content pass repaints the pane before the runner applies
+        // (see `slide_in_bottom_at_duration_matches_snapshot`).
+        let mut work = after_buf.clone();
         let status = effect.apply(&mut work, area, Duration::from_millis(100));
         assert_eq!(status, EffectStatus::Done);
         for dy in 0..area.height {
@@ -1310,6 +1412,45 @@ mod tests {
                 assert_eq!(cell.symbol(), "N");
             }
         }
+    }
+
+    /// The incoming snapshot is retaken from `buf` on every apply. It used to
+    /// be captured once, on the first apply, and shifted for the slide's whole
+    /// duration — so a pane whose content changed mid-slide kept showing its
+    /// first frame's cells until the slide ended, and past it (the runner asked
+    /// for no frame after). The content pass paints the pane into `buf` before
+    /// the runner applies, so `buf` at apply time *is* the incoming content.
+    #[test]
+    fn slide_in_retakes_the_incoming_snapshot_every_apply() {
+        let area = Rect::new(0, 0, 3, 4);
+        let mut effect = SlideIn::new(Edge::Right, Duration::from_millis(100));
+
+        // First frame of the slide: the pane still holds its stale cells.
+        let mut stale = make_buf(3, 4);
+        paint(&mut stale, area, 'S', Color::Red);
+        effect.apply(&mut stale, area, Duration::ZERO);
+
+        // A few frames in, the content pass has repainted the pane.
+        let mut fresh = make_buf(3, 4);
+        paint(&mut fresh, area, 'N', Color::Blue);
+        effect.apply(&mut fresh, area, Duration::from_millis(50));
+        for dy in 0..area.height {
+            for dx in 0..area.width {
+                let sym = fresh.cell((area.x + dx, area.y + dy)).unwrap().symbol();
+                assert_ne!(
+                    sym, "S",
+                    "the slide painted the first frame's cell at ({dx},{dy}) over content \
+                     that has since changed"
+                );
+            }
+        }
+        // ...and at least some of the new content is on its way in.
+        let any_new = (0..area.height)
+            .any(|dy| (0..area.width).any(|dx| fresh.cell((dx, dy)).unwrap().symbol() == "N"));
+        assert!(
+            any_new,
+            "mid-slide, the incoming content should be partly visible"
+        );
     }
 
     #[test]
@@ -1886,22 +2027,32 @@ mod tests {
         assert!(!runner.is_active(), "wave finishes past its duration cap");
     }
 
+    /// Dismissing the wave owes the frame that paints the content it was
+    /// drawn over — the same debt an effect that finishes on its own
+    /// records. Without it a frontend that doesn't separately ask for a
+    /// redraw leaves the last wave frame frozen on screen.
     #[test]
-    fn is_animating_at_covers_area() {
-        let area = Rect::new(10, 5, 3, 2);
+    fn cancel_dismissable_owes_a_settle_frame() {
+        let area = Rect::new(0, 0, 6, 5);
         let mut runner = AnimationRunner::new();
         runner.start(
             area,
-            AnimationKind::SlideIn {
-                from: Edge::Bottom,
-                duration: Duration::from_millis(500),
-                delay: Duration::ZERO,
+            AnimationKind::Wave {
+                duration: Duration::from_secs(600),
             },
         );
-        assert!(runner.is_animating_at(10, 5));
-        assert!(runner.is_animating_at(12, 6));
-        assert!(!runner.is_animating_at(9, 5));
-        assert!(!runner.is_animating_at(13, 5));
-        assert!(!runner.is_animating_at(10, 7));
+        let mut buf = make_buf(6, 5);
+        paint(&mut buf, area, '#', Color::Rgb(180, 180, 180));
+        runner.apply_all(&mut buf);
+        assert!(!runner.take_settle_frame(), "nothing owed while it runs");
+
+        runner.cancel_dismissable();
+        assert!(!runner.is_active());
+        assert!(runner.take_settle_frame(), "the dismissal owes one frame");
+        assert!(!runner.take_settle_frame(), "and only one");
+
+        // Cancelling with nothing dismissable running owes nothing.
+        runner.cancel_dismissable();
+        assert!(!runner.take_settle_frame());
     }
 }

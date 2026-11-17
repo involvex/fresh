@@ -1,368 +1,29 @@
-//! The split grid: widget-panel content surfaces, separators,
-//! close/maximize buttons, tab bars, v/h scrollbars, and the editor
-//! content rects.
+//! The split grid's behaviour.
+//!
+//! **There is no chrome component here any more.** Every surface a pane has —
+//! its dividers, its tab strip with the split controls on it, both scrollbars,
+//! its content, and the buffer-group grid a pane can hold inside that content
+//! — is a node in the shell's tree (`view::shell::splits`), keyed by the pane
+//! it belongs to. What is left in this file is what those nodes dispatch to:
+//! the handlers themselves, which take a pane and a cell and do the work.
+//!
+//! Each of them used to open by asking every recorded rectangle in turn
+//! whether it contained the point, because a `LayoutBox` is a rectangle and
+//! the pane's identity had to be recovered from it. A node has that identity.
+//! What the handlers still read back is geometry that is genuinely a record of
+//! the last paint — where a scrollbar's thumb ended up, where the tab renderer
+//! put each tab — and the pane's own content rectangle, which is read from the
+//! node that defines it.
 
-use crate::app::types::HoverTarget;
+use crate::app::types::{HoverTarget, PointerDrag, SelectionDrag, TabContextMenu};
 use crate::app::BufferId;
 use crate::input::keybindings::Action;
 use crate::model::event::{CursorId, LeafId, SplitDirection};
-use crate::view::ui::tabs::TabHit;
-use crate::widgets::LayoutBox;
 use anyhow::Result as AnyhowResult;
-use rust_i18n::t;
+use fresh_i18n::t;
 
-use super::{in_rect, ChromeComponent, ChromeTreeBuilder, Editor};
+use super::Editor;
 
-pub(crate) struct Splits;
-
-impl ChromeComponent for Splits {
-    fn collect(&self, ed: &Editor, t: &mut ChromeTreeBuilder) {
-        for (_, buffer_id, content_rect, ..) in &ed.active_layout().split_areas {
-            if !ed.widget_registry.panels_for_buffer(*buffer_id).is_empty() {
-                t.rect("chrome:split_widget_panel", 120, *content_rect);
-            }
-        }
-        for (_, direction, sep_x, sep_y, sep_len) in &ed.active_layout().separator_areas {
-            let (w, h) = match direction {
-                SplitDirection::Horizontal => (*sep_len as u32, 1),
-                SplitDirection::Vertical => (1, *sep_len as u32),
-            };
-            let mut b = LayoutBox::plain(
-                "chrome:split_separators",
-                *sep_y as u32,
-                *sep_x as u32,
-                w,
-                h,
-            );
-            b.z = 80;
-            t.push(b);
-        }
-        for (_, btn_row, start, end) in &ed.active_layout().close_split_areas {
-            let mut b = LayoutBox::plain(
-                "chrome:split_buttons",
-                *btn_row as u32,
-                *start as u32,
-                end.saturating_sub(*start) as u32,
-                1,
-            );
-            b.z = 70;
-            t.push(b);
-        }
-        for (_, btn_row, start, end) in &ed.active_layout().maximize_split_areas {
-            let mut b = LayoutBox::plain(
-                "chrome:split_buttons",
-                *btn_row as u32,
-                *start as u32,
-                end.saturating_sub(*start) as u32,
-                1,
-            );
-            b.z = 70;
-            t.push(b);
-        }
-        for (_, tl) in &ed.active_layout().tab_layouts {
-            t.rect("chrome:tabs", 60, tl.bar_area);
-        }
-        for (_, _, _, scrollbar_rect, _, _) in &ed.active_layout().split_areas {
-            t.rect("chrome:scrollbars", 50, *scrollbar_rect);
-        }
-        for (_, _, r, _, _, _) in &ed.active_layout().horizontal_scrollbar_areas {
-            t.rect("chrome:h_scrollbar", 50, *r);
-        }
-        for (_, _, content_rect, ..) in &ed.active_layout().split_areas {
-            t.rect("chrome:editor", 10, *content_rect);
-        }
-        // Right-click-only act-then-continue guard at the very top
-        // band: a right-click ANYWHERE clears the "+" new-tab menu and
-        // the close-split confirmation before routing — even when a
-        // higher surface then consumes the click (the old pre-walk
-        // clear's semantics, kept exactly).
-        t.full("chrome:tab_menu_clear_guard", 200);
-    }
-
-    fn hover(&self, ed: &mut Editor, bx: &LayoutBox, col: u16, row: u16) -> Option<HoverTarget> {
-        match bx.kind {
-            "chrome:split_separators" => {
-                for (split_id, direction, sep_x, sep_y, sep_length) in
-                    &ed.active_layout().separator_areas
-                {
-                    let is_on_separator = match direction {
-                        SplitDirection::Horizontal => {
-                            row == *sep_y && col >= *sep_x && col < sep_x + sep_length
-                        }
-                        SplitDirection::Vertical => {
-                            col == *sep_x && row >= *sep_y && row < sep_y + sep_length
-                        }
-                    };
-                    if is_on_separator {
-                        return Some(HoverTarget::SplitSeparator(*split_id, *direction));
-                    }
-                }
-                None
-            }
-            "chrome:split_buttons" => {
-                // Split control buttons sit on top of the tab row.
-                for (split_id, btn_row, start_col, end_col) in &ed.active_layout().close_split_areas
-                {
-                    if row == *btn_row && col >= *start_col && col < *end_col {
-                        return Some(HoverTarget::CloseSplitButton(*split_id));
-                    }
-                }
-                for (split_id, btn_row, start_col, end_col) in
-                    &ed.active_layout().maximize_split_areas
-                {
-                    if row == *btn_row && col >= *start_col && col < *end_col {
-                        return Some(HoverTarget::MaximizeSplitButton(*split_id));
-                    }
-                }
-                None
-            }
-            "chrome:tabs" => {
-                for (split_id, tab_layout) in &ed.active_layout().tab_layouts {
-                    match tab_layout.hit_test(col, row) {
-                        Some(TabHit::CloseButton(target)) => {
-                            return Some(HoverTarget::TabCloseButton(target, *split_id));
-                        }
-                        Some(TabHit::TabName(target)) => {
-                            return Some(HoverTarget::TabName(target, *split_id));
-                        }
-                        Some(TabHit::ScrollLeft)
-                        | Some(TabHit::ScrollRight)
-                        | Some(TabHit::BarBackground)
-                        | Some(TabHit::NewTabButton)
-                        | None => {}
-                    }
-                }
-                None
-            }
-            "chrome:scrollbars" => {
-                for (split_id, _buffer_id, _content_rect, scrollbar_rect, thumb_start, thumb_end) in
-                    &ed.active_layout().split_areas
-                {
-                    if in_rect(col, row, *scrollbar_rect) {
-                        let relative_row = row.saturating_sub(scrollbar_rect.y) as usize;
-                        let is_on_thumb = relative_row >= *thumb_start && relative_row < *thumb_end;
-                        if is_on_thumb {
-                            return Some(HoverTarget::ScrollbarThumb(*split_id));
-                        } else {
-                            return Some(HoverTarget::ScrollbarTrack(
-                                *split_id,
-                                relative_row as u16,
-                            ));
-                        }
-                    }
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-
-    fn on_pointer(
-        &self,
-        ed: &mut Editor,
-        bx: &LayoutBox,
-        ev: &super::ChromePointer,
-    ) -> anyhow::Result<super::Disposition> {
-        use super::{Disposition, PointerPress};
-        match ev.press {
-            PointerPress::Left => {}
-            // A right-click anywhere dismisses the left-click-only
-            // popups (the "+" new-tab menu and the close-split
-            // confirmation) and keeps routing — the pre-walk clear
-            // expressed as a top-band act-then-continue guard.
-            PointerPress::Right => {
-                if bx.kind == "chrome:tab_menu_clear_guard" {
-                    ed.active_window_mut().new_tab_menu = None;
-                    ed.active_window_mut().close_split_menu = None;
-                    return Ok(Disposition::PassAfter);
-                }
-                return Ok(Disposition::Pass);
-            }
-            // Double = word select, triple = line select, on the split
-            // under the pointer (moved from the old post-walk scan /
-            // hand-ordered ladder — a popup's opaque box above this
-            // band now blocks them by construction).
-            PointerPress::Double | PointerPress::Triple => {
-                if bx.kind != "chrome:editor" {
-                    return Ok(Disposition::Pass);
-                }
-                // A double/triple press on a folded line's gutter
-                // indicator toggles the fold instead of selecting.
-                // Checked before word/line select (its historical
-                // pre-walk position), and INSIDE the walk since the
-                // move from `handle_mouse`'s pre-band: a popup's
-                // opaque box or the overlay prompt's double-click
-                // swallow above this band now blocks it by
-                // construction, like its select siblings.
-                if let Some((buffer_id, byte_pos)) =
-                    ed.fold_toggle_line_at_screen_position(ev.col, ev.row)
-                {
-                    ed.active_window_mut()
-                        .toggle_fold_at_byte(buffer_id, byte_pos);
-                    return Ok(Disposition::Consumed);
-                }
-                let areas: Vec<_> = ed
-                    .active_layout()
-                    .split_areas
-                    .iter()
-                    .map(|(split_id, buffer_id, content_rect, _, _, _)| {
-                        (*split_id, *buffer_id, *content_rect)
-                    })
-                    .collect();
-                for (split_id, buffer_id, content_rect) in areas {
-                    if in_rect(ev.col, ev.row, content_rect) {
-                        if ev.press == PointerPress::Double {
-                            ed.handle_split_double_click(
-                                split_id,
-                                buffer_id,
-                                content_rect,
-                                ev.col,
-                                ev.row,
-                            )?;
-                        } else {
-                            ed.handle_split_triple_click(
-                                split_id,
-                                buffer_id,
-                                content_rect,
-                                ev.col,
-                                ev.row,
-                            )?;
-                        }
-                        return Ok(Disposition::Consumed);
-                    }
-                }
-                return Ok(Disposition::Pass);
-            }
-        }
-        let consumed = match bx.kind {
-            "chrome:scrollbars" => ed.handle_click_scrollbar(ev.col, ev.row),
-            "chrome:h_scrollbar" => ed.handle_click_horizontal_scrollbar(ev.col, ev.row),
-            "chrome:split_separators" => ed.handle_click_split_separator(ev.col, ev.row),
-            "chrome:split_buttons" => ed.handle_click_split_controls(ev.col, ev.row),
-            "chrome:tabs" => ed.handle_click_tab_bar(ev.col, ev.row),
-            "chrome:editor" => {
-                let areas: Vec<_> = ed
-                    .active_layout()
-                    .split_areas
-                    .iter()
-                    .map(|(split_id, buffer_id, content_rect, _, _, _)| {
-                        (*split_id, *buffer_id, *content_rect)
-                    })
-                    .collect();
-                for (split_id, buffer_id, content_rect) in areas {
-                    if in_rect(ev.col, ev.row, content_rect) {
-                        ed.handle_editor_click(
-                            ev.col,
-                            ev.row,
-                            split_id,
-                            buffer_id,
-                            content_rect,
-                            ev.modifiers,
-                        )?;
-                        return Ok(Disposition::Consumed);
-                    }
-                }
-                None
-            }
-            _ => None,
-        };
-        if let Some(r) = consumed {
-            r?;
-            return Ok(Disposition::Consumed);
-        }
-        Ok(Disposition::Pass)
-    }
-
-    fn on_wheel(
-        &self,
-        ed: &mut Editor,
-        bx: &LayoutBox,
-        col: u16,
-        row: u16,
-        delta: i32,
-    ) -> anyhow::Result<super::Disposition> {
-        use super::Disposition;
-        match bx.kind {
-            "chrome:split_widget_panel" => {
-                if ed.handle_split_widget_panel_wheel(col, row, delta) {
-                    Ok(Disposition::Consumed)
-                } else {
-                    Ok(Disposition::Pass)
-                }
-            }
-            // A vertical wheel over a horizontal tab strip pans it: up
-            // walks toward the first tab, down toward the last.
-            "chrome:tabs" => {
-                let Some(split_id) = ed.active_window().tab_bar_split_at(col, row) else {
-                    return Ok(Disposition::Pass);
-                };
-                ed.dismiss_transient_popups();
-                ed.active_window().wheel_plugin_hook(col, row, delta);
-                ed.active_window_mut().scroll_tab_strip(split_id, delta);
-                Ok(Disposition::Consumed)
-            }
-            // A split pane, hit in its content rect or scrollbar
-            // gutter (moved from the old central `wheel_surface_at`
-            // fork — the surface's wheel lives with the surface).
-            "chrome:editor" | "chrome:scrollbars" | "chrome:h_scrollbar" => {
-                let Some((split_id, buffer_id)) = ed.active_window().split_at_position(col, row)
-                else {
-                    return Ok(Disposition::Pass);
-                };
-                // Only a wheel over a pane changes that terminal's
-                // live/scrollback state; panning the tab strip or the
-                // explorer leaves a live terminal streaming.
-                if ed.active_window().focused_terminal_live() {
-                    ed.enter_terminal_scrollback();
-                } else {
-                    ed.active_window_mut()
-                        .set_split_terminal_drag_scrollback(split_id, buffer_id, false);
-                }
-                ed.dismiss_transient_popups();
-                ed.active_window().wheel_plugin_hook(col, row, delta);
-                ed.active_window_mut()
-                    .scroll_split_surface(split_id, buffer_id, delta);
-                Ok(Disposition::Consumed)
-            }
-            _ => Ok(Disposition::Pass),
-        }
-    }
-
-    fn on_hwheel(
-        &self,
-        ed: &mut Editor,
-        bx: &LayoutBox,
-        col: u16,
-        row: u16,
-        delta: i32,
-    ) -> anyhow::Result<super::Disposition> {
-        use super::Disposition;
-        match bx.kind {
-            // A horizontal wheel over the tab strip pans it the same
-            // way the vertical wheel does.
-            "chrome:tabs" => {
-                let Some(split_id) = ed.active_window().tab_bar_split_at(col, row) else {
-                    return Ok(Disposition::Pass);
-                };
-                ed.active_window_mut().scroll_tab_strip(split_id, delta);
-                Ok(Disposition::Consumed)
-            }
-            "chrome:editor" | "chrome:scrollbars" | "chrome:h_scrollbar" => {
-                let Some((split_id, buffer_id)) = ed.active_window().split_at_position(col, row)
-                else {
-                    return Ok(Disposition::Pass);
-                };
-                ed.active_window_mut()
-                    .pan_split_horizontal(split_id, buffer_id, delta)?;
-                Ok(Disposition::Consumed)
-            }
-            _ => Ok(Disposition::Pass),
-        }
-    }
-}
-
-/// Behavior owned by this component (moved from mouse_input.rs —
-/// the handlers its arms dispatch to).
 impl Editor {
     /// Double-click on a split's content rect: the Splits component's
     /// `chrome:editor` arm (moved from the old post-walk scan).
@@ -370,7 +31,7 @@ impl Editor {
         &mut self,
         split_id: LeafId,
         buffer_id: BufferId,
-        content_rect: ratatui::layout::Rect,
+        byte: Option<usize>,
         col: u16,
         row: u16,
     ) -> AnyhowResult<()> {
@@ -396,17 +57,17 @@ impl Editor {
         self.active_window_mut().key_context = crate::input::keybindings::KeyContext::Normal;
 
         // Position cursor at click location and select word
-        self.handle_editor_double_click(col, row, split_id, buffer_id, content_rect)
+        self.handle_editor_double_click(byte, split_id, buffer_id)
     }
 
-    /// Handle double-click in editor content area - selects the word under cursor
+    /// Handle double-click in editor content area - selects the word under
+    /// cursor. `byte` is where the press landed, as the pane's leaf answered
+    /// it (`Event::text_byte`); `None` is a pane with nothing to select in.
     fn handle_editor_double_click(
         &mut self,
-        col: u16,
-        row: u16,
+        byte: Option<usize>,
         split_id: LeafId,
         buffer_id: BufferId,
-        content_rect: ratatui::layout::Rect,
     ) -> AnyhowResult<()> {
         use crate::model::event::Event;
 
@@ -420,55 +81,8 @@ impl Editor {
         // Focus this split
         self.focus_split(split_id, buffer_id);
 
-        // Get cached view line mappings for this split
-        let cached_mappings = self
-            .active_layout()
-            .view_line_mappings
-            .get(&split_id)
-            .cloned();
-
-        // Get fallback from SplitViewState viewport
         let leaf_id = split_id;
-        let fallback = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
-            .get(&leaf_id)
-            .map(|vs| vs.viewport.top_byte())
-            .unwrap_or(0);
-
-        // Get compose width for this split
-        let compose_width = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
-            .get(&leaf_id)
-            .and_then(|vs| vs.compose_width);
-
-        // Pull the bits we need out of the active window separately;
-        // the per-step helper methods (`apply_event_to_buffer` etc.)
-        // hide the disjoint sub-field borrowing.
-        let gutter_width = self
-            .active_window()
-            .buffers
-            .get(&buffer_id)
-            .map(|s| s.margins.left_total_width() as u16)
-            .unwrap_or(0);
-
-        let Some(target_position) = crate::app::click_geometry::screen_to_buffer_position(
-            col,
-            row,
-            content_rect,
-            gutter_width,
-            &cached_mappings,
-            fallback,
-            true, // Allow gutter clicks
-            compose_width,
-        ) else {
+        let Some(target_position) = byte else {
             return Ok(());
         };
 
@@ -477,7 +91,7 @@ impl Editor {
             .buffers
             .splits()
             .and_then(|(_, vs)| vs.get(&leaf_id))
-            .map(|vs| vs.cursors.primary_id())
+            .map(|vs| vs.buffer_tab_state().cursors.primary_id())
             .unwrap_or(CursorId(0));
         let event = Event::MoveCursor {
             cursor_id: primary_cursor_id,
@@ -500,23 +114,21 @@ impl Editor {
 
         // Set up drag state so subsequent drag events extend selection word-by-word
         if let Some(cursor) = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
+            .active_window()
+            .split_view_states()
             .get(&leaf_id)
-            .map(|vs| vs.cursors.primary())
+            .map(|vs| vs.buffer_tab_state().cursors.primary())
         {
             // Store both edges of the selected word so we can use the appropriate
             // anchor when dragging forward (use word start) vs backward (use word end).
             let sel_start = cursor.selection_start();
             let sel_end = cursor.selection_end();
-            self.active_window_mut().mouse_state.dragging_text_selection = true;
-            self.active_window_mut().mouse_state.drag_selection_split = Some(split_id);
-            self.active_window_mut().mouse_state.drag_selection_anchor = Some(sel_start);
-            self.active_window_mut().mouse_state.drag_selection_by_words = true;
-            self.active_window_mut().mouse_state.drag_selection_word_end = Some(sel_end);
+            self.active_window_mut().mouse_state.drag =
+                Some(PointerDrag::Selection(SelectionDrag {
+                    pane: split_id,
+                    anchor: Some(sel_start),
+                    word_end: Some(sel_end),
+                }));
         }
 
         Ok(())
@@ -528,7 +140,7 @@ impl Editor {
         &mut self,
         split_id: LeafId,
         buffer_id: BufferId,
-        content_rect: ratatui::layout::Rect,
+        byte: Option<usize>,
         col: u16,
         row: u16,
     ) -> AnyhowResult<()> {
@@ -550,17 +162,17 @@ impl Editor {
 
         // Use the same pattern as handle_editor_double_click:
         // first focus and position cursor, then select line
-        self.handle_editor_triple_click(col, row, split_id, buffer_id, content_rect)
+        self.handle_editor_triple_click(byte, split_id, buffer_id)
     }
 
-    /// Handle triple-click in editor content area - selects the entire line under cursor
+    /// Handle triple-click in editor content area - selects the entire line
+    /// under cursor. `byte` is where the press landed, as the pane's leaf
+    /// answered it.
     fn handle_editor_triple_click(
         &mut self,
-        col: u16,
-        row: u16,
+        byte: Option<usize>,
         split_id: LeafId,
         buffer_id: BufferId,
-        content_rect: ratatui::layout::Rect,
     ) -> AnyhowResult<()> {
         use crate::model::event::Event;
 
@@ -571,54 +183,8 @@ impl Editor {
         // Focus this split
         self.focus_split(split_id, buffer_id);
 
-        // Get cached view line mappings for this split
-        let cached_mappings = self
-            .active_layout()
-            .view_line_mappings
-            .get(&split_id)
-            .cloned();
-
         let leaf_id = split_id;
-        let fallback = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
-            .get(&leaf_id)
-            .map(|vs| vs.viewport.top_byte())
-            .unwrap_or(0);
-
-        // Get compose width for this split
-        let compose_width = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
-            .get(&leaf_id)
-            .and_then(|vs| vs.compose_width);
-
-        // Pull the bits we need out of the active window separately;
-        // the per-step helper methods (`apply_event_to_buffer` etc.)
-        // hide the disjoint sub-field borrowing.
-        let gutter_width = self
-            .active_window()
-            .buffers
-            .get(&buffer_id)
-            .map(|s| s.margins.left_total_width() as u16)
-            .unwrap_or(0);
-
-        let Some(target_position) = crate::app::click_geometry::screen_to_buffer_position(
-            col,
-            row,
-            content_rect,
-            gutter_width,
-            &cached_mappings,
-            fallback,
-            true,
-            compose_width,
-        ) else {
+        let Some(target_position) = byte else {
             return Ok(());
         };
 
@@ -627,7 +193,7 @@ impl Editor {
             .buffers
             .splits()
             .and_then(|(_, vs)| vs.get(&leaf_id))
-            .map(|vs| vs.cursors.primary_id())
+            .map(|vs| vs.buffer_tab_state().cursors.primary_id())
             .unwrap_or(CursorId(0));
         let event = Event::MoveCursor {
             cursor_id: primary_cursor_id,
@@ -651,23 +217,87 @@ impl Editor {
         Ok(())
     }
 
-    pub(super) fn handle_click_scrollbar(
+    /// Where the body — the split grid — is, read off the tree that placed
+    /// it. `None` before the first frame.
+    pub(crate) fn body_area(&self) -> Option<ratatui::layout::Rect> {
+        let ui = self.shell_ui.as_ref()?;
+        let last = self.active_chrome().last_frame;
+        let size = ratatui::layout::Rect::new(0, 0, last.width, last.height);
+        crate::view::shell::frame::regions_of(ui, size)
+            .into_iter()
+            .find(|(r, _)| *r == crate::view::shell::frame::HostRegion::Body)
+            .map(|(_, rect)| rect)
+    }
+
+    /// Where the dividers are, read off the tree that placed them: every
+    /// container of the grid and of the active groups' grids, as
+    /// `(container, direction, x, y, length)`.
+    pub(crate) fn separator_rects(
+        &self,
+    ) -> Vec<(
+        crate::model::event::ContainerId,
+        crate::model::event::SplitDirection,
+        u16,
+        u16,
+        u16,
+    )> {
+        let Some(ui) = self.shell_ui.as_ref() else {
+            return Vec::new();
+        };
+        let win = self.active_window();
+        let Some((mgr, _)) = win.buffers.splits() else {
+            return Vec::new();
+        };
+        let last = self.active_chrome().last_frame;
+        let size = ratatui::layout::Rect::new(0, 0, last.width, last.height);
+        let groups = win.pane_groups();
+        crate::view::shell::splits::separator_rects_of(ui, mgr.root(), groups.values(), size)
+    }
+
+    /// Where `pane`'s bar's thumb is, on the track the tree laid the bar out
+    /// to: `(start, end, track)` in the bar's own cells — from the facts the
+    /// bar's leaf paints with and the same arithmetic
+    /// (`BarFacts::thumb`), so a press and the picture cannot disagree.
+    /// `None` for a pane with no such bar.
+    pub(crate) fn bar_thumb(
+        &self,
+        pane: LeafId,
+        axis: fresh_ui::Axis,
+    ) -> Option<(usize, usize, usize)> {
+        let facts = self.active_window().panes.get(&pane)?.bar(axis)?;
+        let rect = match axis {
+            fresh_ui::Axis::Vertical => self.pane_vscroll_rect(pane)?,
+            fresh_ui::Axis::Horizontal => self.pane_hscroll_rect(pane)?,
+        };
+        let track = match axis {
+            fresh_ui::Axis::Vertical => rect.height,
+            fresh_ui::Axis::Horizontal => rect.width,
+        };
+        if track == 0 {
+            return None;
+        }
+        let (start, end) = facts.thumb(track);
+        Some((usize::from(start), usize::from(end), usize::from(track)))
+    }
+
+    pub(crate) fn handle_click_scrollbar(
         &mut self,
+        pane: LeafId,
         col: u16,
         row: u16,
     ) -> Option<AnyhowResult<()>> {
-        let (split_id, buffer_id, scrollbar_rect, is_on_thumb) =
-            self.active_layout().split_areas.iter().find_map(
-                |(split_id, buffer_id, _content, scrollbar_rect, thumb_start, thumb_end)| {
-                    if in_rect(col, row, *scrollbar_rect) {
-                        let relative_row = row.saturating_sub(scrollbar_rect.y) as usize;
-                        let on_thumb = relative_row >= *thumb_start && relative_row < *thumb_end;
-                        Some((*split_id, *buffer_id, *scrollbar_rect, on_thumb))
-                    } else {
-                        None
-                    }
-                },
-            )?;
+        // **Which pane is the node's, and so is where its bar is, and so is
+        // the thumb**: read from the bar's own facts (`bar_thumb`).
+        let (split_id, scrollbar_rect) = (pane, self.pane_vscroll_rect(pane)?);
+        let buffer_id = self
+            .windows
+            .get(&self.active_window)
+            .and_then(|w| w.pane_buffer(pane))?;
+        let is_on_thumb = {
+            let (start, end, _) = self.bar_thumb(pane, fresh_ui::Axis::Vertical)?;
+            let relative_row = row.saturating_sub(scrollbar_rect.y) as usize;
+            relative_row >= start && relative_row < end
+        };
 
         self.focus_split(split_id, buffer_id);
         // Grabbing the scrollbar of a drag-parked terminal scrollback view is
@@ -676,35 +306,33 @@ impl Editor {
         self.active_window_mut()
             .set_split_terminal_drag_scrollback(split_id, buffer_id, false);
         if is_on_thumb {
-            self.active_window_mut().mouse_state.dragging_scrollbar = Some(split_id);
-            self.active_window_mut().mouse_state.drag_start_row = Some(row);
-            if self.active_window().is_composite_buffer(buffer_id) {
-                if let Some(vs) = self
-                    .active_window()
+            use crate::app::types::{VerticalGrab, VerticalScroll};
+            let from = if self.active_window().is_composite_buffer(buffer_id) {
+                self.active_window()
                     .composite_view_states
                     .get(&(split_id, buffer_id))
-                {
-                    self.active_window_mut()
-                        .mouse_state
-                        .drag_start_composite_scroll_row = Some(vs.scroll_row);
-                }
+                    .map(|vs| VerticalScroll::Composite {
+                        scroll_row: vs.scroll_row,
+                    })
             } else {
-                let snap = self
-                    .windows
+                self.windows
                     .get(&self.active_window)
                     .and_then(|w| w.buffers.splits())
-                    .map(|(_, vs)| vs)
-                    .expect("active window must have a populated split layout")
-                    .get(&split_id)
-                    .map(|vs| (vs.viewport.top_byte(), vs.viewport.top_view_line_offset()));
-                if let Some((top_byte, top_view_line_offset)) = snap {
-                    let ms = &mut self.active_window_mut().mouse_state;
-                    ms.drag_start_top_byte = Some(top_byte);
-                    ms.drag_start_view_line_offset = Some(top_view_line_offset);
-                }
-            }
+                    .and_then(|(_, vs)| vs.get(&split_id))
+                    .map(|vs| VerticalScroll::Buffer {
+                        top_byte: vs.buffer_tab_state().viewport.top_byte(),
+                        view_line_offset: vs.buffer_tab_state().viewport.top_view_line_offset(),
+                    })
+            };
+            self.active_window_mut().mouse_state.drag = Some(PointerDrag::VerticalScrollbar {
+                pane: split_id,
+                grab: from.map(|from| VerticalGrab { row, from }),
+            });
         } else {
-            self.active_window_mut().mouse_state.dragging_scrollbar = Some(split_id);
+            self.active_window_mut().mouse_state.drag = Some(PointerDrag::VerticalScrollbar {
+                pane: split_id,
+                grab: None,
+            });
             if let Err(e) = self.active_window_mut().handle_scrollbar_jump(
                 col,
                 row,
@@ -714,70 +342,69 @@ impl Editor {
             ) {
                 return Some(Err(e));
             }
-            self.active_window_mut().mouse_state.hover_target =
-                Some(HoverTarget::ScrollbarThumb(split_id));
+            // The thumb jumped to the pointer, so the pointer is on the thumb
+            // now — and the tree will not say so again until the pointer
+            // moves. Written to the tree's field, since that is where this
+            // bar's hover comes from and it would otherwise still read
+            // `ScrollbarTrack` from the move that preceded the click.
+            self.shell_hover = Some(HoverTarget::ScrollbarThumb(split_id));
         }
         Some(Ok(()))
     }
 
-    pub(super) fn handle_click_horizontal_scrollbar(
+    /// The horizontal bar's range, in columns: the widest line, and how many
+    /// columns of text the pane shows beside its gutter. Both are the bar's
+    /// own facts, so a press, a drag and the thumb all measure one range.
+    fn hbar_extent(&self, pane: LeafId) -> Option<(usize, usize)> {
+        let facts = self
+            .active_window()
+            .panes
+            .get(&pane)?
+            .bar(fresh_ui::Axis::Horizontal)?;
+        let crate::view::shell::buffer_host::BarWindow::Cells(visible) = facts.window else {
+            return None;
+        };
+        Some((facts.content as usize, visible as usize))
+    }
+
+    pub(crate) fn handle_click_horizontal_scrollbar(
         &mut self,
+        pane: LeafId,
         col: u16,
-        row: u16,
+        _row: u16,
     ) -> Option<AnyhowResult<()>> {
-        let (split_id, buffer_id, hscrollbar_rect, max_content_width, is_on_thumb) = self
-            .active_layout()
-            .horizontal_scrollbar_areas
-            .iter()
-            .find_map(
-                |(
-                    split_id,
-                    buffer_id,
-                    hscrollbar_rect,
-                    max_content_width,
-                    thumb_start,
-                    thumb_end,
-                )| {
-                    if col >= hscrollbar_rect.x
-                        && col < hscrollbar_rect.x + hscrollbar_rect.width
-                        && row >= hscrollbar_rect.y
-                        && row < hscrollbar_rect.y + hscrollbar_rect.height
-                    {
-                        let relative_col = col.saturating_sub(hscrollbar_rect.x) as usize;
-                        let on_thumb = relative_col >= *thumb_start && relative_col < *thumb_end;
-                        Some((
-                            *split_id,
-                            *buffer_id,
-                            *hscrollbar_rect,
-                            *max_content_width,
-                            on_thumb,
-                        ))
-                    } else {
-                        None
-                    }
-                },
-            )?;
+        // The bar is the tree's and the buffer is the window's; the thumb
+        // and the content's width are the bar's own facts.
+        let (split_id, hscrollbar_rect) = (pane, self.pane_hscroll_rect(pane)?);
+        let buffer_id = self
+            .windows
+            .get(&self.active_window)
+            .and_then(|w| w.pane_buffer(pane))?;
+        let (max_content_width, visible_width) = self.hbar_extent(pane)?;
+        let is_on_thumb = {
+            let (start, end, _) = self.bar_thumb(pane, fresh_ui::Axis::Horizontal)?;
+            let relative_col = col.saturating_sub(hscrollbar_rect.x) as usize;
+            relative_col >= start && relative_col < end
+        };
 
         self.focus_split(split_id, buffer_id);
-        self.active_window_mut()
-            .mouse_state
-            .dragging_horizontal_scrollbar = Some(split_id);
-        if is_on_thumb {
-            self.active_window_mut().mouse_state.drag_start_hcol = Some(col);
-            if let Some(vs) = self
-                .windows
-                .get(&self.active_window)
-                .and_then(|w| w.buffers.splits())
-                .map(|(_, vs)| vs)
-                .expect("active window must have a populated split layout")
-                .get(&split_id)
-            {
-                self.active_window_mut().mouse_state.drag_start_left_column =
-                    Some(vs.viewport.left_column);
-            }
-        } else {
-            self.active_window_mut().mouse_state.drag_start_hcol = None;
-            self.active_window_mut().mouse_state.drag_start_left_column = None;
+        let grab = is_on_thumb
+            .then(|| {
+                self.windows
+                    .get(&self.active_window)
+                    .and_then(|w| w.buffers.splits())
+                    .and_then(|(_, vs)| vs.get(&split_id))
+                    .map(|vs| crate::app::types::HorizontalGrab {
+                        col,
+                        left_column: vs.buffer_tab_state().viewport.left_column,
+                    })
+            })
+            .flatten();
+        self.active_window_mut().mouse_state.drag = Some(PointerDrag::HorizontalScrollbar {
+            pane: split_id,
+            grab,
+        });
+        if !is_on_thumb {
             let relative_col = col.saturating_sub(hscrollbar_rect.x) as f64;
             let track_width = hscrollbar_rect.width as f64;
             let ratio = if track_width > 1.0 {
@@ -786,223 +413,522 @@ impl Editor {
                 0.0
             };
             if let Some(vs) = self
-                .windows
-                .get_mut(&self.active_window)
-                .and_then(|w| w.split_view_states_mut())
-                .expect("active window must have a populated split layout")
+                .active_window_mut()
+                .split_view_states_mut()
                 .get_mut(&split_id)
             {
-                let visible_width = vs.viewport.width as usize;
                 let max_scroll = max_content_width.saturating_sub(visible_width);
                 let target_col = (ratio * max_scroll as f64).round() as usize;
-                vs.viewport.left_column = target_col.min(max_scroll);
-                vs.viewport.set_skip_ensure_visible();
+                vs.buffer_tab_state_mut().viewport.left_column = target_col.min(max_scroll);
+                vs.buffer_tab_state_mut().viewport.set_skip_ensure_visible();
             }
         }
         Some(Ok(()))
     }
 
-    pub(super) fn handle_click_split_separator(
+    /// A left press on a pane's content: place the caret, select the word, or
+    /// select the line — or toggle a fold, when the cell is a folded line's
+    /// gutter indicator, which is checked first and was checked first when it
+    /// lived pre-walk.
+    ///
+    /// The pane comes from the node. The content rectangle comes from that
+    /// same node, read back from the laid-out tree: click-to-byte projects
+    /// through the view pipeline and needs the extent. It used to come from
+    /// whichever recorded rectangle happened to contain the point.
+    pub(crate) fn press_pane_content(
         &mut self,
+        pane: LeafId,
+        byte: Option<usize>,
         col: u16,
         row: u16,
-    ) -> Option<AnyhowResult<()>> {
-        let separator_areas = self.active_layout().separator_areas.clone();
-        for (split_id, direction, sep_x, sep_y, sep_length) in &separator_areas {
-            let is_on_separator = match direction {
-                SplitDirection::Horizontal => {
-                    row == *sep_y && col >= *sep_x && col < sep_x + sep_length
-                }
-                SplitDirection::Vertical => {
-                    col == *sep_x && row >= *sep_y && row < sep_y + sep_length
-                }
-            };
-            if is_on_separator {
-                self.active_window_mut().mouse_state.dragging_separator =
-                    Some((*split_id, *direction));
-                self.active_window_mut().mouse_state.drag_start_position = Some((col, row));
-                let ratio = self
-                    .split_manager_mut()
-                    .get_ratio((*split_id).into())
-                    .or_else(|| self.grouped_split_ratio(*split_id));
-                if let Some(ratio) = ratio {
-                    self.active_window_mut().mouse_state.drag_start_ratio = Some(ratio);
-                }
-                return Some(Ok(()));
+        clicks: u8,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> AnyhowResult<()> {
+        // The pane's content is a live terminal that wants the mouse, or a
+        // Ctrl+Click on a path it printed. Both are the content's, and both
+        // come before placing a caret — the same order they had when they sat
+        // between the tree and the legacy walk, back when a box did this.
+        if let Some(ev) = self.shell_pointer_event.map(|(ev, _)| ev) {
+            if let Some(r) = self.pane_content_takes_pointer(col, row, ev) {
+                r?;
+                return Ok(());
             }
         }
-        None
-    }
-
-    pub(super) fn handle_click_split_controls(
-        &mut self,
-        col: u16,
-        row: u16,
-    ) -> Option<AnyhowResult<()>> {
-        let close_split_hit = self
-            .active_layout()
-            .close_split_areas
-            .iter()
-            .find(|(_, btn_row, start_col, end_col)| {
-                row == *btn_row && col >= *start_col && col < *end_col
-            })
-            .map(|(split_id, btn_row, start_col, _)| (*split_id, *btn_row, *start_col));
-        if let Some((split_id, btn_row, start_col)) = close_split_hit {
-            // Closing a split isn't undoable, so don't act on the raw click —
-            // pop a small confirmation just below the `×` button offering
-            // "Close split" / "Cancel". Dismiss any other native menu first so
-            // only one popup is visible.
-            self.active_window_mut().close_context_menus();
-            self.active_window_mut().close_split_menu = Some(
-                crate::app::types::CloseSplitMenu::new(split_id, start_col, btn_row + 1),
-            );
-            return Some(Ok(()));
-        }
-
-        let maximize_target = self
-            .active_layout()
-            .maximize_split_areas
-            .iter()
-            .find(|(_, btn_row, start_col, end_col)| {
-                row == *btn_row && col >= *start_col && col < *end_col
-            })
-            .map(|(split_id, _, _, _)| *split_id);
-        if let Some(target) = maximize_target {
-            // Move focus to the clicked split before maximizing. Otherwise
-            // a click on a non-active split's button leaves the active
-            // split (now hidden by the maximize) silently capturing
-            // keystrokes. Skip when already maximized: the unmaximize
-            // click can only land on the maximized split, which is
-            // already the active one.
-            let already_maximized = self
-                .windows
-                .get(&self.active_window)
-                .and_then(|w| w.buffers.splits())
-                .map(|(mgr, _)| mgr.is_maximized())
-                .unwrap_or(false);
-            if !already_maximized {
-                if let Some(buffer_id) = self
-                    .windows
-                    .get(&self.active_window)
-                    .and_then(|w| w.buffers.splits())
-                    .map(|(mgr, _)| mgr)
-                    .expect("active window must have a populated split layout")
-                    .buffer_for_split(target)
-                {
-                    self.focus_split(target, buffer_id);
-                }
-            }
-            match self
-                .windows
-                .get_mut(&self.active_window)
-                .and_then(|w| w.split_manager_mut())
-                .expect("active window must have a populated split layout")
-                .toggle_maximize_for(target)
+        if clicks >= 2 {
+            if let Some((buffer_id, byte_pos)) = self.fold_toggle_line_at_screen_position(col, row)
             {
-                Ok(maximized) => {
-                    let msg = if maximized {
-                        t!("split.maximized").to_string()
-                    } else {
-                        t!("split.restored").to_string()
-                    };
-                    self.set_status_message(msg);
-                }
-                Err(e) => self.set_status_message(e),
-            }
-            // Maximize/restore changed every pane's geometry: reflow through
-            // the single layout funnel, exactly as the keyboard/command
-            // `toggle_maximize_split` does. Without this the mouse path left
-            // every visible terminal at its pre-toggle PTY size and scroll-back
-            // wrap column.
-            self.relayout();
-            return Some(Ok(()));
-        }
-
-        None
-    }
-
-    pub(super) fn handle_click_tab_bar(&mut self, col: u16, row: u16) -> Option<AnyhowResult<()>> {
-        let tab_hit = self
-            .active_layout()
-            .tab_layouts
-            .iter()
-            .find_map(|(split_id, tab_layout)| {
-                tab_layout.hit_test(col, row).map(|h| (*split_id, h))
-            });
-        let (split_id, hit) = tab_hit?;
-        tracing::trace!(?split_id, ?hit, col, row, "handle_click_tab_bar: hit");
-        match hit {
-            TabHit::CloseButton(target) => {
-                match target {
-                    crate::view::split::TabTarget::Buffer(buffer_id) => {
-                        self.focus_split(split_id, buffer_id);
-                        self.close_tab_in_split(buffer_id, split_id);
-                    }
-                    crate::view::split::TabTarget::Group(group_leaf) => {
-                        self.close_buffer_group_by_leaf(group_leaf);
-                    }
-                }
-                Some(Ok(()))
-            }
-            TabHit::TabName(target) => {
-                let direction = self
-                    .windows
-                    .get(&self.active_window)
-                    .and_then(|w| w.buffers.splits())
-                    .map(|(_, vs)| vs)
-                    .expect("active window must have a populated split layout")
-                    .get(&split_id)
-                    .map(|vs| {
-                        let open = &vs.open_buffers;
-                        let cur = vs.active_target();
-                        let cur_idx = open.iter().position(|t| *t == cur);
-                        let new_idx = open.iter().position(|t| *t == target);
-                        match (cur_idx, new_idx) {
-                            (Some(c), Some(n)) if n > c => 1,
-                            (Some(c), Some(n)) if n < c => -1,
-                            _ => 0,
-                        }
-                    })
-                    .unwrap_or(0);
                 self.active_window_mut()
-                    .animate_tab_switch(split_id, direction);
-                match target {
-                    crate::view::split::TabTarget::Buffer(buffer_id) => {
-                        self.focus_split(split_id, buffer_id);
-                        self.active_window_mut()
-                            .promote_buffer_from_preview(buffer_id);
-                        self.active_window_mut().mouse_state.dragging_tab = Some(
-                            crate::app::types::TabDragState::new(buffer_id, split_id, (col, row)),
-                        );
-                    }
-                    crate::view::split::TabTarget::Group(group_leaf) => {
-                        self.activate_group_tab(split_id, group_leaf);
-                    }
-                }
-                Some(Ok(()))
+                    .toggle_fold_at_byte(buffer_id, byte_pos);
+                return Ok(());
             }
-            // The indicators and the wheel nudge the strip through one shared
-            // helper, so a click and a wheel notch move it by the same step
-            // and both stop at the last tab.
-            TabHit::ScrollLeft => {
-                self.active_window_mut().scroll_tab_strip(split_id, -1);
-                Some(Ok(()))
-            }
-            TabHit::ScrollRight => {
-                self.active_window_mut().scroll_tab_strip(split_id, 1);
-                Some(Ok(()))
-            }
-            TabHit::NewTabButton => {
-                // Open the "+" popup just below the button. Close any tab
-                // context menu first so only one popup is visible.
-                self.active_window_mut().tab_context_menu = None;
-                self.active_window_mut().new_tab_menu =
-                    Some(crate::app::types::NewTabMenu::new(split_id, col, row + 1));
-                Some(Ok(()))
-            }
-            TabHit::BarBackground => None,
+        }
+        let (Some(buffer_id), Some(content_rect)) = (
+            self.active_window().pane_buffer(pane),
+            self.pane_content_rect(pane),
+        ) else {
+            return Ok(());
+        };
+        match clicks {
+            1 => self.handle_editor_click(byte, col, row, pane, buffer_id, content_rect, modifiers),
+            2 => self.handle_split_double_click(pane, buffer_id, byte, col, row),
+            _ => self.handle_split_triple_click(pane, buffer_id, byte, col, row),
         }
     }
+
+    /// The pane's content captured the pointer on its press and this is a
+    /// move of it: a selection drag if the press armed one, a live
+    /// terminal's own drag if it is forwarding, and nothing otherwise.
+    ///
+    /// The one place a content drag is decided. It was
+    /// `PointerGrab::TextSelection` and `TerminalSelectPending` in the
+    /// legacy walk, ranked against the other grabs by a flag ladder — the
+    /// node holds the pointer now, so the move comes back to the pane the
+    /// press was on and there is nothing to rank.
+    pub(crate) fn drag_pane_content(
+        &mut self,
+        pane: LeafId,
+        col: u16,
+        row: u16,
+    ) -> AnyhowResult<()> {
+        // A live terminal that wants the mouse takes the motion, as it took
+        // the press.
+        if let Some(ev) = self.shell_pointer_event.map(|(ev, _)| ev) {
+            if let Some(r) = self.pane_content_takes_pointer(col, row, ev) {
+                r?;
+                return Ok(());
+            }
+        }
+        // Text selection in the buffer, or a scrollbar behind the overlay
+        // prompt: swallowed while the overlay is up, so the buffer stays put.
+        if self.overlay_prompt_active() {
+            return Ok(());
+        }
+        // **A described page sweeps its own selection.** Its pane has no
+        // screen-to-byte projection — the content is the panel's subtree, not
+        // the buffer's leaf — so the buffer's drag below could not answer
+        // where the pointer is in the text. The page's own window can, and
+        // does; this returns true for any page pane, selecting or not, so the
+        // buffer path never runs over one.
+        if self.drag_moved_the_page_selection(pane, col, row) {
+            return Ok(());
+        }
+        match self.active_window().mouse_state.drag {
+            // The press landed on a live terminal grid and this is the first
+            // motion: selection intent. Drop the split into read-only
+            // scrollback and start a text-selection drag anchored at the
+            // press.
+            Some(PointerDrag::TerminalPress {
+                pane: split_id,
+                buffer,
+                col: ocol,
+                row: orow,
+            }) if split_id == pane => {
+                self.begin_terminal_grid_selection(split_id, buffer, ocol, orow, col, row)
+            }
+            Some(PointerDrag::Selection(drag)) if drag.pane == pane => {
+                self.handle_text_selection_drag(drag, col, row)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The pane's content released the pointer it captured: whatever drag
+    /// the press armed is over. The selection it made stays.
+    pub(crate) fn release_pane_content(&mut self, _pane: LeafId) {
+        self.active_window_mut().mouse_state.drag = None;
+    }
+
+    /// Move the keyboard to a pane, without placing a caret in it.
+    ///
+    /// What [`Self::press_pane_content`] does before it turns the cell into a
+    /// byte — and all of it a pane showing a described plugin panel wants,
+    /// because a panel has no text to put a caret in.
+    pub(crate) fn focus_pane(&mut self, pane: LeafId) {
+        if let Some(buffer) = self.active_window().pane_buffer(pane) {
+            self.focus_split(pane, buffer);
+        }
+    }
+
+    /// Where the shell laid this pane's content out.
+    pub fn pane_content_rect(&self, pane: LeafId) -> Option<ratatui::layout::Rect> {
+        self.pane_part_rect(crate::view::shell::splits::content_key(pane))
+    }
+
+    /// Where the shell laid this pane's vertical scrollbar, or `None` when the
+    /// pane has no bar.
+    ///
+    /// **`None` is "no bar", which is what a zero-width record meant.**
+    /// `pane_interior` places all three parts whether or not the pane has
+    /// them and gives the missing ones a width of zero; `rect_of` drops a
+    /// zero-size element. So the two spellings of "there is no scrollbar
+    /// here" — a zero-width `Rect` in `split_areas` and a `None` from the
+    /// tree — say the same thing, and every caller of these already had to
+    /// handle it.
+    pub fn pane_vscroll_rect(&self, pane: LeafId) -> Option<ratatui::layout::Rect> {
+        self.pane_part_rect(crate::view::shell::splits::vscroll_key(pane))
+    }
+
+    /// The same, for the horizontal bar.
+    pub fn pane_hscroll_rect(&self, pane: LeafId) -> Option<ratatui::layout::Rect> {
+        self.pane_part_rect(crate::view::shell::splits::hscroll_key(pane))
+    }
+
+    fn pane_part_rect(&self, key: fresh_ui::Key) -> Option<ratatui::layout::Rect> {
+        crate::view::shell::rect_of(
+            self.shell_ui.as_ref()?,
+            &key,
+            ratatui::layout::Rect::new(
+                0,
+                0,
+                self.active_chrome().last_frame.width,
+                self.active_chrome().last_frame.height,
+            ),
+        )
+    }
+
+    /// The pane whose **content** covers a screen cell, and that content's
+    /// rectangle.
+    ///
+    /// **One implementation, and the rectangle is the tree's.** Four places
+    /// scanned `split_areas` for a content rect containing the cell, each
+    /// writing the comparison out again and two of them wanting the rectangle
+    /// they found on the way — a recorded list standing in for a layout the
+    /// shell already owns.
+    ///
+    /// Deliberately containment and not `Ui::hit_test`: the question here is
+    /// "which pane's content covers this cell", which is not "what would a
+    /// click hit". A popup over the cell changes the second answer and must
+    /// not change the first — the plugin `mouse_move` hook converts screen
+    /// coordinates to content coordinates with it, and the LSP hover probe has
+    /// its own popup guard.
+    pub(crate) fn pane_content_at(
+        &self,
+        col: u16,
+        row: u16,
+    ) -> Option<(LeafId, ratatui::layout::Rect)> {
+        let leaves = self
+            .windows
+            .get(&self.active_window)?
+            .buffers
+            .splits()
+            .map(|(mgr, _)| mgr.visible_leaves())?;
+        leaves.into_iter().find_map(|(pane, _)| {
+            let r = self.pane_content_rect(pane)?;
+            crate::app::chrome::in_rect(col, row, r).then_some((pane, r))
+        })
+    }
+
+    /// The pane whose tab strip covers a screen cell.
+    ///
+    /// A pane with no strip has none — which is the whole point: the caller
+    /// that guessed this row as "the content's, minus one" named the row above
+    /// the pane for every such pane.
+    pub(crate) fn pane_strip_at(&self, col: u16, row: u16) -> Option<LeafId> {
+        let ui = self.shell_ui.as_ref()?;
+        let frame = ratatui::layout::Rect::new(
+            0,
+            0,
+            self.active_chrome().last_frame.width,
+            self.active_chrome().last_frame.height,
+        );
+        let leaves = self
+            .windows
+            .get(&self.active_window)?
+            .buffers
+            .splits()
+            .map(|(mgr, _)| mgr.visible_leaves())?;
+        leaves.into_iter().find_map(|(pane, _)| {
+            let strip = crate::view::shell::rect_of(
+                ui,
+                &crate::view::shell::splits::tabs_key(pane),
+                frame,
+            )?;
+            crate::app::chrome::in_rect(col, row, strip).then_some(pane)
+        })
+    }
+
+    /// Where the pane showing this buffer laid its content out.
+    ///
+    /// The three callers that wanted this scanned `split_areas` for an entry
+    /// whose buffer matched and took the rectangle beside it — a lookup that
+    /// answered "which pane" from the painter's record of the last frame when
+    /// the split model already knows. The model says which pane, the tree says
+    /// where it is.
+    ///
+    /// A buffer mounted in no visible pane has no rectangle, which is what an
+    /// absent entry meant.
+    pub fn pane_content_rect_for_buffer(
+        &self,
+        buffer_id: crate::app::BufferId,
+    ) -> Option<ratatui::layout::Rect> {
+        let pane = self
+            .windows
+            .get(&self.active_window)?
+            .buffers
+            .splits()
+            .map(|(mgr, _)| mgr.visible_leaves())?
+            .into_iter()
+            .find_map(|(pane, bid)| (bid == buffer_id).then_some(pane))?;
+        self.pane_content_rect(pane)
+    }
+
+    /// The terminal a screen cell is over, and the rectangle its grid occupies.
+    ///
+    /// The terminal's own mouse handling lives on `impl Window`, which cannot
+    /// see the tree, so this is asked here and the answer travels down. It was
+    /// `Window::get_terminal_content_area_at_position`, a third scan of
+    /// `split_areas`.
+    pub(crate) fn terminal_pane_at(
+        &self,
+        col: u16,
+        row: u16,
+    ) -> Option<(crate::app::BufferId, ratatui::layout::Rect)> {
+        let (pane, rect) = self.pane_content_at(col, row)?;
+        let win = self.windows.get(&self.active_window)?;
+        let buffer_id = win.pane_buffer(pane)?;
+        win.is_terminal_buffer(buffer_id)
+            .then_some((buffer_id, rect))
+    }
+
+    /// Whether the pointer is on a pane's scrollbar thumb or its track.
+    ///
+    /// The pane comes from the node, **and so does the bar**; the thumb's
+    /// extent is the recorded read of the scroll state, which is what makes
+    /// this a lookup rather than a calculation.
+    pub(crate) fn scrollbar_hover(&self, pane: LeafId, row: u16) -> Option<HoverTarget> {
+        let bar = self.pane_vscroll_rect(pane)?;
+        let (thumb_start, thumb_end, _) = self.bar_thumb(pane, fresh_ui::Axis::Vertical)?;
+        let rel = row.saturating_sub(bar.y) as usize;
+        Some(match rel >= thumb_start && rel < thumb_end {
+            true => HoverTarget::ScrollbarThumb(pane),
+            false => HoverTarget::ScrollbarTrack(pane, rel as u16),
+        })
+    }
+
+    /// Where `pane`'s tabs landed, read off the laid-out tree, in the order
+    /// the pane opens them. A tab scrolled off the strip is not listed.
+    ///
+    /// What `TabLayout::tabs` recorded, for the readers that want geometry
+    /// rather than a press: the drag's drop zone, the web's tab bar, and the
+    /// tests that aim a click at a tab.
+    pub fn tab_rects(&self, pane: LeafId) -> Vec<crate::view::shell::tabs::TabRect> {
+        let Some(ui) = self.shell_ui.as_ref() else {
+            return Vec::new();
+        };
+        let targets: Vec<crate::view::split::TabTarget> = self
+            .windows
+            .get(&self.active_window)
+            .and_then(|w| w.buffers.splits())
+            .and_then(|(mgr, vs)| {
+                vs.get(&pane).map(|v| v.open_buffers.clone()).or_else(|| {
+                    mgr.buffer_for_split(pane)
+                        .map(|b| vec![crate::view::split::TabTarget::Buffer(b)])
+                })
+            })
+            .unwrap_or_default();
+        let f = self.active_chrome().last_frame;
+        crate::view::shell::tabs::rects(
+            ui,
+            ratatui::layout::Rect::new(0, 0, f.width, f.height),
+            pane,
+            &targets,
+        )
+    }
+
+    /// Pan a pane's tab strip by `delta` notches.
+    ///
+    /// **A message to the window, not a number the editor keeps.** This used
+    /// to add to `SplitViewState::tab_scroll_offset` and clamp it against a
+    /// second measurement of every tab; the strip is a window now, so the
+    /// editor asks it to move and the window says how far it can. The wheel
+    /// is still the editor's — it dismisses the transient popups and fires
+    /// the plugin hook on its way — which is why it is a fact at all.
+    pub(crate) fn pan_pane_tab_strip(&mut self, pane: LeafId, delta: i32) {
+        let step = crate::view::shell::tabs::TAB_SCROLL_STEP_COLUMNS as i32;
+        self.active_window()
+            .tab_reveal_for(pane)
+            .scroll_by(delta.signum() * step);
+    }
+
+    /// A right press on a tab raises its context menu, just below the cell
+    /// pressed.
+    ///
+    /// Context menus only make sense for buffer tabs — groups are
+    /// plugin-managed — which is what `as_buffer` is asking.
+    pub(crate) fn open_tab_context_menu(
+        &mut self,
+        pane: LeafId,
+        target: crate::view::split::TabTarget,
+        col: u16,
+        row: u16,
+    ) {
+        self.active_window_mut().tab_context_menu = target
+            .as_buffer()
+            .map(|buffer_id| TabContextMenu::new(buffer_id, pane, col, row + 1));
+    }
+
+    /// The `×` on a pane's strip.
+    ///
+    /// Closing a split is not undoable, so the press offers "Close split" /
+    /// "Cancel" just below the button rather than acting — which needs the
+    /// button's own cell, and that is now the node's rectangle instead of the
+    /// `(row, start_col)` the painter recorded beside it.
+    pub(crate) fn close_split_button(&mut self, pane: LeafId) {
+        let Some(btn) = self.split_control_rect(&crate::view::shell::splits::close_key(pane))
+        else {
+            return;
+        };
+        // One popup at a time.
+        self.active_window_mut().close_context_menus();
+        self.active_window_mut().close_split_menu = Some(crate::app::types::CloseSplitMenu::new(
+            pane,
+            btn.x,
+            btn.y + 1,
+        ));
+    }
+
+    /// The `□` / `⧉` beside it: maximize this pane, or restore it.
+    pub(crate) fn maximize_split_button(&mut self, pane: LeafId) {
+        // Move focus to the clicked split before maximizing. Otherwise
+        // a click on a non-active split's button leaves the active
+        // split (now hidden by the maximize) silently capturing
+        // keystrokes. Skip when already maximized: the unmaximize
+        // click can only land on the maximized split, which is
+        // already the active one.
+        let already_maximized = self
+            .windows
+            .get(&self.active_window)
+            .and_then(|w| w.buffers.splits())
+            .map(|(mgr, _)| mgr.is_maximized())
+            .unwrap_or(false);
+        if !already_maximized {
+            // What the pane shows decides how it takes focus: a buffer is
+            // focused as ever, but a pane showing a group only becomes the
+            // active pane — focusing the buffer tab behind the group would
+            // switch the pane to it and drop the group from the screen.
+            let shows = self
+                .active_window()
+                .split_view_states()
+                .get(&pane)
+                .map(|vs| vs.shown());
+            match shows {
+                Some(crate::view::split::Shown::Buffer(buffer_id)) => {
+                    self.focus_split(pane, buffer_id);
+                }
+                Some(crate::view::split::Shown::Group { .. }) => {
+                    self.active_window_mut()
+                        .split_manager_mut()
+                        .set_active_split(pane);
+                }
+                None => {}
+            }
+        }
+        match self
+            .active_window_mut()
+            .split_manager_mut()
+            .toggle_maximize_for(pane)
+        {
+            Ok(maximized) => {
+                let msg = if maximized {
+                    t!("split.maximized").to_string()
+                } else {
+                    t!("split.restored").to_string()
+                };
+                self.set_status_message(msg);
+            }
+            Err(e) => self.set_status_message(e),
+        }
+        // Maximize/restore changed every pane's geometry: reflow through
+        // the single layout funnel, exactly as the keyboard/command
+        // `toggle_maximize_split` does. Without this the mouse path left
+        // every visible terminal at its pre-toggle PTY size and scroll-back
+        // wrap column.
+        // Maximize/restore changed every pane's geometry: reflow through
+        // the single layout funnel, exactly as the keyboard/command
+        // `toggle_maximize_split` does. Without this the mouse path left
+        // every visible terminal at its pre-toggle PTY size and scroll-back
+        // wrap column.
+        self.relayout();
+    }
+
+    /// Where one of a pane's strip buttons is, read off the laid-out tree.
+    fn split_control_rect(&self, key: &fresh_ui::Key) -> Option<ratatui::layout::Rect> {
+        crate::view::shell::rect_of(
+            self.shell_ui.as_ref()?,
+            key,
+            ratatui::layout::Rect::new(
+                0,
+                0,
+                self.active_chrome().last_frame.width,
+                self.active_chrome().last_frame.height,
+            ),
+        )
+    }
+
+    /// A tab's `×`: close the tab, or the group.
+    pub(crate) fn close_tab_button(&mut self, pane: LeafId, target: crate::view::split::TabTarget) {
+        match target {
+            crate::view::split::TabTarget::Buffer(buffer_id) => {
+                self.focus_split(pane, buffer_id);
+                self.close_tab_in_split(buffer_id, pane);
+            }
+            crate::view::split::TabTarget::Group(group_leaf) => {
+                self.close_buffer_group_by_leaf(group_leaf);
+            }
+        }
+    }
+
+    /// A press on a tab's name: activate it — sliding the content in from
+    /// the side the tab is on — and, for a buffer, begin the drag that a
+    /// motion past the threshold turns into a move.
+    pub(crate) fn press_tab(
+        &mut self,
+        pane: LeafId,
+        target: crate::view::split::TabTarget,
+        at: (u16, u16),
+    ) {
+        let direction = self
+            .active_window()
+            .split_view_states()
+            .get(&pane)
+            .map(|vs| {
+                let open = &vs.open_buffers;
+                let cur = vs.active_target();
+                let cur_idx = open.iter().position(|t| *t == cur);
+                let new_idx = open.iter().position(|t| *t == target);
+                match (cur_idx, new_idx) {
+                    (Some(c), Some(n)) if n > c => 1,
+                    (Some(c), Some(n)) if n < c => -1,
+                    _ => 0,
+                }
+            })
+            .unwrap_or(0);
+        if let Some(area) = self.pane_or_group_content_rect(pane) {
+            self.active_window_mut().animate_tab_switch(area, direction);
+        }
+        match target {
+            crate::view::split::TabTarget::Buffer(buffer_id) => {
+                self.focus_split(pane, buffer_id);
+                self.active_window_mut()
+                    .promote_buffer_from_preview(buffer_id);
+                self.active_window_mut().mouse_state.drag = Some(PointerDrag::Tab(
+                    crate::app::types::TabDragState::new(buffer_id, pane, at),
+                ));
+            }
+            crate::view::split::TabTarget::Group(group_leaf) => {
+                self.activate_group_tab(pane, group_leaf);
+            }
+        }
+    }
+
+    /// The `+` after the last tab: its menu, just below the cell pressed.
+    /// Any tab context menu closes first so only one popup is visible.
+    pub(crate) fn new_tab_button(&mut self, pane: LeafId, col: u16, row: u16) {
+        self.active_window_mut().tab_context_menu = None;
+        self.active_window_mut().new_tab_menu =
+            Some(crate::app::types::NewTabMenu::new(pane, col, row + 1));
+    }
+
     /// Execute a "+" new-tab popup menu action.
     pub(super) fn execute_new_tab_menu_action(
         &mut self,
@@ -1090,10 +1016,8 @@ impl Editor {
     /// scrollback modes, and refocus whichever split becomes active.
     fn close_split_confirmed(&mut self, split_id: LeafId) {
         if let Err(e) = self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_manager_mut())
-            .expect("active window must have a populated split layout")
+            .active_window_mut()
+            .split_manager_mut()
             .close_split(split_id)
         {
             self.set_status_message(
@@ -1104,19 +1028,10 @@ impl Editor {
         // Drop the closed split from every terminal's scrollback set.
         self.active_window_mut()
             .forget_split_terminal_modes(split_id);
-        let new_active = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split();
+        let new_active = self.active_window().split_manager().active_split();
         if let Some(buffer_id) = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
+            .active_window()
+            .split_manager()
             .buffer_for_split(new_active)
         {
             self.set_active_buffer(buffer_id);
@@ -1129,97 +1044,107 @@ impl Editor {
         self.set_status_message(t!("split.closed").to_string());
     }
 
-    /// Vertical scrollbar drag (`PointerGrab::VScrollbar`): relative
-    /// thumb drag or track jump on the grabbed split.
+    /// Vertical scrollbar drag: relative thumb drag or track jump on the
+    /// grabbed split. Reached from `UiFact::PaneScrollbarDrag` — the bar
+    /// captured the pointer on its press, so the move is its own.
     pub(crate) fn handle_vscrollbar_drag(&mut self, col: u16, row: u16) -> AnyhowResult<()> {
-        if let Some(dragging_split_id) = self.active_window_mut().mouse_state.dragging_scrollbar {
-            // Snapshot split_areas so we don't borrow `self.active_layout()` and
-            // `self.active_window_mut()` simultaneously below.
-            let split_areas = self.active_layout().split_areas.clone();
-            for (split_id, buffer_id, _content_rect, scrollbar_rect, _thumb_start, _thumb_end) in
-                &split_areas
-            {
-                if *split_id == dragging_split_id {
-                    // Check if we started dragging from the thumb (have drag_start_row)
-                    if self.active_window().mouse_state.drag_start_row.is_some() {
-                        // Relative drag from thumb
-                        self.active_window_mut().handle_scrollbar_drag_relative(
-                            row,
-                            *split_id,
-                            *buffer_id,
-                            *scrollbar_rect,
-                        )?;
-                    } else {
-                        // Jump drag (started from track)
-                        self.active_window_mut().handle_scrollbar_jump(
-                            col,
-                            row,
-                            *split_id,
-                            *buffer_id,
-                            *scrollbar_rect,
-                        )?;
-                    }
-                    return Ok(());
+        if let Some(PointerDrag::VerticalScrollbar {
+            pane: dragging_split_id,
+            grab,
+        }) = self.active_window().mouse_state.drag
+        {
+            // The bar is where the tree put it, and the buffer is the one the
+            // pane is showing — neither is a fact about the last paint. The
+            // scan this replaces read both out of `split_areas`, one entry of
+            // which is the pane being dragged.
+            let bar = self.pane_vscroll_rect(dragging_split_id);
+            let buffer = self
+                .windows
+                .get(&self.active_window)
+                .and_then(|w| w.pane_buffer(dragging_split_id));
+            if let (Some(bar), Some(buffer_id)) = (bar, buffer) {
+                // A drag that started on the thumb moves relative to where it
+                // was grabbed; one that started on the track jumps.
+                match grab {
+                    Some(grab) => self.active_window_mut().handle_scrollbar_drag_relative(
+                        row,
+                        grab,
+                        dragging_split_id,
+                        buffer_id,
+                        bar,
+                    )?,
+                    None => self.active_window_mut().handle_scrollbar_jump(
+                        col,
+                        row,
+                        dragging_split_id,
+                        buffer_id,
+                        bar,
+                    )?,
                 }
             }
         }
         Ok(())
     }
 
-    /// Horizontal scrollbar drag (`PointerGrab::HScrollbar`): relative
-    /// thumb drag or track jump on the grabbed split.
+    /// Horizontal scrollbar drag: relative thumb drag or track jump on the
+    /// grabbed split. Reached from `UiFact::PaneScrollbarDrag`, as above.
     pub(crate) fn handle_hscrollbar_drag(&mut self, col: u16, _row: u16) -> AnyhowResult<()> {
-        if let Some(dragging_split_id) = self
-            .active_window_mut()
-            .mouse_state
-            .dragging_horizontal_scrollbar
+        if let Some(PointerDrag::HorizontalScrollbar {
+            pane: dragging_split_id,
+            grab,
+        }) = self.active_window().mouse_state.drag
         {
-            // Clone the scrollbar layout so the loop doesn't hold an
-            // immutable borrow on `self` while it mutates
-            // `self.split_view_states`. The active window's layout cache
-            // is repopulated each frame, so a one-frame snapshot is fine.
-            let hscrollbar_areas = self.active_layout().horizontal_scrollbar_areas.clone();
-            for (
-                split_id,
-                _buffer_id,
-                hscrollbar_rect,
-                max_content_width,
-                thumb_start,
-                thumb_end,
-            ) in &hscrollbar_areas
+            // The bar is the tree's, and the thumb and the content width are
+            // the bar's own facts — read before the view state is borrowed
+            // to move.
+            let Some(bar) = self.pane_hscroll_rect(dragging_split_id) else {
+                return Ok(());
+            };
+            let Some((max_content_width, visible_width)) = self.hbar_extent(dragging_split_id)
+            else {
+                return Ok(());
+            };
+            let Some((thumb_start, thumb_end, _)) =
+                self.bar_thumb(dragging_split_id, fresh_ui::Axis::Horizontal)
+            else {
+                return Ok(());
+            };
             {
-                if *split_id == dragging_split_id {
+                {
+                    let hscrollbar_rect = &bar;
                     let track_width = hscrollbar_rect.width as f64;
                     if track_width <= 1.0 {
-                        break;
+                        return Ok(());
                     }
 
-                    if let (Some(drag_start_hcol), Some(drag_start_left_column)) = (
-                        self.active_window_mut().mouse_state.drag_start_hcol,
-                        self.active_window_mut().mouse_state.drag_start_left_column,
-                    ) {
+                    if let Some(crate::app::types::HorizontalGrab {
+                        col: drag_start_hcol,
+                        left_column: drag_start_left_column,
+                    }) = grab
+                    {
                         // Relative drag from thumb - move proportionally to mouse offset
                         // Use thumb size to compute the correct ratio so thumb tracks with mouse
                         let col_offset = (col as i32) - (drag_start_hcol as i32);
                         if let Some(view_state) = self
-                            .windows
-                            .get_mut(&self.active_window)
-                            .and_then(|w| w.split_view_states_mut())
-                            .expect("active window must have a populated split layout")
+                            .active_window_mut()
+                            .split_view_states_mut()
                             .get_mut(&dragging_split_id)
                         {
-                            let visible_width = view_state.viewport.width as usize;
                             let max_scroll = max_content_width.saturating_sub(visible_width);
                             if max_scroll > 0 {
-                                let thumb_size = thumb_end.saturating_sub(*thumb_start).max(1);
+                                let thumb_size = thumb_end.saturating_sub(thumb_start).max(1);
                                 let track_travel = (track_width - thumb_size as f64).max(1.0);
                                 let scroll_per_pixel = max_scroll as f64 / track_travel;
                                 let scroll_offset =
                                     (col_offset as f64 * scroll_per_pixel).round() as i64;
                                 let new_left =
                                     (drag_start_left_column as i64 + scroll_offset).max(0) as usize;
-                                view_state.viewport.left_column = new_left.min(max_scroll);
-                                view_state.viewport.set_skip_ensure_visible();
+                                view_state.buffer_tab_state_mut().viewport.left_column =
+                                    new_left.min(max_scroll);
+                                view_state
+                                    .buffer_tab_state_mut()
+                                    .viewport
+                                    .set_skip_ensure_visible();
                             }
                         }
                     } else {
@@ -1228,17 +1153,18 @@ impl Editor {
                         let ratio = (relative_col / (track_width - 1.0)).clamp(0.0, 1.0);
 
                         if let Some(view_state) = self
-                            .windows
-                            .get_mut(&self.active_window)
-                            .and_then(|w| w.split_view_states_mut())
-                            .expect("active window must have a populated split layout")
+                            .active_window_mut()
+                            .split_view_states_mut()
                             .get_mut(&dragging_split_id)
                         {
-                            let visible_width = view_state.viewport.width as usize;
                             let max_scroll = max_content_width.saturating_sub(visible_width);
                             let target_col = (ratio * max_scroll as f64).round() as usize;
-                            view_state.viewport.left_column = target_col.min(max_scroll);
-                            view_state.viewport.set_skip_ensure_visible();
+                            view_state.buffer_tab_state_mut().viewport.left_column =
+                                target_col.min(max_scroll);
+                            view_state
+                                .buffer_tab_state_mut()
+                                .viewport
+                                .set_skip_ensure_visible();
                         }
                     }
 
@@ -1250,64 +1176,68 @@ impl Editor {
     }
 
     /// Handle text selection drag - extends selection from anchor to current position
-    pub(crate) fn handle_text_selection_drag(&mut self, col: u16, row: u16) -> AnyhowResult<()> {
+    pub(crate) fn handle_text_selection_drag(
+        &mut self,
+        drag: SelectionDrag,
+        col: u16,
+        row: u16,
+    ) -> AnyhowResult<()> {
         use crate::model::event::Event;
         use crate::primitives::word_navigation::{find_word_end, find_word_start};
 
-        let Some(split_id) = self.active_window_mut().mouse_state.drag_selection_split else {
-            return Ok(());
-        };
-        let Some(anchor_position) = self.active_window_mut().mouse_state.drag_selection_anchor
-        else {
+        let split_id = drag.pane;
+        let Some(anchor_position) = drag.anchor else {
             return Ok(());
         };
 
-        // Find the buffer and content rect for this split in one pass
-        let Some((buffer_id, content_rect)) = self
-            .active_layout()
-            .split_areas
-            .iter()
-            .find(|(sid, _, _, _, _, _)| *sid == split_id)
-            .map(|(_, bid, rect, _, _, _)| (*bid, *rect))
+        // Where the pane is, and which buffer it shows. The scan this replaces
+        // read both from the painter's record of the last frame.
+        let Some(content_rect) = self.pane_content_rect(split_id) else {
+            return Ok(());
+        };
+        let Some(buffer_id) = self
+            .windows
+            .get(&self.active_window)
+            .and_then(|w| w.pane_buffer(split_id))
         else {
             return Ok(());
         };
-
-        // Get cached view line mappings for this split
-        let cached_mappings = self
-            .active_layout()
-            .view_line_mappings
-            .get(&split_id)
-            .cloned();
 
         let leaf_id = split_id;
 
+        // A text row on the screen's own edge — the menu, tab or status bar
+        // hidden — has nothing past it for the pointer to reach, so it is
+        // where a drag past that edge happens: it counts as one row beyond
+        // the text area (#3006) rather than as a row inside it, where the
+        // view holds still (#3329).
+        let edge_rows: isize = if row == 0 && row == content_rect.y {
+            -1
+        } else if row == self.terminal_height.saturating_sub(1)
+            && row == content_rect.bottom().saturating_sub(1)
+        {
+            1
+        } else {
+            0
+        };
+
         // Get fallback from SplitViewState viewport
         let fallback = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
+            .active_window()
+            .split_view_states()
             .get(&leaf_id)
-            .map(|vs| vs.viewport.top_byte())
+            .map(|vs| vs.buffer_tab_state().viewport.top_byte())
             .unwrap_or(0);
 
         // Get compose width for this split
         let compose_width = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
+            .active_window()
+            .split_view_states()
             .get(&leaf_id)
-            .and_then(|vs| vs.compose_width);
+            .and_then(|vs| vs.buffer_tab_state().compose_width);
 
         // Calculate the target position and selection geometry by
         // reading buffer state directly, then dispatch the move via
         // Window helpers.
-        let drag_by_words = self.active_window_mut().mouse_state.drag_selection_by_words;
-        let drag_word_end = self.active_window_mut().mouse_state.drag_selection_word_end;
 
         // Terminal scrollback views are unwrapped and gutter-free, so a
         // screen cell maps to a byte exactly (viewport top line + row).
@@ -1326,6 +1256,12 @@ impl Editor {
             None
         };
 
+        // The rows the pane's last text pass drew, as its leaf keeps them —
+        // borrowed for the resolve below, never copied: a drag samples this
+        // on every motion report.
+        let view = self.active_window().pane_view(split_id);
+        let cached_mappings: Option<&[crate::app::types::ViewLineMapping]> =
+            view.as_deref().map(|v| &v.rows[..]);
         let Some((target_position, new_position, anchor_position, new_sticky_column)) = self
             .active_window()
             .buffers
@@ -1341,7 +1277,7 @@ impl Editor {
                                 row,
                                 content_rect,
                                 gutter_width,
-                                &cached_mappings,
+                                cached_mappings,
                                 fallback,
                                 true, // Allow gutter clicks for drag selection
                                 compose_width,
@@ -1357,8 +1293,9 @@ impl Editor {
                         // effect of the scroll-off margin, so a configured
                         // `scroll_offset = 0` means dragging past the edge
                         // does nothing at all.
-                        let rows_past_edge =
-                            target.row_overshoot as isize - target.row_undershoot as isize;
+                        let rows_past_edge = target.row_overshoot as isize
+                            - target.row_undershoot as isize
+                            + edge_rows;
                         crate::app::click_geometry::position_offset_by_lines(
                             &state.buffer,
                             target.position,
@@ -1366,18 +1303,16 @@ impl Editor {
                         )
                     }
                 };
-                let (new_position, anchor_pos) = if drag_by_words {
-                    if target_position >= anchor_position {
-                        (
-                            find_word_end(&state.buffer, target_position),
-                            anchor_position,
-                        )
-                    } else {
-                        let word_end = drag_word_end.unwrap_or(anchor_position);
-                        (find_word_start(&state.buffer, target_position), word_end)
-                    }
-                } else {
-                    (target_position, anchor_position)
+                // After a double click the drag extends by whole words, and
+                // going backwards it keeps the clicked word by anchoring at
+                // its end.
+                let (new_position, anchor_pos) = match drag.word_end {
+                    Some(_) if target_position >= anchor_position => (
+                        find_word_end(&state.buffer, target_position),
+                        anchor_position,
+                    ),
+                    Some(word_end) => (find_word_start(&state.buffer, target_position), word_end),
+                    None => (target_position, anchor_position),
                 };
                 // Visual column, not byte column — see `visual_column_of`.
                 let new_sticky_column =
@@ -1387,6 +1322,7 @@ impl Editor {
         else {
             return Ok(());
         };
+        drop(view);
         let _ = target_position;
 
         let (primary_cursor_id, old_position, old_anchor, old_sticky_column) = self
@@ -1395,9 +1331,9 @@ impl Editor {
             .splits()
             .and_then(|(_, vs)| vs.get(&leaf_id))
             .map(|vs| {
-                let cursor = vs.cursors.primary();
+                let cursor = vs.buffer_tab_state().cursors.primary();
                 (
-                    vs.cursors.primary_id(),
+                    vs.buffer_tab_state().cursors.primary_id(),
                     cursor.position,
                     cursor.anchor,
                     cursor.sticky_column,
@@ -1418,20 +1354,46 @@ impl Editor {
         if let Some(event_log) = self.active_window_mut().event_logs.get_mut(&buffer_id) {
             event_log.append(event.clone());
         }
-        // A drag is cursor motion, so it owns vertical placement from here on
-        // — exactly like a key press, which clears this same flag in
-        // `handle_key`. A wheel or scrollbar scroll sets `skip_ensure_visible`
-        // so the render pass won't yank the viewport back to the cursor, and
-        // nothing on the mouse path used to clear it again: after any scroll
-        // by wheel or scrollbar, a drag-select moved the selection head but
-        // the viewport stayed frozen, in *both* directions (issue #3006).
+        // Above or below the text rows, a drag is cursor motion that owns
+        // vertical placement — exactly like a key press, which clears this
+        // same flag in `handle_key`. A wheel or scrollbar scroll sets
+        // `skip_ensure_visible` so the render pass won't yank the viewport
+        // back to the cursor, and nothing on the mouse path used to clear it
+        // again: after any scroll by wheel or scrollbar, a drag-select moved
+        // the selection head but the viewport stayed frozen, in *both*
+        // directions (issue #3006).
+        //
+        // Level with the text rows the head is on the pointer's row, which is
+        // on screen by construction, so the rows must stay put — whether the
+        // pointer is over the text or has left the pane sideways. Letting
+        // ensure-visible place them applied the scroll-off margin to the
+        // head: a drag within `scroll_offset` rows of an edge scrolled the
+        // view, the next motion at the same screen row then named a line
+        // further along, and the selection ran away from the pointer —
+        // backwards from the anchor on a drag along the top rows (issue
+        // #3329). The columns still follow the head: with no wrap its cell
+        // can be the gutter's (the line's first visible column) or the last
+        // one, and scrolling sideways from there is how a drag reaches the
+        // rest of a long line.
+        let pointer_level_with_text =
+            (content_rect.y..content_rect.bottom()).contains(&row) && edge_rows == 0;
         if let Some(view_state) = self
             .windows
             .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
+            .and_then(|w| w.buffers.split_view_states_mut())
             .and_then(|states| states.get_mut(&leaf_id))
         {
-            view_state.viewport.clear_skip_ensure_visible();
+            if pointer_level_with_text {
+                view_state
+                    .buffer_tab_state_mut()
+                    .viewport
+                    .hold_rows_while_head_at(new_position);
+            } else {
+                view_state
+                    .buffer_tab_state_mut()
+                    .viewport
+                    .clear_skip_ensure_visible();
+            }
         }
         self.active_window_mut()
             .apply_event_to_buffer(buffer_id, leaf_id, &event);
@@ -1444,17 +1406,15 @@ impl Editor {
         &mut self,
         col: u16,
         row: u16,
-        split_id: crate::model::event::ContainerId,
-        direction: crate::model::event::SplitDirection,
+        drag: crate::app::types::SeparatorDrag,
     ) -> AnyhowResult<()> {
-        let Some((start_col, start_row)) = self.active_window_mut().mouse_state.drag_start_position
-        else {
-            return Ok(());
-        };
-        let Some(start_ratio) = self.active_window_mut().mouse_state.drag_start_ratio else {
-            return Ok(());
-        };
-        let Some(editor_area) = self.active_layout().editor_content_area else {
+        let crate::app::types::SeparatorDrag {
+            container: split_id,
+            direction,
+            press: (start_col, start_row),
+            start_ratio,
+        } = drag;
+        let Some(editor_area) = self.body_area() else {
             return Ok(());
         };
 
@@ -1488,23 +1448,32 @@ impl Editor {
             // split tree or inside a stashed Grouped subtree (buffer group
             // panels like the theme editor); try the main tree first and
             // fall back to the grouped subtrees.
-            if self
-                .windows
-                .get(&self.active_window)
-                .and_then(|w| w.buffers.splits())
-                .map(|(mgr, _)| mgr)
-                .expect("active window must have a populated split layout")
-                .get_ratio(split_id.into())
-                .is_some()
-            {
+            let main_ratio = self
+                .active_window()
+                .split_manager()
+                .get_ratio(split_id.into());
+            // **A ratio that did not move does not reflow.** The grip holds
+            // the pointer capture for the whole drag, so its `Move` fires for
+            // every motion report — including the ones that travel *along*
+            // the divider rather than across it, where `delta` is unchanged
+            // and this recomputes the ratio it already has. `relayout` is a
+            // full geometry pass (every window's panes placed, every visible
+            // PTY resized) and it was being paid for each of those.
+            let current = main_ratio.or_else(|| {
+                self.windows
+                    .get(&self.active_window)
+                    .and_then(|w| w.grouped_split_ratio(split_id))
+            });
+            if current == Some(new_ratio) {
+                return Ok(());
+            }
+            if main_ratio.is_some() {
                 // Guarded by the `get_ratio(..).is_some()` check above, so
                 // this id resolves to a resizable Split; the bool result is
                 // not actionable here (the drag can only target a container).
                 let _resized = self
-                    .windows
-                    .get_mut(&self.active_window)
-                    .and_then(|w| w.split_manager_mut())
-                    .expect("active window must have a populated split layout")
+                    .active_window_mut()
+                    .split_manager_mut()
                     .set_ratio(split_id, new_ratio);
             } else {
                 self.set_grouped_split_ratio(split_id, new_ratio);

@@ -1,64 +1,64 @@
 === focus in the new-task field
  File  Go ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
 Filter      │new task…▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪ Add
-(o) All░░░░░│»[x] write the spec░░░░░░░░░░░░░░░░░░░░░░░░
-( ) Open    │»[x] build the reconciler
-( ) Done    │»[ ] lay it out
-            │»[ ] route the pointer
-            │»[ ] wire up focus
+(o) All░░░░░│ ribbon: click the text, it falls through ·
+( ) Open    │»[x] build the reconciler                #2
+( ) Done    │»[ ] lay it out                          #3
+┌──────────┐│»[ ] route the pointer                   #4
+│clip-test ││»[ ] wire up focus                       #5
+└──────────┘│
             │
             │
             │
             │
-            │
-            │
+ alpha · visit 1
 5 tasks · light · synced 0 · ready
 
 === typed
  File  Go ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
 Filter      │ship it▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪ Add
-(o) All░░░░░│»[x] write the spec░░░░░░░░░░░░░░░░░░░░░░░░
-( ) Open    │»[x] build the reconciler
-( ) Done    │»[ ] lay it out
-            │»[ ] route the pointer
-            │»[ ] wire up focus
+(o) All░░░░░│ ribbon: click the text, it falls through ·
+( ) Open    │»[x] build the reconciler                #2
+( ) Done    │»[ ] lay it out                          #3
+┌──────────┐│»[ ] route the pointer                   #4
+│clip-test ││»[ ] wire up focus                       #5
+└──────────┘│
             │
             │
             │
             │
-            │
-            │
+ alpha · visit 1
 5 tasks · light · synced 0 · ready
 
 === submitted
  File  Go ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
 Filter      │new task…▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪ Add
-(o) All░░░░░│»[x] write the spec░░░░░░░░░░░░░░░░░░░░░░░░
-( ) Open    │»[x] build the reconciler
-( ) Done    │»[ ] lay it out
-            │»[ ] route the pointer
-            │»[ ] wire up focus
-            │»[ ] ship it
+(o) All░░░░░│ ribbon: click the text, it falls through ·
+( ) Open    │»[x] build the reconciler                #2
+( ) Done    │»[ ] lay it out                          #3
+┌──────────┐│»[ ] route the pointer                   #4
+│clip-test ││»[ ] wire up focus                       #5
+└──────────┘│»[ ] ship it                             #6
             │
             │
             │
             │
-            │
+ alpha · visit 1
 6 tasks · light · synced 0 · added #6
 
 === the field is empty, so backspace does nothing
  File  Go ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
 Filter      │new task…▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪ Add
-(o) All░░░░░│»[x] write the spec░░░░░░░░░░░░░░░░░░░░░░░░
-( ) Open    │»[x] build the reconciler
-( ) Done    │»[ ] lay it out
-            │»[ ] route the pointer
-            │»[ ] wire up focus
-            │»[ ] ship it
+(o) All░░░░░│ ribbon: click the text, it falls through ·
+( ) Open    │»[x] build the reconciler                #2
+( ) Done    │»[ ] lay it out                          #3
+┌──────────┐│»[ ] route the pointer                   #4
+│clip-test ││»[ ] wire up focus                       #5
+└──────────┘│»[ ] ship it                             #6
             │
             │
             │
             │
-            │
+ alpha · visit 1
 6 tasks · light · synced 0 · added #6
 

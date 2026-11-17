@@ -46,21 +46,6 @@ impl LineIndicator {
             marker_id: MarkerId(0), // Placeholder, set by MarginManager
         }
     }
-
-    /// Create a line indicator with a specific marker ID
-    pub fn with_marker(
-        symbol: impl Into<String>,
-        color: Color,
-        priority: i32,
-        marker_id: MarkerId,
-    ) -> Self {
-        Self {
-            symbol: symbol.into(),
-            color,
-            priority,
-            marker_id,
-        }
-    }
 }
 
 /// Content type for a margin at a specific line
@@ -128,6 +113,26 @@ impl MarginContent {
     }
 }
 
+/// The left margin's separator: the line, with a space before it (for the
+/// indicators) and one after it (for readability).
+pub const GUTTER_SEPARATOR: &str = " │ ";
+
+/// What separates the line numbers from the text when the theme draws no
+/// line there (`chrome.gutter_separator: false`): one cell of the gutter's
+/// own ground.
+pub const GUTTER_PAD: &str = " ";
+
+/// The separator's width in cells, drawn or not. One statement, read by the
+/// margin and by [`crate::view::viewport::gutter_width`], so the wrap and
+/// scroll math measure the gutter the renderer paints.
+pub fn gutter_separator_cols(drawn: bool) -> usize {
+    if drawn {
+        GUTTER_SEPARATOR.chars().count()
+    } else {
+        GUTTER_PAD.chars().count()
+    }
+}
+
 /// Configuration for a margin
 #[derive(Debug, Clone, PartialEq)]
 pub struct MarginConfig {
@@ -162,7 +167,7 @@ impl MarginConfig {
             width: MIN_LINE_NUMBER_DIGITS,
             enabled: true,
             show_separator: true,
-            separator: " │ ".to_string(), // Separator with spaces: " │ " (space before for indicators, space after for readability)
+            separator: GUTTER_SEPARATOR.to_string(),
             style: Style::default().fg(Color::DarkGray),
             separator_style: Style::default().fg(Color::DarkGray),
         }
@@ -249,15 +254,6 @@ impl MarginAnnotation {
         )
     }
 
-    /// Helper: Create a breakpoint indicator
-    pub fn breakpoint(line: usize) -> Self {
-        Self::new(
-            line,
-            MarginPosition::Left,
-            MarginContent::colored_symbol("●", Color::Red),
-        )
-    }
-
     /// Helper: Create an error indicator
     pub fn error(line: usize) -> Self {
         Self::new(
@@ -329,14 +325,6 @@ impl MarginManager {
         }
     }
 
-    /// Create a margin manager with line numbers disabled
-    pub fn without_line_numbers() -> Self {
-        let mut manager = Self::new();
-        manager.left_config.width = 0;
-        manager.left_config.enabled = false;
-        manager
-    }
-
     // =========================================================================
     // Edit Propagation - called when buffer content changes
     // =========================================================================
@@ -383,17 +371,6 @@ impl MarginManager {
         marker_id
     }
 
-    /// Remove line indicator for a specific namespace at a marker
-    pub fn remove_line_indicator(&mut self, marker_id: MarkerId, namespace: &str) {
-        if let Some(indicators) = self.line_indicators.get_mut(&marker_id.0) {
-            indicators.remove(namespace);
-            if indicators.is_empty() {
-                self.line_indicators.remove(&marker_id.0);
-                self.indicator_markers.delete(marker_id);
-            }
-        }
-    }
-
     /// Clear all line indicators for a specific namespace
     pub fn clear_line_indicators_for_namespace(&mut self, namespace: &str) {
         // Collect marker IDs to delete (can't modify while iterating)
@@ -411,38 +388,6 @@ impl MarginManager {
             self.line_indicators.remove(&marker_id);
             self.indicator_markers.delete(MarkerId(marker_id));
         }
-    }
-
-    /// Get the line indicator for a specific line number
-    ///
-    /// This looks up all indicators whose markers resolve to the given line.
-    /// Returns the highest priority indicator if multiple exist on the same line.
-    ///
-    /// Note: This is O(n) in the number of indicators. For rendering, prefer
-    /// `get_indicators_in_viewport` which is more efficient.
-    pub fn get_line_indicator(
-        &self,
-        line: usize,
-        get_line_fn: impl Fn(usize) -> usize,
-    ) -> Option<&LineIndicator> {
-        // Find all indicators on this line
-        let mut best: Option<&LineIndicator> = None;
-
-        for (&marker_id, indicators) in &self.line_indicators {
-            if let Some(byte_pos) = self.indicator_markers.get_position(MarkerId(marker_id)) {
-                let indicator_line = get_line_fn(byte_pos);
-                if indicator_line == line {
-                    // Found an indicator on this line, check if it's higher priority
-                    for indicator in indicators.values() {
-                        if best.is_none() || indicator.priority > best.unwrap().priority {
-                            best = Some(indicator);
-                        }
-                    }
-                }
-            }
-        }
-
-        best
     }
 
     /// Get indicators within a viewport byte range
@@ -578,19 +523,6 @@ impl MarginManager {
         self.right_annotations.clear();
     }
 
-    /// Get all annotations at a specific line
-    pub fn get_at_line(
-        &self,
-        line: usize,
-        position: MarginPosition,
-    ) -> Option<&[MarginAnnotation]> {
-        let annotations = match position {
-            MarginPosition::Left => &self.left_annotations,
-            MarginPosition::Right => &self.right_annotations,
-        };
-        annotations.get(&line).map(|v| v.as_slice())
-    }
-
     /// Get the content to render for a specific line in a margin.
     /// If `show_line_numbers` is true and position is Left, includes line number.
     pub fn render_line(
@@ -630,14 +562,45 @@ impl MarginManager {
     /// Update the left margin width based on buffer size.
     /// Only adjusts width when `show_line_numbers` is true.
     pub fn update_width_for_buffer(&mut self, buffer_total_lines: usize, show_line_numbers: bool) {
-        if show_line_numbers {
-            let digits = if buffer_total_lines == 0 {
-                1
-            } else {
-                ((buffer_total_lines as f64).log10().floor() as usize) + 1
-            };
-            self.left_config.width = digits.max(MIN_LINE_NUMBER_DIGITS);
+        update_left_width_for_buffer(&mut self.left_config, buffer_total_lines, show_line_numbers);
+    }
+
+    /// What [`Self::configure_for_line_numbers`] followed by
+    /// [`Self::update_width_for_buffer`] would leave `left_config` as —
+    /// computed without writing it.
+    ///
+    /// The margin state is per *buffer* while line-number visibility is per
+    /// *split*, so two panes showing one buffer can want two gutters in the
+    /// same frame. The render path resolves each pane's gutter from this and
+    /// reads only the value; the pre-frame reconcile writes it back so the
+    /// readers between frames (mouse mapping, `left_total_width`) see the
+    /// last pane's, as they always did.
+    pub fn resolved_left_config(
+        &self,
+        show_line_numbers: bool,
+        buffer_total_lines: usize,
+    ) -> MarginConfig {
+        let mut cfg = self.left_config.clone();
+        configure_left_for_line_numbers(&mut cfg, show_line_numbers);
+        update_left_width_for_buffer(&mut cfg, buffer_total_lines, show_line_numbers);
+        cfg
+    }
+
+    /// Whether the left margin draws its separator line, as the theme's
+    /// `chrome.gutter_separator` says. Settled before each frame with the
+    /// rest of the pane's gutter, so the width every reader measures — the
+    /// render, the cursor, mouse mapping — is the one painted.
+    pub fn set_gutter_separator(&mut self, drawn: bool) {
+        let separator = if drawn { GUTTER_SEPARATOR } else { GUTTER_PAD };
+        if self.left_config.separator != separator {
+            self.left_config.separator = separator.to_string();
         }
+    }
+
+    /// Whether the left margin draws its separator line (the last
+    /// [`Self::set_gutter_separator`]).
+    pub fn gutter_separator_drawn(&self) -> bool {
+        self.left_config.separator == GUTTER_SEPARATOR
     }
 
     /// Get the total width of the left margin (including separator)
@@ -646,43 +609,52 @@ impl MarginManager {
         self.left_config.total_width()
     }
 
-    /// Get the total width of the right margin (including separator)
-    pub fn right_total_width(&self) -> usize {
-        self.right_config.total_width()
-    }
-
     /// Configure left margin layout for line number visibility.
     ///
     /// This adjusts `left_config.enabled` and `left_config.width` so that
     /// `left_total_width()` returns the correct gutter size for the given
-    /// `show_line_numbers` setting. Called at render time with the per-split
-    /// line number state.
+    /// `show_line_numbers` setting. Called with the per-split line number
+    /// state — by the pre-frame reconcile on the render path, and by the
+    /// appliers that flip the setting between frames.
     pub fn configure_for_line_numbers(&mut self, show_line_numbers: bool) {
-        if !show_line_numbers {
-            // Hide the line-number digits and the separator, but keep the gutter
-            // enabled with a zero-width number column so the 1-char indicator
-            // slot survives. This lets diagnostic / git / fold indicators still
-            // render in compose mode (issue #2146) without showing line numbers
-            // or the `│` separator. The render layer draws this slot in the
-            // compose desk margin so it doesn't shrink the text width.
-            self.left_config.width = 0;
-            self.left_config.enabled = true;
-            self.left_config.show_separator = false;
-        } else {
-            self.left_config.enabled = true;
-            self.left_config.show_separator = true;
-            if self.left_config.width == 0 {
-                self.left_config.width = MIN_LINE_NUMBER_DIGITS;
-            }
+        configure_left_for_line_numbers(&mut self.left_config, show_line_numbers);
+    }
+}
+
+/// Body of [`MarginManager::configure_for_line_numbers`], on a config value.
+fn configure_left_for_line_numbers(cfg: &mut MarginConfig, show_line_numbers: bool) {
+    if !show_line_numbers {
+        // Hide the line-number digits and the separator, but keep the gutter
+        // enabled with a zero-width number column so the 1-char indicator
+        // slot survives. This lets diagnostic / git / fold indicators still
+        // render in compose mode (issue #2146) without showing line numbers
+        // or the `│` separator. The render layer draws this slot in the
+        // compose desk margin so it doesn't shrink the text width.
+        cfg.width = 0;
+        cfg.enabled = true;
+        cfg.show_separator = false;
+    } else {
+        cfg.enabled = true;
+        cfg.show_separator = true;
+        if cfg.width == 0 {
+            cfg.width = MIN_LINE_NUMBER_DIGITS;
         }
     }
+}
 
-    /// Get the number of annotations in a position
-    pub fn annotation_count(&self, position: MarginPosition) -> usize {
-        match position {
-            MarginPosition::Left => self.left_annotations.values().map(|v| v.len()).sum(),
-            MarginPosition::Right => self.right_annotations.values().map(|v| v.len()).sum(),
-        }
+/// Body of [`MarginManager::update_width_for_buffer`], on a config value.
+fn update_left_width_for_buffer(
+    cfg: &mut MarginConfig,
+    buffer_total_lines: usize,
+    show_line_numbers: bool,
+) {
+    if show_line_numbers {
+        let digits = if buffer_total_lines == 0 {
+            1
+        } else {
+            ((buffer_total_lines as f64).log10().floor() as usize) + 1
+        };
+        cfg.width = digits.max(MIN_LINE_NUMBER_DIGITS);
     }
 }
 
@@ -732,9 +704,16 @@ mod tests {
         assert_eq!(line_num.line, 5);
         assert_eq!(line_num.position, MarginPosition::Left);
 
-        let breakpoint = MarginAnnotation::breakpoint(10);
-        assert_eq!(breakpoint.line, 10);
-        assert_eq!(breakpoint.position, MarginPosition::Left);
+        let error = MarginAnnotation::error(10);
+        assert_eq!(error.line, 10);
+        assert_eq!(error.position, MarginPosition::Left);
+    }
+
+    /// What the gutter paints for `line` on `position` with line numbers
+    /// off — the render path's own read, trimmed of its padding.
+    fn rendered(manager: &MarginManager, line: usize, position: MarginPosition) -> String {
+        let (text, _) = manager.render_line(line, position, 100, false).render(8);
+        text.trim().to_string()
     }
 
     #[test]
@@ -742,10 +721,8 @@ mod tests {
         let mut manager = MarginManager::new();
 
         // Add annotation
-        let annotation = MarginAnnotation::line_number(5);
-        manager.add_annotation(annotation);
-
-        assert_eq!(manager.annotation_count(MarginPosition::Left), 1);
+        manager.add_annotation(MarginAnnotation::line_number(5));
+        assert_eq!(rendered(&manager, 5, MarginPosition::Left), "6");
 
         // Add annotation with ID
         let annotation = MarginAnnotation::with_id(
@@ -755,16 +732,16 @@ mod tests {
             "test-id".to_string(),
         );
         manager.add_annotation(annotation);
+        assert_eq!(rendered(&manager, 10, MarginPosition::Left), "test");
 
-        assert_eq!(manager.annotation_count(MarginPosition::Left), 2);
-
-        // Remove by ID
+        // Remove by ID: only the annotation carrying it goes
         manager.remove_by_id("test-id");
-        assert_eq!(manager.annotation_count(MarginPosition::Left), 1);
+        assert_eq!(rendered(&manager, 10, MarginPosition::Left), "");
+        assert_eq!(rendered(&manager, 5, MarginPosition::Left), "6");
 
         // Clear all
         manager.clear_all();
-        assert_eq!(manager.annotation_count(MarginPosition::Left), 0);
+        assert_eq!(rendered(&manager, 5, MarginPosition::Left), "");
     }
 
     #[test]
@@ -776,8 +753,8 @@ mod tests {
         let (rendered, _) = content.render(4);
         assert!(rendered.contains("6")); // Line 5 is displayed as "6" (1-indexed)
 
-        // Add a breakpoint annotation
-        manager.add_annotation(MarginAnnotation::breakpoint(5));
+        // Add an error annotation
+        manager.add_annotation(MarginAnnotation::error(5));
 
         // Should now render stacked content (line number + breakpoint)
         let content = manager.render_line(5, MarginPosition::Left, 100, true);
@@ -836,8 +813,10 @@ mod tests {
 
     #[test]
     fn test_margin_manager_without_line_numbers() {
-        let manager = MarginManager::without_line_numbers();
-        assert!(!manager.left_config.enabled);
+        let mut manager = MarginManager::new();
+        manager.configure_for_line_numbers(false);
+        // The digits and separator go; the one-cell indicator slot stays.
+        assert_eq!(manager.left_total_width(), 1);
 
         let content = manager.render_line(5, MarginPosition::Left, 100, false);
         assert!(content.is_empty());
@@ -859,12 +838,12 @@ mod tests {
             MarginContent::text("right"),
         ));
 
-        assert_eq!(manager.annotation_count(MarginPosition::Left), 1);
-        assert_eq!(manager.annotation_count(MarginPosition::Right), 1);
+        assert_eq!(rendered(&manager, 1, MarginPosition::Left), "left");
+        assert_eq!(rendered(&manager, 1, MarginPosition::Right), "right");
 
         manager.clear_position(MarginPosition::Left);
-        assert_eq!(manager.annotation_count(MarginPosition::Left), 0);
-        assert_eq!(manager.annotation_count(MarginPosition::Right), 1);
+        assert_eq!(rendered(&manager, 1, MarginPosition::Left), "");
+        assert_eq!(rendered(&manager, 1, MarginPosition::Right), "right");
     }
 
     // Helper: simulates a buffer where each line is 10 bytes (9 chars + newline)
@@ -878,6 +857,14 @@ mod tests {
         line * 10
     }
 
+    // Helper: the indicator the gutter shows on `line`, read the way the
+    // render path reads it — the viewport query, here over the whole buffer.
+    fn indicator_on(manager: &MarginManager, line: usize) -> Option<LineIndicator> {
+        manager
+            .get_indicators_for_viewport(0, usize::MAX, byte_to_line)
+            .remove(&line)
+    }
+
     #[test]
     fn test_line_indicator_basic() {
         let mut manager = MarginManager::new();
@@ -887,7 +874,7 @@ mod tests {
         manager.set_line_indicator(line_to_byte(5), "git-gutter".to_string(), indicator);
 
         // Check it can be retrieved on line 5
-        let retrieved = manager.get_line_indicator(5, byte_to_line);
+        let retrieved = indicator_on(&manager, 5);
         assert!(retrieved.is_some());
         let retrieved = retrieved.unwrap();
         assert_eq!(retrieved.symbol, "│");
@@ -895,7 +882,7 @@ mod tests {
         assert_eq!(retrieved.priority, 10);
 
         // Non-existent line should return None
-        assert!(manager.get_line_indicator(10, byte_to_line).is_none());
+        assert!(indicator_on(&manager, 10).is_none());
     }
 
     #[test]
@@ -914,7 +901,7 @@ mod tests {
         );
 
         // Should return the highest priority indicator
-        let retrieved = manager.get_line_indicator(5, byte_to_line);
+        let retrieved = indicator_on(&manager, 5);
         assert!(retrieved.is_some());
         let retrieved = retrieved.unwrap();
         assert_eq!(retrieved.symbol, "●"); // Breakpoint has higher priority
@@ -946,44 +933,13 @@ mod tests {
         manager.clear_line_indicators_for_namespace("git-gutter");
 
         // Git gutter indicators should be gone
-        assert!(manager.get_line_indicator(1, byte_to_line).is_none());
-        assert!(manager.get_line_indicator(2, byte_to_line).is_none());
+        assert!(indicator_on(&manager, 1).is_none());
+        assert!(indicator_on(&manager, 2).is_none());
 
         // Breakpoint should still be there
-        let breakpoint = manager.get_line_indicator(3, byte_to_line);
+        let breakpoint = indicator_on(&manager, 3);
         assert!(breakpoint.is_some());
         assert_eq!(breakpoint.unwrap().symbol, "●");
-    }
-
-    #[test]
-    fn test_line_indicator_remove_specific() {
-        let mut manager = MarginManager::new();
-
-        // Add two indicators at the same byte position (line 5)
-        let git_marker = manager.set_line_indicator(
-            line_to_byte(5),
-            "git-gutter".to_string(),
-            LineIndicator::new("│", Color::Green, 10),
-        );
-        let bp_marker = manager.set_line_indicator(
-            line_to_byte(5),
-            "breakpoints".to_string(),
-            LineIndicator::new("●", Color::Red, 20),
-        );
-
-        // Remove just the git-gutter indicator
-        manager.remove_line_indicator(git_marker, "git-gutter");
-
-        // Should still have the breakpoint indicator on line 5
-        let retrieved = manager.get_line_indicator(5, byte_to_line);
-        assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap().symbol, "●");
-
-        // Remove the breakpoint indicator too
-        manager.remove_line_indicator(bp_marker, "breakpoints");
-
-        // Now no indicators on line 5
-        assert!(manager.get_line_indicator(5, byte_to_line).is_none());
     }
 
     #[test]
@@ -998,15 +954,15 @@ mod tests {
         );
 
         // Verify it's on line 5
-        assert!(manager.get_line_indicator(5, byte_to_line).is_some());
-        assert!(manager.get_line_indicator(6, byte_to_line).is_none());
+        assert!(indicator_on(&manager, 5).is_some());
+        assert!(indicator_on(&manager, 6).is_none());
 
         // Insert 10 bytes (one line) at the beginning
         manager.adjust_for_insert(0, 10);
 
         // Now indicator should be on line 6 (shifted down by 1)
-        assert!(manager.get_line_indicator(5, byte_to_line).is_none());
-        assert!(manager.get_line_indicator(6, byte_to_line).is_some());
+        assert!(indicator_on(&manager, 5).is_none());
+        assert!(indicator_on(&manager, 6).is_some());
     }
 
     #[test]
@@ -1021,14 +977,14 @@ mod tests {
         );
 
         // Verify it's on line 5
-        assert!(manager.get_line_indicator(5, byte_to_line).is_some());
+        assert!(indicator_on(&manager, 5).is_some());
 
         // Delete first 20 bytes (2 lines)
         manager.adjust_for_delete(0, 20);
 
         // Now indicator should be on line 3 (shifted up by 2)
-        assert!(manager.get_line_indicator(5, byte_to_line).is_none());
-        assert!(manager.get_line_indicator(3, byte_to_line).is_some());
+        assert!(indicator_on(&manager, 5).is_none());
+        assert!(indicator_on(&manager, 3).is_some());
     }
 
     #[test]
@@ -1057,11 +1013,11 @@ mod tests {
         manager.adjust_for_insert(25, 20);
 
         // Old positions should be empty
-        assert!(manager.get_line_indicator(3, byte_to_line).is_none());
+        assert!(indicator_on(&manager, 3).is_none());
 
         // New positions should have indicators
-        assert!(manager.get_line_indicator(5, byte_to_line).is_some());
-        assert!(manager.get_line_indicator(7, byte_to_line).is_some());
-        assert!(manager.get_line_indicator(9, byte_to_line).is_some());
+        assert!(indicator_on(&manager, 5).is_some());
+        assert!(indicator_on(&manager, 7).is_some());
+        assert!(indicator_on(&manager, 9).is_some());
     }
 }

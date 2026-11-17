@@ -2,7 +2,7 @@
 
 #![cfg(feature = "plugins")]
 
-use crate::common::git_test_helper::{DirGuard, GitTestRepo};
+use crate::common::git_test_helper::GitTestRepo;
 use crate::common::harness::{copy_plugin, copy_plugin_lib, EditorTestHarness};
 use crate::common::tracing::init_tracing_from_env;
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -67,8 +67,7 @@ editor.debug("Test package plugin loaded!");
     .unwrap();
 
     // Change to repo directory
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     // Create editor with the project directory
     let mut harness = EditorTestHarness::with_config_and_working_dir(
@@ -117,8 +116,7 @@ fn test_pkg_list_installed_empty() {
     copy_plugin(&plugins_dir, "pkg");
 
     // Change to repo directory
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
         100,
@@ -207,8 +205,7 @@ globalThis.sample_cmd = function() { editor.setStatus("Sample plugin works!"); }
     let packages_dir = plugins_dir.join("packages");
     fs::create_dir_all(&packages_dir).unwrap();
 
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     let mut harness = EditorTestHarness::with_config_and_working_dir(
         120,
@@ -329,8 +326,7 @@ fn test_pkg_install_plugin_empty_registry() {
         .expect("Failed to git commit in fake registry");
 
     // Change to repo directory
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     let mut harness = EditorTestHarness::with_shared_dir_context(
         100,
@@ -464,8 +460,7 @@ fn test_pkg_install_plugin_auto_syncs_stale_registry() {
     // - With auto-sync: git pull runs, shows "test-plugin"
 
     // Change to repo directory
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     let mut harness = EditorTestHarness::with_shared_dir_context(
         120,
@@ -594,8 +589,7 @@ fn test_pkg_manager_ui_split_view_and_tab_navigation() {
         .expect("Failed to git commit in fake registry");
 
     // Change to repo directory
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     let mut harness = EditorTestHarness::with_shared_dir_context(
         100,
@@ -819,8 +813,7 @@ globalThis.beta_cmd = function() { editor.setStatus("Beta plugin works!"); };
         .output()
         .expect("Failed to git commit in fake registry");
 
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     let mut harness = EditorTestHarness::with_shared_dir_context(
         120,
@@ -1173,8 +1166,7 @@ editor.debug("Bundle test plugin 2 loaded!");
     let bundles_packages_dir = dir_context.config_dir.join("bundles").join("packages");
     fs::create_dir_all(&bundles_packages_dir).unwrap();
 
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     let mut harness = EditorTestHarness::with_shared_dir_context(
         120,
@@ -1558,8 +1550,7 @@ globalThis.uninstall_test_hello = function() { editor.setStatus("Hello from unin
     )
     .unwrap();
 
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     let mut harness = EditorTestHarness::with_shared_dir_context(
         120,
@@ -1910,8 +1901,7 @@ fn test_pkg_install_from_url_upgrades_installed_package() {
     monorepo.git_add_all();
     monorepo.git_commit("alpha 1.0.0");
 
-    let original_dir = env.repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = env.repo.change_to_repo_dir();
 
     let mut harness = EditorTestHarness::with_shared_dir_context(
         120,
@@ -1999,8 +1989,7 @@ fn test_pkg_browser_update_action_reachable_and_updates() {
     monorepo.git_add_all();
     monorepo.git_commit("alpha 1.0.0");
 
-    let original_dir = env.repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = env.repo.change_to_repo_dir();
 
     let mut harness = EditorTestHarness::with_shared_dir_context(
         120,
@@ -2070,8 +2059,7 @@ fn test_pkg_browser_update_action_reachable_and_updates() {
 fn test_pkg_browser_reopens_after_close_buffer() {
     let env = setup_pkg_ui_env("{}");
 
-    let original_dir = env.repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = env.repo.change_to_repo_dir();
 
     let mut harness = EditorTestHarness::with_shared_dir_context(
         120,
@@ -2156,8 +2144,7 @@ fn test_pkg_browser_arrow_down_moves_selection_on_first_press() {
         ..Default::default()
     };
 
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     let mut harness = EditorTestHarness::with_shared_dir_context(
         120,
@@ -2203,8 +2190,7 @@ fn test_pkg_url_installed_package_appears_in_open_browser() {
     monorepo.git_add_all();
     monorepo.git_commit("gamma 1.0.0");
 
-    let original_dir = env.repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = env.repo.change_to_repo_dir();
 
     let mut harness = EditorTestHarness::with_shared_dir_context(
         120,
@@ -2244,4 +2230,97 @@ fn test_pkg_url_installed_package_appears_in_open_browser() {
         "The package should also be on disk at {:?}",
         env.packages_dir.join("plugin-gamma")
     );
+}
+
+/// A bundle's plugin must be able to use the bundle's own grammars as soon as
+/// it loads. Detection plugins (e.g. ssh-config in fresh-plugins) switch
+/// already-open buffers to the bundle's language at load time; that only
+/// works if the bundle's grammars are applied before its plugins run.
+#[test]
+#[cfg_attr(windows, ignore)] // like the other local-path install tests above
+fn test_pkg_install_bundle_plugin_sees_bundle_grammar_on_load() {
+    let env = setup_pkg_ui_env("{}");
+
+    let bundle_temp = tempfile::TempDir::new().unwrap();
+    let bundle_dir = bundle_temp.path().join("probe-bundle");
+    fs::create_dir_all(bundle_dir.join("grammars")).unwrap();
+    fs::create_dir_all(bundle_dir.join("plugins")).unwrap();
+    fs::write(
+        bundle_dir.join("grammars").join("ProbeLang.sublime-syntax"),
+        r#"%YAML 1.2
+---
+name: ProbeLang
+file_extensions: [probelang]
+scope: source.probelang
+contexts:
+  main:
+    - match: '#.*'
+      scope: comment.line
+"#,
+    )
+    .unwrap();
+    // Claims `.probe` files, which no grammar maps by extension.
+    fs::write(
+        bundle_dir.join("plugins").join("detect.ts"),
+        r#"
+const editor = getEditor();
+for (const buffer of editor.listBuffers()) {
+    if (!buffer.is_virtual && buffer.language === "text" && buffer.path.endsWith(".probe")) {
+        editor.setBufferLanguage(buffer.id, "detected.probelang");
+    }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        bundle_dir.join("package.json"),
+        r##"{
+    "name": "probe-bundle",
+    "version": "1.0.0",
+    "description": "Bundle whose plugin uses the bundle's grammar on load",
+    "type": "bundle",
+    "fresh": {
+        "languages": [
+            {
+                "id": "probelang",
+                "grammar": {
+                    "file": "grammars/ProbeLang.sublime-syntax",
+                    "extensions": ["probelang"]
+                }
+            }
+        ],
+        "plugins": [{ "entry": "plugins/detect.ts" }]
+    }
+}"##,
+    )
+    .unwrap();
+
+    let probe_file = env.repo.path.join("notes.probe");
+    fs::write(&probe_file, "# a comment\n").unwrap();
+
+    let _guard = env.repo.change_to_repo_dir();
+
+    let mut harness = EditorTestHarness::with_shared_dir_context(
+        120,
+        35,
+        Default::default(),
+        env.repo.path.clone(),
+        env.dir_context.clone(),
+    )
+    .unwrap();
+    harness.open_file(&probe_file).unwrap();
+    harness
+        .wait_until(|h| h.get_status_bar().contains("Text"))
+        .unwrap();
+
+    install_from_url(&mut harness, &bundle_dir.display().to_string());
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Installed bundle"))
+        .unwrap();
+
+    // Without the fix the plugin runs before the grammar is applied, the
+    // language switch resolves to nothing, and the buffer stays "Text".
+    harness
+        .wait_until(|h| h.get_status_bar().contains("ProbeLang"))
+        .unwrap();
 }

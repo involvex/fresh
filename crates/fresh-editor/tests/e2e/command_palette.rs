@@ -539,7 +539,7 @@ fn test_quick_open_goto_line_live_preview_buffer_edit_invalidates() {
     harness
         .apply_event(Event::Insert {
             position: 0,
-            text: "PREFIX\n".to_string(),
+            text: "PREFIX\n".to_string().into(),
             cursor_id: CursorId(999_999),
         })
         .unwrap();
@@ -1987,4 +1987,513 @@ fn test_command_palette_description_search() {
     // Should find commands whose descriptions match
     harness.assert_screen_contains("Toggle Page View");
     harness.assert_screen_contains("Set Page Width");
+}
+
+// ---------------------------------------------------------------------------
+// "The state changed and nothing asked for a repaint."
+//
+// The whole suite is blind to this class by construction: every input helper
+// on `EditorTestHarness` ends in `self.render()`, so a test can only ever
+// assert what a frame *contains*. In the real terminal nothing calls
+// `render()` for you — `main.rs` repaints only when `Editor::handle_mouse`
+// returns `true` — so a surface that mutates its own state and reports
+// `false` looks perfect here and is frozen on the user's screen.
+//
+// Three bugs of exactly that shape shipped on the retained-UI migration:
+//
+//  1. a described panel's hover changed state but no frame was requested;
+//  2. `Dispatched::changed` was `!result.msgs.is_empty()` alone, so a
+//     `widgets::List`'s own hover write — an updater that deliberately
+//     produces no message, so the host is not bothered with it — never got a
+//     frame. `changed` is now `ui.needs_frame() || !msgs.is_empty()`;
+//  3. `update_lsp_hover_state` dismissed a tooltip and returned nothing, so
+//     the dismissal was never drawn.
+//
+// The tests below use `mouse_move_reporting_render`, which does NOT render:
+// the returned bool is the assertion. The command palette's suggestion list is
+// a `fresh_ui::widgets::List` (`view::shell::prompt`), so it is bug 2's exact
+// shape — its rows keep their hover in list state, not in a `UiFact`.
+// ---------------------------------------------------------------------------
+
+/// The (col, row) of the first cell of `needle` on screen, in *character*
+/// columns — the popup is drawn inside a box-drawing frame, so a byte offset
+/// into the line is not a column.
+fn cell_of(harness: &EditorTestHarness, needle: &str) -> (u16, u16) {
+    let screen = harness.screen_to_string();
+    for (r, line) in screen.lines().enumerate() {
+        if let Some(byte) = line.find(needle) {
+            return (line[..byte].chars().count() as u16, r as u16);
+        }
+    }
+    panic!("screen missing '{needle}':\n{screen}");
+}
+
+/// Open the command palette and settle it, returning the cell of a suggestion
+/// row that is **not** the selected one.
+///
+/// Not the selected row on purpose: the selected row is already painted with
+/// its own band, so a hover that failed to repaint could hide behind it. The
+/// row under test is one whose only reason to be redrawn is the pointer.
+fn palette_with_unselected_row(harness: &mut EditorTestHarness) -> (u16, u16) {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    // "Add Cursor Above" sorts first and is therefore the selected row;
+    // "Add Cursor Below" is the row below it.
+    harness.assert_screen_contains("Add Cursor Below");
+    let cell = cell_of(harness, "Add Cursor Below");
+    // Settle: whatever the palette's own first frame queued must be flushed
+    // before the pointer is the only thing that can dirty the tree.
+    harness.render().unwrap();
+    harness.render().unwrap();
+    cell
+}
+
+/// Moving the pointer onto a suggestion row must **ask for a frame**, and
+/// leaving it there must not.
+///
+/// This is the pinned bug: a `widgets::List` owns its hover, and it writes it
+/// through an updater that returns no message — precisely so the host is not
+/// bothered with a highlight. `Dispatched::changed` was computed from
+/// `!result.msgs.is_empty()`, which is empty for exactly that write, so
+/// `handle_mouse` answered "nothing to draw" while the list sat dirty in the
+/// scheduler waiting for a frame that was never asked for. Rows never lit
+/// under the pointer, while the menu bar's did — the menu bar's hover is a
+/// `UiFact` and a list's is not.
+///
+/// The two halves are asserted together deliberately. A `true` on its own
+/// would survive anyone making `changed` unconditionally true; the second move
+/// lands on the same cell, crosses no element boundary, queues nothing, and
+/// must therefore answer `false`. Only the pair proves the bool is computed
+/// from the tree's state rather than being a constant.
+#[test]
+fn test_palette_row_hover_requests_a_frame() {
+    let mut harness = EditorTestHarness::new(100, 24).unwrap();
+    let (col, row) = palette_with_unselected_row(&mut harness);
+
+    let asked = harness.mouse_move_reporting_render(col, row).unwrap();
+    assert!(
+        asked,
+        "hovering the palette row at ({col},{row}) wrote the list's hover state, so \
+         handle_mouse had to report needs_render — it reported false, which in the \
+         real editor is a highlight that never gets drawn:\n{}",
+        harness.screen_to_string()
+    );
+
+    // Draw the frame that was just asked for, then hold still.
+    harness.render().unwrap();
+    let asked_again = harness.mouse_move_reporting_render(col, row).unwrap();
+    assert!(
+        !asked_again,
+        "a second motion onto the cell the pointer is already on crosses no element \
+         boundary and changes nothing, so it must not request a frame — reporting \
+         true here means the needs-render answer is a constant and the assertion \
+         above is vacuous:\n{}",
+        harness.screen_to_string()
+    );
+}
+
+/// A pointer moving over ground that owns no hover must not ask for a frame.
+///
+/// The negative half of the rule, on a second surface so it is not only the
+/// "same cell twice" case: the editor's own text area is not a tree surface
+/// with a hover, and bare motion across it changes nothing anybody draws. An
+/// editor that repaints on every motion event burns a frame per pointer
+/// sample, which is the failure mode a careless fix for the bug above
+/// produces — `changed = true` unconditionally makes every test in this file
+/// pass and the editor repaint continuously.
+#[test]
+fn test_bare_motion_over_the_text_area_requests_no_frame() {
+    let mut harness = EditorTestHarness::new(100, 24).unwrap();
+    let _fixture = harness
+        .load_buffer_from_text("alpha beta gamma\ndelta epsilon\n")
+        .unwrap();
+    harness.render().unwrap();
+
+    // Two moves: the first may legitimately request a frame (it is the first
+    // time the pointer has been anywhere), the second is the assertion.
+    harness.mouse_move(40, 10).unwrap();
+    harness.render().unwrap();
+    let asked = harness.mouse_move_reporting_render(41, 10).unwrap();
+    assert!(
+        !asked,
+        "bare motion across the text area changes nothing, so it must not request a \
+         frame:\n{}",
+        harness.screen_to_string()
+    );
+}
+
+/// **PageDown in the palette moves by the rows the popup shows.** The popup
+/// holds up to ten rows, but a short terminal clamps it; a fixed page of ten
+/// skipped the rows between the clamped window and the tenth.
+#[test]
+fn test_command_palette_page_down_moves_by_the_clamped_window() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let mut harness = EditorTestHarness::new(100, 9).unwrap();
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    let screen = harness.screen_to_string();
+    let selected = |h: &EditorTestHarness| {
+        h.editor()
+            .active_window()
+            .prompt
+            .as_ref()
+            .and_then(|p| p.selected_suggestion())
+    };
+    // The rows inside the popup's ring.
+    let rows = screen.lines().filter(|l| l.starts_with("│  ")).count();
+    assert!(
+        (1..10).contains(&rows),
+        "a short terminal clamps the popup:\n{screen}"
+    );
+    let from = selected(&harness).expect("a selection");
+    harness
+        .send_key(KeyCode::PageDown, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    assert_eq!(
+        selected(&harness),
+        Some(from + rows),
+        "a page is the {rows} rows on screen:\n{screen}"
+    );
+}
+
+/// On a terminal too short for the full list, the list gives up rows instead
+/// of covering the hints row and the input line (#3578). The list used to be
+/// flipped below the prompt row, run off the screen, and get clamped back up
+/// over the last two rows.
+#[test]
+fn test_quick_open_list_shrinks_above_the_prompt_on_a_short_terminal() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    let mut harness = EditorTestHarness::with_temp_project(182, 12).unwrap();
+    let root = harness.project_dir().unwrap();
+    for i in 1..=12 {
+        fs::write(root.join(format!("shortterm{i}.txt")), "x").unwrap();
+    }
+
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness
+        .send_key(KeyCode::Backspace, KeyModifiers::NONE)
+        .unwrap();
+    harness.type_text("shortterm").unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("shortterm1"))
+        .unwrap();
+
+    let screen = harness.screen_to_string();
+    let lines: Vec<&str> = screen.lines().collect();
+    let last = lines.len() - 1;
+    assert!(
+        lines[last].starts_with("shortterm"),
+        "the input line must stay visible on the last row:\n{screen}"
+    );
+    assert!(
+        lines[last - 1].contains(">command"),
+        "the mode hints must stay visible above the input line:\n{screen}"
+    );
+    assert!(
+        lines[last - 2].starts_with('└'),
+        "the list's bottom edge must sit right above the hints row:\n{screen}"
+    );
+    let rows = lines.iter().filter(|l| l.starts_with("│  ")).count();
+    assert!(
+        (1..10).contains(&rows),
+        "the list gives up rows to fit:\n{screen}"
+    );
+}
+
+/// Quick Open in a non-Git folder lists dotfiles only while Show Hidden Files is on.
+#[test]
+fn test_quick_open_follows_show_hidden_files_in_non_git_folder() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    let mut harness = EditorTestHarness::with_temp_project(120, 40).unwrap();
+    let project_root = harness.project_dir().unwrap();
+    fs::write(project_root.join(".quickopen_dotfile"), "hidden").unwrap();
+    fs::write(project_root.join("quickopen_dot_visible.txt"), "visible").unwrap();
+
+    harness.editor_mut().focus_file_explorer();
+    harness.wait_for_file_explorer().unwrap();
+    harness
+        .wait_for_file_explorer_item("quickopen_dot_visible.txt")
+        .unwrap();
+
+    // Hide the explorer so only Quick Open can put the dotfile on screen.
+    harness.editor_mut().file_explorer_toggle_hidden();
+    harness.editor_mut().toggle_file_explorer();
+    harness.render().unwrap();
+
+    let open_quick_open = |harness: &mut EditorTestHarness| {
+        harness
+            .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+            .unwrap();
+        harness
+            .send_key(KeyCode::Backspace, KeyModifiers::NONE)
+            .unwrap();
+        harness.type_text("quickopen_dot").unwrap();
+        harness
+            .wait_until(|h| h.screen_to_string().contains("quickopen_dot_visible.txt"))
+            .unwrap();
+    };
+
+    open_quick_open(&mut harness);
+    harness
+        .wait_until(|h| h.screen_to_string().contains(".quickopen_dotfile"))
+        .unwrap();
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+
+    harness.editor_mut().file_explorer_toggle_hidden();
+    harness.render().unwrap();
+    open_quick_open(&mut harness);
+    harness.assert_screen_not_contains(".quickopen_dotfile");
+}
+
+/// Show Hidden Files is per window, but Quick Open is editor-wide: switching
+/// windows makes Quick Open follow the newly active window's setting.
+#[test]
+fn test_quick_open_follows_show_hidden_files_of_active_window() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    let mut harness = EditorTestHarness::with_temp_project(120, 40).unwrap();
+    let alpha = harness.project_dir().unwrap();
+    let beta_dir = tempfile::TempDir::new().unwrap();
+    let beta = beta_dir.path().to_path_buf();
+    for root in [&alpha, &beta] {
+        fs::write(root.join(".winswitch_dotfile"), "hidden").unwrap();
+        fs::write(root.join("winswitch_visible.txt"), "visible").unwrap();
+    }
+
+    // Toggle Show Hidden Files in the active window's explorer, then hide the
+    // explorer so only Quick Open can put the dotfile on screen.
+    let toggle_hidden_in_explorer = |harness: &mut EditorTestHarness| {
+        harness.editor_mut().focus_file_explorer();
+        harness.wait_for_file_explorer().unwrap();
+        harness
+            .wait_for_file_explorer_item("winswitch_visible.txt")
+            .unwrap();
+        harness.editor_mut().file_explorer_toggle_hidden();
+        harness.editor_mut().toggle_file_explorer();
+        harness.render().unwrap();
+    };
+    let open_quick_open = |harness: &mut EditorTestHarness| {
+        harness
+            .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+            .unwrap();
+        harness
+            .send_key(KeyCode::Backspace, KeyModifiers::NONE)
+            .unwrap();
+        harness.type_text("winswitch_").unwrap();
+        harness
+            .wait_until(|h| h.screen_to_string().contains("winswitch_visible.txt"))
+            .unwrap();
+    };
+
+    // Window A: hidden files on.
+    let alpha_window = harness.editor().active_window_id();
+    toggle_hidden_in_explorer(&mut harness);
+
+    // Window B: its explorer starts from the config A's toggle saved (on), so
+    // one toggle turns hidden files off there.
+    let beta_window = harness
+        .editor_mut()
+        .create_window_at(beta.clone(), "beta".to_string());
+    harness.editor_mut().set_active_window(beta_window);
+    toggle_hidden_in_explorer(&mut harness);
+    open_quick_open(&mut harness);
+    harness.assert_screen_not_contains(".winswitch_dotfile");
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+
+    // Back in A, Quick Open shows hidden files again.
+    harness.editor_mut().set_active_window(alpha_window);
+    harness.render().unwrap();
+    open_quick_open(&mut harness);
+    harness
+        .wait_until(|h| h.screen_to_string().contains(".winswitch_dotfile"))
+        .unwrap();
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+
+    // And in B they are hidden again.
+    harness.editor_mut().set_active_window(beta_window);
+    harness.render().unwrap();
+    open_quick_open(&mut harness);
+    harness.assert_screen_not_contains(".winswitch_dotfile");
+}
+
+/// A project with two crates whose names share the `fresh-` prefix, plus a
+/// top-level file, with Quick Open in file mode showing `input`'s matches.
+///
+/// Waits for every file `input` should match to be on screen, so Tab sees
+/// the whole list rather than a partially scanned one.
+fn quick_open_files(input: &str, expected: &[&str]) -> EditorTestHarness {
+    let mut harness =
+        EditorTestHarness::with_temp_project_and_config(100, 24, Default::default()).unwrap();
+    let project_root = harness.project_dir().unwrap();
+    fs::create_dir_all(project_root.join("crates/fresh-editor/src")).unwrap();
+    fs::create_dir_all(project_root.join("crates/fresh-gui")).unwrap();
+    fs::write(
+        project_root.join("crates/fresh-editor/src/main.rs"),
+        "fn main() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        project_root.join("crates/fresh-gui/lib.rs"),
+        "pub fn gui() {}\n",
+    )
+    .unwrap();
+    fs::write(project_root.join("notes.txt"), "first\nsecond line\n").unwrap();
+
+    type_in_quick_open_file_mode(&mut harness, input, expected);
+    harness
+}
+
+/// Open Quick Open (it starts in command mode), switch to file mode, type
+/// `input`, and wait until every path in `expected` is listed — so Tab sees
+/// the whole list rather than a partially scanned one.
+fn type_in_quick_open_file_mode(harness: &mut EditorTestHarness, input: &str, expected: &[&str]) {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness
+        .send_key(KeyCode::Backspace, KeyModifiers::NONE)
+        .unwrap();
+    harness.type_text(input).unwrap();
+    // Both halves matter. The files have to be listed, and the scan has to
+    // have finished: while it is running the provider reports its list as
+    // incomplete and Tab deliberately leaves the input alone, so a wait on
+    // the files alone would race the scan and sometimes see no completion.
+    // The scan says so on screen, which is what keeps this observable.
+    harness
+        .wait_until(|h| {
+            let screen = h.screen_to_string();
+            expected.iter().all(|path| screen.contains(path))
+                && !screen.contains("Loading files…")
+                && !screen.contains("Scanning for more files…")
+        })
+        .expect("Quick Open should list the matching files and finish scanning");
+}
+
+const QUICK_OPEN_CRATES: &[&str] = &["crates/fresh-editor/src/main.rs", "crates/fresh-gui/lib.rs"];
+
+/// Press Tab and return the prompt line. The suggestion list shows full
+/// paths, so the assertions read the prompt line rather than the screen.
+fn tab_and_read_prompt(harness: &mut EditorTestHarness) -> String {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+    harness.get_prompt_line()
+}
+
+/// Tab in Quick Open's file finder completes one directory at a time, and
+/// only as far as the matching paths agree, like shell completion.
+#[test]
+fn test_quick_open_tab_completes_shared_prefix_by_directory() {
+    let mut harness = quick_open_files("crat", QUICK_OPEN_CRATES);
+
+    let prompt = tab_and_read_prompt(&mut harness);
+    assert!(prompt.contains("crates/"), "prompt: {prompt}");
+    assert!(
+        !prompt.contains("crates/fresh"),
+        "stopped past the directory: {prompt}"
+    );
+
+    let prompt = tab_and_read_prompt(&mut harness);
+    assert!(prompt.contains("crates/fresh-"), "prompt: {prompt}");
+    assert!(
+        !prompt.contains("crates/fresh-editor"),
+        "picked one crate: {prompt}"
+    );
+    assert!(
+        !prompt.contains("crates/fresh-gui"),
+        "picked one crate: {prompt}"
+    );
+}
+
+/// Arrowing to a row and pressing Tab still fills in that row's full path.
+#[test]
+fn test_quick_open_tab_after_arrowing_accepts_highlighted_path() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    let mut harness = quick_open_files("crates/fre", QUICK_OPEN_CRATES);
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+
+    let prompt = tab_and_read_prompt(&mut harness);
+    assert!(
+        QUICK_OPEN_CRATES.iter().any(|path| prompt.contains(path)),
+        "Tab should accept the highlighted path: {prompt}"
+    );
+}
+
+/// When nothing starts with the typed text, Tab accepts the highlighted
+/// fuzzy match as it always has.
+#[test]
+fn test_quick_open_tab_fuzzy_match_accepts_highlighted_path() {
+    let mut harness = quick_open_files("main", &["crates/fresh-editor/src/main.rs"]);
+
+    let prompt = tab_and_read_prompt(&mut harness);
+    assert!(
+        prompt.contains("crates/fresh-editor/src/main.rs"),
+        "prompt: {prompt}"
+    );
+}
+
+/// A completed file name keeps its `:line` suffix and opens at that line.
+#[test]
+fn test_quick_open_tab_keeps_line_suffix_and_opens_file() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    let mut harness = quick_open_files("not:2", &["notes.txt"]);
+
+    let prompt = tab_and_read_prompt(&mut harness);
+    assert!(prompt.contains("notes.txt:2"), "prompt: {prompt}");
+
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .wait_until(|h| {
+            let screen = h.screen_to_string();
+            screen.contains("Ln 2") && screen.contains("second line")
+        })
+        .expect("Enter should open notes.txt at line 2");
+}
+
+/// Off Windows a backslash is an ordinary filename character, not a
+/// directory boundary: two files really named `a\b1.txt` and `a\b2.txt`
+/// share the prefix `a\b`, and Tab completes the whole of it rather than
+/// stopping at `a\` as if `a` were a directory.
+///
+/// End to end, so it also covers the listing underneath: while the project
+/// walk rewrote `\` to `/` in the relative path, these two files reached the
+/// palette under two spellings each, their longest common prefix was the
+/// typed `a`, and Tab completed nothing.
+#[test]
+#[cfg(not(windows))]
+fn test_quick_open_tab_completes_across_a_backslash_in_a_name() {
+    let mut harness =
+        EditorTestHarness::with_temp_project_and_config(100, 24, Default::default()).unwrap();
+    let project_root = harness.project_dir().unwrap();
+    fs::write(project_root.join("a\\b1.txt"), "one\n").unwrap();
+    fs::write(project_root.join("a\\b2.txt"), "two\n").unwrap();
+
+    type_in_quick_open_file_mode(&mut harness, "a", &["a\\b1.txt", "a\\b2.txt"]);
+
+    let prompt = tab_and_read_prompt(&mut harness);
+    assert!(
+        prompt.contains("a\\b"),
+        "Tab should complete past the backslash: {prompt}"
+    );
+    assert!(
+        !prompt.contains("a\\b1") && !prompt.contains("a\\b2"),
+        "Tab should stop where the two names diverge: {prompt}"
+    );
 }

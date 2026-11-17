@@ -3,8 +3,10 @@ import {
   button,
   col,
   flexSpacer,
+  FloatingWidgetPanel,
   hintBar,
   key as widgetKey,
+  label,
   parseHintString,
   raw,
   row,
@@ -20,6 +22,7 @@ import {
   type WidgetAction,
   WidgetPanel,
   type WidgetSpec,
+  wrappingRow,
 } from "./lib/widgets.ts";
 
 const editor = getEditor();
@@ -62,6 +65,44 @@ type FocusPanel = "query" | "options" | "matches";
 type QueryField = "search" | "replace";
 
 interface PanelState {
+  /** The window the panel lives in. Its buffer and splits belong to that
+   *  window, and split ids mean nothing outside it (#3704). */
+  windowId: number;
+  /** The panel's window's root, for project-relative paths. Kept because
+   *  `getCwd()` answers for the active window, which a search running in
+   *  the background is not. */
+  root: string;
+  /** Its results are out of date: a re-search was asked for, or a replace
+   *  finished, while the panel's window was in the background. Re-searched
+   *  when the window is active again. */
+  stale: boolean;
+  /** The deferred re-search was an edit's, which keeps the user's place in
+   *  the results (`rerunSearch(keepPosition)`). */
+  staleKeepPosition: boolean;
+  /** A search finished or progressed while the panel's window was in the
+   *  background, where nothing is drawn: draw it when the window is back. */
+  needsRedraw: boolean;
+  /** Incremented on each new search of this panel to discard stale results.
+   *  Per panel, so a search in one window never cancels another's. */
+  searchGeneration: number;
+  /** This panel's in-flight search, kept so a superseding one can cancel it. */
+  searchHandle: SearchHandle | null;
+  /** Debounce generation for re-searches of this panel: a newer request
+   *  drops an older pending one, but never another window's. */
+  debounceGeneration: number;
+  /** The re-search an edit started, while it runs. It empties the result
+   *  set until the new one lands and then puts the selection back, so a step
+   *  pressed meanwhile waits for it instead of being dropped as "Searching…". */
+  searchAfterEdit: Promise<void> | null;
+  /** Lock against re-entrant Replace All / Replace Scoped on this panel. */
+  replaceInProgress: boolean;
+  /** A status message for this panel's window, held while it was in the
+   *  background (status messages are per window) and shown on return. */
+  pendingStatus: string | null;
+  /** The per-window context the module-level `resumeAnchor` and
+   *  `lastReplacedFiles` hold for the active panel, parked here while the
+   *  panel's window is in the background. */
+  parked: { resumeAnchor: ResumeAnchor | null; replacedFiles: Set<string> } | null;
   resultsBufferId: number;
   sourceSplitId: number;
   resultsSplitId: number;
@@ -135,14 +176,89 @@ interface PanelState {
   // `docs/internal/plugin-widget-library-design.md` §10.
   widgetPanel: WidgetPanel | null;
 }
+/** Each window's panel, by window id. A window has its own panel — query,
+ *  results, selection and scroll — and switching windows leaves the other
+ *  windows' panels as they were (#3704). */
+const panels = new Map<number, PanelState>();
+/** Run `fn` with `panel` pointing at `p`. The view builders read the
+ *  module-level `panel`; a search runs for the panel it started in, which
+ *  may no longer be the active one. Synchronous, so nothing else can observe
+ *  the swap. */
+function withPanel<T>(p: PanelState, fn: () => T): T {
+  const saved = panel;
+  panel = p;
+  try {
+    return fn();
+  } finally {
+    panel = saved;
+  }
+}
+
+/** A window's open buffers, by path. Per window (`listBuffers(windowId)`),
+ *  never the active one's: buffer ids are unique editor-wide, but two
+ *  windows can each hold a buffer of the same file. */
+function windowBuffersByPath(windowId: number): Map<string, number> {
+  const byPath = new Map<string, number>();
+  for (const b of editor.listBuffers(windowId)) {
+    if (b.path) byPath.set(b.path, b.id);
+  }
+  return byPath;
+}
+
+/** The window the user is in, kept current by `active_window_changed`. */
+let currentWindowId = editor.activeWindow();
+/** The active window's panel: `panels.get(currentWindowId)`, kept as a
+ *  variable because everything that handles input reads it. Only this panel
+ *  is ever searched or drawn — the host searches and paints the active
+ *  window. */
 let panel: PanelState | null = null;
+
+/** The match options the *next* panel opens on.
+ *
+ * The panel itself is rebuilt from scratch every time it opens, so
+ * without this the Case / Regex / Word toggles reset on each open and
+ * a user who wants case-sensitive matching has to say so again every
+ * single time. Seeded from the `editor.search` config preset, then
+ * updated by every toggle — so the last state wins for the rest of the
+ * session, and the config decides only where the session starts.
+ *
+ * Session-scoped on purpose: the config file is not rewritten behind
+ * the user's back, and the in-buffer search prompt persists its own
+ * copy with the workspace.
+ */
+const sessionMatchOptions = {
+  caseSensitive: false,
+  useRegex: false,
+  wholeWords: false,
+};
+
+/** Seed `sessionMatchOptions` from `editor.search`. Anything missing or
+ *  non-boolean stays off, which is also the shipped default. */
+function seedMatchOptionsFromConfig(): void {
+  const search = (
+    editor.getConfig() as
+      | {
+          editor?: {
+            search?: {
+              case_sensitive?: unknown;
+              regex?: unknown;
+              whole_word?: unknown;
+            };
+          };
+        }
+      | null
+  )?.editor?.search;
+  sessionMatchOptions.caseSensitive = search?.case_sensitive === true;
+  sessionMatchOptions.useRegex = search?.regex === true;
+  sessionMatchOptions.wholeWords = search?.whole_word === true;
+}
+seedMatchOptionsFromConfig();
 
 const MAX_RESULTS = 10000;
 const MIN_WIDTH = 60;
 const DEFAULT_WIDTH = 100;
 const SEARCH_DEBOUNCE_MS = 150;
 
-let searchDebounceGeneration = 0;
 
 /** Most-recent-first history of search patterns, capped at HISTORY_MAX.
  *  Up arrow in the search field walks back into older entries; Down
@@ -157,13 +273,6 @@ let historyIndex = -1;
  *  to enter history-walk mode. Restored when they Down past the most
  *  recent history entry. */
 let historySavedPattern: string | null = null;
-/** Most recent widget_event we saw a widget_key for. Used to decide
- *  whether Up/Down should walk history (when focus appears to be on
- *  the search field) or fall through to the widget runtime. The
- *  widget runtime doesn't expose focus directly to the plugin, but
- *  every event that's relevant (change/select/toggle/activate/expand)
- *  carries widget_key. Best-effort proxy. */
-let lastFocusedWidget: string | null = null;
 
 function historyPush(pattern: string): void {
   if (!pattern) return;
@@ -273,6 +382,21 @@ function truncate(s: string, maxLen: number): string {
   return result + "...";
 }
 
+/** The UTF-16 index in `text` of its UTF-8 byte offset `byte` (clamped to
+ *  the text). A binary search over native byte counts, so a long line —
+ *  a minified bundle's 50 000 characters — costs a few calls rather than
+ *  a walk through it codepoint by codepoint. */
+function utf16IndexOfByte(text: string, byte: number): number {
+  let lo = 0;
+  let hi = text.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (editor.utf8ByteLength(text.slice(0, mid)) < byte) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
 // Get the active field's text
 function getActiveFieldText(): string {
   if (!panel) return "";
@@ -297,19 +421,14 @@ function setActiveFieldText(text: string): void {
 // Mode — uses allowTextInput for inline editing (supports all keyboard layouts)
 // =============================================================================
 
-// Only explicit bindings for special keys; character input is handled via
-// allowTextInput which dispatches unbound characters as mode_text_input events.
-const modeBindings: [string, string][] = [
-  ["Return", "search_replace_enter"],
-  ["Space", "search_replace_space"],
-  ["Tab", "search_replace_tab"],
-  ["S-Tab", "search_replace_shift_tab"],
-  ["Up", "search_replace_nav_up"],
-  ["Down", "search_replace_nav_down"],
-  ["PageUp", "search_replace_nav_page_up"],
-  ["PageDown", "search_replace_nav_page_down"],
-  ["Left", "search_replace_nav_left"],
-  ["Right", "search_replace_nav_right"],
+// The focused control answers a key first — a field types, moves its caret
+// and edits; the match tree walks, opens and folds; a toggle or button runs
+// on Enter/Space; Tab walks the controls — so the mode binds only the
+// panel's own commands, and ↑/↓ for the search field's history (a
+// single-line field leaves them).
+const modeBindings: string[][] = [
+  ["Up", "search_replace_nav_up", "on:searchField"],
+  ["Down", "search_replace_nav_down", "on:searchField"],
   ["M-c", "search_replace_toggle_case"],
   ["M-r", "search_replace_toggle_regex"],
   ["M-w", "search_replace_toggle_whole_word"],
@@ -322,10 +441,6 @@ const modeBindings: [string, string][] = [
   ["C-M-Right", "search_replace_next_match"],
   ["C-M-Left", "search_replace_prev_match"],
   ["Escape", "search_replace_close"],
-  ["Backspace", "search_replace_backspace"],
-  ["Delete", "search_replace_delete"],
-  ["Home", "search_replace_home"],
-  ["End", "search_replace_end"],
 ];
 
 editor.defineMode("search-replace-list", modeBindings, true, true);
@@ -345,8 +460,8 @@ registerHandler("mode_text_input", mode_text_input);
 // File grouping
 // =============================================================================
 
-function getRelativePath(filePath: string): string {
-  const cwd = editor.getCwd();
+function getRelativePath(filePath: string, root: string = panel?.root ?? editor.getCwd()): string {
+  const cwd = root;
   if (filePath.startsWith(cwd)) {
     return filePath.slice(cwd.length + 1);
   }
@@ -481,35 +596,41 @@ function getViewportWidth(): number {
 // Panel content builder — compact two-line control bar + match tree
 // =============================================================================
 
-// Build the typed Row spec for the options line (3 toggles + Replace
-// All button). Was previously hand-built into entries with manual
-// byte-offset overlay arithmetic (see git history pre-widget); now
-// dispatched through the host's Toggle/Button widgets so styling,
-// theme keys, and focus affordance match every other plugin.
+// The Replace All button. Its label tracks scope (§1):
+//   * allFiles=true  → "Replace All (Alt+Ret)"
+//   * allFiles=false → "Replace All in <file> (Alt+Ret)"
+// sourceBufferRelPath is empty for an unsaved buffer, in which case we
+// fall back to the all-files label since restricting to a path-less
+// buffer can't match anything anyway.
+function replaceAllButtonSpec(): WidgetSpec {
+  const scoped = !!panel && !panel.allFiles && !!panel.sourceBufferRelPath;
+  const replLabel = scoped
+    ? editor.t("panel.replace_all_in_file_btn", { file: panel!.sourceBufferRelPath })
+    : editor.t("panel.replace_all_btn");
+  return button(replLabel, { intent: "primary", key: "replaceAll" });
+}
+
+// True when the Replace All button sits on the scope row rather than the
+// options row: a one-file scope names the file in the button, which then
+// no longer fits beside the toggles (it was cut off against them).
+function replaceAllOnScopeRow(): boolean {
+  return !!panel && !panel.allFiles && !!panel.sourceBufferRelPath;
+}
+
+// Build the typed Row spec for the options line (the toggles, plus the
+// Replace All button unless it sits on the scope row). Dispatched through
+// the host's Toggle/Button widgets so styling, theme keys, and focus
+// affordance match every other plugin.
 function buildOptionsRowSpec(): WidgetSpec {
   if (!panel) return col();
-  const { focusPanel, optionIndex, caseSensitive, useRegex, wholeWords, allFiles } = panel;
-  const W = Math.max(MIN_WIDTH, panel.viewportWidth - 2);
-  const oFocus = focusPanel === "options";
+  const { caseSensitive, useRegex, wholeWords, allFiles } = panel;
 
   const caseLabel = editor.t("panel.case_toggle");
   const regexLabel = editor.t("panel.regex_toggle");
   const wholeLabel = editor.t("panel.whole_toggle");
   const allFilesLabel = editor.t("panel.all_files_toggle");
-  // Replace All button label tracks scope (§1):
-  //   * allFiles=true  → "Replace All (Alt+Ret)"
-  //   * allFiles=false → "Replace All in <file> (Alt+Ret)"
-  // sourceBufferRelPath is empty for an unsaved buffer, in which
-  // case we fall back to the all-files label since restricting to
-  // a path-less buffer can't match anything anyway.
-  const replLabel = (!allFiles && panel.sourceBufferRelPath)
-    ? editor.t("panel.replace_all_in_file_btn", { file: panel.sourceBufferRelPath })
-    : editor.t("panel.replace_all_btn");
-  void oFocus;
-  void optionIndex;
-  void W;
 
-  return row(
+  const children: WidgetSpec[] = [
     spacer(1),
     toggle(allFiles, allFilesLabel, { key: "allFiles" }),
     spacer(2),
@@ -518,25 +639,34 @@ function buildOptionsRowSpec(): WidgetSpec {
     toggle(useRegex, regexLabel, { key: "regex" }),
     spacer(2),
     toggle(wholeWords, wholeLabel, { key: "whole" }),
-    flexSpacer(),
-    button(replLabel, { intent: "primary", key: "replaceAll" }),
-  );
+  ];
+  if (!replaceAllOnScopeRow()) {
+    children.push(flexSpacer(), replaceAllButtonSpec());
+  }
+  return row(...children);
 }
 
 // Build the scope-info row shown only when allFiles=false. Tells the
-// user which single file the search is restricted to. When allFiles=true
-// the function returns an empty col() (the spec composer skips it).
+// user which single file the search is restricted to, and carries the
+// "Replace All in <file>" button after it. When
+// allFiles=true the function returns an empty col() (the spec composer
+// skips it).
 function buildScopeRowSpec(): WidgetSpec {
   if (!panel) return col();
   if (panel.allFiles) return col();
-  const label = panel.sourceBufferRelPath
+  const scopeLabel = panel.sourceBufferRelPath
     ? editor.t("panel.scope_row_file", { file: panel.sourceBufferRelPath })
     : editor.t("panel.scope_row_unnamed");
-  return raw([{
-    text: " " + label,
+  const scopeText = raw([{
+    text: " " + scopeLabel,
     properties: { type: "scope-row" },
     style: { fg: C.label, italic: true },
   }]);
+  if (!replaceAllOnScopeRow()) return scopeText;
+  // Wrapping, so a panel too narrow for both puts the button on a line of
+  // its own instead of cutting its label off. The button carries its own
+  // one-cell indent, so a wrapped line keeps the rows' left margin.
+  return wrappingRow(scopeText, spacer(1), row(spacer(1), replaceAllButtonSpec()));
 }
 
 // Build the typed Row spec for line 1 (search + replace fields with
@@ -666,27 +796,38 @@ function flatItemKey(item: FlatItem): string {
 // inside the context substring) ride on the relevant segment via
 // its `overlays` field, addressed in char units relative to that
 // segment alone.
-function renderFlatItemEntry(item: FlatItem, W: number): TextPropertyEntry {
-  if (!panel) return { text: "" };
+/** One rendered row: the entry, plus the char span the row exists to show.
+ *
+ *  The span is the host's to act on — it rests the row's window on it when
+ *  the row is wider than the panel, and the reader pans away from there. The
+ *  plugin no longer cuts the string itself: it sends the capped context whole
+ *  and says where the interesting part is, which is what makes panning left
+ *  able to reach the head of the line at all. See `TreeNode.windowAnchor`. */
+type RenderedRow = { entry: TextPropertyEntry; anchor?: TextWindowAnchor };
+
+function renderFlatItemEntry(item: FlatItem, W: number): RenderedRow {
+  if (!panel) return { entry: { text: "" } };
   if (item.type === "file") {
     const group = panel.fileGroups[item.fileIndex];
     const badge = getFileExtBadge(group.relPath);
     const matchCount = group.matches.length;
     const selectedInFile = group.matches.filter(m => m.selected).length;
-    return styledRow(
-      [
-        { text: badge, style: { fg: C.fileIcon, bold: true } },
-        { text: " " },
-        { text: group.relPath, style: { fg: C.filePath } },
-        { text: ` (${selectedInFile}/${matchCount})` },
-      ],
-      {
-        // Host prefix at depth 0: disclosure (▶/▼) + space + checkbox
-        // ([v]/[ ]) + space = 6 cols.
-        padToChars: Math.max(0, W - 6),
-        properties: { type: "file-row", fileIndex: item.fileIndex },
-      },
-    );
+    return {
+      entry: styledRow(
+        [
+          { text: badge, style: { fg: C.fileIcon, bold: true } },
+          { text: " " },
+          { text: group.relPath, style: { fg: C.filePath } },
+          { text: ` (${selectedInFile}/${matchCount})` },
+        ],
+        {
+          // Host prefix at depth 0: disclosure (▶/▼) + space + checkbox
+          // ([v]/[ ]) + space = 6 cols.
+          padToChars: Math.max(0, W - 6),
+          properties: { type: "file-row", fileIndex: item.fileIndex },
+        },
+      ),
+    };
   }
   // Match row. The Tree widget's prefix at depth=1 is 6 cols
   // (4 indent + 2 alignment). Use the remaining width for content.
@@ -704,9 +845,27 @@ function renderFlatItemEntry(item: FlatItem, W: number): TextPropertyEntry {
   // past ~512 chars is invisible anyway.
   const CONTEXT_HARD_CAP = 512;
   const rawCtx = result.match.context;
-  const context = (rawCtx.length > CONTEXT_HARD_CAP
-    ? rawCtx.slice(0, CONTEXT_HARD_CAP)
-    : rawCtx).trim();
+  // Anchor that cap on the *match*, not on the start of the line.
+  // Slicing from 0 threw away the only part of the row anyone opened
+  // it for whenever the match sat past the cap — and the same for the
+  // display-width truncation below (issue #1580: a match at column 257
+  // of a 290-char line rendered as `start xxxx…`, with the matched
+  // text nowhere on screen).
+  //
+  // Where the match is, from the search that found it (`contextOffset`),
+  // in UTF-16 units of `rawCtx`; its end clamped to the line — a multi-line
+  // match runs past it.
+  const { contextOffset, length } = result.match;
+  const anchor = utf16IndexOfByte(rawCtx, contextOffset);
+  const anchorEnd = Math.max(anchor, utf16IndexOfByte(rawCtx, contextOffset + length));
+  const capStart = rawCtx.length > CONTEXT_HARD_CAP
+    ? Math.max(0, Math.min(anchor - CONTEXT_HARD_CAP / 2, rawCtx.length - CONTEXT_HARD_CAP))
+    : 0;
+  const capped = rawCtx.slice(capStart, capStart + CONTEXT_HARD_CAP);
+  // Leading indentation is noise worth trimming when the window starts
+  // at the beginning of the line; a window that already starts mid-line
+  // must not shift further, or the offsets below drift.
+  const context = capStart === 0 ? capped.trim() : capped.replace(/\s+$/, "");
   // Host prefix consumes:
   //   indent (depth=1) = 2
   //   leaf-alignment   = 2 (in lieu of disclosure glyph)
@@ -714,33 +873,63 @@ function renderFlatItemEntry(item: FlatItem, W: number): TextPropertyEntry {
   // Total: 8 cols.
   const innerWidth = Math.max(0, W - 8);
 
-  // Best-effort context budget: enough room for the fixed leading
-  // pieces plus " - " plus the context itself. JS `.length` gives
-  // UTF-16 code-unit counts which match codepoint counts for the
-  // overwhelmingly-ASCII case (paths + line numbers); slight
-  // over-counting on rare non-BMP filenames just trims a little
-  // more of the context, which is fine.
-  const maxCtx = innerWidth - location.length - 3;
-  const displayCtx = truncate(context, Math.max(10, maxCtx));
-
-  // Pattern-match highlights inside the context substring. Emitted
-  // in segment-local char units; the host shifts them by the
-  // context segment's char start during entry concatenation.
-  const ctxOverlays: InlineOverlay[] = [];
-  if (panel.searchPattern) {
-    highlightMatches(displayCtx, panel.searchPattern, panel.useRegex, panel.caseSensitive, ctxOverlays);
-  }
+  // Where this row's match sits in `context`, after the cap slice and
+  // the leading trim above, in codepoints.
+  const trimmedLead = capStart === 0 ? capped.length - capped.trimStart().length : 0;
+  const clampToContext = (i: number) => Math.max(0, Math.min(i - capStart - trimmedLead, context.length));
+  const matchStart = clampToContext(anchor);
+  const matchEnd = clampToContext(anchorEnd);
+  const span = {
+    start: charLen(context.slice(0, matchStart)),
+    length: charLen(context.slice(matchStart, matchEnd)),
+  };
+  // **The whole capped context goes to the host, not a slice of it.**
+  //
+  // Fitting a row to the panel used to happen here, which meant the row the
+  // host received was already the only thing that could ever be read: there
+  // was nothing to the left of the window's `…` and nothing to the right, so
+  // there was nothing to pan (issue #1580). The host fits the row now, and
+  // this says where the window should rest — so panning left walks back
+  // through the head of the line and panning right runs to its tail.
+  //
+  // The cap is unchanged: `CONTEXT_HARD_CAP` still bounds every per-codepoint
+  // walk below, and it is what bounds how far a pan can travel.
+  //
+  // The row's own match is highlighted: what the search matched, whole
+  // words and regex alike, rather than a JS re-match of the pattern. Other
+  // matches on the line have rows of their own.
+  const ctxOverlays: InlineOverlay[] = span.length > 0
+    ? [{ start: span.start, end: span.start + span.length, style: { bg: C.matchBg, fg: C.matchFg }, unit: "char" }]
+    : [];
 
   const segments: StyledSegment[] = [
     { text: location, style: { fg: C.lineNum } },
     { text: " - " },
-    { text: displayCtx, overlays: ctxOverlays },
+    { text: context, overlays: ctxOverlays },
   ];
 
-  return styledRow(segments, {
+  const entry = styledRow(segments, {
     padToChars: innerWidth,
     properties: { type: "match-row", fileIndex: item.fileIndex, matchIndex: item.matchIndex },
   });
+  // The window is addressed to the whole row, so both numbers carry the
+  // leading pieces' width. `location` is a path plus a line number — the
+  // codepoint/UTF-16 distinction only bites on a non-BMP filename, where
+  // being a codepoint or two out moves the resting window by that much and
+  // nothing else.
+  //
+  // `pinned` keeps `path:line - ` in place while the context slides under it:
+  // it is which match this row *is*, and rows that pan it away cannot be told
+  // apart.
+  const pinned = charLen(location) + 3;
+  return {
+    entry,
+    anchor: {
+      pinned,
+      start: pinned + span.start,
+      len: span.length,
+    },
+  };
 }
 
 // Convert a slice of `FlatItem`s into the corresponding TreeNodes.
@@ -754,7 +943,7 @@ function flatItemsToTreeNodes(
   W: number,
 ): TreeNode[] {
   return flatItems.map((item, i) => {
-    const entry = renderFlatItemEntry(item, W);
+    const { entry, anchor } = renderFlatItemEntry(item, W);
     if (item.type === "file") {
       const k = itemKeys[i];
       if (!panel!.knownFileKeys.has(k)) {
@@ -768,7 +957,12 @@ function flatItemsToTreeNodes(
     }
     const matchSelected = panel!.fileGroups[item.fileIndex]
       .matches[item.matchIndex!].selected;
-    return treeNode(entry, { depth: 1, hasChildren: false, checked: matchSelected });
+    return treeNode(entry, {
+      depth: 1,
+      hasChildren: false,
+      checked: matchSelected,
+      windowAnchor: anchor,
+    });
   });
 }
 
@@ -966,35 +1160,6 @@ function addCursorOverlay(value: string, cursorPos: number, fieldByteStart: numb
 // indices and Unicode codepoint indices coincide, so `indexOf` /
 // `RegExp.exec` indices map directly to char offsets without a
 // per-overlay codepoint walk.
-function highlightMatches(text: string, pattern: string, isRegex: boolean, caseSensitive: boolean, overlays: InlineOverlay[]): void {
-  if (!pattern) return;
-  try {
-    if (!isRegex) {
-      let searchText = text;
-      let searchPat = pattern;
-      if (!caseSensitive) {
-        searchText = text.toLowerCase();
-        searchPat = pattern.toLowerCase();
-      }
-      let pos = 0;
-      while (pos < searchText.length) {
-        const idx = searchText.indexOf(searchPat, pos);
-        if (idx < 0) break;
-        overlays.push({ start: idx, end: idx + pattern.length, style: { bg: C.matchBg, fg: C.matchFg }, unit: "char" });
-        pos = idx + pattern.length;
-      }
-    } else {
-      const flags = caseSensitive ? "g" : "gi";
-      const re = new RegExp(pattern, flags);
-      let m;
-      while ((m = re.exec(text)) !== null) {
-        if (m[0].length === 0) { re.lastIndex++; continue; }
-        overlays.push({ start: m.index, end: m.index + m[0].length, style: { bg: C.matchBg, fg: C.matchFg }, unit: "char" });
-      }
-    }
-  } catch (_e) { /* invalid regex */ }
-}
-
 // =============================================================================
 // Panel update
 // =============================================================================
@@ -1057,47 +1222,9 @@ function updatePanelContent(): void {
 // Search
 // =============================================================================
 
-/** Current search generation — incremented on each new search to discard stale results. */
-let currentSearchGeneration = 0;
-/** The active search handle, kept so a superseding search can cancel it. */
-let activeSearchHandle: SearchHandle | null = null;
 /** Pump cadence between successive `take()` drains (ms). The host writes
  * matches at full speed; this knob bounds the UI rebuild rate. */
 const SEARCH_PUMP_INTERVAL_MS = 50;
-/** Number of `buildFlatItems()` entries the streaming path has already
- *  pushed to the host via `appendTreeNodes`. Zero means "no streaming
- *  append has happened for the current search"; the first batch of
- *  results will do a full `updatePanelContent()` instead so the Tree
- *  exists for subsequent appends. Reset at the start of each search
- *  and after `batch.done` (which forces a full re-emit). */
-let lastStreamingFlatCount = 0;
-
-/** Absolute-path → index-into-`panel.fileGroups`, maintained while a
- *  search is streaming so each new match locates its file group in
- *  O(1) instead of triggering a full `buildFileGroups(allResults)`
- *  rebuild (which is O(N) per batch and pins the JS event loop on
- *  large result sets). Cleared at the start of each search. */
-let streamingFileIndexByPath: Map<string, number> | null = null;
-
-/** Carryover queue: matches the host handed us in a `take()` but that
- *  we haven't processed yet because the batch was too big to drain in
- *  a single pump iteration. Drained CHUNK at a time inside the pump
- *  loop; `take()` is only re-called once this is empty so we don't
- *  flood the queue.  Reset at the start of each search. */
-let pendingMatches: GrepMatch[] = [];
-
-/** Pending tree-append delta that hasn't been flushed to the host yet.
- *  Each pump chunk pushes its `FlatItem[]` here; the loop coalesces
- *  several chunks worth before firing one `appendTreeNodes` IPC, so
- *  the host's main thread isn't pinned servicing ~20 ms IPCs back to
- *  back during a long streaming search. */
-let pendingTreeDeltaItems: FlatItem[] = [];
-/** Parallel pending list of new file-row keys whose expansion state
- *  must be pushed to the host on the next flush. */
-let pendingNewExpandedKeys: string[] = [];
-/** Wall-clock ms of the last UI flush (the last appendTreeNodes IPC).
- *  Compared against UI_FLUSH_INTERVAL_MS to decide when to flush. */
-let lastUiFlush = 0;
 /** Don't flush more often than this. */
 const UI_FLUSH_INTERVAL_MS = 80;
 /** Hard cap on each `appendTreeNodes` flush payload. Each TreeNode in
@@ -1116,67 +1243,105 @@ const UI_FLUSH_MAX_DELTA = 100;
  * per-chunk callbacks crossing the FFI boundary, so the host's main
  * thread is free to process input and render between pumps.
  */
-async function performSearch(pattern: string, silent?: boolean): Promise<SearchResult[]> {
-  if (!panel) return [];
+async function performSearch(
+  p: PanelState | null,
+  pattern: string,
+  silent?: boolean,
+): Promise<SearchResult[]> {
+  if (!p) return [];
 
-  const generation = ++currentSearchGeneration;
+  const generation = ++p.searchGeneration;
   // Each fresh search resets the per-file expansion set: previous
   // results may have included files that don't appear in the new
   // result set, and the user's collapse state for the *previous*
   // result set isn't meaningful for the new one.
-  panel.expandedFileKeys.clear();
-  panel.knownFileKeys.clear();
+  p.expandedFileKeys.clear();
+  p.knownFileKeys.clear();
   // New search → reset the streaming-append checkpoint. The first
   // batch of results will trigger a full `updatePanelContent()`
   // (mounting the empty Tree); subsequent batches append deltas to
   // that mounted Tree.
-  lastStreamingFlatCount = 0;
-  streamingFileIndexByPath = new Map();
-  pendingMatches = [];
-  pendingTreeDeltaItems = [];
-  pendingNewExpandedKeys = [];
-  lastUiFlush = 0;
+  //
+  // Number of `buildFlatItems()` entries already pushed to the host via
+  // `appendTreeNodes`. Zero means "nothing streamed into the mounted tree
+  // yet": the next batch does a full `updatePanelContent()` instead, so the
+  // Tree exists for later appends. Also reset while the panel's window is in
+  // the background, where nothing is drawn.
+  let lastStreamingFlatCount = 0;
+  // Absolute path → index into `p.fileGroups`, so each new match finds its
+  // file group in O(1) instead of a full `buildFileGroups` per batch.
+  const streamingFileIndexByPath = new Map<string, number>();
+  // Matches taken from the host but not processed yet: a big batch is
+  // drained CHUNK at a time, and `take()` is only called again once empty.
+  let pendingMatches: GrepMatch[] = [];
+  // Tree-append delta not flushed to the host yet; several chunks are
+  // coalesced into one `appendTreeNodes` IPC (~20 ms each on the host).
+  let pendingTreeDeltaItems: FlatItem[] = [];
+  // New file-row keys whose expansion must go out with the next flush.
+  let pendingNewExpandedKeys: string[] = [];
+  // Wall-clock ms of the last UI flush.
+  let lastUiFlush = 0;
   // Reset accumulating state so a re-search (debounce from typing,
   // toggle flip, scope change) starts from empty rather than
   // appending to the previous run's results. Drop the previous run's
   // anchor markers first so they don't leak on the source buffers.
-  clearMatchMarkers();
-  panel.searchResults = [];
-  panel.fileGroups = [];
+  withPanel(p, clearMatchMarkers);
+  p.searchResults = [];
+  p.fileGroups = [];
 
   // Cancel any in-flight search before kicking off a new one. Without
   // this the prior search would keep walking the project until it
   // hit max_results, wasting CPU.
-  if (activeSearchHandle) {
-    try { activeSearchHandle.cancel(); } catch (_e) { /* ignore */ }
-    activeSearchHandle = null;
+  if (p.searchHandle) {
+    try { p.searchHandle.cancel(); } catch (_e) { /* ignore */ }
+    p.searchHandle = null;
   }
+  // Buffers of the panel's own window, by path, for anchoring matches. Read
+  // per window, not from the active one: the search keeps running when the
+  // user switches windows, and another window may hold its own buffer of
+  // the same file (#3704). Refreshed every pump tick.
+  let buffersByPath = windowBuffersByPath(p.windowId);
 
   try {
-    const fixedString = !panel.useRegex;
+    const fixedString = !p.useRegex;
     const allResults: SearchResult[] = [];
 
-    // Whole-word filtering is done Rust-side so maxResults is respected correctly
+    // Whole-word filtering is done Rust-side so maxResults is respected
+    // correctly. "Current file only" searches just that buffer, as it is;
+    // all files walks the project.
     const handle = editor.beginSearch(pattern, {
       fixedString,
-      caseSensitive: panel.caseSensitive,
+      caseSensitive: p.caseSensitive,
       maxResults: MAX_RESULTS,
-      wholeWords: panel.wholeWords,
-      fileGlob: panel.fileGlob,
-      // Lets the host search an unnamed/unsaved source buffer in-memory;
-      // it has no on-disk file the project walk could otherwise reach.
-      sourceBufferId: panel.sourceBufferId,
+      wholeWords: p.wholeWords,
+      ...(p.allFiles
+        ? {
+          fileGlob: p.fileGlob,
+          // Lets the host search an unnamed/unsaved source buffer in-memory;
+          // it has no on-disk file the project walk could otherwise reach.
+          sourceBufferId: p.sourceBufferId,
+        }
+        // "Current file only": just that buffer, as it is.
+        : { bufferId: p.sourceBufferId || editor.getActiveBufferId() }),
     });
-    activeSearchHandle = handle;
+    p.searchHandle = handle;
 
     let truncated = false;
     let producerError: string | null = null;
 
     while (true) {
       // Discard the in-flight search if a newer one started while we slept.
-      if (generation !== currentSearchGeneration || !panel) {
+      // …or the panel was closed.
+      if (generation !== p.searchGeneration || panels.get(p.windowId) !== p) {
         try { handle.cancel(); } catch (_e) { /* ignore */ }
         return allResults;
+      }
+      // Only the active window's panel is drawn. One in the background keeps
+      // collecting results and is redrawn in full when its window is back.
+      const shown = p === panel;
+      if (!shown) {
+        lastStreamingFlatCount = 0;
+        p.needsRedraw = true;
       }
 
       // Drain matches in chunks of at most CHUNK per pump iteration.
@@ -1213,43 +1378,33 @@ async function performSearch(pattern: string, silent?: boolean): Promise<SearchR
       const deltaItems: FlatItem[] = [];
       const newExpandedKeys: string[] = []; // file rows added this batch
       for (const m of chunk) {
-        // §1 scope filter: when scope is "current file only", drop
-        // matches from any other source. Done client-side because the
-        // host grep API is project-wide. A named buffer matches by path;
-        // an unnamed/unsaved buffer (empty sourceBufferPath) matches by
-        // buffer id instead — the host tags its in-memory matches with it.
-        if (!panel.allFiles) {
-          const sameFile = !!panel.sourceBufferPath && m.file === panel.sourceBufferPath;
-          const sameBuffer = !!panel.sourceBufferId && m.bufferId === panel.sourceBufferId;
-          if (!sameFile && !sameBuffer) continue;
-        }
         const result: SearchResult = { match: m, selected: true };
         // Anchor the match to its buffer if the file is already open, so
         // edits made while stepping keep it in sync (#2583). Files opened
         // later are handled by the after_file_open hook.
-        ensureMatchMarker(result);
+        ensureMatchMarker(result, buffersByPath);
         allResults.push(result);
         let fileIdx = streamingFileIndexByPath?.get(m.file);
         if (fileIdx === undefined) {
-          fileIdx = panel.fileGroups.length;
+          fileIdx = p.fileGroups.length;
           streamingFileIndexByPath?.set(m.file, fileIdx);
-          panel.fileGroups.push({
-            relPath: getRelativePath(m.file),
+          p.fileGroups.push({
+            relPath: getRelativePath(m.file, p.root),
             absPath: m.file,
             expanded: true,
             matches: [],
           });
           deltaItems.push({ type: "file", fileIndex: fileIdx });
           const fileKey = `file:${fileIdx}`;
-          panel.expandedFileKeys.add(fileKey);
-          panel.knownFileKeys.add(fileKey);
+          p.expandedFileKeys.add(fileKey);
+          p.knownFileKeys.add(fileKey);
           newExpandedKeys.push(fileKey);
         }
-        const matchIdx = panel.fileGroups[fileIdx].matches.length;
-        panel.fileGroups[fileIdx].matches.push(result);
+        const matchIdx = p.fileGroups[fileIdx].matches.length;
+        p.fileGroups[fileIdx].matches.push(result);
         deltaItems.push({ type: "match", fileIndex: fileIdx, matchIndex: matchIdx });
       }
-      panel.searchResults = allResults;
+      p.searchResults = allResults;
       // Coalesce the per-chunk delta into a pending buffer. Each
       // `appendTreeNodes` IPC costs ~20 ms on the host (spec mutation
       // + Tree-visible-rows recompute + virtual-buffer repaint).
@@ -1267,37 +1422,41 @@ async function performSearch(pattern: string, silent?: boolean): Promise<SearchR
         producerFinished ||
         pendingTreeDeltaItems.length >= UI_FLUSH_MAX_DELTA ||
         nowMs - lastUiFlush >= UI_FLUSH_INTERVAL_MS;
-      if (
+      if (!shown) {
+        // Nothing to draw into; the redraw on return covers it.
+        pendingTreeDeltaItems = [];
+        pendingNewExpandedKeys = [];
+      } else if (
         dueToFlush &&
         pendingTreeDeltaItems.length > 0 &&
-        panel.widgetPanel &&
+        p.widgetPanel &&
         lastStreamingFlatCount > 0
       ) {
-        const W = Math.max(MIN_WIDTH, panel.viewportWidth - 2);
+        const W = Math.max(MIN_WIDTH, p.viewportWidth - 2);
         const flushed = pendingTreeDeltaItems;
         const flushedNewExp = pendingNewExpandedKeys;
         pendingTreeDeltaItems = [];
         pendingNewExpandedKeys = [];
         const newItemKeys = flushed.map(flatItemKey);
-        const newNodes = flatItemsToTreeNodes(flushed, newItemKeys, W);
-        panel.widgetPanel.appendTreeNodes("matchTree", newNodes, newItemKeys);
+        const newNodes = withPanel(p, () => flatItemsToTreeNodes(flushed, newItemKeys, W));
+        p.widgetPanel.appendTreeNodes("matchTree", newNodes, newItemKeys);
         lastStreamingFlatCount += flushed.length;
         lastUiFlush = nowMs;
         if (flushedNewExp.length > 0) {
-          panel.widgetPanel.setExpandedKeys(
+          p.widgetPanel.setExpandedKeys(
             "matchTree",
-            [...panel.expandedFileKeys],
+            [...p.expandedFileKeys],
           );
         }
-      } else if (lastStreamingFlatCount === 0 && panel.fileGroups.length > 0) {
+      } else if (lastStreamingFlatCount === 0 && p.fileGroups.length > 0) {
         // First time we have any results — mount the Tree via a full
-        // panel update. Subsequent batches use the cheap append path.
+        // p update. Subsequent batches use the cheap append path.
         // Also drain the pending buffer into the spec since
         // updatePanelContent rebuilds from `panel.fileGroups` directly.
         pendingTreeDeltaItems = [];
         pendingNewExpandedKeys = [];
-        updatePanelContent();
-        lastStreamingFlatCount = panel.fileGroups.length + panel.searchResults.length;
+        withPanel(p, updatePanelContent);
+        lastStreamingFlatCount = p.fileGroups.length + p.searchResults.length;
         lastUiFlush = nowMs;
       }
       if (producerFinished) {
@@ -1308,22 +1467,25 @@ async function performSearch(pattern: string, silent?: boolean): Promise<SearchR
         // input fields, and the "Matches (N in M files)" header in
         // the separator. Update them in place via `setRawEntries`
         // (a few-hundred-byte mutation) instead of re-emitting the
-        // full panel spec — the latter would force `js_to_json` over
+        // full p spec — the latter would force `js_to_json` over
         // every TreeNode (~447 bytes × 5 000 nodes = 2.2 MB) and
         // block the JS thread for ~1 second, exactly when user input
         // piles up unread in the request channel. See the
         // RESOLVE_CB_DONE dur_us=1095122 case in the perf trace.
-        if (panel.widgetPanel) {
-          if (panel.fileGroups.length === 0) {
+        if (shown && p.widgetPanel) {
+          if (p.fileGroups.length === 0) {
             // Special case: 0 matches. The matches body is an
             // empty-state `raw()`, not a `tree()` — we have to swap
             // widget kinds, which `setRawEntries` alone can't do.
             // The full re-emit here is cheap because the tree is
             // empty (no per-node serialization cost).
-            updatePanelContent();
+            withPanel(p, updatePanelContent);
           } else {
-            panel.widgetPanel.setRawEntries("matchStats", buildMatchStatsEntries());
-            panel.widgetPanel.setRawEntries("separator", buildPanelEntries("postOptions"));
+            const w = p.widgetPanel;
+            withPanel(p, () => {
+              w.setRawEntries("matchStats", buildMatchStatsEntries());
+              w.setRawEntries("separator", buildPanelEntries("postOptions"));
+            });
           }
         }
         lastStreamingFlatCount = 0;
@@ -1332,9 +1494,12 @@ async function performSearch(pattern: string, silent?: boolean): Promise<SearchR
       }
       // Also refresh the matchStats label on every streaming flush so
       // the count updates in real time as results stream in.
-      if (!producerFinished && dueToFlush && panel.widgetPanel) {
-        panel.widgetPanel.setRawEntries("matchStats", buildMatchStatsEntries());
-        panel.widgetPanel.setRawEntries("separator", buildPanelEntries("postOptions"));
+      if (shown && !producerFinished && dueToFlush && p.widgetPanel) {
+        const w = p.widgetPanel;
+        withPanel(p, () => {
+          w.setRawEntries("matchStats", buildMatchStatsEntries());
+          w.setRawEntries("separator", buildPanelEntries("postOptions"));
+        });
       }
 
       if (producerFinished) {
@@ -1350,34 +1515,38 @@ async function performSearch(pattern: string, silent?: boolean): Promise<SearchR
       // on `handle.take()`.
       const yieldMs = moreInQueue ? 0 : SEARCH_PUMP_INTERVAL_MS;
       await editor.delay(yieldMs);
+      buffersByPath = windowBuffersByPath(p.windowId);
     }
 
-    if (activeSearchHandle === handle) {
-      activeSearchHandle = null;
+    if (p.searchHandle === handle) {
+      p.searchHandle = null;
     }
 
     // Final state
-    if (generation !== currentSearchGeneration || !panel) return allResults;
+    if (generation !== p.searchGeneration || panels.get(p.windowId) !== p) return allResults;
 
     if (producerError) {
       throw new Error(producerError);
     }
 
-    panel.truncated = truncated;
+    p.truncated = truncated;
+
+    // Status messages are per window: one for a background panel is held
+    // until its window is back (`showStatusFor`).
 
     if (!silent) {
       if (allResults.length === 0) {
-        editor.setStatus(editor.t("status.no_matches", { pattern }));
-      } else if (panel.truncated) {
-        editor.setStatus(editor.t("status.found_matches", { count: String(allResults.length) }) + " " + editor.t("panel.limited"));
+        showStatusFor(p, editor.t("status.no_matches", { pattern }));
+      } else if (p.truncated) {
+        showStatusFor(p, editor.t("status.found_matches", { count: String(allResults.length) }) + " " + editor.t("panel.limited"));
       } else {
-        editor.setStatus(editor.t("status.found_matches", { count: String(allResults.length) }));
+        showStatusFor(p, editor.t("status.found_matches", { count: String(allResults.length) }));
       }
     }
     return allResults;
   } catch (e) {
     if (!silent) {
-      editor.setStatus(editor.t("status.search_error", { error: String(e) }));
+      showStatusFor(p, editor.t("status.search_error", { error: String(e) }));
     }
     return [];
   }
@@ -1445,6 +1614,7 @@ async function openPanelInner(opts?: { allFiles?: boolean }): Promise<void> {
   const allFiles = opts?.allFiles ?? true;
   const sourceBufferRelPath = sourceBufferPath ? getRelativePath(sourceBufferPath) : "";
 
+  // `panel` is this window's panel; another window's is left alone.
   if (panel) {
     panel.focusPanel = "query";
     panel.queryField = "search";
@@ -1461,6 +1631,9 @@ async function openPanelInner(opts?: { allFiles?: boolean }): Promise<void> {
   }
 
   const sourceSplitId = editor.getActiveSplitId();
+  // The window the buffer is created in, should the user switch away while
+  // the host creates it.
+  const windowId = currentWindowId;
 
   try {
     // Create the buffer *before* publishing `panel`. Everything that reads
@@ -1494,7 +1667,19 @@ async function openPanelInner(opts?: { allFiles?: boolean }): Promise<void> {
       scrollable: false,
     });
 
-    panel = {
+    const created: PanelState = {
+      windowId,
+      root: editor.getCwd(),
+      stale: false,
+      staleKeepPosition: false,
+      needsRedraw: false,
+      searchGeneration: 0,
+      searchHandle: null,
+      debounceGeneration: 0,
+      searchAfterEdit: null,
+      replaceInProgress: false,
+      pendingStatus: null,
+      parked: null,
       resultsBufferId: result.bufferId,
       sourceSplitId,
       resultsSplitId: result.splitId ?? editor.getActiveSplitId(),
@@ -1507,9 +1692,9 @@ async function openPanelInner(opts?: { allFiles?: boolean }): Promise<void> {
       queryField: "search",
       optionIndex: 0,
       matchIndex: 0,
-      caseSensitive: false,
-      useRegex: false,
-      wholeWords: false,
+      caseSensitive: sessionMatchOptions.caseSensitive,
+      useRegex: sessionMatchOptions.useRegex,
+      wholeWords: sessionMatchOptions.wholeWords,
       allFiles,
       sourceBufferPath,
       sourceBufferRelPath,
@@ -1525,14 +1710,21 @@ async function openPanelInner(opts?: { allFiles?: boolean }): Promise<void> {
       knownFileKeys: new Set<string>(),
       widgetPanel: null,
     };
+    panels.set(windowId, created);
     editor.debug(`Search/Replace: panel opened, bufferId=${result.bufferId}, splitId=${result.splitId}`);
 
+    if (windowId !== currentWindowId) {
+      // The user left the window while its panel was being created: draw it
+      // when they come back.
+      created.stale = true;
+      return;
+    }
+    panel = created;
     updatePanelContent();
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     editor.setStatus(editor.t("status.failed_open_panel"));
     editor.debug(`ERROR: createVirtualBufferInSplit failed: ${errorMessage}`);
-    panel = null;
   }
 }
 
@@ -1540,9 +1732,15 @@ async function openPanelInner(opts?: { allFiles?: boolean }): Promise<void> {
 // Replacements
 // =============================================================================
 
+/** Files the last replace rewrote. An undo there puts the replaced matches
+ *  back, so the panel re-runs its search when one of them changes (see the
+ *  `buffer_modified` handler). Cleared when the panel closes. */
+let lastReplacedFiles = new Set<string>();
+
 async function executeReplacements(results?: SearchResult[]): Promise<string> {
-  if (!panel) return "";
-  const toReplace = results || panel.searchResults.filter(r => r.selected);
+  const p = panel;
+  if (!p) return "";
+  const toReplace = results || p.searchResults.filter(r => r.selected);
   if (toReplace.length === 0) {
     return editor.t("status.no_selected");
   }
@@ -1569,15 +1767,32 @@ async function executeReplacements(results?: SearchResult[]): Promise<string> {
   let replacementsCount = 0;
   const errors: string[] = [];
 
+  // In regex mode the replacement is a template (`$1`, `${name}`, `\n`);
+  // the host expands it per match against the search that found it.
+  const regex = p.useRegex
+    ? { pattern: p.searchPattern, caseSensitive: p.caseSensitive, wholeWords: p.wholeWords }
+    : undefined;
+
   const groupList: Group[] = [];
   groups.forEach((g) => groupList.push(g));
+  lastReplacedFiles = new Set(groupList.map((g) => g.filePath));
+  let interrupted = false;
   for (const group of groupList) {
+    // The host rewrites files and buffers of the active window. Once the
+    // user has switched windows, the rest of these belong to a window that
+    // is no longer active: stop. The panel re-searches when its window is
+    // back (`rerunSearchQuiet` defers a search it can't start here).
+    if (panel !== p) {
+      interrupted = true;
+      break;
+    }
     try {
       const result = await editor.replaceInFile(
         group.filePath,
         group.matches,
-        panel.replaceText,
-        group.bufferId
+        p.replaceText,
+        group.bufferId,
+        regex
       );
       replacementsCount += result.replacements;
       if (result.replacements > 0) filesModified++;
@@ -1586,6 +1801,15 @@ async function executeReplacements(results?: SearchResult[]): Promise<string> {
     }
   }
 
+  if (interrupted) {
+    // Said in the panel's window when the user is back there (the caller
+    // holds the message), so a partial replace is never silent.
+    return editor.t("status.replace_interrupted", {
+      count: String(replacementsCount),
+      files: String(filesModified),
+      total: String(groupList.length),
+    });
+  }
   if (errors.length > 0) {
     editor.debug(`Replacement errors: ${errors.join(", ")}`);
     return editor.t("status.replaced_with_errors", { files: String(filesModified), errors: String(errors.length) });
@@ -1597,109 +1821,188 @@ async function executeReplacements(results?: SearchResult[]): Promise<string> {
 // Re-search
 // =============================================================================
 
-async function rerunSearch(): Promise<void> {
-  if (!panel || !panel.searchPattern) return;
-  // No `panel.busy` early-return: if a search is already running for
-  // an older pattern (e.g. user typed "pr" then "proj"), we want the
-  // newer search to start NOW, not after the old one finishes
-  // walking the project. `performSearch` increments
-  // `currentSearchGeneration` and cancels the prior handle; the older
-  // in-flight `performSearch` sees the gen mismatch on its next
-  // pump tick and bails out without writing to panel state.
-  searchDebounceGeneration++;
-  // Capture the generation this rerunSearch will own once performSearch
-  // increments it. If a newer rerunSearch slots in while we're awaiting,
-  // currentSearchGeneration moves past `myGen` and we know not to
-  // finalize busy/searchPerformed for this stale invocation.
-  const myGen = currentSearchGeneration + 1;
-  panel.truncated = false;
-  panel.busy = true;
-  panel.matchIndex = 0;
-  panel.scrollOffset = 0;
-  await performSearch(panel.searchPattern);
-  // performSearch maintains panel.searchResults / panel.fileGroups
-  // incrementally during streaming and pushes matchStats / separator
-  // updates via cheap targeted mutations on batch.done — no full
-  // spec re-emit needed here. Only finalize busy + searchPerformed
-  // if we are still the latest search; the busy flip drives the
-  // "No matches" empty-state branch in `buildMatchListSpec`, so
-  // when totalMatches===0 we also need to refresh the matches Raw
-  // (a tiny mutation) so the user sees the empty-state label.
-  if (panel && currentSearchGeneration === myGen) {
-    panel.busy = false;
-    panel.searchPerformed = true;
-    if (panel.widgetPanel) {
-      if (panel.searchResults.length === 0) {
-        // Zero matches: the match-list body is an empty-state `raw()`
-        // last rendered while `busy` was still true → "Searching…".
-        // `setRawEntries("matchStats", …)` only refreshes the small
-        // count label next to the inputs, not the body, so without a
-        // full re-emit the body stays stuck on "Searching…". Re-emit
-        // now that the flags are final so it shows "No matches".
-        // Cheap: the tree is empty (no per-node serialization cost).
-        updatePanelContent();
-      } else {
-        // The tree was built incrementally in file-arrival order while
-        // streaming. Now that the search is finished, re-order the file
-        // groups into natural path order and re-emit once so the
-        // reviewer sees a stable, sorted list (#2435). This is the only
-        // full re-emit of the run — it happens after streaming has
-        // stopped and the user is about to start reviewing, so it
-        // doesn't compete with input the way per-batch re-emits would.
-        sortFileGroups();
-        updatePanelContent();
-      }
-    }
+/** The match the user had stepped onto when an edit re-ran the search
+ *  (`buffer_modified`), so stepping goes on from it rather than starting over
+ *  at the first match. Held by a marker of its own while the re-search runs:
+ *  each keystroke of the edit starts another re-search, and the edits made in
+ *  the meantime must shift it too. A match in a file that isn't open has no
+ *  marker; its file can't be edited, so its grep position stands. */
+type ResumeAnchor = { file: string; byte: number; bufferId?: number; key?: string };
+let resumeAnchor: ResumeAnchor | null = null;
+
+/** Anchor the match at the panel's selection, unless an earlier re-search
+ *  still holds an anchor — the selection was reset when that one started. */
+function anchorSteppedMatch(): void {
+  if (!panel || resumeAnchor) return;
+  const item = buildFlatItems()[panel.matchIndex];
+  if (!item || item.type !== "match") return;
+  const result = panel.fileGroups[item.fileIndex].matches[item.matchIndex!];
+  let byte = result.match.byteOffset;
+  if (result.markerKey && result.markerBufferId) {
+    const marker = editor.getMarker(result.markerBufferId, result.markerKey) as
+      | { start: number }
+      | null;
+    if (marker && typeof marker.start === "number") byte = marker.start;
+  }
+  resumeAnchor = { file: result.match.file, byte };
+  const key = `sr:${nextMatchMarkerId++}`;
+  if (result.markerBufferId && editor.createMarker(result.markerBufferId, key, byte, byte + result.match.length, null)) {
+    resumeAnchor.bufferId = result.markerBufferId;
+    resumeAnchor.key = key;
   }
 }
 
-function rerunSearchDebounced(): void {
-  const gen = ++searchDebounceGeneration;
-  editor.delay(SEARCH_DEBOUNCE_MS).then(() => {
-    if (gen === searchDebounceGeneration) {
-      rerunSearch();
+/** Forget the anchor, returning where its match is now. */
+function takeResumeAnchor(): { file: string; byte: number } | null {
+  const anchor = resumeAnchor;
+  resumeAnchor = null;
+  if (!anchor) return null;
+  if (anchor.bufferId && anchor.key) {
+    const marker = editor.getMarker(anchor.bufferId, anchor.key) as { start: number } | null;
+    if (marker && typeof marker.start === "number") anchor.byte = marker.start;
+    editor.deleteMarker(anchor.bufferId, anchor.key);
+  }
+  return { file: anchor.file, byte: anchor.byte };
+}
+
+/** The row to step on from: the match now at `at`, else the last one before
+ *  it in its file, else that file's header row — so the next step lands on the
+ *  first match after `at` either way. The top of the list when its file has no
+ *  matches left. */
+function flatIndexAtLocation(at: { file: string; byte: number }): number {
+  if (!panel) return 0;
+  const flat = buildFlatItems();
+  let found = 0;
+  for (let i = 0; i < flat.length; i++) {
+    const item = flat[i];
+    const group = panel.fileGroups[item.fileIndex];
+    if (group.absPath !== at.file) continue;
+    if (item.type === "match" && group.matches[item.matchIndex!].match.byteOffset > at.byte) {
+      break;
     }
+    found = i;
+  }
+  return found;
+}
+
+
+/** Re-run the search. `keepPosition` is for the re-search an edit starts:
+ *  the user did not ask for it, so their place in the results survives it.
+ *
+ *  Runs for the active window's panel and finishes for that panel even if
+ *  the user switches windows meanwhile: the search keeps going in the
+ *  background and the panel is drawn when its window is back. */
+async function rerunSearch(keepPosition = false): Promise<void> {
+  const p = panel;
+  if (!p || !p.searchPattern) return;
+  // No `busy` early-return: if a search is already running for an older
+  // pattern (e.g. user typed "pr" then "proj"), the newer search starts
+  // NOW, not after the old one finishes walking the project.
+  // `performSearch` bumps the panel's search generation and cancels the
+  // prior handle; the older in-flight search sees the mismatch on its next
+  // pump tick and bails out without writing to panel state.
+  p.debounceGeneration++;
+  // The generation this rerunSearch will own once performSearch increments
+  // it. If a newer search of this panel slots in while we're awaiting, the
+  // generation moves past `myGen` and this stale invocation doesn't
+  // finalize busy/searchPerformed.
+  const myGen = p.searchGeneration + 1;
+  if (keepPosition) anchorSteppedMatch();
+  else takeResumeAnchor();
+  p.truncated = false;
+  p.busy = true;
+  p.matchIndex = 0;
+  p.scrollOffset = 0;
+  await performSearch(p, p.searchPattern);
+  if (p.searchGeneration !== myGen || panels.get(p.windowId) !== p) return;
+  // performSearch maintained searchResults / fileGroups incrementally while
+  // streaming and pushed matchStats / separator updates via cheap targeted
+  // mutations. What's left: final flags, the sort, and one re-emit.
+  p.busy = false;
+  p.searchPerformed = true;
+  // The tree was built in file-arrival order while streaming; re-order the
+  // file groups into natural path order so the reviewer sees a stable,
+  // sorted list (#2435).
+  if (p.searchResults.length > 0) withPanel(p, sortFileGroups);
+  if (p !== panel) {
+    // Finished in the background: the resume position (parked with the
+    // panel) and the redraw are applied when its window is back.
+    p.needsRedraw = true;
+    return;
+  }
+  if (p.widgetPanel) {
+    // The only full re-emit of the run — after streaming has stopped, so it
+    // doesn't compete with input the way per-batch re-emits would. With
+    // zero matches it is also what replaces the "Searching…" body (last
+    // drawn while `busy` was true) with "No matches"; cheap then, the tree
+    // being empty.
+    const resumeAt = takeResumeAnchor();
+    if (resumeAt && p.searchResults.length > 0) p.matchIndex = flatIndexAtLocation(resumeAt);
+    updatePanelContent();
+  }
+}
+
+function rerunSearchDebounced(keepPosition = false): void {
+  const owner = panel;
+  if (!owner) return;
+  const gen = ++owner.debounceGeneration;
+  editor.delay(SEARCH_DEBOUNCE_MS).then(() => {
+    if (gen !== owner.debounceGeneration) return;
+    if (panel !== owner) {
+      // Asked for in a window the user has since left: run it when that
+      // window is back.
+      owner.stale = true;
+      owner.staleKeepPosition = owner.staleKeepPosition || keepPosition;
+      return;
+    }
+    const run = rerunSearch(keepPosition);
+    if (!keepPosition) return;
+    owner.searchAfterEdit = run;
+    run.finally(() => {
+      if (owner.searchAfterEdit === run) owner.searchAfterEdit = null;
+    });
   });
 }
 
-// Same as rerunSearch but doesn't update status bar (preserves replacement message)
-async function rerunSearchQuiet(): Promise<void> {
-  if (!panel || !panel.searchPattern) return;
-  if (panel.busy) return;
-  searchDebounceGeneration++;
-  panel.busy = true;
-  const results = await performSearch(panel.searchPattern, true);
-  if (panel) {
-    panel.searchResults = results;
-    panel.fileGroups = buildFileGroups(results);
-    panel.matchIndex = 0;
-    panel.scrollOffset = 0;
-    panel.busy = false;
-    panel.searchPerformed = true;
-    updatePanelContent();
+// Same as rerunSearch but doesn't update status bar (preserves replacement
+// message), and for a given panel, which may be in the background by now.
+async function rerunSearchQuiet(p: PanelState | null = panel): Promise<void> {
+  if (!p || !p.searchPattern) return;
+  if (p !== panel) {
+    // The host searches the *active* window's project, so a search can't be
+    // started for a panel in the background (one already running keeps its
+    // own). Run it when the panel's window is back.
+    p.stale = true;
+    p.needsRedraw = false;
+    return;
   }
+  if (p.busy) return;
+  p.debounceGeneration++;
+  p.busy = true;
+  const myGen = p.searchGeneration + 1;
+  const results = await performSearch(p, p.searchPattern, true);
+  if (p.searchGeneration !== myGen || panels.get(p.windowId) !== p) return;
+  p.searchResults = results;
+  p.fileGroups = withPanel(p, () => buildFileGroups(results));
+  p.matchIndex = 0;
+  p.scrollOffset = 0;
+  p.busy = false;
+  p.searchPerformed = true;
+  if (p === panel) updatePanelContent();
+  else p.needsRedraw = true;
 }
 
 // =============================================================================
 // Text editing handlers (inline editing of query fields)
 // =============================================================================
 
-// All editing / navigation keys route through the widget runtime
-// via the smart `Key` dispatch — the host knows which widget is
-// focused and routes accordingly (Backspace into TextInput; Up/Down
-// across List rows; Enter/Space activate Toggle/Button/List;
-// printable Space inserts into TextInput; Tab/Shift+Tab cycles
-// focus). See WidgetAction::Key for the full table.
+// ↓ in the search field that is not walking history goes on to the
+// host's own arrow handling (into the match tree): the binding owns the
+// key on that field, so it hands it back explicitly.
 function dispatch(action: WidgetAction): void {
   panel?.widgetPanel?.command(action);
 }
 
-registerHandler("search_replace_backspace", () => dispatch(widgetKey("Backspace")));
-registerHandler("search_replace_delete",    () => dispatch(widgetKey("Delete")));
-registerHandler("search_replace_home",      () => dispatch(widgetKey("Home")));
-registerHandler("search_replace_end",       () => dispatch(widgetKey("End")));
-registerHandler("search_replace_nav_left",  () => dispatch(widgetKey("Left")));
-registerHandler("search_replace_nav_right", () => dispatch(widgetKey("Right")));
 /** Apply a stored history entry to the search field. Mutates the
  *  widget's value via setValue so the host instance state stays in
  *  sync with the plugin's panel.searchPattern, and triggers a
@@ -1713,35 +2016,25 @@ function applyHistoryEntry(text: string): void {
   rerunSearchDebounced();
 }
 
-/** Whether Up/Down should be intercepted for history walk (instead of
- *  being passed to the focused widget). True only when the most recent
- *  widget_event indicated focus was on the search field. */
-function shouldInterceptForHistory(): boolean {
-  return lastFocusedWidget === "searchField" || lastFocusedWidget === null;
-}
-
+// Bound only on the search field (`on:searchField`): everywhere else ↑/↓
+// are the focused control's, or the host's spatial move.
 registerHandler("search_replace_nav_up", () => {
-  if (!panel) return;
-  if (shouldInterceptForHistory()) {
-    if (searchHistory.length === 0) return;
-    if (historyIndex < 0) {
-      // Entering history walk — snapshot what the user had typed so
-      // a Down past the most recent entry restores it.
-      historySavedPattern = panel.searchPattern;
-      historyIndex = 0;
-    } else if (historyIndex < searchHistory.length - 1) {
-      historyIndex += 1;
-    } else {
-      return; // already at the oldest entry
-    }
-    applyHistoryEntry(searchHistory[historyIndex]);
-    return;
+  if (!panel || searchHistory.length === 0) return;
+  if (historyIndex < 0) {
+    // Entering history walk — snapshot what the user had typed so
+    // a Down past the most recent entry restores it.
+    historySavedPattern = panel.searchPattern;
+    historyIndex = 0;
+  } else if (historyIndex < searchHistory.length - 1) {
+    historyIndex += 1;
+  } else {
+    return; // already at the oldest entry
   }
-  dispatch(widgetKey("Up"));
+  applyHistoryEntry(searchHistory[historyIndex]);
 });
 registerHandler("search_replace_nav_down", () => {
   if (!panel) return;
-  if (shouldInterceptForHistory() && historyIndex >= 0) {
+  if (historyIndex >= 0) {
     if (historyIndex > 0) {
       historyIndex -= 1;
       applyHistoryEntry(searchHistory[historyIndex]);
@@ -1757,29 +2050,11 @@ registerHandler("search_replace_nav_down", () => {
   }
   dispatch(widgetKey("Down"));
 });
-registerHandler("search_replace_nav_page_up",   () => dispatch(widgetKey("PageUp")));
-registerHandler("search_replace_nav_page_down", () => dispatch(widgetKey("PageDown")));
-
-// Tab / Shift+Tab now cycle focus through the host's tabbable
-// widget set (declared in spec via `key`s — searchField,
-// replaceField, case, regex, whole, replaceAll, matchTree).
-// The host re-renders with focus styling on the new widget; the
-// plugin needn't track focusPanel/queryField/optionIndex anymore
-// (the legacy fields linger in PanelState until the rest of the
-// plugin migrates off them).
-registerHandler("search_replace_tab",       () => dispatch(widgetKey("Tab")));
-registerHandler("search_replace_shift_tab", () => dispatch(widgetKey("Shift+Tab")));
-
-// Left/Right route through the smart-key dispatcher: the host
-// expands/collapses Tree nodes (when the matchTree is focused) or
-// moves the TextInput cursor (when a search/replace field is
-// focused). Plugin no longer needs separate file-row expand
-// handling.
-
 // Global option toggles (Alt+C, Alt+R, Alt+W)
 function search_replace_toggle_case(): void {
   if (!panel) return;
   panel.caseSensitive = !panel.caseSensitive;
+  sessionMatchOptions.caseSensitive = panel.caseSensitive;
   updatePanelContent();
   rerunSearchDebounced();
 }
@@ -1788,6 +2063,7 @@ registerHandler("search_replace_toggle_case", search_replace_toggle_case);
 function search_replace_toggle_regex(): void {
   if (!panel) return;
   panel.useRegex = !panel.useRegex;
+  sessionMatchOptions.useRegex = panel.useRegex;
   updatePanelContent();
   rerunSearchDebounced();
 }
@@ -1796,6 +2072,7 @@ registerHandler("search_replace_toggle_regex", search_replace_toggle_regex);
 function search_replace_toggle_whole_word(): void {
   if (!panel) return;
   panel.wholeWords = !panel.wholeWords;
+  sessionMatchOptions.wholeWords = panel.wholeWords;
   updatePanelContent();
   rerunSearchDebounced();
 }
@@ -1815,22 +2092,66 @@ registerHandler("search_replace_replace_scoped", search_replace_replace_scoped);
 // Action handlers
 // =============================================================================
 
-// Enter / Space route to the widget runtime. The host decides what
-// each does based on the focused widget kind:
-//   * Toggle (case/regex/whole) → fires `widget_event` "toggle".
-//   * Button (replaceAll)       → fires `widget_event` "activate".
-//   * Tree   (matchTree)        → fires `widget_event` "activate"
-//                                  with the focused row's index/key.
-//                                  Plugin handler opens the match
-//                                  for leaf rows or toggles
-//                                  expansion for file rows.
-//   * TextInput + Space         → inserts " " (fires "change").
-//   * TextInput + Enter         → no-op (plugin can still bind a
-//                                  separate handler if it wants
-//                                  Enter to mean "submit").
-// Per-event handling lives in the `widget_event` listener below.
-registerHandler("search_replace_enter", () => dispatch(widgetKey("Enter")));
-registerHandler("search_replace_space", () => dispatch(widgetKey("Space")));
+// =============================================================================
+// Replace confirmation dialog
+// =============================================================================
+//
+// Replacements write to disk immediately and Undo only covers files that
+// stay open, so a replace asks first. It used to ask on the prompt line at
+// the bottom of the screen, which was easy to miss; this is a modal dialog
+// centred on the screen instead. Enter replaces (focus starts on Replace),
+// Esc / Cancel / the [×] back out.
+
+let confirmDialog: { panel: FloatingWidgetPanel; resolve: (ok: boolean) => void } | null = null;
+
+function confirmReplace(count: number, files: number): Promise<boolean> {
+  settleConfirmDialog(false);
+  return new Promise((resolve) => {
+    const dialog = new FloatingWidgetPanel();
+    confirmDialog = { panel: dialog, resolve };
+    dialog.mount(
+      col(
+        spacer(0),
+        label(" " + editor.t("dialog.confirm_replace_body", {
+          count: String(count),
+          files: String(files),
+        }), { wrap: true }),
+        label(" " + editor.t("dialog.confirm_replace_undo_note"), {
+          wrap: true,
+          style: { fg: C.label, italic: true },
+        }),
+        spacer(0),
+        row(
+          flexSpacer(),
+          button(editor.t("dialog.cancel_btn"), { key: "confirmCancel" }),
+          spacer(2),
+          button(editor.t("dialog.confirm_replace_btn"), { intent: "primary", key: "confirmReplace" }),
+          spacer(1),
+        ),
+      ),
+      {
+        widthPct: 50,
+        heightPct: 30,
+        focusMarker: true,
+        title: editor.t("dialog.confirm_replace_title"),
+        closable: true,
+      },
+    );
+    // Centre on the whole screen, not just the area beside the dock.
+    editor.floatingPanelControl(dialog.id(), "fullscreen", 1);
+    dialog.setFocusKey("confirmReplace");
+  });
+}
+
+/** Resolve the open confirmation, if any. `unmount` is false when the host
+ *  has already taken the dialog down (Esc, click outside, the [×]). */
+function settleConfirmDialog(ok: boolean, unmount = true): void {
+  if (!confirmDialog) return;
+  const { panel: dialog, resolve } = confirmDialog;
+  confirmDialog = null;
+  if (unmount) dialog.unmount();
+  resolve(ok);
+}
 
 /** Lock against re-entrant Replace All / Replace Scoped. Set as soon
  *  as doReplaceAll/doReplaceScoped enters and cleared in a try/finally
@@ -1839,7 +2160,6 @@ registerHandler("search_replace_space", () => dispatch(widgetKey("Space")));
  *  once the search finishes — the host queues each keystroke and
  *  drains them all when the JS event loop frees up; by then
  *  `panel.busy` is false so the busy guard doesn't fire. */
-let replaceInProgress = false;
 
 async function doReplaceAll(): Promise<void> {
   if (!panel) return;
@@ -1851,16 +2171,17 @@ async function doReplaceAll(): Promise<void> {
     editor.setStatus(editor.t("status.replace_wait_for_search"));
     return;
   }
-  if (replaceInProgress) {
+  if (panel.replaceInProgress) {
     // First Alt+Enter is already showing its prompt or running the
     // rewrites. Drop the duplicate so we don't stack prompts.
     return;
   }
-  replaceInProgress = true;
+  const owner = panel;
+  owner.replaceInProgress = true;
   try {
     await doReplaceAllInner();
   } finally {
-    replaceInProgress = false;
+    owner.replaceInProgress = false;
   }
 }
 
@@ -1878,32 +2199,27 @@ async function doReplaceAllInner(): Promise<void> {
   // Confirm before applying.  Replacements write to disk immediately; Undo
   // only covers files that remain open in this session (see bug #1 report).
   const fileCount = new Set(selected.map(r => r.match.file)).size;
-  const confirmed = await editor.prompt(
-    editor.t("prompt.confirm_replace", {
-      count: String(selected.length),
-      files: String(fileCount),
-    }),
-    "",
-  );
-  if (confirmed === null) {
-    editor.setStatus(editor.t("status.replace_cancelled"));
+  const owner = panel;
+  if (!await confirmReplace(selected.length, fileCount)) {
+    if (panel === owner) editor.setStatus(editor.t("status.replace_cancelled"));
     return;
   }
+  if (!panel || panel !== owner) return;
   panel.busy = true;
   editor.setStatus(editor.t("status.replacing", { count: String(selected.length) }));
   const statusMsg = await executeReplacements(selected);
-  editor.setStatus(statusMsg);
+  showStatusFor(owner, statusMsg);
   // Clear stale results before re-searching: the byte offsets in
   // `panel.searchResults` now point at positions in the pre-replacement
   // file and must never be re-used (see bug #4 — a second Alt+Enter would
   // otherwise corrupt files by writing into moved offsets).  We also drop
   // `busy` so rerunSearchQuiet doesn't bail out on its own guard.
-  clearMatchMarkers();
-  panel.searchResults = [];
-  panel.fileGroups = [];
-  panel.busy = false;
-  await rerunSearchQuiet();
-  updatePanelContent();
+  withPanel(owner, clearMatchMarkers);
+  owner.searchResults = [];
+  owner.fileGroups = [];
+  owner.busy = false;
+  await rerunSearchQuiet(owner);
+  if (panel === owner) updatePanelContent();
 }
 
 async function doReplaceScoped(): Promise<void> {
@@ -1912,12 +2228,13 @@ async function doReplaceScoped(): Promise<void> {
     editor.setStatus(editor.t("status.replace_wait_for_search"));
     return;
   }
-  if (replaceInProgress) return;
-  replaceInProgress = true;
+  if (panel.replaceInProgress) return;
+  const owner = panel;
+  owner.replaceInProgress = true;
   try {
     await doReplaceScopedInner();
   } finally {
-    replaceInProgress = false;
+    owner.replaceInProgress = false;
   }
 }
 
@@ -1943,29 +2260,24 @@ async function doReplaceScopedInner(): Promise<void> {
   }
 
   const fileCount = new Set(toReplace.map(r => r.match.file)).size;
-  const confirmed = await editor.prompt(
-    editor.t("prompt.confirm_replace", {
-      count: String(toReplace.length),
-      files: String(fileCount),
-    }),
-    "",
-  );
-  if (confirmed === null) {
-    editor.setStatus(editor.t("status.replace_cancelled"));
+  const owner = panel;
+  if (!await confirmReplace(toReplace.length, fileCount)) {
+    if (panel === owner) editor.setStatus(editor.t("status.replace_cancelled"));
     return;
   }
+  if (!panel || panel !== owner) return;
 
   panel.busy = true;
   editor.setStatus(editor.t("status.replacing", { count: String(toReplace.length) }));
   const statusMsg = await executeReplacements(toReplace);
-  editor.setStatus(statusMsg);
+  showStatusFor(owner, statusMsg);
   // See doReplaceAll — clear stale offsets and drop busy before re-searching.
-  clearMatchMarkers();
-  panel.searchResults = [];
-  panel.fileGroups = [];
-  panel.busy = false;
-  await rerunSearchQuiet();
-  updatePanelContent();
+  withPanel(owner, clearMatchMarkers);
+  owner.searchResults = [];
+  owner.fileGroups = [];
+  owner.busy = false;
+  await rerunSearchQuiet(owner);
+  if (panel === owner) updatePanelContent();
 }
 
 // =============================================================================
@@ -2034,9 +2346,9 @@ let nextMatchMarkerId = 0;
 /** Register an interval marker for `result` when its file is open and it has
  *  no marker yet. The marker spans the match's byte range; the editor keeps
  *  it shifted. No-op for closed files (no buffer to anchor to). */
-function ensureMatchMarker(result: SearchResult): void {
+function ensureMatchMarker(result: SearchResult, buffersByPath: Map<string, number>): void {
   if (result.markerKey) return;
-  const bid = result.match.bufferId || editor.findBufferByPath(result.match.file);
+  const bid = result.match.bufferId || buffersByPath.get(result.match.file);
   if (!bid || bid <= 0) return;
   const start = result.match.byteOffset;
   const key = `sr:${nextMatchMarkerId++}`;
@@ -2048,10 +2360,11 @@ function ensureMatchMarker(result: SearchResult): void {
 
 /** Register markers for every match in a file's buffer — used when a file is
  *  opened after the search captured it, so later edits to it still track. */
-function ensureMarkersForPath(path: string): void {
-  if (!panel || !path) return;
-  for (const r of panel.searchResults) {
-    if (r.match.file === path) ensureMatchMarker(r);
+function ensureMarkersForPath(p: PanelState, path: string, bufferId: number): void {
+  if (!path) return;
+  const byPath = new Map([[path, bufferId]]);
+  for (const r of p.searchResults) {
+    if (r.match.file === path) ensureMatchMarker(r, byPath);
   }
 }
 
@@ -2147,6 +2460,16 @@ async function jumpToMatch(flat: FlatItem[], flatIdx: number): Promise<void> {
 }
 
 function navigateMatch(dir: 1 | -1): void {
+  const waitFor = panel?.searchAfterEdit;
+  if (waitFor) {
+    // This window's own re-search; a step is dropped if the user has left
+    // the window by the time it lands.
+    const p = panel;
+    waitFor.then(() => {
+      if (panel === p) navigateMatch(dir);
+    });
+    return;
+  }
   if (!panel || panel.searchResults.length === 0) {
     editor.setStatus(
       editor.t(panel?.busy ? "panel.searching" : "status.no_active_search"),
@@ -2224,19 +2547,51 @@ function search_replace_close(): void {
   // Drop the anchor markers we registered on the source buffers so they
   // don't linger after the panel is gone.
   clearMatchMarkers();
+  takeResumeAnchor();
   const sourceSplitId = panel.sourceSplitId;
   panel.widgetPanel?.unmount();
   editor.closeBuffer(panel.resultsBufferId);
   if (panel.resultsSplitId !== panel.sourceSplitId) {
     editor.closeSplit(panel.resultsSplitId);
   }
-  panel = null;
+  forgetPanel(panel);
   // Restore focus to the split the user came from. Without this,
   // `getActiveBufferId()` on the next invocation can return the
   // utility dock's leftover buffer, and the §1 current-file scope
   // shows "(unsaved buffer)" instead of the real filename.
   editor.focusSplit(sourceSplitId);
   editor.setStatus(editor.t("status.closed"));
+}
+
+/** Show `msg` in `p`'s window: now if it is the active one, else when the
+ *  user is back there (status messages are per window). */
+function showStatusFor(p: PanelState, msg: string): void {
+  if (panel === p) editor.setStatus(msg);
+  else p.pendingStatus = msg;
+}
+
+/** Drop `p` from the per-window table, and its window-local context with it
+ *  when it is the active window's panel. */
+function forgetPanel(p: PanelState): void {
+  // Stop its search, and drop its anchors: the active panel's are dropped by
+  // the callers, a background panel's (and its parked resume anchor) here.
+  p.searchGeneration++;
+  if (p.searchHandle) {
+    try { p.searchHandle.cancel(); } catch (_e) { /* ignore */ }
+    p.searchHandle = null;
+  }
+  if (panel !== p) {
+    withPanel(p, clearMatchMarkers);
+    const anchor = p.parked?.resumeAnchor;
+    if (anchor?.bufferId && anchor.key) editor.deleteMarker(anchor.bufferId, anchor.key);
+    p.parked = null;
+  }
+  if (panels.get(p.windowId) === p) panels.delete(p.windowId);
+  if (panel === p) {
+    panel = null;
+    settleConfirmDialog(false);
+    lastReplacedFiles.clear();
+  }
 }
 registerHandler("search_replace_close", search_replace_close);
 
@@ -2294,16 +2649,105 @@ editor.on("buffer_closed", (args) => {
     // The results buffer went away → tear down. Drop our anchor markers on
     // the (still-open) source buffers first so they don't leak.
     clearMatchMarkers();
+    takeResumeAnchor();
     panel.widgetPanel?.unmount();
-    panel = null;
+    forgetPanel(panel);
+    return;
+  }
+  // A background window's panel buffer (closed along with its window).
+  for (const p of panels.values()) {
+    if (p.resultsBufferId === args.buffer_id) forgetPanel(p);
+  }
+});
+
+editor.on("window_closed", (args) => {
+  const p = panels.get(args.id);
+  if (p) forgetPanel(p);
+});
+
+// Each window keeps its own panel (#3704). A search in the window being left
+// keeps running for its own panel, which collects results without drawing
+// (only the active window is drawn); the panel being returned to picks up
+// where it was, drawing whatever arrived meanwhile.
+editor.on("active_window_changed", (args) => {
+  const outgoing = panel;
+  if (outgoing) {
+    outgoing.parked = { resumeAnchor, replacedFiles: lastReplacedFiles };
+  }
+  // The confirm dialog floats over the window being left.
+  settleConfirmDialog(false);
+
+  currentWindowId = args.active_id;
+  panel = panels.get(currentWindowId) ?? null;
+  resumeAnchor = panel?.parked?.resumeAnchor ?? null;
+  lastReplacedFiles = panel?.parked?.replacedFiles ?? new Set<string>();
+  if (!panel) return;
+  panel.parked = null;
+  if (panel.pendingStatus) {
+    editor.setStatus(panel.pendingStatus);
+    panel.pendingStatus = null;
+  }
+  if (panel.stale) {
+    // A re-search was asked for while the window was in the background.
+    const keepPosition = panel.staleKeepPosition;
+    panel.stale = false;
+    panel.staleKeepPosition = false;
+    panel.needsRedraw = false;
+    if (panel.searchPattern) void rerunSearch(keepPosition);
+    else updatePanelContent();
+  } else if (panel.needsRedraw && !panel.busy) {
+    // A search finished in the background. (One still running redraws
+    // itself on its next pump tick.)
+    panel.needsRedraw = false;
+    const resumeAt = takeResumeAnchor();
+    if (resumeAt && panel.searchResults.length > 0) panel.matchIndex = flatIndexAtLocation(resumeAt);
+    updatePanelContent();
+  } else if (!panel.busy && getViewportWidth() !== panel.viewportWidth) {
+    // The terminal was resized while the window was in the background; the
+    // `resize` hook only redrew the active window's panel.
+    updatePanelContent();
   }
 });
 
 // When a file is opened after the search captured it (e.g. the user steps
 // into a result whose file wasn't open), register anchor markers for that
 // file's matches so subsequent edits to it keep them in sync (#2583).
+// Keep the results current when a file the panel is about changes — above
+// all when the replace itself is undone, which puts every replaced match
+// back in one bulk edit (no `after_insert` / `after_delete` fires for it).
+// Only edits to the source file, a file with results, or a file the last
+// replace rewrote re-run the search; typing elsewhere leaves it alone.
+editor.on("buffer_modified", (args) => {
+  // The panel of the window the buffer belongs to.
+  const p = panels.get(args.window_id);
+  if (!p || !p.searchPattern || args.buffer_id === p.resultsBufferId) return true;
+  if (p === panel) {
+    if (!p.replaceInProgress && panelWatchesBuffer(args.buffer_id)) rerunSearchDebounced(true);
+    return true;
+  }
+  // A background window's file changed: re-search when the window is back.
+  const path = editor.listBuffers(p.windowId).find((b) => b.id === args.buffer_id)?.path;
+  if (
+    args.buffer_id === p.sourceBufferId
+    || (path && (p.parked?.replacedFiles.has(path) || p.fileGroups.some((g) => g.absPath === path)))
+  ) {
+    p.stale = true;
+  }
+  return true;
+});
+
+function panelWatchesBuffer(bufferId: number): boolean {
+  if (!panel) return false;
+  if (bufferId === panel.sourceBufferId) return true;
+  const path = editor.getBufferPath(bufferId);
+  if (!path) return false;
+  return lastReplacedFiles.has(path) || panel.fileGroups.some((g) => g.absPath === path);
+}
+
 editor.on("after_file_open", (args) => {
-  if (panel) ensureMarkersForPath(args.path);
+  // The window the file opened in; its panel's matches in that file.
+  const p = panels.get(args.window_id);
+  if (p) ensureMarkersForPath(p, args.path, args.buffer_id);
   return true;
 });
 
@@ -2318,16 +2762,17 @@ editor.on("after_file_open", (args) => {
 // `focusPanel`/`optionIndex` to the clicked widget before applying
 // the state change.
 editor.on("widget_event", (args) => {
-  if (!panel || args.panel_id !== panel.widgetPanel?.id()) return;
-
-  // Track most-recent focused widget so Up/Down can decide whether to
-  // walk search history (search field) or pass through to the widget
-  // runtime (matches tree, toggles, button). The widget runtime
-  // doesn't expose focus to the plugin directly; this best-effort
-  // proxy is good enough for the history-walk gesture. See §11.
-  if (typeof args.widget_key === "string" && args.widget_key.length > 0) {
-    lastFocusedWidget = args.widget_key;
+  if (confirmDialog && args.panel_id === confirmDialog.panel.id()) {
+    if (args.event_type === "cancel") {
+      // Esc / click outside / [×]: the host has already unmounted it.
+      settleConfirmDialog(false, false);
+    } else if (args.event_type === "activate") {
+      if (args.widget_key === "confirmReplace") settleConfirmDialog(true);
+      else if (args.widget_key === "confirmCancel") settleConfirmDialog(false);
+    }
+    return;
   }
+  if (!panel || args.panel_id !== panel.widgetPanel?.id()) return;
 
   // `change` — fired for TextInput edits (Backspace, Delete,
   // arrows, Home/End, mode_text_input). Payload carries the new
@@ -2460,16 +2905,19 @@ editor.on("widget_event", (args) => {
         break;
       case "case":
         panel.caseSensitive = newChecked;
+        sessionMatchOptions.caseSensitive = newChecked;
         panel.widgetPanel?.setChecked("case", newChecked);
         rerunSearchDebounced();
         break;
       case "regex":
         panel.useRegex = newChecked;
+        sessionMatchOptions.useRegex = newChecked;
         panel.widgetPanel?.setChecked("regex", newChecked);
         rerunSearchDebounced();
         break;
       case "whole":
         panel.wholeWords = newChecked;
+        sessionMatchOptions.wholeWords = newChecked;
         panel.widgetPanel?.setChecked("whole", newChecked);
         rerunSearchDebounced();
         break;

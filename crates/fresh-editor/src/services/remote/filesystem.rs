@@ -3,16 +3,18 @@
 //! Implements the FileSystem trait for remote operations via SSH agent.
 
 use crate::model::filesystem::{
-    DirEntry, EntryType, FileMetadata, FilePermissions, FileReader, FileSystem, FileWriter, WriteOp,
+    ContentDigest, DirEntry, EntryType, FileMetadata, FilePermissions, FileReader, FileSystem,
+    FileWriter, WriteOp,
 };
 use crate::services::remote::channel::{AgentChannel, ChannelError};
 use crate::services::remote::protocol::{
-    append_params, count_lf_params, decode_base64, ls_params, patch_params, read_params,
-    stat_params, sudo_write_params, truncate_params, write_params, PatchOp, RemoteDirEntry,
-    RemoteMetadata,
+    append_params, count_lf_params, decode_base64, digest_params, ls_params, patch_params,
+    read_params, stat_params, sudo_write_params, truncate_params, write_params, PatchOp,
+    RemoteDirEntry, RemoteMetadata,
 };
+use fresh_editor_core::model::host_path::{HostPath, HostPathBuf, PathStyle};
 use std::io::{self, Cursor, Read, Seek, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -30,6 +32,10 @@ struct RemoteSysInfo {
     home: Option<PathBuf>,
     /// Remote temp dir (agent's `tempfile.gettempdir()`), `/tmp` fallback.
     temp_dir: PathBuf,
+    /// The rules this host's paths follow, from the `sep` the agent reported
+    /// (`os.sep`, evaluated *on the host*). `None` when an older agent did
+    /// not send it.
+    style: Option<PathStyle>,
 }
 
 /// Remote filesystem that communicates with the Python agent
@@ -59,6 +65,10 @@ impl RemoteFileSystem {
         RemoteSysInfo {
             home: info.get("home").and_then(|v| v.as_str()).map(PathBuf::from),
             temp_dir: Self::parse_temp_dir_from_info(Some(info)),
+            style: info
+                .get("sep")
+                .and_then(|v| v.as_str())
+                .and_then(PathStyle::from_separator),
         }
     }
 
@@ -162,14 +172,14 @@ impl RemoteFileSystem {
         let is_hidden = name.starts_with('.');
         let permissions = FilePermissions::from_mode(rm.mode);
 
-        #[cfg(unix)]
-        let is_readonly = {
-            let (euid, user_groups) =
-                crate::model::filesystem::StdFileSystem::current_user_groups();
-            permissions.is_readonly_for_user(euid, rm.uid, rm.gid, &user_groups)
+        // Writability is a question about the *remote* user, so the agent
+        // answers it. The local euid and groups are no evidence: the SSH user
+        // usually has a different uid, and every file it owns would read as
+        // someone else's (#2944).
+        let is_readonly = match rm.writable {
+            Some(writable) => !writable,
+            None => Self::readonly_from_mode(rm, &permissions),
         };
-        #[cfg(not(unix))]
-        let is_readonly = permissions.is_readonly();
 
         let mut meta = FileMetadata::new(rm.size)
             .with_hidden(is_hidden)
@@ -187,6 +197,23 @@ impl RemoteFileSystem {
         }
 
         meta
+    }
+
+    /// The fallback for an agent that does not report `writable`: the mode
+    /// bits, judged against the local user. Wrong whenever the remote user's
+    /// uid differs, which is why the agent's answer is preferred.
+    fn readonly_from_mode(rm: &RemoteMetadata, permissions: &FilePermissions) -> bool {
+        #[cfg(unix)]
+        {
+            let (euid, user_groups) =
+                crate::model::filesystem::StdFileSystem::current_user_groups();
+            permissions.is_readonly_for_user(euid, rm.uid, rm.gid, &user_groups)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = rm;
+            permissions.is_readonly()
+        }
     }
 
     /// Convert remote dir entry to DirEntry
@@ -218,7 +245,11 @@ impl RemoteFileSystem {
             metadata = metadata.with_modified(m);
         }
 
-        let mut entry = DirEntry::new(PathBuf::from(&re.path), re.name.clone(), entry_type);
+        let mut entry = DirEntry::new(
+            HostPathBuf::from_os_string(std::ffi::OsString::from(&re.path)),
+            re.name.clone(),
+            entry_type,
+        );
         entry.metadata = Some(metadata);
         entry.symlink_target_is_dir = re.link_dir;
 
@@ -226,9 +257,38 @@ impl RemoteFileSystem {
     }
 }
 
+/// A SHA-256 as the agent reports it: 64 hex digits.
+fn parse_sha256_hex(hex: &str) -> Option<[u8; 32]> {
+    let digits = hex.as_bytes();
+    // `from_str_radix` alone would take a sign ("+f").
+    if digits.len() != 64 || !digits.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (byte, pair) in out.iter_mut().zip(digits.chunks_exact(2)) {
+        let pair = std::str::from_utf8(pair).ok()?;
+        *byte = u8::from_str_radix(pair, 16).ok()?;
+    }
+    Some(out)
+}
+
 impl FileSystem for RemoteFileSystem {
-    fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
-        let path_str = path.to_string_lossy();
+    /// What the host said, not what this client runs.
+    ///
+    /// The agent evaluates `os.sep` on the host and reports it in `info`, so
+    /// this is told rather than inferred. An agent too old to send it leaves
+    /// `None`, and then POSIX is the answer: every SSH host that has ever
+    /// worked with this editor is POSIX, and the alternative — the *client's*
+    /// platform — is the bug sinelaw/fresh#3758 was about. It is a documented
+    /// default for one missing field, not a guess at a path's spelling.
+    fn style(&self) -> PathStyle {
+        self.sys_info()
+            .and_then(|info| info.style)
+            .unwrap_or(PathStyle::Posix)
+    }
+
+    fn read_file(&self, path: &HostPath) -> io::Result<Vec<u8>> {
+        let path_str = path.to_wire_string();
         let (data_chunks, _result) = self
             .channel
             .request_with_data_blocking("read", read_params(&path_str, None, None))
@@ -247,8 +307,8 @@ impl FileSystem for RemoteFileSystem {
         Ok(content)
     }
 
-    fn read_range(&self, path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        let path_str = path.to_string_lossy();
+    fn read_range(&self, path: &HostPath, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        let path_str = path.to_wire_string();
         let (data_chunks, result) = self
             .channel
             .request_with_data_blocking("read", read_params(&path_str, Some(offset), Some(len)))
@@ -290,8 +350,13 @@ impl FileSystem for RemoteFileSystem {
         Ok(content)
     }
 
-    fn count_line_feeds_in_range(&self, path: &Path, offset: u64, len: usize) -> io::Result<usize> {
-        let path_str = path.to_string_lossy();
+    fn count_line_feeds_in_range(
+        &self,
+        path: &HostPath,
+        offset: u64,
+        len: usize,
+    ) -> io::Result<usize> {
+        let path_str = path.to_wire_string();
         let result = self
             .channel
             .request_blocking("count_lf", count_lf_params(&path_str, offset, len))
@@ -309,53 +374,102 @@ impl FileSystem for RemoteFileSystem {
             })
     }
 
-    fn write_file(&self, path: &Path, data: &[u8]) -> io::Result<()> {
-        let path_str = path.to_string_lossy();
+    fn content_digest(&self, path: &HostPath) -> io::Result<ContentDigest> {
+        let path_str = path.to_wire_string();
+        let result = self
+            .channel
+            .request_blocking("digest", digest_params(&path_str))
+            .map_err(Self::to_io_error)?;
+
+        let invalid = |what: &str| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{what} in digest response"),
+            )
+        };
+        let size = result
+            .get("size")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| invalid("missing size"))?;
+        let hex = result
+            .get("sha256")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| invalid("missing sha256"))?;
+        let sha256 = parse_sha256_hex(hex).ok_or_else(|| invalid("malformed sha256"))?;
+        Ok(ContentDigest { size, sha256 })
+    }
+
+    fn write_file(&self, path: &HostPath, data: &[u8]) -> io::Result<()> {
+        let path_str = path.to_wire_string();
         self.channel
             .request_blocking("write", write_params(&path_str, data))
             .map_err(Self::to_io_error)?;
         Ok(())
     }
 
-    fn create_file(&self, path: &Path) -> io::Result<Box<dyn FileWriter>> {
+    fn create_file(&self, path: &HostPath) -> io::Result<Box<dyn FileWriter>> {
         // Create an empty file first
         self.write_file(path, &[])?;
         Ok(Box::new(RemoteFileWriter::new(
             self.channel.clone(),
-            path.to_path_buf(),
+            path.to_host_path_buf(),
         )))
     }
 
-    fn open_file(&self, path: &Path) -> io::Result<Box<dyn FileReader>> {
+    /// The agent protocol has no exclusive create, so this can't be done
+    /// without racing. Nothing on a remote host needs it: saves there go
+    /// through `write_file` / `write_patched`, never a sudo temp file or an
+    /// in-place staging copy.
+    fn create_new_file(&self, path: &HostPath) -> io::Result<Box<dyn FileWriter>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "exclusive create of {} is not supported on a remote host",
+                path.display()
+            ),
+        ))
+    }
+
+    /// See [`Self::create_new_file`].
+    fn create_new_private_file(&self, path: &HostPath) -> io::Result<Box<dyn FileWriter>> {
+        self.create_new_file(path)
+    }
+
+    fn open_file(&self, path: &HostPath) -> io::Result<Box<dyn FileReader>> {
         // Read the entire file into memory for seeking
         let data = self.read_file(path)?;
         Ok(Box::new(RemoteFileReader::new(data)))
     }
 
-    fn open_file_for_write(&self, path: &Path) -> io::Result<Box<dyn FileWriter>> {
+    fn open_file_for_write(&self, path: &HostPath) -> io::Result<Box<dyn FileWriter>> {
         Ok(Box::new(RemoteFileWriter::new(
             self.channel.clone(),
-            path.to_path_buf(),
+            path.to_host_path_buf(),
         )))
     }
 
-    fn open_file_for_append(&self, path: &Path) -> io::Result<Box<dyn FileWriter>> {
+    fn open_file_for_append(&self, path: &HostPath) -> io::Result<Box<dyn FileWriter>> {
         // Use append-only writer that sends only new data
         Ok(Box::new(AppendingRemoteFileWriter::new(
             self.channel.clone(),
-            path.to_path_buf(),
+            path.to_host_path_buf(),
         )))
     }
 
-    fn set_file_length(&self, path: &Path, len: u64) -> io::Result<()> {
-        let path_str = path.to_string_lossy();
+    fn set_file_length(&self, path: &HostPath, len: u64) -> io::Result<()> {
+        let path_str = path.to_wire_string();
         self.channel
             .request_blocking("truncate", truncate_params(&path_str, len))
             .map_err(Self::to_io_error)?;
         Ok(())
     }
 
-    fn write_patched(&self, src_path: &Path, dst_path: &Path, ops: &[WriteOp]) -> io::Result<()> {
+    fn write_patched(
+        &self,
+        src_path: &HostPath,
+        dst_path: &HostPath,
+        ops: &[WriteOp],
+    ) -> io::Result<()> {
         // Convert WriteOps to protocol PatchOps
         let patch_ops: Vec<PatchOp> = ops
             .iter()
@@ -365,8 +479,8 @@ impl FileSystem for RemoteFileSystem {
             })
             .collect();
 
-        let src_str = src_path.to_string_lossy();
-        let dst_str = dst_path.to_string_lossy();
+        let src_str = src_path.to_wire_string();
+        let dst_str = dst_path.to_wire_string();
         let dst_param = if src_path == dst_path {
             None
         } else {
@@ -379,10 +493,10 @@ impl FileSystem for RemoteFileSystem {
         Ok(())
     }
 
-    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+    fn rename(&self, from: &HostPath, to: &HostPath) -> io::Result<()> {
         let params = serde_json::json!({
-            "from": from.to_string_lossy(),
-            "to": to.to_string_lossy()
+            "from": from.to_wire_string(),
+            "to": to.to_wire_string()
         });
         self.channel
             .request_blocking("mv", params)
@@ -390,10 +504,10 @@ impl FileSystem for RemoteFileSystem {
         Ok(())
     }
 
-    fn copy(&self, from: &Path, to: &Path) -> io::Result<u64> {
+    fn copy(&self, from: &HostPath, to: &HostPath) -> io::Result<u64> {
         let params = serde_json::json!({
-            "from": from.to_string_lossy(),
-            "to": to.to_string_lossy()
+            "from": from.to_wire_string(),
+            "to": to.to_wire_string()
         });
         let result = self
             .channel
@@ -403,24 +517,24 @@ impl FileSystem for RemoteFileSystem {
         Ok(result.get("size").and_then(|v| v.as_u64()).unwrap_or(0))
     }
 
-    fn remove_file(&self, path: &Path) -> io::Result<()> {
-        let params = serde_json::json!({"path": path.to_string_lossy()});
+    fn remove_file(&self, path: &HostPath) -> io::Result<()> {
+        let params = serde_json::json!({"path": path.to_wire_string()});
         self.channel
             .request_blocking("rm", params)
             .map_err(Self::to_io_error)?;
         Ok(())
     }
 
-    fn remove_dir(&self, path: &Path) -> io::Result<()> {
-        let params = serde_json::json!({"path": path.to_string_lossy()});
+    fn remove_dir(&self, path: &HostPath) -> io::Result<()> {
+        let params = serde_json::json!({"path": path.to_wire_string()});
         self.channel
             .request_blocking("rmdir", params)
             .map_err(Self::to_io_error)?;
         Ok(())
     }
 
-    fn metadata(&self, path: &Path) -> io::Result<FileMetadata> {
-        let path_str = path.to_string_lossy();
+    fn metadata(&self, path: &HostPath) -> io::Result<FileMetadata> {
+        let path_str = path.to_wire_string();
         let result = self
             .channel
             .request_blocking("stat", stat_params(&path_str, true))
@@ -429,15 +543,16 @@ impl FileSystem for RemoteFileSystem {
         let rm: RemoteMetadata = serde_json::from_value(result)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        let name = path
+        let name = self
+            .at(path)
             .file_name()
-            .map(|n| n.to_string_lossy().to_string())
+            .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         Ok(Self::convert_metadata(&rm, &name))
     }
 
-    fn symlink_metadata(&self, path: &Path) -> io::Result<FileMetadata> {
-        let path_str = path.to_string_lossy();
+    fn symlink_metadata(&self, path: &HostPath) -> io::Result<FileMetadata> {
+        let path_str = path.to_wire_string();
         let result = self
             .channel
             .request_blocking("stat", stat_params(&path_str, false))
@@ -446,15 +561,16 @@ impl FileSystem for RemoteFileSystem {
         let rm: RemoteMetadata = serde_json::from_value(result)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        let name = path
+        let name = self
+            .at(path)
             .file_name()
-            .map(|n| n.to_string_lossy().to_string())
+            .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         Ok(Self::convert_metadata(&rm, &name))
     }
 
-    fn is_dir(&self, path: &Path) -> io::Result<bool> {
-        let path_str = path.to_string_lossy();
+    fn is_dir(&self, path: &HostPath) -> io::Result<bool> {
+        let path_str = path.to_wire_string();
         let result = self
             .channel
             .request_blocking("stat", stat_params(&path_str, true))
@@ -463,8 +579,8 @@ impl FileSystem for RemoteFileSystem {
         Ok(result.get("dir").and_then(|v| v.as_bool()).unwrap_or(false))
     }
 
-    fn is_file(&self, path: &Path) -> io::Result<bool> {
-        let path_str = path.to_string_lossy();
+    fn is_file(&self, path: &HostPath) -> io::Result<bool> {
+        let path_str = path.to_wire_string();
         let result = self
             .channel
             .request_blocking("stat", stat_params(&path_str, true))
@@ -476,11 +592,43 @@ impl FileSystem for RemoteFileSystem {
             .unwrap_or(false))
     }
 
-    fn set_permissions(&self, path: &Path, permissions: &FilePermissions) -> io::Result<()> {
+    /// One request instead of one per ancestor. The default implementation
+    /// would issue a `stat` per directory per marker, and every one of those
+    /// is a blocking round trip on the editor thread — an unacceptable cost
+    /// on the file-open path, which is where this is called from.
+    fn find_up(
+        &self,
+        start: &HostPath,
+        markers: &[&str],
+        max_dirs: Option<usize>,
+    ) -> io::Result<Vec<HostPathBuf>> {
+        let params = serde_json::json!({
+            "path": start.to_wire_string(),
+            "markers": markers,
+            "max_dirs": max_dirs,
+        });
+        let result = self
+            .channel
+            .request_blocking("find_up", params)
+            .map_err(Self::to_io_error)?;
+
+        Ok(result
+            .get("dirs")
+            .and_then(|v| v.as_array())
+            .map(|dirs| {
+                dirs.iter()
+                    .filter_map(|d| d.as_str())
+                    .map(|d| HostPathBuf::from_os_string(std::ffi::OsString::from(d)))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    fn set_permissions(&self, path: &HostPath, permissions: &FilePermissions) -> io::Result<()> {
         #[cfg(unix)]
         {
             let params = serde_json::json!({
-                "path": path.to_string_lossy(),
+                "path": path.to_wire_string(),
                 "mode": permissions.mode()
             });
             self.channel
@@ -494,8 +642,8 @@ impl FileSystem for RemoteFileSystem {
         Ok(())
     }
 
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
-        let path_str = path.to_string_lossy();
+    fn read_dir(&self, path: &HostPath) -> io::Result<Vec<DirEntry>> {
+        let path_str = path.to_wire_string();
         let result = self
             .channel
             .request_blocking("ls", ls_params(&path_str))
@@ -509,17 +657,17 @@ impl FileSystem for RemoteFileSystem {
         Ok(entries.iter().map(Self::convert_dir_entry).collect())
     }
 
-    fn create_dir(&self, path: &Path) -> io::Result<()> {
-        let params = serde_json::json!({"path": path.to_string_lossy()});
+    fn create_dir(&self, path: &HostPath) -> io::Result<()> {
+        let params = serde_json::json!({"path": path.to_wire_string()});
         self.channel
             .request_blocking("mkdir", params)
             .map_err(Self::to_io_error)?;
         Ok(())
     }
 
-    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+    fn create_dir_all(&self, path: &HostPath) -> io::Result<()> {
         let params = serde_json::json!({
-            "path": path.to_string_lossy(),
+            "path": path.to_wire_string(),
             "parents": true
         });
         self.channel
@@ -528,8 +676,8 @@ impl FileSystem for RemoteFileSystem {
         Ok(())
     }
 
-    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
-        let params = serde_json::json!({"path": path.to_string_lossy()});
+    fn canonicalize(&self, path: &HostPath) -> io::Result<HostPathBuf> {
+        let params = serde_json::json!({"path": path.to_wire_string()});
         let result = self
             .channel
             .request_blocking("realpath", params)
@@ -539,7 +687,9 @@ impl FileSystem for RemoteFileSystem {
             io::Error::new(io::ErrorKind::InvalidData, "missing path in response")
         })?;
 
-        Ok(PathBuf::from(canonical))
+        Ok(HostPathBuf::from_os_string(std::ffi::OsString::from(
+            canonical,
+        )))
     }
 
     fn current_uid(&self) -> u32 {
@@ -564,7 +714,7 @@ impl FileSystem for RemoteFileSystem {
         Some(self.channel.reconnect_notify())
     }
 
-    fn home_dir(&self) -> io::Result<PathBuf> {
+    fn home_dir(&self) -> io::Result<HostPathBuf> {
         // Served from the connect-time cache on the hot path (workspace
         // restore / file open / file explorer), so the editor thread doesn't
         // block; see `sys_info`. A remote that couldn't answer `info` never
@@ -572,73 +722,58 @@ impl FileSystem for RemoteFileSystem {
         // rejects it before the session is promoted.
         self.sys_info()
             .and_then(|info| info.home)
+            .map(HostPathBuf::from_path_buf)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "remote home directory unknown"))
     }
 
-    fn unique_temp_path(&self, dest_path: &Path) -> PathBuf {
+    fn unique_temp_path(&self, dest_path: &HostPath) -> HostPathBuf {
         // Use the remote system's temp directory instead of hardcoding /tmp,
         // which doesn't exist on Windows remotes. Served from the connect-time
         // cache when primed (see `sys_info`); falls back to /tmp if the info
         // request fails (e.g. older agent without temp_dir support).
-        let temp_dir = self
-            .sys_info()
-            .map(|i| i.temp_dir)
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
-        let file_name = dest_path
-            .file_name()
-            .unwrap_or_else(|| std::ffi::OsStr::new("fresh-save"));
+        let temp_dir = HostPathBuf::from_path_buf(
+            self.sys_info()
+                .map(|i| i.temp_dir)
+                .unwrap_or_else(|| PathBuf::from("/tmp")),
+        );
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        temp_dir.join(format!(
+        self.at(&temp_dir).join_name(std::ffi::OsStr::new(&format!(
             "{}-{}-{}.tmp",
-            file_name.to_string_lossy(),
+            crate::model::filesystem::temp_name_stem(self.at(dest_path)),
             std::process::id(),
             timestamp
-        ))
+        )))
     }
 
     fn search_file(
         &self,
-        path: &Path,
+        path: &HostPath,
         pattern: &str,
         opts: &crate::model::filesystem::FileSearchOptions,
-        cursor: &mut crate::model::filesystem::FileSearchCursor,
     ) -> io::Result<Vec<crate::model::filesystem::SearchMatch>> {
-        if cursor.done {
+        // Skipped as the local search skips it, without asking the agent.
+        if crate::model::filesystem::has_binary_extension(self.at(path)) {
             return Ok(vec![]);
         }
-
-        let path_str = path.to_string_lossy();
-        let mut params = serde_json::json!({
+        let path_str = path.to_wire_string();
+        let params = serde_json::json!({
             "path": path_str,
             "pattern": pattern,
             "fixed_string": opts.fixed_string,
             "case_sensitive": opts.case_sensitive,
             "whole_word": opts.whole_word,
             "max_matches": opts.max_matches,
-            "offset": cursor.offset,
-            "running_line": cursor.running_line,
+            "max_file_size": crate::model::filesystem::MAX_PROJECT_SEARCH_FILE_SIZE,
+            "context_bytes": crate::model::buffer::MATCH_CONTEXT,
         });
-        if let Some(end) = cursor.end_offset {
-            params["end_offset"] = serde_json::json!(end);
-        }
 
         let result = self
             .channel
             .request_blocking("search_file", params)
             .map_err(Self::to_io_error)?;
-
-        cursor.offset = result
-            .get("next_offset")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-        cursor.running_line = result
-            .get("running_line")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1) as usize;
-        cursor.done = result.get("done").and_then(|v| v.as_bool()).unwrap_or(true);
 
         let matches: Vec<crate::model::filesystem::SearchMatch> = result
             .get("matches")
@@ -652,6 +787,7 @@ impl FileSystem for RemoteFileSystem {
                             line: m.get("line")?.as_u64()? as usize,
                             column: m.get("column")?.as_u64()? as usize,
                             context: m.get("context")?.as_str()?.to_string(),
+                            context_offset: m.get("context_offset")?.as_u64()? as usize,
                         })
                     })
                     .collect()
@@ -663,73 +799,124 @@ impl FileSystem for RemoteFileSystem {
 
     fn sudo_write(
         &self,
-        path: &Path,
+        path: &HostPath,
         data: &[u8],
-        mode: u32,
-        uid: u32,
-        gid: u32,
+        mode: Option<u32>,
+        owner: Option<(u32, u32)>,
     ) -> io::Result<()> {
-        let path_str = path.to_string_lossy();
+        let path_str = path.to_wire_string();
         self.channel
             .request_blocking(
                 "sudo_write",
-                sudo_write_params(&path_str, data, mode, uid, gid),
+                sudo_write_params(&path_str, data, mode, owner),
             )
             .map_err(Self::to_io_error)?;
         Ok(())
     }
 
-    fn walk_files(
+    fn walk(
         &self,
-        root: &Path,
-        skip_dirs: &[&str],
+        root: &HostPath,
+        opts: &fresh_editor_core::model::filesystem::WalkOptions<'_>,
         cancel: &std::sync::atomic::AtomicBool,
-        on_file: &mut dyn FnMut(&Path, &str) -> bool,
+        on_entry: &mut dyn FnMut(fresh_editor_core::model::filesystem::WalkEntry<'_>) -> bool,
     ) -> io::Result<()> {
-        let path_str = root.to_string_lossy();
+        use fresh_editor_core::model::filesystem::{EntryType, FileMetadata, WalkEntry};
+
+        let path_str = root.to_wire_string();
         let params = serde_json::json!({
             "path": path_str,
-            "skip_dirs": skip_dirs,
+            "skip_dirs": opts.skip_dirs,
+            "include_hidden": opts.include_hidden,
+            "include_dirs": opts.include_dirs,
+            "max_depth": opts.max_depth,
+            "max_files": opts.max_entries,
         });
 
-        // Server-side walk: the remote agent walks the tree and streams
-        // back batches of relative paths.  We process each batch as it
-        // arrives, keeping memory bounded.
-        let (mut data_rx, result_rx) = self
+        // The agent walks server-side and streams batches with the metadata it
+        // already stat'd. A new `walk_entries` method rather than new params
+        // on `walk_files`: an old agent would ignore them and stream an empty
+        // result, whereas an unknown method fails loudly. The id lets a
+        // consumer that stops reading cancel the producer.
+        let (request_id, mut data_rx, result_rx) = self
             .channel
-            .request_streaming_blocking("walk_files", params)
+            .request_streaming_id_blocking("walk_entries", params)
             .map_err(Self::to_io_error)?;
 
-        // Process streaming batches
-        while let Some(data) = data_rx.blocking_recv() {
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                // Drop receivers — server sees send fail and stops
-                drop(data_rx);
-                drop(result_rx);
-                return Ok(());
-            }
+        // `recv_chunk_blocking` also notices a gone caller and a quiet machine.
+        loop {
+            let data = match crate::services::remote::channel::recv_chunk_blocking(
+                &mut data_rx,
+                cancel,
+                crate::services::remote::channel::STREAM_IDLE_TIMEOUT,
+            ) {
+                crate::services::remote::channel::ChunkWait::Data(data) => data,
+                crate::services::remote::channel::ChunkWait::Closed => break,
+                crate::services::remote::channel::ChunkWait::Cancelled => {
+                    self.channel.cancel_detached(request_id);
+                    drop(data_rx);
+                    drop(result_rx);
+                    return Ok(());
+                }
+                crate::services::remote::channel::ChunkWait::Idle => {
+                    self.channel.cancel_detached(request_id);
+                    drop(data_rx);
+                    drop(result_rx);
+                    // An error, not a short answer: a truncated walk must not look complete.
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "{}: the machine stopped sending entries",
+                            root.to_wire_string()
+                        ),
+                    ));
+                }
+            };
 
-            if let Some(files) = data.get("files").and_then(|v| v.as_array()) {
-                for file in files {
-                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                        drop(result_rx);
-                        return Ok(());
-                    }
-                    if let Some(rel) = file.as_str() {
-                        let abs = root.join(rel);
-                        if !on_file(&abs, rel) {
-                            // Caller limit reached — drop receivers to signal
-                            // cancellation to the server
-                            drop(result_rx);
-                            return Ok(());
-                        }
-                    }
+            let Some(entries) = data.get("entries").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for entry in entries {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    self.channel.cancel_detached(request_id);
+                    drop(data_rx);
+                    drop(result_rx);
+                    return Ok(());
+                }
+                let Some(rel) = entry.get("rel").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let abs = self.at(root).join_rel(rel);
+                let entry_type = match entry.get("kind").and_then(|v| v.as_str()) {
+                    Some("dir") => EntryType::Directory,
+                    Some("symlink") => EntryType::Symlink,
+                    _ => EntryType::File,
+                };
+                let mut metadata =
+                    FileMetadata::new(entry.get("size").and_then(|v| v.as_u64()).unwrap_or(0));
+                metadata.modified = entry
+                    .get("mtime")
+                    .and_then(|v| v.as_f64())
+                    .and_then(|mtime| {
+                        std::time::UNIX_EPOCH
+                            .checked_add(std::time::Duration::from_secs_f64(mtime.max(0.0)))
+                    });
+
+                if !on_entry(WalkEntry {
+                    path: abs.as_host_path(),
+                    rel,
+                    entry_type,
+                    metadata,
+                }) {
+                    self.channel.cancel_detached(request_id);
+                    drop(data_rx);
+                    drop(result_rx);
+                    return Ok(());
                 }
             }
         }
 
-        // Drain the final result — channel may already be closed if the
-        // server finished before we read this, which is fine.
+        // Drain the final result; the channel may already be closed, which is fine.
         drop(result_rx.blocking_recv());
         Ok(())
     }
@@ -765,12 +952,12 @@ impl FileReader for RemoteFileReader {}
 /// Remote file writer - buffers writes and flushes on sync
 struct RemoteFileWriter {
     channel: Arc<AgentChannel>,
-    path: PathBuf,
+    path: HostPathBuf,
     buffer: Vec<u8>,
 }
 
 impl RemoteFileWriter {
-    fn new(channel: Arc<AgentChannel>, path: PathBuf) -> Self {
+    fn new(channel: Arc<AgentChannel>, path: HostPathBuf) -> Self {
         Self {
             channel,
             path,
@@ -793,7 +980,7 @@ impl Write for RemoteFileWriter {
 
 impl FileWriter for RemoteFileWriter {
     fn sync_all(&self) -> io::Result<()> {
-        let path_str = self.path.to_string_lossy();
+        let path_str = self.path.to_wire_string();
         self.channel
             .request_blocking("write", write_params(&path_str, &self.buffer))
             .map_err(RemoteFileSystem::to_io_error)?;
@@ -804,12 +991,12 @@ impl FileWriter for RemoteFileWriter {
 /// Remote file writer for append operations - only sends new data
 struct AppendingRemoteFileWriter {
     channel: Arc<AgentChannel>,
-    path: PathBuf,
+    path: HostPathBuf,
     buffer: Vec<u8>,
 }
 
 impl AppendingRemoteFileWriter {
-    fn new(channel: Arc<AgentChannel>, path: PathBuf) -> Self {
+    fn new(channel: Arc<AgentChannel>, path: HostPathBuf) -> Self {
         Self {
             channel,
             path,
@@ -834,7 +1021,7 @@ impl FileWriter for AppendingRemoteFileWriter {
         if self.buffer.is_empty() {
             return Ok(());
         }
-        let path_str = self.path.to_string_lossy();
+        let path_str = self.path.to_wire_string();
         self.channel
             .request_blocking("append", append_params(&path_str, &self.buffer))
             .map_err(RemoteFileSystem::to_io_error)?;
@@ -845,6 +1032,28 @@ impl FileWriter for AppendingRemoteFileWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exactly 64 hex digits: no sign, no whitespace, no other length.
+    #[test]
+    fn parse_sha256_hex_takes_only_hex_digits() {
+        let hex = "00ff".repeat(16);
+        let mut expected = [0u8; 32];
+        for pair in expected.chunks_exact_mut(2) {
+            pair[1] = 0xff;
+        }
+        assert_eq!(parse_sha256_hex(&hex), Some(expected));
+        assert_eq!(parse_sha256_hex(&hex.to_uppercase()), Some(expected));
+
+        for bad in [
+            format!("+f{}", &hex[2..]),
+            format!(" f{}", &hex[2..]),
+            format!("zz{}", &hex[2..]),
+            hex[2..].to_string(),
+            format!("{hex}00"),
+        ] {
+            assert_eq!(parse_sha256_hex(&bad), None, "{bad:?}");
+        }
+    }
 
     #[test]
     fn test_convert_metadata() {
@@ -867,6 +1076,7 @@ mod tests {
             dir: false,
             file: true,
             link: false,
+            writable: None,
         };
 
         let meta = RemoteFileSystem::convert_metadata(&rm, "test.txt");
@@ -876,6 +1086,47 @@ mod tests {
 
         let meta = RemoteFileSystem::convert_metadata(&rm, ".hidden");
         assert!(meta.is_hidden);
+    }
+
+    /// The agent's `stat` reply for a file the remote user owns, under a uid
+    /// the local user does not have (#2944). The mode bits alone, judged
+    /// against the local user, say read-only; the agent says writable, and
+    /// that is the answer that counts. (Run as root the fallback errs the
+    /// other way — root writes anything — which the second half catches.)
+    #[test]
+    fn test_convert_metadata_trusts_remote_writability() {
+        #[cfg(unix)]
+        let foreign_uid = {
+            let (euid, _) = crate::model::filesystem::StdFileSystem::current_user_groups();
+            euid.wrapping_add(1)
+        };
+        #[cfg(not(unix))]
+        let foreign_uid = 4242u32;
+        let reply = |writable: bool| {
+            serde_json::json!({
+                "size": 15,
+                "mtime": 1700000000,
+                "mode": 0o100644,
+                "uid": foreign_uid,
+                "gid": 4242,
+                "dir": false,
+                "file": true,
+                "link": false,
+                "writable": writable,
+            })
+        };
+
+        let rm: RemoteMetadata = serde_json::from_value(reply(true)).unwrap();
+        assert!(
+            !RemoteFileSystem::convert_metadata(&rm, "notes.txt").is_readonly,
+            "a file the remote user can write must not be marked read-only"
+        );
+
+        let rm: RemoteMetadata = serde_json::from_value(reply(false)).unwrap();
+        assert!(
+            RemoteFileSystem::convert_metadata(&rm, "notes.txt").is_readonly,
+            "a file the remote user cannot write must stay read-only"
+        );
     }
 
     #[test]

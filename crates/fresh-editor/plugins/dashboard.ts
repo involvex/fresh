@@ -26,7 +26,7 @@ const editor = getEditor();
 //     reshape).
 //   - Auto-refreshes every 5 seconds while visible.
 //   - All colors are theme keys → repaints for free on theme switch.
-//   - Clickable rows (repo URL, branch name, PR numbers, review-branch
+//   - Clickable rows (repo URL, branch name, PR numbers, branch-log
 //     action) route clicks through the mouse_click hook, so they work
 //     in terminals that swallow OSC-8 hyperlinks. The OSC-8 `url` span
 //     is still set as a fallback for terminals that do honor it.
@@ -970,9 +970,9 @@ function paint(dims?: { width: number; height: number }) {
     for (const e of drawToEntries(drawn)) entries.push(e);
     // Pad below the frame so the buffer covers the full viewport height.
     // Without this, rows past the last frame line render with
-    // `editor.after_eof_bg` (a deliberate shade off from `editor.bg` to mark
-    // end-of-file in code buffers) and show up as a different-colored strip
-    // at the bottom of the dashboard.
+    // `editor.after_eof_bg`, which follows `editor.bg` by default but is a
+    // separate color a theme may shade — that would show up as a
+    // different-colored strip at the bottom of the dashboard.
     const bottomPad = Math.max(0, height - topPad - frameHeight);
     for (let i = 0; i < bottomPad; i++) entries.push({ text: "\n" });
 
@@ -1069,10 +1069,10 @@ function paint(dims?: { width: number; height: number }) {
 // platform; the other exits immediately with ENOENT and causes no
 // user-visible effect. Fire-and-forget: we don't await.
 function openUrl(url: string) {
-    // spawnProcess returns a ProcessHandle; we intentionally discard it.
+    // runOnTarget returns a ProcessHandle; we intentionally discard it.
     // The process runs to completion on its own; failures are silent.
-    editor.spawnProcess("xdg-open", [url]);
-    editor.spawnProcess("open", [url]);
+    editor.runOnTarget("xdg-open", [url]);
+    editor.runOnTarget("open", [url]);
 }
 
 function dispatchClickAction(action: ClickAction) {
@@ -1098,15 +1098,15 @@ async function run(
     cwd: string,
     timeoutMs: number,
 ): Promise<{ stdout: string; stderr: string; ok: boolean }> {
-    const handle = editor.spawnProcess(cmd, args, cwd);
+    const handle = editor.runOnTarget(cmd, args, cwd);
     const timeout = editor.delay(timeoutMs).then(() => "__timeout__");
     const res = await Promise.race([(async () => await handle)(), timeout]);
     if (res === "__timeout__") {
         await handle.kill();
         return { stdout: "", stderr: "timed out", ok: false };
     }
-    const r = res as SpawnResult;
-    return { stdout: r.stdout ?? "", stderr: r.stderr ?? "", ok: r.exit_code === 0 };
+    const r = res as CommandResult;
+    return { stdout: r.stdout ?? "", stderr: r.stderr ?? "", ok: r.code === 0 };
 }
 
 const trim = (s: string) => s.replace(/\s+$/, "");
@@ -1148,21 +1148,29 @@ function bar(pct: number, width: number): string {
 type WttrHour = {
     time?: string; // "0", "300", …, "2100"
     tempC?: string;
+    tempF?: string;
     FeelsLikeC?: string;
+    FeelsLikeF?: string;
     windspeedKmph?: string;
+    windspeedMiles?: string;
     humidity?: string;
     weatherDesc?: { value?: string }[];
 };
 type WttrDay = {
     date?: string;
     maxtempC?: string;
+    maxtempF?: string;
     mintempC?: string;
+    mintempF?: string;
     hourly?: WttrHour[];
 };
 type WttrCurrent = {
     temp_C?: string;
+    temp_F?: string;
     FeelsLikeC?: string;
+    FeelsLikeF?: string;
     windspeedKmph?: string;
+    windspeedMiles?: string;
     humidity?: string;
     weatherDesc?: { value?: string }[];
 };
@@ -1192,12 +1200,27 @@ function hourlyAt(hours: WttrHour[], targetHour: number): WttrHour | null {
 }
 
 function formatCurrent(c: WttrCurrent | undefined): string | null {
+    const units = weatherUnits();
+
     if (!c) return null;
     const cond = c.weatherDesc?.[0]?.value ?? "";
-    const temp = c.temp_C ? `${c.temp_C}°C` : "";
-    const feels = c.FeelsLikeC && c.FeelsLikeC !== c.temp_C
-        ? `feels ${c.FeelsLikeC}°C` : "";
-    const wind = c.windspeedKmph ? `${c.windspeedKmph} km/h` : "";
+
+    let temp: string;
+    let feels: string;
+    let wind: string;
+
+    if (units === "Metric") {
+        temp = c.temp_C ? `${c.temp_C}°C` : "";
+        feels = c.FeelsLikeC && c.FeelsLikeC !== c.temp_C
+            ? `feels ${c.FeelsLikeC}°C` : "";
+        wind = c.windspeedKmph ? `${c.windspeedKmph} km/h` : "";
+    } else {
+        temp = c.temp_F ? `${c.temp_F}°F` : "";
+        feels = c.FeelsLikeF && c.FeelsLikeF !== c.temp_F
+            ? `feels ${c.FeelsLikeF}°F` : "";
+        wind = c.windspeedMiles ? `${c.windspeedMiles} mph` : "";
+    }
+
     const hum = c.humidity ? `${c.humidity}%` : "";
     const s = [cond, temp, feels, wind, hum]
         .filter((x) => x.length > 0)
@@ -1206,11 +1229,24 @@ function formatCurrent(c: WttrCurrent | undefined): string | null {
 }
 
 function formatHour(h: WttrHour | null): string | null {
+    const units = weatherUnits();
+
     if (!h) return null;
     const cond = h.weatherDesc?.[0]?.value ?? "";
-    const temp = h.tempC ? `${h.tempC}°C` : "";
-    const feels = h.FeelsLikeC && h.FeelsLikeC !== h.tempC
-        ? `feels ${h.FeelsLikeC}°C` : "";
+
+    let temp: string;
+    let feels: string;
+
+    if (units === "Metric") {
+        temp = h.tempC ? `${h.tempC}°C` : "";
+        feels = h.FeelsLikeC && h.FeelsLikeC !== h.tempC
+            ? `feels ${h.FeelsLikeC}°C` : "";
+    } else {
+        temp = h.tempF ? `${h.tempF}°F` : "";
+        feels = h.FeelsLikeF && h.FeelsLikeF !== h.tempF
+            ? `feels ${h.FeelsLikeF}°F` : "";
+    }
+
     const s = [cond, temp, feels]
         .filter((x) => x.length > 0)
         .join(" · ");
@@ -1218,14 +1254,49 @@ function formatHour(h: WttrHour | null): string | null {
 }
 
 function formatDaySummary(day: WttrDay | undefined): string | null {
+    const units = weatherUnits();
+
     if (!day) return null;
     const midday = hourlyAt(day.hourly ?? [], 12);
     const cond = midday?.weatherDesc?.[0]?.value ?? "";
-    const range = day.mintempC && day.maxtempC
-        ? `${day.mintempC}°..${day.maxtempC}°C`
-        : "";
+
+    let range: string;
+
+    if (units === "Metric") {
+        range = day.mintempC && day.maxtempC
+            ? `${day.mintempC}°..${day.maxtempC}°C`
+            : "";
+    } else {
+        range = day.mintempF && day.maxtempF
+            ? `${day.mintempF}°..${day.maxtempF}°F`
+            : "";
+    }
+
     const s = [range, cond].filter((x) => x.length > 0).join(" · ");
     return s ? truncate(s, valueMax()) : null;
+}
+
+editor.defineConfigString("weatherLocation", {
+    default: "",
+    description: "Location wttr.in should use for the weather section, instead of its IP-based geolocation. Leave blank to auto-detect.",
+});
+
+function weatherLocation(): string {
+    const cfg = (editor.getPluginConfig() ?? {}) as { weatherLocation?: string };
+    return (cfg.weatherLocation ?? "").trim();
+}
+
+editor.defineConfigEnum("weatherUnits", {
+    values: ["Metric", "Imperial"] as const,
+    default: "Metric",
+    description: "Units for the weather section: Metric (°C, km/h) or Imperial (°F, mph).",
+});
+
+// Anything other than an explicit "Imperial" (including an unset config)
+// is Metric, matching the declared default.
+function weatherUnits(): "Metric" | "Imperial" {
+    const cfg = (editor.getPluginConfig() ?? {}) as { weatherUnits?: string };
+    return cfg.weatherUnits === "Imperial" ? "Imperial" : "Metric";
 }
 
 const weatherRefresh: SectionRefresh = async (ctx) => {
@@ -1234,9 +1305,13 @@ const weatherRefresh: SectionRefresh = async (ctx) => {
     try {
         // j1 = full JSON payload (current + 3-day forecast, 3-hour samples).
         // Larger than the old %-format but gets us everything in one call.
+        // A configured location takes wttr.in's IP-geolocation lookup out of
+        // the loop entirely — the path segment pins the location.
+        const location = weatherLocation();
+        const path = location ? `/${encodeURIComponent(location)}` : "";
         const res = await run(
             "curl",
-            ["-fsS", "--max-time", "5", "https://wttr.in/?format=j1"],
+            ["-fsS", "--max-time", "5", `https://wttr.in${path}?format=j1`],
             "",
             6000,
         );
@@ -1408,16 +1483,16 @@ const gitRefresh: SectionRefresh = async (ctx) => {
         modified > 0 ? "warn" : "muted",
     );
 
-    // Clickable "review branch" action. Triggers the audit_mode
-    // plugin's `start_review_branch` handler via the plugin-action
+    // Clickable "branch log" action. Triggers the audit_mode
+    // plugin's `start_branch_log` handler via the plugin-action
     // bridge — executeAction falls through to Action::PluginAction
     // for any name that's not a built-in, and the plugin manager
     // dispatches that to the registered handler by name.
-    ctx.text("    " + pad("review", 10), { color: "muted" });
-    ctx.text("review branch", {
+    ctx.text("    " + pad("log", 10), { color: "muted" });
+    ctx.text("branch log", {
         color: "accent",
         bold: true,
-        onClick: () => editor.executeAction("start_review_branch"),
+        onClick: () => editor.executeAction("start_branch_log"),
     });
     ctx.newline();
 };

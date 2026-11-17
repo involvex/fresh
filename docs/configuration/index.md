@@ -3,6 +3,7 @@
 - [Overview](./) - Layered configuration system
 - [Startup Script (init.ts)](./init.md) - Run TypeScript at startup for environment-dependent setup
 - [Keyboard](./keyboard.md) - Keyboard shortcuts and keybinding configuration
+- [Actions](./actions.md) - Every built-in action name and the args it takes
 
 ---
 
@@ -42,7 +43,7 @@ Settings are loaded from multiple layers, with higher layers overriding lower on
 | Layer | Location | Scope | Use Case |
 |-------|----------|-------|----------|
 | **System** | Built-in defaults | Global | Factory defaults (read-only) |
-| **User** | `~/.config/fresh/config.json` | All projects | Personal preferences |
+| **User** | `~/.config/fresh/config.json`, or `$XDG_CONFIG_HOME/fresh/config.json` when that variable is an absolute path | All projects | Personal preferences |
 | **Project** | `.fresh/config.json` in project root | Single project | Project-specific settings |
 | **Session** | `.fresh/session.json` (temporary) | Current run | Temporary overrides |
 
@@ -55,6 +56,7 @@ Settings are loaded from multiple layers, with higher layers overriding lower on
 
 **Path Notes:**
 - On Windows, User config is at `%APPDATA%\fresh\config.json`
+- On macOS, an existing `~/.config/fresh` keeps being used until your files are in `$XDG_CONFIG_HOME/fresh`: move them there (`mv ~/.config/fresh/* "$XDG_CONFIG_HOME/fresh/"`) to switch. Creating the directory on its own changes nothing, so there is no window in which Fresh reads neither. The same applies to `XDG_DATA_HOME` and `~/Library/Application Support/fresh`, where sessions and recovery files live. A new install with no files in either place follows `$XDG_CONFIG_HOME` straight away
 - Project config is found by searching up from the current directory for `.fresh/config.json`
 
 ### Per-Buffer Overrides
@@ -255,6 +257,25 @@ The `grammar` field accepts a short name like `"bash"` or `"rust"` as well as th
 fresh --cmd grammar list
 ```
 
+### Use Your Own Grammar File
+
+You can give a language its own syntax highlighting by pointing `textmate_grammar` at a grammar file:
+
+```json
+{
+  "languages": {
+    "widget": {
+      "extensions": ["widget"],
+      "textmate_grammar": "/home/me/.config/fresh/grammars/Widget.sublime-syntax"
+    }
+  }
+}
+```
+
+The file must be a `.sublime-syntax` file; `.tmLanguage` is not supported. It
+highlights files with the language's `extensions`. Use `grammar` instead when
+you just want to reuse a grammar Fresh already knows (see `fresh --cmd grammar list`).
+
 ### Customize Auto-Indentation
 
 Fresh auto-indents new lines when you press Enter. Most languages work out of
@@ -395,9 +416,41 @@ Configure initialization options for a language server:
 }
 ```
 
-### Project-Specific Tab Size
+### Tabs vs Spaces
 
-Create `.fresh/config.json` in your project:
+Two settings decide how Fresh indents:
+
+- `editor.use_tabs` — when `true`, the Tab key and auto-indent insert tab
+  characters; when `false` (the default), they insert spaces.
+- `editor.tab_size` — the width of one indent level (default `4`). With spaces
+  it is how many spaces one level inserts; with tabs it is how wide a tab
+  character is displayed.
+
+```json
+{
+  "editor": {
+    "use_tabs": true,
+    "tab_size": 4
+  }
+}
+```
+
+Each language can override both under `languages.<id>`; a value left unset
+falls back to the `editor` one. Go and Makefile ship with `use_tabs: true`
+already.
+
+```json
+{
+  "languages": {
+    "python": { "use_tabs": false, "tab_size": 4 },
+    "c": { "use_tabs": true, "tab_size": 8 }
+  }
+}
+```
+
+To change only one project, put the same keys in `.fresh/config.json` at the
+project root (see [Configuration Layers](#configuration-layers)):
+
 ```json
 {
   "version": 1,
@@ -406,6 +459,15 @@ Create `.fresh/config.json` in your project:
   }
 }
 ```
+
+A `.editorconfig` file next to (or above) the file you open takes precedence
+over these: `indent_style` sets tabs or spaces and `indent_size` / `tab_width`
+set the width.
+
+For a single buffer, run **Toggle Indentation: Spaces ↔ Tabs (Current Buffer)**
+(action `toggle_indentation_style`) or **Set Tab Size** from the command
+palette. These change only the current buffer, are remembered for that file
+across sessions, and do not convert indentation that is already in the file.
 
 ## Layer Source Indicators
 
@@ -417,7 +479,7 @@ In the Settings UI, each setting shows where its current value comes from:
 
 ## Status Bar
 
-The left and right sides of the status bar are configurable through the Settings UI. Each side uses a **DualList** picker: items live in an **Available** column or an **Included** column, and you move them back and forth to show or hide them. Use the arrow buttons next to the Included list to reorder. Elements include the filename, cursor position, encoding, LSP indicator, git branch, warning counts, palette hint, a `{clock}` element that shows `HH:MM` with a blinking colon, a `{remote}` indicator that lights up when you're attached to an SSH remote or a devcontainer, a `{read_only}` `[RO]` indicator, a clickable `{terminal_restart}` indicator that appears when the active terminal buffer's process has quit (see [Integrated Terminal](../features/terminal.md#restarting-an-exited-terminal)), and a clickable `{trust}` indicator (see [Workspace Trust](../features/workspace-trust.md)) that leads the left side by default. A separator drawn between elements can also be set in the Settings UI.
+The left and right sides of the status bar are configurable through the Settings UI. Each side uses a **DualList** picker: items live in an **Available** column or an **Included** column, and you move them back and forth to show or hide them. Use the arrow buttons next to the Included list to reorder. Elements include the filename, cursor position, encoding, LSP indicator, git branch, warning counts, palette hint, a `{clock}` element that shows `HH:MM` with a blinking colon, a `{remote}` indicator that lights up when you're attached to an SSH remote or a devcontainer, a `{read_only}` `[RO]` indicator, a `{search_nav}` pair of `↓` / `↑` arrows, shown while a search is active, that you can click to go to the next or previous match (like F3 / Shift+F3), a clickable `{terminal_restart}` indicator that appears when the active terminal buffer's process has quit (see [Integrated Terminal](../features/terminal.md#restarting-an-exited-terminal)), and a clickable `{trust}` indicator (see [Workspace Trust](../features/workspace-trust.md)) that leads the left side by default. A separator drawn between elements can also be set in the Settings UI.
 
 The `{remote}` indicator is clickable — activate it to open a context-aware menu for the current authority (detach, show container logs, retry attach, etc.). It also reflects connection state: `Connecting`, `Connected`, or `FailedAttach`.
 
@@ -476,6 +538,41 @@ All settings can be changed via the Settings UI (run **Open Settings** from the 
 |---------|-------------|---------|
 | Tab size | Spaces per indent level | 4 |
 | Use tabs | Indent with tabs instead of spaces | off |
+
+### Search
+
+The state a search starts on. These are defaults, not a lock: the toggles
+stay live in every search UI, and whatever you flip last holds for the rest
+of the session. The Find prompt saves a choice with the workspace, per
+option and only where it differs from the setting here — so changing one of
+these later still reaches every workspace that never had an opinion about
+that particular option.
+
+| Setting | Description | Default | Applies to |
+|---------|-------------|---------|------------|
+| Case sensitive | Match upper and lower case exactly. When off, `todo` finds `TODO` | off | every search UI |
+| Whole word | Match whole words only | off | Find/Replace prompt, Search & Replace panel |
+| Regex | Read the query as a regular expression | off | Find/Replace prompt, Search & Replace panel |
+| Confirm each | Ask before each replacement | off | Replace prompts |
+
+Universal Search keeps its own Word and Regex defaults (regex **on**, matching
+what `rg` and `git grep` do); Git Grep has no word or regex toggle. Case
+sensitivity is the one option all four surfaces take from here.
+
+```json
+{
+  "editor": {
+    "search": {
+      "case_sensitive": true
+    }
+  }
+}
+```
+
+`Alt+C` toggles case sensitivity in the Find/Replace prompt, in Universal
+Search and in the Search & Replace panel. Git Grep shows a **Case** checkbox on
+its prompt toolbar (click it, or Tab to it and press Space); bind
+`git_grep_toggle_case` if you want a chord for it.
 
 ### UI
 

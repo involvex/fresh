@@ -8,7 +8,7 @@
 //! - Navigate back/forward in position history
 //! - Buffer state persistence
 
-use rust_i18n::t;
+use fresh_i18n::t;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
@@ -16,6 +16,7 @@ use std::sync::Arc;
 use crate::model::event::{BufferId, Event, LeafId};
 use crate::state::EditorState;
 
+use super::buffer_close::CloseCause;
 use super::buffer_config_resolve;
 use super::Editor;
 
@@ -76,14 +77,105 @@ impl crate::app::window::Window {
         }
     }
 
+    /// The display settings a freshly seeded view of `buffer_id` should start
+    /// from: the global `editor.*` defaults, with this buffer's language-level
+    /// wrap overrides folded in.
+    ///
+    /// Every path that creates a `BufferViewState` has to stamp these onto it
+    /// (see `BufferViewState::apply_config_defaults`), because the struct's own
+    /// defaults are hard-coded rather than read from the config — and a path
+    /// that forgets re-introduces #3426. Most call sites still spell the struct
+    /// out field by field; prefer this where the window is to hand, so a key
+    /// added to `ViewConfigDefaults` reaches the seeding paths at once.
+    pub(crate) fn view_config_defaults_for_buffer(
+        &self,
+        buffer_id: BufferId,
+    ) -> crate::view::split::ViewConfigDefaults {
+        crate::view::split::ViewConfigDefaults {
+            line_wrap: self.resolve_line_wrap_for_buffer(buffer_id),
+            wrap_column: self.resolve_wrap_column_for_buffer(buffer_id),
+            ..crate::view::split::ViewConfigDefaults::from_editor_config(&self.config().editor)
+        }
+    }
+
+    /// Stamp the config defaults onto `buffer_id`'s view state in `leaf`,
+    /// creating that state if the pane has none for it yet.
+    ///
+    /// Safe to call on a pane that already shows the buffer: the three pinnable
+    /// flags (line numbers, line wrap, current-line highlight) keep an override
+    /// the user set, and the rest — rulers, wrap indent, wrap column, scroll
+    /// offset — are re-stamped from the config, which nothing else sets per
+    /// pane.
+    pub(crate) fn seed_view_config_defaults(&mut self, leaf: LeafId, buffer_id: BufferId) {
+        let defaults = self.view_config_defaults_for_buffer(buffer_id);
+        if let Some(view_state) = self.split_view_states_mut().get_mut(&leaf) {
+            view_state
+                .ensure_buffer_state(buffer_id)
+                .apply_config_defaults(defaults);
+        }
+    }
+
+    /// Re-resolve the editor-wide display defaults on every buffer view state
+    /// in this window, not just the tab each pane shows.
+    ///
+    /// `show_line_numbers`, `line_wrap_enabled` and `highlight_current_line`
+    /// are per-(split, buffer) caches of a resolved `editor.*` setting, so
+    /// changing one of those settings has to refresh all of them (#3449).
+    /// Per-buffer pins and plugin overrides survive, because
+    /// `apply_config_defaults` honours them. Single-view counterpart:
+    /// [`Self::seed_view_config_defaults`].
+    ///
+    /// The skipped views set these flags directly and record no override, so
+    /// resolving would hand them display they are built never to have: virtual
+    /// buffers (terminals, plugin pages, dock panels, grep lists), grid-wrapped
+    /// viewports, grouped panels, and anything outside `ViewMode::Source`. A
+    /// scratch buffer is `BufferKind::File`, so it still follows the setting.
+    /// `grid_wrap` is tested rather than `is_terminal_buffer`, which goes false
+    /// when a terminal's process exits while its scroll-back tab stays open.
+    ///
+    /// Call this once the new config has reached `Window::config()` — that is
+    /// the copy the resolution reads.
+    pub(crate) fn resync_global_display_defaults(&mut self) {
+        // Collected first: the stamping pass below needs the window mutably.
+        let mut targets: Vec<(LeafId, BufferId)> = Vec::new();
+        let Some(view_states) = self.buffers.split_view_states() else {
+            return;
+        };
+        for (leaf_id, view_state) in view_states {
+            if view_state.suppress_chrome {
+                continue;
+            }
+            for (buffer_id, buf_state) in view_state.buffer_states() {
+                if buf_state.view_mode != crate::state::ViewMode::Source
+                    || buf_state.viewport.grid_wrap
+                    || self
+                        .buffer_metadata
+                        .get(buffer_id)
+                        .is_some_and(crate::app::types::BufferMetadata::is_virtual)
+                {
+                    continue;
+                }
+                targets.push((*leaf_id, *buffer_id));
+            }
+        }
+
+        for (leaf_id, buffer_id) in targets {
+            let defaults = self.view_config_defaults_for_buffer(buffer_id);
+            if let Some(buf_state) = self
+                .split_view_states_mut()
+                .get_mut(&leaf_id)
+                .and_then(|vs| vs.buffer_state_mut(buffer_id))
+            {
+                buf_state.apply_config_defaults(defaults);
+            }
+        }
+    }
+
     /// Get the preferred split for opening a file.
     /// If the active split has no label, use it (normal case).
     /// Otherwise find an unlabeled leaf so files don't open in labeled splits (e.g., sidebars).
     pub(crate) fn preferred_split_for_file(&self) -> LeafId {
-        let (mgr, _) = self
-            .buffers
-            .splits()
-            .expect("active window must have a populated split layout");
+        let (mgr, _) = self.splits();
         let active = mgr.active_split();
         if mgr.get_label(active.into()).is_none() {
             return active;
@@ -117,21 +209,42 @@ impl Editor {
     /// on rapid browsing. A future optimization is to keep the LSP session
     /// for the outgoing buffer until the user commits to the new one.
     pub fn open_file_preview(&mut self, path: &Path) -> anyhow::Result<BufferId> {
-        // Dismiss any popup on the buffer being left. The explorer's preview
-        // gesture (mouse single-click *and* keyboard arrow nav both route
-        // through this function) is a focus shift away from the editor pane;
-        // an LSP popup anchored to the previous buffer's cursor must not
-        // follow the user across previews. Doing the cleanup here is the
-        // single dedup point — both input paths get it for free, and the
-        // popup is gone in the next render so a subsequent re-preview of the
-        // same file doesn't resurrect it.
-        if self.active_state().popups.is_visible() {
-            self.clear_popups();
-        }
-
-        // Feature gate — fall back to normal open when preview tabs are off.
+        // Feature gate — the File Explorer's own setting, applied here at the
+        // explorer's entry point. It is deliberately NOT part of
+        // `preview_file`: other browsing surfaces (the finders' result
+        // previews) share the preview *discipline* below without inheriting
+        // the explorer's policy. With the setting off, a click still opens
+        // the file — just permanently.
         if !self.config.file_explorer.preview_tabs {
             return self.open_file(path);
+        }
+        self.preview_file(path)
+    }
+
+    /// The preview discipline itself, with no caller's policy attached:
+    /// open `path` as *the* preview tab of the split the open path picks.
+    ///
+    /// Shared by every surface that browses files rather than opening them —
+    /// the File Explorer (via [`Self::open_file_preview`], which adds its
+    /// setting) and the finders' result previews (via
+    /// [`Self::preview_file_in_split`], which adds a target split). Whoever
+    /// calls it gets the whole set of invariants documented on
+    /// `open_file_preview`, and a fix to any of them lands for all of them.
+    ///
+    /// Errors are the caller's to interpret: a browse should skip a file it
+    /// cannot preview (a large file whose encoding needs confirmation bails
+    /// here rather than prompting), while a deliberate open raises them.
+    pub(crate) fn preview_file(&mut self, path: &Path) -> anyhow::Result<BufferId> {
+        // Dismiss any popup on the buffer being left. A preview gesture —
+        // the explorer's single click or arrow nav, a finder moving its
+        // selection — is a focus shift away from the editor pane; an LSP
+        // popup anchored to the previous buffer's cursor must not follow the
+        // user across previews. Doing the cleanup here is the single dedup
+        // point — every input path gets it for free, and the popup is gone in
+        // the next render so a subsequent re-preview of the same file doesn't
+        // resurrect it.
+        if self.active_state().popups.is_visible() {
+            self.clear_popups();
         }
 
         // Decide target split up-front. `open_file_no_focus` will target
@@ -201,7 +314,7 @@ impl Editor {
                 // promote, but defend in depth), the buffer stays open as a
                 // permanent tab, which *is* a commitment → fire its deferred
                 // hook.
-                if let Err(e) = self.close_buffer(old_id) {
+                if let Err(e) = self.close_buffer_by(old_id, CloseCause::Editor) {
                     tracing::warn!(
                         "preview: could not replace stale preview buffer {:?}, demoting to permanent: {}",
                         old_id,
@@ -223,6 +336,87 @@ impl Editor {
         self.active_window_mut().preview = Some((target_split, buffer_id));
 
         Ok(buffer_id)
+    }
+
+    /// Preview `path` in a *named* split, at `line`/`column` (1-indexed), and
+    /// leave the active split exactly where it was.
+    ///
+    /// This is what a finder's result preview calls as its selection moves.
+    /// The whole preview discipline is [`Self::preview_file`]'s; the only
+    /// thing added here is the target.
+    ///
+    /// Targeting works by making `target_split` active for the duration of
+    /// the open — the open path routes through `preferred_split_for_file`
+    /// and `set_active_buffer`, both of which read the active split — and
+    /// restoring the previous one afterwards. The swap goes through
+    /// `SplitManager::set_active_split` rather than the editor's focus
+    /// handler on purpose: the focus handler commits the preview when it
+    /// moves between splits ("walking away is commitment"), which is right
+    /// for a user walking away and wrong for a browse that never left. Same
+    /// reason the cursor jump happens inside the window: `jump_to_line_column`
+    /// moves the active split's cursor, and the target is the active split
+    /// only until this returns.
+    pub fn preview_file_in_split(
+        &mut self,
+        path: &Path,
+        target_split: LeafId,
+        line: Option<usize>,
+        column: Option<usize>,
+    ) -> anyhow::Result<BufferId> {
+        let previous_split = self
+            .windows
+            .get(&self.active_window)
+            .and_then(|w| w.buffers.splits())
+            .map(|(mgr, _)| mgr.active_split())
+            .ok_or_else(|| anyhow::anyhow!("no split layout"))?;
+
+        let set_active = |editor: &mut Self, split: LeafId| -> bool {
+            editor
+                .windows
+                .get_mut(&editor.active_window)
+                .and_then(|w| w.buffers.split_manager_mut())
+                .is_some_and(|mgr| mgr.set_active_split(split))
+        };
+
+        if !set_active(self, target_split) {
+            anyhow::bail!("preview: split {:?} does not exist", target_split);
+        }
+
+        let result = self.preview_file(path);
+        if result.is_ok() && (line.is_some() || column.is_some()) {
+            self.jump_to_line_column(line, column);
+        }
+
+        // Back to where the user actually is. `previous_split` was live a
+        // moment ago; if the open collapsed it (it cannot — a preview open
+        // adds a buffer, it doesn't close splits) the id simply won't set.
+        set_active(self, previous_split);
+
+        result
+    }
+
+    /// Drop the current preview tab, if any: the browse is over and was not
+    /// committed. Closes the preview buffer so the split falls back to what
+    /// it was showing before.
+    ///
+    /// A preview the user has since *modified* is not closed — editing is
+    /// commitment, and by then it is no longer the preview anyway
+    /// (`promote_active_buffer_from_preview` runs on mutation). A close that
+    /// fails for any other reason promotes instead of leaving a buffer
+    /// half-owned, mirroring the replace path in [`Self::preview_file`].
+    pub fn dismiss_preview(&mut self) {
+        let Some((_split, buffer_id)) = self.active_window_mut().preview.take() else {
+            return;
+        };
+        if let Err(e) = self.close_buffer_by(buffer_id, CloseCause::Editor) {
+            tracing::warn!(
+                "preview: could not dismiss preview buffer {:?}, promoting it: {}",
+                buffer_id,
+                e
+            );
+            self.active_window()
+                .fire_deferred_after_file_open(buffer_id);
+        }
     }
 
     // `promote_buffer_from_preview`, `promote_active_buffer_from_preview`,
@@ -295,8 +489,11 @@ impl Editor {
                 &new_path,
                 self.authority().path_translation.as_ref(),
             );
-            let display_name =
-                super::BufferMetadata::display_name_for_path(&new_path, self.working_dir());
+            let display_name = super::BufferMetadata::display_name_for_path(
+                &*self.authority().filesystem,
+                &new_path,
+                self.working_dir(),
+            );
             if let Some(metadata) = self.active_window_mut().buffer_metadata.get_mut(&id) {
                 metadata.kind = super::BufferKind::File {
                     path: new_path.clone(),
@@ -310,12 +507,6 @@ impl Editor {
 
     // `promote_current_preview`, `promote_preview_if_not_in_split`,
     // `is_buffer_preview`, `current_preview` moved to `impl Window`.
-
-    /// Number of open buffers (including hidden/virtual buffers).
-    /// Intended for tests that verify preview tabs don't accumulate.
-    pub fn open_buffer_count(&self) -> usize {
-        self.active_window().buffers.len()
-    }
 
     /// Whether the active buffer has a full line index available.
     ///
@@ -365,15 +556,10 @@ impl Editor {
             // Column is also 1-indexed, convert to 0-indexed
             let target_col = column.map(|c| c.saturating_sub(1)).unwrap_or(0);
 
-            // Track the known exact line number for scanned large files,
-            // since offset_to_position may not be able to reverse-resolve it accurately.
-            let mut known_line: Option<usize> = None;
-
             let position = if has_line_scan && has_line_index {
                 // Scanned large file: use tree metadata to find exact line offset
                 let max_line = state.buffer.line_count().unwrap_or(1).saturating_sub(1);
                 let actual_line = target_line.min(max_line);
-                known_line = Some(actual_line);
                 // Need mutable access to potentially read chunk data from disk
                 if let Some(state) = self
                     .windows
@@ -415,24 +601,12 @@ impl Editor {
                 new_sticky_column: Some(target_col),
             };
 
-            let split_id = self
-                .windows
-                .get(&self.active_window)
-                .and_then(|w| w.buffers.splits())
-                .map(|(mgr, _)| mgr)
-                .expect("active window must have a populated split layout")
-                .active_split();
-            self.active_window_mut()
-                .apply_event_to_buffer(buffer_id, split_id, &event);
-
-            // For scanned large files, override the line number with the known exact value
-            // since offset_to_position may fall back to proportional estimation.
-            if let Some(line) = known_line {
-                if let Some(state) = self.active_window_mut().buffers.get_mut(&buffer_id) {
-                    state.primary_cursor_line_number =
-                        crate::model::buffer::LineNumber::Absolute(line);
-                }
-            }
+            // Through the editor-level applier, not the window's: the
+            // window's applies the move and nothing else, so this jump
+            // reached the buffer without firing `cursor_moved`, and every
+            // plugin that follows the cursor (the Markdown contents section
+            // among them) kept showing where it had been.
+            self.apply_event_to_active_buffer(&event);
 
             // Center the target line in the viewport. The default
             // `ensure_visible` behavior only scrolls just enough to reveal
@@ -503,13 +677,7 @@ impl Editor {
                 new_sticky_column: Some(end_col_0),
             };
 
-            let split_id = self
-                .windows
-                .get(&self.active_window)
-                .and_then(|w| w.buffers.splits())
-                .map(|(mgr, _)| mgr)
-                .expect("active window must have a populated split layout")
-                .active_split();
+            let split_id = self.effective_active_split();
             self.active_window_mut()
                 .apply_event_to_buffer(buffer_id, split_id, &event);
         }
@@ -527,13 +695,15 @@ impl Editor {
 
         if let Some(state) = self
             .windows
-            .get(&self.active_window)
-            .map(|w| &w.buffers)
+            .get_mut(&self.active_window)
+            .map(|w| &mut w.buffers)
             .expect("active window present")
-            .get(&buffer_id)
+            .get_mut(&buffer_id)
         {
-            let buffer_len = state.buffer.len();
-            let position = offset.min(buffer_len);
+            // The offset is whatever was typed, and on multi-byte text most
+            // bytes are inside a character: the caret goes to the next whole
+            // one, or what is typed there splits the character (issue #3285).
+            let position = state.buffer.char_boundary_at_or_after(offset);
 
             let event = Event::MoveCursor {
                 cursor_id,
@@ -545,15 +715,12 @@ impl Editor {
                 new_sticky_column: None,
             };
 
-            let split_id = self
-                .windows
-                .get(&self.active_window)
-                .and_then(|w| w.buffers.splits())
-                .map(|(mgr, _)| mgr)
-                .expect("active window must have a populated split layout")
-                .active_split();
-            self.active_window_mut()
-                .apply_event_to_buffer(buffer_id, split_id, &event);
+            // Through the editor-level applier, not the window's: the
+            // window's applies the move and nothing else, so this jump
+            // reached the buffer without firing `cursor_moved`, and every
+            // plugin that follows the cursor (the Markdown contents section
+            // among them) kept showing where it had been.
+            self.apply_event_to_active_buffer(&event);
         }
     }
 
@@ -582,20 +749,7 @@ impl Editor {
             Arc::clone(&self.authority().filesystem),
         );
         // Note: line_wrap_enabled is set on SplitViewState.viewport when the split is created
-        state
-            .margins
-            .configure_for_line_numbers(self.config.editor.line_numbers);
-        // Set default line ending for new buffers from config
-        state
-            .buffer
-            .set_default_line_ending(self.config.editor.default_line_ending.to_line_ending());
-        state.apply_occurrence_highlight(self.config.editor.highlight_occurrences);
-        // Buffer settings (whitespace visibility, tabs, guides, …): resolve
-        // from the user's config so a brand-new buffer behaves the same as an
-        // opened file. Without this the buffer kept `BufferSettings::default()`
-        // (e.g. tabs-on/spaces-off whitespace), so configured space indicators
-        // never showed in a new file (issue #2580).
-        state.apply_buffer_config(&self.config);
+        state.apply_unnamed_buffer_config(&self.config);
         self.windows
             .get_mut(&self.active_window)
             .map(|w| &mut w.buffers)
@@ -611,15 +765,9 @@ impl Editor {
         self.set_active_buffer(buffer_id);
 
         // Initialize per-buffer view state with config defaults.
-        // Must happen AFTER set_active_buffer, because switch_buffer creates
+        // Must happen AFTER set_active_buffer, because set_buffer_tab creates
         // the new BufferViewState with defaults (show_line_numbers=true).
-        let active_split = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split();
+        let active_split = self.active_window().split_manager().active_split();
         let line_wrap = self.active_window().resolve_line_wrap_for_buffer(buffer_id);
         let wrap_column = self
             .active_window()
@@ -627,19 +775,21 @@ impl Editor {
         if let Some(view_state) = self
             .windows
             .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
+            .and_then(|w| w.buffers.split_view_states_mut())
             .expect("active window must have a populated split layout")
             .get_mut(&active_split)
         {
-            view_state.apply_config_defaults(crate::view::split::ViewConfigDefaults {
-                line_numbers: self.config.editor.line_numbers,
-                highlight_current_line: self.config.editor.highlight_current_line,
-                line_wrap,
-                wrap_indent: self.config.editor.wrap_indent,
-                wrap_column,
-                rulers: self.config.editor.rulers.clone(),
-                scroll_offset: self.config.editor.scroll_offset,
-            });
+            view_state.buffer_tab_state_mut().apply_config_defaults(
+                crate::view::split::ViewConfigDefaults {
+                    line_numbers: self.config.editor.line_numbers,
+                    highlight_current_line: self.config.editor.highlight_current_line,
+                    line_wrap,
+                    wrap_indent: self.config.editor.wrap_indent,
+                    wrap_column,
+                    rulers: self.config.editor.rulers.clone(),
+                    scroll_offset: self.config.editor.scroll_offset,
+                },
+            );
         }
 
         self.active_window_mut().status_message = Some(t!("buffer.new").to_string());
@@ -654,14 +804,6 @@ impl Editor {
             .mouse_state
             .lsp_hover_state
             .map(|(pos, _, x, y, _)| (pos, x, y))
-    }
-
-    /// Check if a transient popup (hover/signature help) is currently visible
-    pub fn has_transient_popup(&self) -> bool {
-        self.active_state()
-            .popups
-            .top()
-            .is_some_and(|p| p.transient)
     }
 
     /// Force check the mouse hover timer (for testing)

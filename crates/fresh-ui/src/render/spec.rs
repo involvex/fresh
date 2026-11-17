@@ -84,6 +84,8 @@ pub struct Item {
     pub clip: Rect,
     /// Where this item's appearance comes from.
     pub theme: ThemeKey,
+    /// What this item *is*, as opposed to how it is painted.
+    pub classes: Classes,
     pub draw: Draw,
 }
 
@@ -104,15 +106,98 @@ impl ThemeKey {
     }
 }
 
+/// Per-item semantics: the nearest enclosing `classes(..)` tag, a
+/// space-separated list. A backend maps it to an appearance; the library never
+/// interprets it.
+///
+/// **The companion to [`ThemeKey`], and deliberately not the same slot.** The
+/// theme says how an item is painted and its vocabulary is a grammar, because
+/// colour combines — selection × focus × git status multiplies. This says what
+/// an item *is*, and its vocabulary is a list, because structure does not: a
+/// button is a button whether or not it is focused. Two slots, each shaped
+/// like what it names, and each with its own discipline — a theme name that
+/// does not resolve is a bug, while a class no backend knows simply decorates
+/// nothing, which is how a stylesheet is supposed to degrade.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Classes(pub Option<Rc<str>>);
+
+impl Classes {
+    pub fn as_str(&self) -> &str {
+        self.0.as_deref().unwrap_or("")
+    }
+
+    /// The classes, in the order they were written. Later ones win.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.as_str().split_whitespace()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.as_str().is_empty()
+    }
+}
+
+/// Which corner glyphs a [`Draw::Border`] is drawn with.
+///
+/// **A border's corners are a description, not a backend default.** The fold
+/// drew ratatui's `BorderType::Plain` for every box, which is right for the
+/// editor's chrome and wrong for a plugin panel: a `WidgetSpec` card and a
+/// labelled section have always worn `╭╮╰╯`, and describing one turned it
+/// square. A backend that has only one corner set can round to whichever it
+/// draws; a backend that has both is told which was meant.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+pub enum BorderStyle {
+    /// `┌┐└┘` — ratatui's `BorderType::Plain`, and the editor's chrome.
+    #[default]
+    Plain,
+    /// `╭╮╰╯` — the plugin widget vocabulary's card and labelled section.
+    Rounded,
+    /// `┏┓┗┛` with heavy edges — a colour-independent "this one is selected"
+    /// marker. `mark_list_card_selected` swaps a card's light glyphs for these
+    /// rather than banding the row, "even when colours are too subtle"; a
+    /// description that could not name it would lose the marker on any theme
+    /// whose selection colour is faint.
+    Heavy,
+}
+
+impl BorderStyle {
+    /// The six glyphs, in the order a box is drawn: horizontal, vertical, and
+    /// the four corners clockwise from the top left.
+    pub fn glyphs(self) -> (char, char, char, char, char, char) {
+        match self {
+            BorderStyle::Plain => ('─', '│', '┌', '┐', '┘', '└'),
+            BorderStyle::Rounded => ('─', '│', '╭', '╮', '╯', '╰'),
+            BorderStyle::Heavy => ('━', '┃', '┏', '┓', '┛', '┗'),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Draw {
     /// A background region.
     Fill,
-    /// A box outline drawn inside `rect`.
-    Border,
+    /// A background laid over what was painted before it, keeping the text
+    /// there: the region inherits its content and takes the theme's ground.
+    Wash,
+    /// A ground made of this cluster, **tiled across the item's rect** — a
+    /// rule, a divider, a ruled fill.
+    ///
+    /// The cluster, not the finished string: how many of it fit is a
+    /// function of the rectangle layout settled on, which is the whole
+    /// reason this is a draw kind and not text of a computed length. A
+    /// backend that has a better way to say "a line across here" — a DOM
+    /// border, a canvas stroke — is free to ignore the glyph.
+    Rule(Rc<str>),
+    /// A box outline drawn inside `rect`, in the given corner style.
+    Border(BorderStyle),
     /// Covers everything painted before it.
     Scrim(Scrim),
     /// Text, one entry per visual row.
+    ///
+    /// A row's columns are what [`glyph::glyphs`](crate::render::glyph::glyphs)
+    /// says they are: a backend paints each cluster it yields at the column it
+    /// names and blanks the continuation cells of a wide one. Stepping one cell
+    /// per `char` puts everything after a wide glyph two cells left of where
+    /// layout measured it.
     Lines(Vec<Rc<str>>),
     Scrollbar {
         /// How far the window has travelled, in whatever the viewport counts.
@@ -121,8 +206,57 @@ pub enum Draw {
         /// coordinate, because a million-row list has no cell extent that fits
         /// one.
         content: u32,
-        /// Extent of the window, in cells.
+        /// Extent of the window, in that same unit — *not* in cells. For a
+        /// cell-scrolling viewport the two coincide and the window is the
+        /// track's height; for an item-scrolling one it is a count of items,
+        /// and a bar drawn from the track instead would say a list of
+        /// five-row cards is five times as visible as it is.
         window: u16,
+        /// Which way the track runs. A vertical bar's track is its
+        /// rectangle's height and its thumb travels down it; a horizontal
+        /// bar's is the width. The item's rectangle is one cell thick across
+        /// the other axis.
+        axis: crate::event::Axis,
+        /// Marks on the track: an overview of where things are in the
+        /// content — search hits, diagnostics, unsaved changes — each at a
+        /// track cell, in its own theme. Part of the bar's own item rather
+        /// than a second overlay measured against it, so a backend paints the
+        /// mark and the thumb it may share a cell with together. `full`
+        /// paints the whole cell in the mark's theme (a highlighted track
+        /// cell); otherwise a backend paints a glyph in the mark's foreground
+        /// over the bar's own cell, so mark and scroll position stay readable
+        /// in one cell.
+        marks: Rc<[Mark]>,
+    },
+    /// There is more content past this edge of a window.
+    ///
+    /// **A draw kind for the reason [`Draw::Rule`] gives**: whether there is
+    /// more depends on the offset layout settled on, so nothing before paint
+    /// can say. A description that decided it would have to know the offset to
+    /// be built, and be built to produce the offset.
+    ///
+    /// It exists because a track does not always fit. A one-row horizontal
+    /// window — a tab strip — has its content *on* that row, so a
+    /// [`Draw::Scrollbar`] beside it has nowhere to go; what it can offer
+    /// instead is a cap on each edge that has content behind it. The item is
+    /// one cell, painted over the window's own first or last cell rather than
+    /// in a gutter, so the content's extent never depends on the offset
+    /// either.
+    ///
+    /// How it looks is the backend's: `‹`/`›`, a chevron, a gradient. The
+    /// library says only which edge, on which axis, has more behind it.
+    Overflow {
+        /// Which way the window scrolls. `Horizontal` caps sit at the left and
+        /// right edges, `Vertical` at the top and bottom.
+        axis: crate::event::Axis,
+        /// Which edge this cap is on: the one the content came from, or the
+        /// one it continues towards.
+        end: End,
+        /// The pointer is on this cap. A cap is a button — it steps the
+        /// window — so it says so, and the theme it carries is already the
+        /// hovered one (see `Node::bar_hover_theme`); a backend that draws
+        /// hover for itself has the fact too.
+        hovered: bool,
     },
     /// A region whose text the backend may let the user select. The library
     /// holds no selection model; this only says where selecting is meaningful.
@@ -131,7 +265,43 @@ pub enum Draw {
     Host(HostId),
 }
 
+/// Which edge of a window a [`Draw::Overflow`] cap is on.
+///
+/// Named for the content rather than for the screen, so one word serves both
+/// axes: `Before` is where the content already scrolled past — the left edge
+/// of a horizontal window, the top of a vertical one — and `After` is where it
+/// continues.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum End {
+    Before,
+    After,
+}
+
+/// One mark on a [`Draw::Scrollbar`]'s track.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mark {
+    /// The track cell, from the bar's start.
+    pub at: u16,
+    /// Where the mark's colour comes from: a backend paints the glyph in this
+    /// theme's foreground (and, for a `full` mark, the cell in its
+    /// background).
+    pub theme: ThemeKey,
+    /// Paint the whole cell rather than a glyph over the bar's cell.
+    pub full: bool,
+}
+
 impl Draw {
+    /// A bar with no marks, running down its rectangle.
+    pub fn scrollbar(offset: u32, content: u32, window: u16) -> Draw {
+        Draw::Scrollbar {
+            offset,
+            content,
+            window,
+            axis: crate::event::Axis::Vertical,
+            marks: Rc::from(Vec::new()),
+        }
+    }
+
     /// Thumb geometry for a [`Draw::Scrollbar`], in track cells: `(top, len)`.
     ///
     /// Shared so every backend renders the bar identically and correctly at the
@@ -139,13 +309,29 @@ impl Draw {
     /// thumb a row short of the end at maximum scroll. This maps the offset
     /// across `[0, max]` onto the thumb's travel `[0, track - len]`, so a
     /// fully-scrolled thumb sits flush against the bottom.
-    pub fn scrollbar_thumb(offset: u32, content: u32, track: u16) -> (u16, u16) {
+    ///
+    /// **The window is an argument because it is not the track.** `offset`,
+    /// `content` and `window` are all in the viewport's own unit — cells for a
+    /// cell-scrolling window, items for an item-scrolling one — and `track` is
+    /// the bar's height on screen. They coincide for the first kind and part
+    /// company for the second: a list of 16 five-row cards showing four of
+    /// them in a 22-cell track is a window of *four*, and reading the track as
+    /// the window made `len` come out `⌈22·22/16⌉` — clamped to the whole
+    /// track, a solid stripe that says nothing and cannot be dragged.
+    ///
+    /// **The length rounds up.** Flooring under-states the window: 28 rows of
+    /// 434 is 6.5% of the track, which floors to a single cell claiming 3.6%
+    /// — and a one-cell thumb is the hardest thing on the bar to grab, so the
+    /// row the user aims at lands on the track and page-jumps instead. The
+    /// thumb should never claim *less* of the track than the window actually
+    /// shows, so the division ceils and the result is clamped to the track.
+    pub fn scrollbar_thumb(offset: u32, content: u32, window: u32, track: u16) -> (u16, u16) {
         let t = track as u32;
         if content == 0 || t == 0 {
             return (0, track);
         }
-        let len = ((t * t) / content).clamp(1, t);
-        let max_off = content.saturating_sub(t);
+        let len = (t * window.max(1)).div_ceil(content).clamp(1, t);
+        let max_off = content.saturating_sub(window);
         let top = (offset.min(max_off) * (t - len))
             .checked_div(max_off)
             .unwrap_or(0);
@@ -162,6 +348,7 @@ pub struct DrawList {
     pub(crate) key: Option<Key>,
     pub(crate) id: ElementId,
     pub(crate) theme: ThemeKey,
+    pub(crate) classes: Classes,
     pub(crate) cursor: Option<CursorSpec>,
 }
 
@@ -172,6 +359,7 @@ impl DrawList {
             key: None,
             id,
             theme: ThemeKey::default(),
+            classes: Classes::default(),
             cursor: None,
         }
     }
@@ -211,6 +399,7 @@ impl DrawList {
             rect,
             clip,
             theme,
+            classes: self.classes.clone(),
             draw,
         });
     }

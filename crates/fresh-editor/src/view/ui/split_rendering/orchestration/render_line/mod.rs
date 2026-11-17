@@ -18,6 +18,7 @@ use super::contexts::{DecorationContext, SelectionContext};
 use super::overlay_sweep::OverlayActiveSet;
 use super::selection_sweep::SelectionActiveSet;
 use super::tail_fill::{overlay_bg_style, resolve_tail_fill, TailFillInput};
+use crate::view::theme::ThemeStyle;
 use cells::{render_line_cells, CellPassInput};
 use trailing::{fill_eof_rows, render_implicit_trailing_line, PostRowAccumulator, PostRowContext};
 
@@ -50,6 +51,10 @@ pub(crate) struct LastLineEnd {
 
 pub(crate) struct LineRenderInput<'a> {
     pub state: &'a EditorState,
+    /// The left margin this pane draws, resolved for *this* pane's line-number
+    /// setting (`MarginManager::resolved_left_config`) — not read off
+    /// `state.margins`, which is per buffer and may hold another split's.
+    pub margin: &'a crate::view::margin::MarginConfig,
     pub theme: &'a Theme,
     /// Display lines from the view pipeline (each line has its own mappings, styles, etc.)
     pub view_lines: &'a [ViewLine],
@@ -77,6 +82,11 @@ pub(crate) struct LineRenderInput<'a> {
     pub byte_offset_mode: bool,
     /// Whether to show tilde (~) markers on lines past end-of-file
     pub show_tilde: bool,
+    /// Background the content rows of this split are painted on:
+    /// `theme.editor_bg`, or `Color::Reset` when `editor.use_terminal_bg`
+    /// hands the background to the terminal. Rows past end-of-file follow it
+    /// unless the theme names `after_eof_bg`.
+    pub effective_editor_bg: Color,
     /// Whether to highlight the line containing the cursor
     pub highlight_current_line: bool,
     /// Indentation guide rendering mode.
@@ -162,8 +172,10 @@ impl ActiveIndentationGuide {
         // fold whose last hidden line starts at or after the target, so probing
         // with the raw cursor byte would miss the enclosing block whenever the
         // cursor sits past the indentation of that block's last line.
+        // No line start within reach means the cursor sits inside a line with
+        // no foldable indentation structure — nothing to draw a guide for.
         let target_byte =
-            indent_folding::find_line_start_byte(&state.buffer, primary_cursor_position);
+            indent_folding::find_line_start_byte(&state.buffer, primary_cursor_position)?;
         let (header_byte, body_start_byte, body_end_byte) =
             indent_folding::find_fold_range_at_byte(
                 &state.buffer,
@@ -352,7 +364,9 @@ fn prime_guide_stack_from_buffer(
         if line_start == 0 {
             break;
         }
-        let prev_line_start = find_line_start_byte(buffer, line_start - 1);
+        let Some(prev_line_start) = find_line_start_byte(buffer, line_start - 1) else {
+            break;
+        };
         // Slice the previous line's content *excluding* its trailing `\n` (at
         // `line_start - 1`) so a whitespace-only line is correctly classified
         // as blank rather than as content ending in a newline.
@@ -442,7 +456,10 @@ fn append_blank_line_guides(
         let tab_size = normalized_tab_size(tab_size);
         for col in start..=end_col {
             let (ch, cell_style) = if guide_columns.contains(&col) {
-                (glyph, style.fg(theme.indent_rainbow_color(col / tab_size)))
+                (
+                    glyph,
+                    style.theme_fg(theme, Theme::indent_rainbow_key(col / tab_size)),
+                )
             } else {
                 (' ', style)
             };
@@ -467,6 +484,7 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
 
     let LineRenderInput {
         state,
+        margin,
         theme,
         view_lines,
         view_anchor,
@@ -486,6 +504,7 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
         show_line_numbers,
         byte_offset_mode,
         show_tilde,
+        effective_editor_bg,
         highlight_current_line,
         indentation_guide,
         indentation_guide_glyph,
@@ -497,21 +516,26 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
     prefill_cell_theme_map(cell_theme_map, screen_width, render_area, gutter_width);
 
     let primary_cursor_position = selection.primary_cursor_position;
+    // The line relative line numbers count from: this split's own primary
+    // cursor, derived here rather than read from a per-buffer cache that
+    // another split or window could have left behind.
+    let cursor_line_number = state.line_of_position(primary_cursor_position);
 
     // Compute cursor line start byte — universal key for cursor line highlight
+    // Or-floor rather than the exact start: on a line longer than the scan
+    // window the highlight covers the window instead of the whole line, which
+    // is what is on screen anyway.
     let cursor_line_start_byte =
-        indent_folding::find_line_start_byte(&state.buffer, primary_cursor_position);
+        indent_folding::line_start_byte_or_floor(&state.buffer, primary_cursor_position);
 
     // Exclusive end of the cursor's logical line. A view sub-row whose first
     // source byte falls in `[cursor_line_start_byte, cursor_line_end_byte)`
     // belongs to the same logical line as the cursor — even if a plugin
     // soft-break (compose-mode wrapping) put the sub-row's start mid-line.
     // Without this, the highlight only landed on the *first* visual sub-row
-    // of a soft-wrapped paragraph (issue #1790). Computed by direct byte scan
-    // so it doesn't depend on the cached `primary_cursor_line_number` being
-    // in sync with the cursor position.
+    // of a soft-wrapped paragraph (issue #1790). Computed by direct byte scan.
     let cursor_line_end_byte =
-        indent_folding::find_line_end_byte(&state.buffer, primary_cursor_position);
+        indent_folding::line_end_byte_or_ceiling(&state.buffer, primary_cursor_position);
 
     let active_indentation_guide = ActiveIndentationGuide::for_view_lines(
         indentation_guide,
@@ -545,12 +569,15 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
             .flatten()
             .find_map(|line| line.source_start_byte);
         let stack = match first_visible_source {
-            Some(src) => prime_guide_stack_from_buffer(
-                &state.buffer,
-                indent_folding::find_line_start_byte(&state.buffer, src),
-                state.buffer_settings.tab_size,
-                crate::config::INDENT_FOLD_MAX_UPWARD_SCAN,
-            ),
+            Some(src) => match indent_folding::find_line_start_byte(&state.buffer, src) {
+                Some(line_start) => prime_guide_stack_from_buffer(
+                    &state.buffer,
+                    line_start,
+                    state.buffer_settings.tab_size,
+                    crate::config::INDENT_FOLD_MAX_UPWARD_SCAN,
+                ),
+                None => Vec::new(),
+            },
             None => Vec::new(),
         };
         GuideColumnScanner { stack }
@@ -595,10 +622,6 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
     let mut is_on_cursor_line = false;
 
     let is_empty_buffer = state.buffer.is_empty();
-
-    // x of the last visible cell on the most recent non-empty row
-    // (used for cursor-on-newline placement and `last_line_end`)
-    let mut last_visible_x: u16 = 0;
 
     loop {
         // Get the current ViewLine from the pipeline
@@ -682,6 +705,26 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
             None
         };
 
+        // Byte the diagnostics on this row are keyed off. Normally the row's
+        // own start, but the single row of an empty buffer has none: it holds
+        // no characters, and with no preceding newline it arrives here as
+        // `Beginning` rather than `AfterSourceNewline`, so the fallback above
+        // does not catch it. Its logical position is byte 0. Without this, a
+        // diagnostic on a brand-new file — "`main` function not found", say —
+        // was counted in the status bar but drew neither its gutter marker nor
+        // its inline message, and only a typed line break brought it out
+        // (issue #3484).
+        //
+        // Deliberately separate from `line_start_byte`: that value also decides
+        // whether the row takes the cursor-line highlight, and a row with no
+        // content cells can only have its gutter painted, so widening it there
+        // would half-light the first row of every empty file. That is a change
+        // this fix has no reason to make.
+        // `is_empty_buffer` is the same flag that decides whether this row
+        // exists at all, so the row's existence and its position cannot drift.
+        let diagnostic_anchor_byte: Option<usize> =
+            line_start_byte.or_else(|| (!is_continuation && is_empty_buffer).then_some(0));
+
         // Track whether this line is the cursor line (for current line highlighting).
         // Non-continuation lines check their start byte; continuation lines inherit.
         // We use a range check (rather than equality with the logical-line start)
@@ -726,22 +769,25 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
         render_left_margin(
             &LeftMarginContext {
                 state,
+                margin,
                 theme,
                 is_continuation,
                 line_start_byte,
+                diagnostic_anchor_byte,
                 gutter_num,
                 estimated_lines,
                 diagnostic_lines: &decorations.diagnostic_lines,
                 line_indicators: &decorations.line_indicators,
                 fold_indicators: &decorations.fold_indicators,
                 cursor_line_start_byte,
-                cursor_line_number: state.primary_cursor_line_number.value(),
+                cursor_line_number,
                 relative_line_numbers,
                 show_line_numbers,
                 byte_offset_mode,
                 highlight_current_line,
                 is_active,
                 virtual_gutter_glyph: current_view_line.virtual_gutter_glyph.as_ref(),
+                terminal_bg: effective_editor_bg == Color::Reset,
             },
             &mut line_spans,
             &mut line_view_map,
@@ -798,6 +844,24 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
         let active_guide_col =
             active_indentation_guide.and_then(|guide| guide.column_for_line(current_view_line_idx));
 
+        // Byte offset of the logical line this row belongs to. Block-selection
+        // rectangles state their columns as byte offsets within a line
+        // (`cursor.position - line_start`), so the cell pass converts each
+        // cell's source byte into that same unit — see
+        // `SelectionActiveSet::contains`. Read from the row's own first source
+        // byte so a soft-wrapped continuation resolves to its logical line
+        // rather than to the row it starts. Only paid when a block rect
+        // exists, which is nearly never.
+        let block_line_start_byte: Option<usize> = if selection.block_rects.is_empty() {
+            None
+        } else {
+            current_view_line.source_start_byte.and_then(|byte| {
+                state
+                    .buffer
+                    .line_start_offset(state.buffer.get_line_number(byte))
+            })
+        };
+
         // Per-cell pass: walk the line's characters and emit styled spans
         let cells = render_line_cells(
             CellPassInput {
@@ -807,6 +871,7 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
                 selection,
                 decorations,
                 gutter_num,
+                block_line_start_byte,
                 current_row,
                 render_area,
                 gutter_width,
@@ -852,7 +917,7 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
                 .block_rects
                 .iter()
                 .filter(|(start_line, _, end_line, end_col)| {
-                    *start_line <= gutter_num && gutter_num <= *end_line && *end_col >= row_len
+                    *start_line <= gutter_num && gutter_num <= *end_line && *end_col > row_len
                 })
                 .map(|(_, start_col, _, end_col)| ((*start_col).max(row_len), *end_col))
                 .fold(None::<(usize, usize)>, |acc, (s, e)| match acc {
@@ -872,15 +937,16 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
                     );
                     rendered_cols += gap;
                 }
-                // Match the per-cell sweep: block columns are inclusive.
-                let sel_len =
-                    (sel_end + 1 - sel_start).min(content_cols.saturating_sub(rendered_cols));
+                // Match the per-cell sweep: block columns are half-open,
+                // so the rectangle is `sel_end - sel_start` wide — exactly
+                // what `copy_block_selection_text` pads a short line to.
+                let sel_len = (sel_end - sel_start).min(content_cols.saturating_sub(rendered_cols));
                 if sel_len > 0 {
                     push_span_with_map(
                         &mut line_spans,
                         &mut line_view_map,
                         " ".repeat(sel_len),
-                        Style::default().bg(theme.selection_bg),
+                        Style::default().theme_bg(theme, "editor.selection_bg"),
                         None,
                     );
                     rendered_cols += sel_len;
@@ -913,15 +979,23 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
             );
         }
 
+        // Where THIS row's text ends. Per row, and `None` until a source cell is
+        // found: a row that draws none, empty or carrying only decoration, has
+        // no text end of its own and must not inherit another row's.
+        let mut row_text_end_x: Option<u16> = None;
         if !line_spans.is_empty() {
+            let row_end_exclusive = row_end_exclusive(current_view_line, &state.buffer);
             if let Some(x) = locate_cursor_in_view_map(
                 &line_view_map,
                 primary_cursor_position,
+                cursor_line_start_byte,
+                cursor_line_end_byte,
+                row_end_exclusive,
                 is_on_cursor_line,
                 current_row,
                 &mut cursor,
             ) {
-                last_visible_x = x;
+                row_text_end_x = Some(x);
             }
         }
 
@@ -946,9 +1020,9 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
                 IndentationGuideMode::Active => active_guide_col.as_slice(),
                 IndentationGuideMode::None => &[],
             };
-            let mut guide_style = Style::default().fg(theme.indentation_guide_fg);
+            let mut guide_style = Style::default().theme_fg(theme, "editor.indentation_guide_fg");
             if cursor_line_active {
-                guide_style = guide_style.bg(theme.current_line_bg);
+                guide_style = guide_style.theme_bg(theme, "editor.current_line_bg");
             } else if cells.first_line_byte_pos.is_some() && cells.last_line_byte_pos.is_some() {
                 // Match the tail fill: a full-width overlay band must run
                 // under the synthesised guide cells too, or blank rows in
@@ -978,20 +1052,26 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
 
         // Inline diagnostic text: render after line content (before extend_to_line_end fill).
         // Only for non-continuation lines that have a diagnostic overlay.
-        if let Some(lsb) = line_start_byte {
+        if let Some(lsb) = diagnostic_anchor_byte {
             if let Some((message, diag_style)) = decorations.diagnostic_inline_texts.get(&lsb) {
                 append_inline_diagnostic(
                     message,
                     diag_style,
                     content_width,
                     cursor_line_active,
-                    theme.current_line_bg,
+                    Style::default().theme_bg(theme, "editor.current_line_bg"),
                     &mut rendered_cols,
                     &mut line_spans,
                     &mut line_view_map,
                 );
             }
         }
+
+        // For virtual rows (no source bytes), inherit from previous row
+        let prev_line_end_byte = view_line_mappings
+            .last()
+            .map(|prev: &ViewLineMapping| prev.line_end_byte)
+            .unwrap_or(0);
 
         // Paint trailing columns with the overlay-extend bg, or fall
         // back to the virtual-line bg. See `tail_fill` for the policy.
@@ -1004,6 +1084,11 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
                 syntax_extend_bg: cells.syntax_extend_bg,
                 first_line_byte_pos: cells.first_line_byte_pos,
                 last_line_byte_pos: cells.last_line_byte_pos,
+                row_end_byte: row_line_end_byte(
+                    current_view_line,
+                    prev_line_end_byte,
+                    state.buffer.len(),
+                ),
             }) {
                 push_span_with_map(
                     &mut line_spans,
@@ -1021,25 +1106,19 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
         if cursor_line_active && remaining_cols > 0 {
             line_spans.push(Span::styled(
                 " ".repeat(remaining_cols),
-                Style::default().bg(theme.current_line_bg),
+                Style::default().theme_bg(theme, "editor.current_line_bg"),
             ));
         }
 
-        // For virtual rows (no source bytes), inherit from previous row
-        let prev_line_end_byte = view_line_mappings
-            .last()
-            .map(|prev: &ViewLineMapping| prev.line_end_byte)
-            .unwrap_or(0);
         view_line_mappings.push(build_view_line_mapping(
             current_view_line,
             &line_view_map,
             gutter_width,
             prev_line_end_byte,
             state.buffer.len(),
+            &state.buffer,
         ));
 
-        // Track if line was empty before moving line_spans
-        let line_was_empty = line_spans.is_empty();
         lines.push(Line::from(line_spans));
 
         // Detect the trailing empty ViewLine produced by ViewLineIterator
@@ -1058,23 +1137,37 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
         // This ensures the last visible line's metadata is captured.
         //
         // end_x is the cursor position after the last visible character.
-        // For empty lines, last_visible_x stays at 0, so we need to ensure end_x is
-        // at least gutter_width to place the cursor after the gutter, not in it.
-        let end_x = if line_was_empty {
-            gutter_width as u16
-        } else {
+        let end_x = match row_text_end_x {
             // A rendered line-ending indicator adds view-map cells for the
             // newline byte itself; step back over them so the end-of-line
             // cursor lands on the indicator, not past it.
-            last_visible_x
+            Some(x) => x
                 .saturating_add(1)
-                .saturating_sub(cells.newline_indicator_cols as u16)
+                .saturating_sub(cells.newline_indicator_cols as u16),
+            // No source cell, so the row's text ends where text begins.
+            None => gutter_width as u16,
         };
         let line_len_chars = line_content.chars().count();
 
+        // A plugin's virtual row is no more the buffer's last content line
+        // than the iterator's trailing empty one, and for a sharper reason:
+        // it is rendered from an *injected* newline, so standing as
+        // `last_line_end` it makes a buffer with no trailing newline of its
+        // own look newline-terminated. The implicit empty line that only a
+        // final newline can have is then drawn below it — and takes the caret
+        // of a cursor sitting at the buffer end, which is how deleting the `a`
+        // of a `- a` in markdown compose (a list hangs a virtual row under it)
+        // threw the caret two rows down and to the left edge.
+        //
+        // Read off the mapping just pushed for this row, so "virtual" means
+        // here exactly what it means to `move_visual_line`.
+        let is_plugin_virtual_row = view_line_mappings
+            .last()
+            .is_some_and(|m: &ViewLineMapping| m.is_plugin_virtual);
+
         // Don't update last_line_end for the iterator's trailing empty
         // line — it's a display aid, not actual content.
-        if !is_iterator_trailing_empty {
+        if !is_iterator_trailing_empty && !is_plugin_virtual_row {
             last_line_end = Some(LastLineEnd {
                 pos: (end_x, current_row),
                 terminated_with_newline: line_has_newline,
@@ -1088,7 +1181,7 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
                     // Cursor position now includes gutter width (consistent with main cursor tracking).
                     // For empty lines (just newline), cursor should be at gutter width (after gutter);
                     // for lines with content, cursor on newline should be after the content
-                    // (end_x already includes the gutter, via last_visible_x).
+                    // (end_x already includes the gutter, via row_text_end_x).
                     // A virtual-space cursor sits `primary_virtual_cols`
                     // further right of the content end.
                     let vcols = selection.primary_virtual_cols as u16;
@@ -1113,6 +1206,7 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
         last_line_end.as_ref(),
         &PostRowContext {
             state,
+            margin,
             theme,
             render_area,
             gutter_width,
@@ -1127,6 +1221,7 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
             last_gutter_num,
             visible_line_count,
             trailing_empty_line_rendered,
+            terminal_bg: effective_editor_bg == Color::Reset,
         },
         &mut PostRowAccumulator {
             lines: &mut lines,
@@ -1138,8 +1233,16 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
         },
     );
 
-    // Pad the bottom of the viewport with `~` / after_eof_bg shading.
-    fill_eof_rows(&mut lines, theme, render_area, show_tilde);
+    // Pad the bottom of the viewport with `~` markers on the post-EOF
+    // background (the effective editor background unless the theme names a
+    // post-EOF shade of its own).
+    fill_eof_rows(
+        &mut lines,
+        theme,
+        render_area,
+        show_tilde,
+        effective_editor_bg,
+    );
 
     LineRenderOutput {
         lines,
@@ -1156,7 +1259,7 @@ pub(crate) fn render_view_lines(input: LineRenderInput<'_>) -> LineRenderOutput 
 
 /// Fill the content area with default gutter/editor theme info so the
 /// theme inspector has an answer for cells the per-cell pass never touches.
-fn prefill_cell_theme_map(
+pub(super) fn prefill_cell_theme_map(
     cell_theme_map: &mut [crate::app::types::CellThemeInfo],
     screen_width: u16,
     render_area: Rect,
@@ -1196,13 +1299,13 @@ fn prefill_cell_theme_map(
 fn cursor_indicator_style(theme: &Theme, is_active: bool) -> Style {
     if is_active {
         Style::default()
-            .fg(theme.editor_fg)
-            .bg(theme.editor_bg)
+            .theme_fg(theme, "editor.fg")
+            .theme_bg(theme, "editor.bg")
             .add_modifier(Modifier::REVERSED)
     } else {
         Style::default()
-            .fg(theme.editor_fg)
-            .bg(theme.inactive_cursor)
+            .theme_fg(theme, "editor.fg")
+            .theme_bg(theme, "editor.inactive_cursor")
     }
 }
 
@@ -1341,15 +1444,24 @@ fn place_line_end_cursor(
 /// cursor drew a phantom cursor at the top of the new viewport).
 ///
 /// Returns the x of the last visible cell, if any.
+#[allow(clippy::too_many_arguments)]
 fn locate_cursor_in_view_map(
     line_view_map: &[Option<usize>],
     primary_cursor_position: usize,
+    cursor_line_start_byte: usize,
+    cursor_line_end_byte: usize,
+    // One byte past the last character this row drew, when the row ends on a
+    // content character. That position is the row's own — it is where `End`
+    // goes — but no cell carries it, because the wrap consumed the separator.
+    row_end_exclusive: Option<usize>,
     is_on_cursor_line: bool,
     current_row: u16,
     cursor: &mut CursorTracker,
 ) -> Option<u16> {
     let mut nearest_fallback: Option<(u16, usize)> = None; // (screen_x, byte_distance)
     let mut last_visible_x: Option<u16> = None;
+    // Whether this row draws any byte of the cursor's own logical line.
+    let mut row_draws_cursor_line = false;
     for (screen_x, source_offset) in line_view_map.iter().enumerate() {
         if let Some(src) = source_offset {
             // Exact match: cursor byte is visible
@@ -1357,18 +1469,48 @@ fn locate_cursor_in_view_map(
                 cursor.place(screen_x as u16, current_row);
             }
             // Track nearest visible byte >= cursor position for fallback
-            if !cursor.found && is_on_cursor_line && *src >= primary_cursor_position {
+            if !cursor.found && *src >= primary_cursor_position {
                 let dist = *src - primary_cursor_position;
                 if nearest_fallback.is_none_or(|(_, best)| dist < best) {
                     nearest_fallback = Some((screen_x as u16, dist));
                 }
             }
+            if (cursor_line_start_byte..cursor_line_end_byte).contains(src) {
+                row_draws_cursor_line = true;
+            }
             last_visible_x = Some(screen_x as u16);
         }
     }
-    // Fallback: cursor byte was concealed — snap to nearest visible byte
+    // Fallback: cursor byte was concealed — snap to nearest visible byte.
+    //
+    // Gated so a row that has nothing to do with the cursor cannot snap a
+    // phantom onto itself when the cursor's own line is offscreen (#1965).
+    //
+    // `is_on_cursor_line` asks whether the row STARTS inside the cursor's
+    // logical line, which a conceal spanning a newline breaks: compose mode's
+    // reflow draws a paragraph's source lines as one row, so the row that holds
+    // the cursor's bytes starts in the line above and the gate reads false —
+    // leaving the caret undrawn wherever it sat in a byte no cell claims, which
+    // is every byte inside a join and the space a row break lands on. Asking
+    // instead whether the row DRAWS any of that line answers the same question
+    // where a row and a logical line still coincide, and keeps answering it
+    // when they do not. No wider for the phantom case: a row drawing none of
+    // the cursor's line cannot claim the cursor either way.
+    // The position just past this row's last character sits one cell to its
+    // right. Claimed ahead of the nearest-visible fallback, which would hand it
+    // to the row below — the caret jumping a line when `End` goes there.
+    if !cursor.found
+        && row_end_exclusive == Some(primary_cursor_position)
+        && (is_on_cursor_line || row_draws_cursor_line)
+    {
+        if let Some(x) = last_visible_x {
+            cursor.place(x.saturating_add(1), current_row);
+        }
+    }
     if let Some((fallback_x, _)) = nearest_fallback {
-        cursor.place(fallback_x, current_row);
+        if is_on_cursor_line || row_draws_cursor_line {
+            cursor.place(fallback_x, current_row);
+        }
     }
     last_visible_x
 }
@@ -1381,7 +1523,7 @@ fn append_inline_diagnostic(
     diag_style: &Style,
     content_width: usize,
     cursor_line_active: bool,
-    current_line_bg: Color,
+    current_line_bg: Style,
     rendered_cols: &mut usize,
     line_spans: &mut Vec<Span<'static>>,
     line_view_map: &mut Vec<Option<usize>>,
@@ -1407,7 +1549,7 @@ fn append_inline_diagnostic(
     let padding = available.saturating_sub(display_width);
     if padding > 0 {
         let pad_style = if cursor_line_active {
-            Style::default().bg(current_line_bg)
+            current_line_bg
         } else {
             Style::default()
         };
@@ -1423,7 +1565,7 @@ fn append_inline_diagnostic(
 
     // Apply current line background to diagnostic text when on cursor line
     let effective_diag_style = if cursor_line_active && diag_style.bg.is_none() {
-        diag_style.bg(current_line_bg)
+        diag_style.patch(current_line_bg)
     } else {
         *diag_style
     };
@@ -1438,14 +1580,71 @@ fn append_inline_diagnostic(
 }
 
 /// Build the mouse-click/cursor-movement mapping for a rendered row.
-fn build_view_line_mapping(
-    view_line: &ViewLine,
-    line_view_map: &[Option<usize>],
-    gutter_width: usize,
-    prev_line_end_byte: usize,
-    buffer_len: usize,
-) -> ViewLineMapping {
-    let line_end_byte = if view_line.ends_with_newline {
+/// One byte past the last character a row drew, when that position belongs to
+/// the row and no cell carries it. `None` otherwise.
+///
+/// A row ends on a content character whenever the wrap that ended it consumed a
+/// separator — which is what a compose-mode soft break does with the space it
+/// fell on. The position past that character is then the separator's own, drawn
+/// by nobody, and it is where `End` goes.
+///
+/// A wrap can also split a run with no whitespace in it at all — CJK text, a
+/// long URL, an unbreakable token — and there the byte past the last character
+/// is the first character of the NEXT row, which that row draws. Claiming it
+/// would paint the caret on the wrong row and send `End` off the row entirely.
+/// The two cases are told apart by the byte itself: a consumed separator is
+/// whitespace, the next row's first character is not.
+fn row_end_exclusive(view_line: &ViewLine, buffer: &crate::model::buffer::Buffer) -> Option<usize> {
+    // `char_source_bytes` is indexed by character of `text` (its length is
+    // `text.chars().count()`), so the index of the last mapped byte is the
+    // index of its character.
+    let (idx, byte) = view_line
+        .char_source_bytes
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(idx, m)| m.map(|byte| (idx, byte)))?;
+    let ch = view_line
+        .text
+        .chars()
+        .nth(idx)
+        .filter(|c| !c.is_whitespace())?;
+    let end = byte + ch.len_utf8();
+    if end >= buffer.len() || byte_at_is_whitespace(buffer, end) {
+        Some(end)
+    } else {
+        None
+    }
+}
+
+/// Whether the buffer's character at `pos` is whitespace. `pos` must be a
+/// character boundary; the width is read from the leading byte so a slice that
+/// ends mid-character cannot make this fail silently.
+fn byte_at_is_whitespace(buffer: &crate::model::buffer::Buffer, pos: usize) -> bool {
+    let lead = match buffer.slice_bytes(pos..pos.saturating_add(1)).first() {
+        Some(b) => *b,
+        None => return false,
+    };
+    let width = match lead {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => return false,
+    };
+    let bytes = buffer.slice_bytes(pos..pos.saturating_add(width));
+    std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|text| text.chars().next())
+        .is_some_and(char::is_whitespace)
+}
+
+/// The byte a click past the end of `view_line`'s content lands on: the
+/// row's newline, or the position just after its last character. A virtual
+/// row with no source bytes inherits `prev_line_end_byte`, the previous
+/// row's, so cursor movement through it lands at a valid source position.
+fn row_line_end_byte(view_line: &ViewLine, prev_line_end_byte: usize, buffer_len: usize) -> usize {
+    if view_line.ends_with_newline {
         // Position ON the newline - find the last source byte (the newline's position)
         view_line
             .char_source_bytes
@@ -1477,7 +1676,20 @@ fn build_view_line_mapping(
         // Inherit line_end_byte from the previous row so cursor movement
         // through virtual rows lands at a valid source position.
         prev_line_end_byte
-    };
+    }
+}
+
+fn build_view_line_mapping(
+    view_line: &ViewLine,
+    line_view_map: &[Option<usize>],
+    gutter_width: usize,
+    prev_line_end_byte: usize,
+    buffer_len: usize,
+    buffer: &crate::model::buffer::Buffer,
+) -> ViewLineMapping {
+    let line_end_byte = row_line_end_byte(view_line, prev_line_end_byte, buffer_len);
+
+    let end_exclusive = row_end_exclusive(view_line, buffer).filter(|end| *end != line_end_byte);
 
     // Content mapping starts after the gutter
     let content_map = if line_view_map.len() >= gutter_width {
@@ -1499,5 +1711,6 @@ fn build_view_line_mapping(
         char_source_bytes: content_map,
         line_end_byte,
         is_plugin_virtual,
+        end_exclusive,
     }
 }

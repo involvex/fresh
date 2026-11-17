@@ -7,6 +7,8 @@
 use proptest::prelude::*;
 
 mod support;
+use fresh_ui::desc::Wrap;
+use fresh_ui::render::prim;
 use fresh_ui::Axis;
 use fresh_ui::{
     col, distribute, row, text, Input, Key, KeyCode, KeyPress, Mods, MouseButton, Node, Point,
@@ -306,29 +308,13 @@ fn apply(demo: &mut Demo, act: &Act) {
     match act {
         Act::Click(x, y) => {
             let pos = Point::new(*x as i32, *y as i32);
-            demo.input(Input::Press {
-                pos,
-                button: MouseButton::Left,
-                mods: m,
-            });
-            demo.input(Input::Release {
-                pos,
-                button: MouseButton::Left,
-                mods: m,
-            });
+            demo.input(Input::press(pos, MouseButton::Left, m));
+            demo.input(Input::release(pos, MouseButton::Left, m));
         }
         Act::RightClick(x, y) => {
             let pos = Point::new(*x as i32, *y as i32);
-            demo.input(Input::Press {
-                pos,
-                button: MouseButton::Right,
-                mods: m,
-            });
-            demo.input(Input::Release {
-                pos,
-                button: MouseButton::Right,
-                mods: m,
-            });
+            demo.input(Input::press(pos, MouseButton::Right, m));
+            demo.input(Input::release(pos, MouseButton::Right, m));
         }
         Act::Move(x, y) => {
             demo.input(Input::Move {
@@ -462,5 +448,281 @@ proptest! {
             demo.ui.live_count(),
             acts.len()
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Floors, pointer modes, and the click run — the three attributes added for
+// hosts that were writing arithmetic around their absence.
+// ---------------------------------------------------------------------------
+
+proptest! {
+    /// **A floor is never violated.** Whatever a container is doing with the
+    /// space it has — dividing a remainder, running out of it entirely — a
+    /// child that declared a minimum extent gets at least that many cells.
+    ///
+    /// The interesting half is the overflow case: a row too narrow for its
+    /// children still honours their floors and overflows, rather than
+    /// quietly handing out zero.
+    #[test]
+    fn a_floor_is_never_violated(
+        width in 1u16..40,
+        kids in prop::collection::vec((0u16..12, 0u16..6, any::<bool>()), 1..6),
+    ) {
+        let mut ui: Ui<()> = Ui::new();
+        let children: Vec<Node<()>> = kids
+            .iter()
+            .map(|&(cells, floor, flexible)| {
+                let n = text("");
+                let n = if flexible { n.flex(1) } else { n.w(Sizing::Cells(cells)) };
+                n.min_w(floor)
+            })
+            .collect();
+        ui.frame(row().children(children), Size::new(width, 1));
+        for (i, &(_, floor, _)) in kids.iter().enumerate() {
+            let r = ui.rect(ui.at(&[i]).unwrap());
+            prop_assert!(
+                r.w >= floor,
+                "child {i} wanted at least {floor} cells, got {} (width {width})",
+                r.w
+            );
+            // **And the cells are its own.** Width alone is not the guarantee:
+            // an overflowing row used to pull later children *back* over a
+            // floored one, so the extent was right and the separation was gone.
+            // A floor that a sibling may sit on top of is not a floor.
+            if floor > 0 && i + 1 < kids.len() {
+                let next = ui.rect(ui.at(&[i + 1]).unwrap());
+                prop_assert!(
+                    next.x >= r.x + r.w as i32,
+                    "child {} was placed at {}, over child {i}'s cells ({}..{})",
+                    i + 1,
+                    next.x,
+                    r.x,
+                    r.x + r.w as i32
+                );
+            }
+        }
+    }
+
+    /// **A floor never shrinks anything.** Adding one can only ever widen a
+    /// child, never narrow it — so it is safe to add to an existing layout.
+    #[test]
+    fn adding_a_floor_never_narrows_a_child(
+        width in 1u16..40,
+        cells in prop::collection::vec(0u16..12, 1..6),
+        floor in 0u16..6,
+        which in 0usize..6,
+    ) {
+        let which = which % cells.len();
+        let build = |floor_on: Option<usize>| -> Vec<Node<()>> {
+            cells
+                .iter()
+                .enumerate()
+                .map(|(i, &c)| {
+                    let n = text("").w(Sizing::Cells(c));
+                    if floor_on == Some(i) { n.min_w(floor) } else { n }
+                })
+                .collect()
+        };
+        let mut a: Ui<()> = Ui::new();
+        a.frame(row().children(build(None)), Size::new(width, 1));
+        let before = a.rect(a.at(&[which]).unwrap()).w;
+        let mut b: Ui<()> = Ui::new();
+        b.frame(row().children(build(Some(which))), Size::new(width, 1));
+        let after = b.rect(b.at(&[which]).unwrap()).w;
+        prop_assert!(after >= before, "floor narrowed {which}: {before} -> {after}");
+    }
+
+    /// **A transparent cover is invisible to the pointer, everywhere.** Not at
+    /// one sampled cell: at every cell of the area it covers.
+    #[test]
+    fn a_transparent_cover_never_absorbs(x in 0i32..12, y in 0i32..4) {
+        use std::cell::Cell;
+        use std::rc::Rc as R;
+        use fresh_ui::{col, gesture, stack, Event, GestureKind, PointerMode};
+        let hit = R::new(Cell::new(false));
+        let h = hit.clone();
+        let mut ui: Ui<()> = Ui::new();
+        ui.frame(
+            stack().children([
+                gesture(text("")).w(Sizing::Cells(12)).h(Sizing::Cells(4)).on(
+                    GestureKind::Press,
+                    R::new(move |_: &Event| { h.set(true); None }),
+                ),
+                col()
+                    .pointer_mode(PointerMode::Transparent)
+                    .w(Sizing::Cells(12))
+                    .h(Sizing::Cells(4)),
+            ]),
+            Size::new(12, 4),
+        );
+        ui.dispatch(Input::press(Point::new(x, y), MouseButton::Left, Mods::NONE));
+        prop_assert!(hit.get(), "the cover swallowed the press at ({x}, {y})");
+    }
+
+    /// …and an opaque one absorbs at every cell. The pair is what makes either
+    /// half meaningful.
+    #[test]
+    fn an_opaque_cover_always_absorbs(x in 0i32..12, y in 0i32..4) {
+        use std::cell::Cell;
+        use std::rc::Rc as R;
+        use fresh_ui::{col, gesture, stack, Event, GestureKind};
+        let hit = R::new(Cell::new(false));
+        let h = hit.clone();
+        let mut ui: Ui<()> = Ui::new();
+        ui.frame(
+            stack().children([
+                gesture(text("")).w(Sizing::Cells(12)).h(Sizing::Cells(4)).on(
+                    GestureKind::Press,
+                    R::new(move |_: &Event| { h.set(true); None }),
+                ),
+                col().w(Sizing::Cells(12)).h(Sizing::Cells(4)),
+            ]),
+            Size::new(12, 4),
+        );
+        ui.dispatch(Input::press(Point::new(x, y), MouseButton::Left, Mods::NONE));
+        prop_assert!(!hit.get(), "the cover let the press through at ({x}, {y})");
+    }
+
+    /// **The run count is carried, not invented.** Whatever the host reports on
+    /// the press arrives on the press *and* on the click it completes — the
+    /// library neither counts nor re-counts.
+    #[test]
+    fn the_click_run_is_reported_unchanged(n in 1u8..=8) {
+        use std::cell::RefCell as RC;
+        use std::rc::Rc as R;
+        use fresh_ui::{gesture, Event, GestureKind};
+        let seen: R<RC<Vec<(GestureKind, u8)>>> = R::default();
+        let (a, b) = (seen.clone(), seen.clone());
+        let mut ui: Ui<()> = Ui::new();
+        ui.frame(
+            gesture(text("")).w(Sizing::Cells(4)).h(Sizing::Cells(1))
+                .on(GestureKind::Press, R::new(move |e: &Event| {
+                    a.borrow_mut().push((e.kind, e.clicks)); None
+                }))
+                .on(GestureKind::Click, R::new(move |e: &Event| {
+                    b.borrow_mut().push((e.kind, e.clicks)); None
+                })),
+            Size::new(4, 1),
+        );
+        let at = Point::new(1, 0);
+        ui.dispatch(Input::press_n(at, MouseButton::Left, Mods::NONE, n));
+        ui.dispatch(Input::release(at, MouseButton::Left, Mods::NONE));
+        prop_assert_eq!(
+            &*seen.borrow(),
+            &vec![(GestureKind::Press, n), (GestureKind::Click, n)]
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The wrapped-text byte mapping
+// ---------------------------------------------------------------------------
+
+/// Text with everything a wrap has to reason about: words, runs of spaces that
+/// a break may eat, hard newlines, a word too long for any row, and characters
+/// that are neither one byte nor one cell.
+fn wrappable() -> impl Strategy<Value = String> {
+    prop::collection::vec(
+        prop::sample::select(vec![
+            "a",
+            "word",
+            "supercalifragilistic",
+            " ",
+            "   ",
+            "\n",
+            "名前",
+            "ß",
+        ]),
+        0..14,
+    )
+    .prop_map(|parts| parts.concat())
+}
+
+fn wrap_modes() -> impl Strategy<Value = Wrap> {
+    prop::sample::select(vec![Wrap::Word, Wrap::Hanging, Wrap::None])
+}
+
+proptest! {
+    /// **A row's text is the source it says it is.** Everything else here
+    /// rests on this: `text[indent..] == source[src]`, byte for byte, for
+    /// every row of every wrap. Nothing added is inside `src`, and nothing
+    /// inside `src` was dropped.
+    #[test]
+    fn a_row_is_the_source_it_claims(
+        text in wrappable(), w in 1u16..24, wrap in wrap_modes(),
+    ) {
+        for r in prim::rows_of(&text, w, wrap) {
+            prop_assert_eq!(&r.text[r.indent..], &text[r.src.clone()]);
+        }
+    }
+
+    /// **Byte → cell → byte is the identity for every byte a row shows.**
+    ///
+    /// This is what lets a caret be stated in bytes: state it, let the wrap
+    /// place it, and a press on the cell it was placed in names the byte
+    /// again. It has to hold at the ends as much as in the middle — the first
+    /// byte of a continuation row sits behind an indent with no source, and a
+    /// row's trailing edge is a caret position with no character under it.
+    #[test]
+    fn a_shown_byte_survives_the_round_trip(
+        text in wrappable(), w in 1u16..24, wrap in wrap_modes(),
+    ) {
+        let rows = prim::rows_of(&text, w, wrap);
+        for r in &rows {
+            let bytes = text[r.src.clone()]
+                .char_indices()
+                .map(|(i, _)| r.src.start + i)
+                .chain(std::iter::once(r.src.end));
+            for b in bytes {
+                let (row, col) = prim::cell_of(&rows, &text, b);
+                prop_assert_eq!(
+                    prim::byte_of(&rows, &text, row, col as i32), Some(b),
+                    "byte {} drew at row {} column {}", b, row, col
+                );
+            }
+        }
+    }
+
+    /// **A byte no row shows still lands somewhere, and stays there.**
+    ///
+    /// The whitespace a break ate and the `\n` between two paragraphs are in
+    /// no row's `src`, so they cannot round-trip to themselves — a run of
+    /// three dropped spaces is one cell, and one cell cannot name three
+    /// bytes. What it must not do is drift: reading such a byte's cell back
+    /// gives a byte that draws in that same cell, so a caret asked to sit on
+    /// a dropped space does not walk while nothing is typed.
+    #[test]
+    fn snapping_a_byte_onto_a_cell_is_idempotent(
+        text in wrappable(), w in 1u16..24, wrap in wrap_modes(),
+    ) {
+        let rows = prim::rows_of(&text, w, wrap);
+        let bytes = text.char_indices().map(|(i, _)| i).chain(std::iter::once(text.len()));
+        for b in bytes {
+            let at = prim::cell_of(&rows, &text, b);
+            let snapped = prim::byte_of(&rows, &text, at.0, at.1 as i32)
+                .expect("cell_of names a row that exists");
+            prop_assert_eq!(prim::cell_of(&rows, &text, snapped), at, "byte {}", b);
+        }
+    }
+
+    /// **Every cell of every row names a byte, and only cells of rows do.**
+    ///
+    /// A press can land anywhere inside the run's rectangle, including past
+    /// the end of a short row and inside an indent. None of those is an error;
+    /// each snaps to the caret position it is nearest, which is why
+    /// `Event::text_byte` is `Some` for any press on text at all.
+    #[test]
+    fn every_cell_of_a_row_names_a_byte(
+        text in wrappable(), w in 1u16..24, wrap in wrap_modes(),
+    ) {
+        let rows = prim::rows_of(&text, w, wrap);
+        for i in 0..rows.len() {
+            for col in 0..(w as i32 + 4) {
+                let b = prim::byte_of(&rows, &text, i, col);
+                prop_assert!(b.is_some_and(|b| text.is_char_boundary(b)), "row {} column {}", i, col);
+            }
+        }
+        prop_assert_eq!(prim::byte_of(&rows, &text, rows.len(), 0), None);
     }
 }

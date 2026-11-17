@@ -5,7 +5,7 @@
 //! events to the active buffer. Pure decision logic for smart-home lives
 //! in `super::smart_home`; these methods are the cross-cutting drivers.
 
-use rust_i18n::t;
+use fresh_i18n::t;
 
 use crate::model::event::{Event, LeafId};
 
@@ -15,8 +15,10 @@ impl Editor {
     /// Smart home: toggle between line start and first non-whitespace character.
     ///
     /// Runs independently for every cursor so multi-cursor selections all move
-    /// to their respective line starts / first-non-ws positions.
-    pub(super) fn smart_home(&mut self) {
+    /// to their respective line starts / first-non-ws positions. With `select`
+    /// the selection is extended to the same target instead
+    /// (`select_smart_home`).
+    pub(super) fn smart_home(&mut self, select: bool) {
         let estimated_line_length = self.config.editor.estimated_line_length;
         let line_wrap = self.config.editor.line_wrap;
 
@@ -29,14 +31,7 @@ impl Editor {
             .collect();
 
         let split_id = if line_wrap {
-            Some(
-                self.windows
-                    .get(&self.active_window)
-                    .and_then(|w| w.buffers.splits())
-                    .map(|(mgr, _)| mgr)
-                    .expect("active window must have a populated split layout")
-                    .active_split(),
-            )
+            Some(self.active_window().split_manager().active_split())
         } else {
             None
         };
@@ -56,18 +51,29 @@ impl Editor {
             } else {
                 // Fall back to physical-line toggle.
                 let state = self.active_state_mut();
-                let mut iter = state
+                // The line's real start. Asking the reader for it scans back on
+                // a budget and, when the budget runs out, reports how far it
+                // looked — a "line start" in the middle of the line. Home then
+                // lands there, and a second press is needed to reach the real
+                // one, which is exactly what a long line used to do.
+                let buffer_len = state.buffer.len();
+                let line_start = state
                     .buffer
-                    .line_iterator(cursor.position, estimated_line_length);
-                let Some((line_start, line_content)) = iter.next_line() else {
-                    continue;
-                };
-                let first_non_ws = line_content
-                    .chars()
-                    .take_while(|c| *c != '\n')
-                    .position(|c| !c.is_whitespace())
-                    .map(|offset| line_start + offset)
-                    .unwrap_or(line_start);
+                    .prev_line_start_within(cursor.position, buffer_len)
+                    .unwrap_or(0);
+                // Only the indent decides where Home goes, and indentation is at
+                // the front of the line — so read a page of it rather than the
+                // line, which on a minified file is the file.
+                const INDENT_SCAN_BYTES: usize = 4096;
+                let head_len = INDENT_SCAN_BYTES.min(buffer_len.saturating_sub(line_start));
+                let head = state
+                    .buffer
+                    .get_text_range_mut(line_start, head_len)
+                    .unwrap_or_default();
+                let head = String::from_utf8_lossy(&head);
+                let first_non_ws =
+                    super::smart_home::first_non_whitespace_offset(&head, usize::MAX)
+                        .map_or(line_start, |offset| line_start + offset);
                 if cursor.position == first_non_ws {
                     line_start
                 } else {
@@ -75,10 +81,14 @@ impl Editor {
                 }
             };
 
-            // Respect Emacs-style mark mode: preserve the anchor when movement
-            // should keep extending the selection (e.g. after Set Mark), so the
-            // Home key extends the selection instead of collapsing it.
-            let new_anchor = if cursor.deselect_on_move {
+            // Selecting extends from the existing anchor, or starts one where
+            // the cursor was. Otherwise respect Emacs-style mark mode: preserve
+            // the anchor when movement should keep extending the selection
+            // (e.g. after Set Mark), so the Home key extends the selection
+            // instead of collapsing it.
+            let new_anchor = if select {
+                Some(cursor.anchor.unwrap_or(cursor.position))
+            } else if cursor.deselect_on_move {
                 None
             } else {
                 cursor.anchor
@@ -124,20 +134,17 @@ impl Editor {
         cursor_pos: usize,
         estimated_line_length: usize,
     ) -> Option<usize> {
-        use super::smart_home::{smart_home_target, SmartHomeTarget};
+        use super::smart_home::{first_non_whitespace_offset, smart_home_target, SmartHomeTarget};
 
         let visual_start = self
-            .active_layout()
+            .active_window()
             .visual_line_start(split_id, cursor_pos, false)?;
 
         // Determine the physical line start to tell first-row from continuation.
-        let buffer_id = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_buffer_id()?;
+        // The buffer the user is on, which `split_id`'s pane shows — not
+        // the split manager's active leaf, whose buffer tab is behind the
+        // group while a group is shown.
+        let buffer_id = self.active_buffer();
         let state = self
             .windows
             .get_mut(&self.active_window)
@@ -155,17 +162,12 @@ impl Editor {
         // compute it eagerly anyway so the pure helper stays unconditional.
         let first_non_ws = if is_first_visual_row {
             let visual_end = self
-                .active_layout()
+                .active_window()
                 .visual_line_end(split_id, cursor_pos, false)
                 .unwrap_or(visual_start);
             let visual_len = visual_end.saturating_sub(visual_start);
-            content
-                .chars()
-                .take(visual_len)
-                .take_while(|c| *c != '\n')
-                .position(|c| !c.is_whitespace())
-                .map(|offset| visual_start + offset)
-                .unwrap_or(visual_start)
+            first_non_whitespace_offset(&content, visual_len)
+                .map_or(visual_start, |offset| visual_start + offset)
         } else {
             visual_start
         };
@@ -173,7 +175,7 @@ impl Editor {
         match smart_home_target(cursor_pos, visual_start, is_first_visual_row, first_non_ws) {
             SmartHomeTarget::At(pos) => Some(pos),
             SmartHomeTarget::PreviousVisualRowStart => self
-                .active_layout()
+                .active_window()
                 .visual_line_start(split_id, cursor_pos, true),
         }
     }
@@ -290,7 +292,7 @@ impl Editor {
                     .to_string();
                     events.push(Event::Delete {
                         range: (line_start + leading_ws)..(line_start + leading_ws + remove_len),
-                        deleted_text,
+                        deleted_text: deleted_text.into(),
                         cursor_id,
                     });
                     position_deltas.push((line_start, -(remove_len as isize)));
@@ -302,7 +304,7 @@ impl Editor {
             for &line_start in line_starts.iter().rev() {
                 events.push(Event::Insert {
                     position: line_start,
-                    text: comment_prefix.to_string(),
+                    text: comment_prefix.to_string().into(),
                     cursor_id,
                 });
                 position_deltas.push((line_start, prefix_len as isize));
@@ -354,8 +356,8 @@ impl Editor {
 
         // Use optimized bulk edit for multi-line comment toggle
         let description = format!("{} lines", action_desc);
-        if let Some(bulk_edit) = self.apply_events_as_bulk_edit(events, description) {
-            self.active_event_log_mut().append(bulk_edit);
+        if let Some(applied) = self.apply_events_as_bulk_edit(events, description) {
+            self.active_event_log_mut().append(applied);
         }
 
         self.set_status_message(
@@ -388,120 +390,40 @@ impl Editor {
 
         let ch = bytes[0] as char;
 
-        // All supported bracket pairs
-        const BRACKET_PAIRS: &[(char, char)] = &[('(', ')'), ('[', ']'), ('{', '}'), ('<', '>')];
+        // The same pair table the highlighter uses, and the same language
+        // question: `<` and `>` are brackets only where they are delimiters
+        // rather than comparison operators (issue #3090). Asking it here too
+        // is what keeps the jump and the colouring telling one story — with a
+        // table of its own, this command still walked into the `<` of
+        // `if (a < b)` and called it the enclosing bracket.
+        let angle_brackets = state
+            .highlighter
+            .language()
+            .is_some_and(|language| language.angle_brackets_are_delimiters());
+        let bracket_pairs = crate::view::bracket_highlight_overlay::bracket_pairs(angle_brackets);
+        let bracket_info =
+            crate::view::bracket_highlight_overlay::get_bracket_pair(ch, angle_brackets);
 
-        let bracket_info = match ch {
-            '(' => Some(('(', ')', true)),
-            ')' => Some(('(', ')', false)),
-            '[' => Some(('[', ']', true)),
-            ']' => Some(('[', ']', false)),
-            '{' => Some(('{', '}', true)),
-            '}' => Some(('{', '}', false)),
-            '<' => Some(('<', '>', true)),
-            '>' => Some(('<', '>', false)),
-            _ => None,
+        // On a bracket, its match; elsewhere, the match of the bracket
+        // enclosing the cursor. Found with the highlight's scan, though
+        // without its comment and string ranges, which only a drawn frame
+        // has.
+        use crate::view::bracket_highlight_overlay::{
+            find_enclosing_bracket, find_matching_bracket,
         };
-
-        // Limit searches to avoid O(n) scans on huge files.
-        use crate::view::bracket_highlight_overlay::MAX_BRACKET_SEARCH_BYTES;
-
-        // If cursor is not on a bracket, search backward for the nearest
-        // enclosing opening bracket, then jump to its matching close.
-        let (opening, closing, search_start, forward) =
-            if let Some((opening, closing, forward)) = bracket_info {
-                (opening, closing, pos, forward)
-            } else {
-                // Search backward from cursor to find enclosing opening bracket.
-                // Track depth per bracket type to handle nesting correctly.
-                let mut depths: Vec<i32> = vec![0; BRACKET_PAIRS.len()];
-                let mut found = None;
-                let search_limit = pos.saturating_sub(MAX_BRACKET_SEARCH_BYTES);
-                let mut search_pos = pos.saturating_sub(1);
-                loop {
-                    let b = state.buffer.slice_bytes(search_pos..search_pos + 1);
-                    if !b.is_empty() {
-                        let c = b[0] as char;
-                        for (i, &(open, close)) in BRACKET_PAIRS.iter().enumerate() {
-                            if c == close {
-                                depths[i] += 1;
-                            } else if c == open {
-                                if depths[i] > 0 {
-                                    depths[i] -= 1;
-                                } else {
-                                    // Found an unmatched opening bracket — this encloses us
-                                    found = Some((open, close, search_pos));
-                                    break;
-                                }
-                            }
-                        }
-                        if found.is_some() {
-                            break;
-                        }
-                    }
-                    if search_pos <= search_limit {
-                        break;
-                    }
-                    search_pos -= 1;
-                }
-
-                if let Some((opening, closing, bracket_pos)) = found {
-                    // Jump forward from the enclosing opening bracket to its match
-                    (opening, closing, bracket_pos, true)
-                } else {
+        let (opening, closing, start, forward) = match bracket_info {
+            Some((opening, closing, forward)) => (opening, closing, pos, forward),
+            None => match find_enclosing_bracket(&state.buffer, pos, bracket_pairs, &[]) {
+                Some((opening, closing, at)) => (opening, closing, at, true),
+                None => {
                     self.set_status_message(t!("diagnostics.bracket_none").to_string());
                     return;
                 }
-            };
-
-        // Find matching bracket (bounded to MAX_BRACKET_SEARCH_BYTES)
-        let buffer_len = state.buffer.len();
-        let mut depth = 1;
-        let matching_pos = if forward {
-            let search_limit = (search_start + 1 + MAX_BRACKET_SEARCH_BYTES).min(buffer_len);
-            let mut search_pos = search_start + 1;
-            let mut found = None;
-            while search_pos < search_limit && depth > 0 {
-                let b = state.buffer.slice_bytes(search_pos..search_pos + 1);
-                if !b.is_empty() {
-                    let c = b[0] as char;
-                    if c == opening {
-                        depth += 1;
-                    } else if c == closing {
-                        depth -= 1;
-                        if depth == 0 {
-                            found = Some(search_pos);
-                        }
-                    }
-                }
-                search_pos += 1;
-            }
-            found
-        } else {
-            let search_limit = search_start.saturating_sub(MAX_BRACKET_SEARCH_BYTES);
-            let mut search_pos = search_start.saturating_sub(1);
-            let mut found = None;
-            loop {
-                let b = state.buffer.slice_bytes(search_pos..search_pos + 1);
-                if !b.is_empty() {
-                    let c = b[0] as char;
-                    if c == closing {
-                        depth += 1;
-                    } else if c == opening {
-                        depth -= 1;
-                        if depth == 0 {
-                            found = Some(search_pos);
-                            break;
-                        }
-                    }
-                }
-                if search_pos <= search_limit {
-                    break;
-                }
-                search_pos -= 1;
-            }
-            found
+            },
         };
+        let bound = if forward { usize::MAX } else { 0 };
+        let matching_pos =
+            find_matching_bracket(&state.buffer, start, opening, closing, forward, &[], bound);
 
         if let Some(new_pos) = matching_pos {
             // Respect Emacs-style mark mode: when movement should preserve the

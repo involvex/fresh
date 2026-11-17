@@ -43,6 +43,16 @@ impl std::fmt::Debug for RenderId {
 pub struct Geom {
     pub rect: Rect,
     pub clip: Rect,
+    /// Where the pointer is, for a node that draws an affordance of its own
+    /// and has to say whether it is under it.
+    ///
+    /// **Hover on a library-drawn thing is the library's**, for the same
+    /// reason the press is: the affordance exists because the framework knows
+    /// something the description cannot — a `Draw::Overflow` cap is drawn
+    /// because the window knows there is more that way — so who else would
+    /// know when the pointer is on it. `None` when the pointer is not in the
+    /// window, or has left it.
+    pub pointer: Option<Point>,
 }
 
 /// What a render object does with a point inside its own rectangle.
@@ -69,17 +79,39 @@ pub trait LayoutCx {
     /// The size request a child carries, resolved through nodes with no
     /// geometry of their own.
     fn sizing(&self, child: RenderId) -> (Sizing, Sizing);
+    /// The floors a child carries, in cells, resolved the same way. `0` is no
+    /// floor. A container that distributes remaining space applies them after
+    /// the share is computed, so "a share of what is left, but never less than
+    /// this" is one statement rather than an arithmetic special case in every
+    /// caller.
+    fn floor(&self, child: RenderId) -> (u16, u16) {
+        let _ = child;
+        (0, 0)
+    }
+    /// Who keeps its size when the container runs out of room: higher yields
+    /// last. A container that resolves children against remaining space sizes
+    /// them in descending priority, so "reserve this before spending that" is
+    /// a property of the child rather than arithmetic the caller does first.
+    /// `0` is no preference, and equal priorities keep declaration order.
+    fn priority(&self, child: RenderId) -> u8 {
+        let _ = child;
+        0
+    }
     /// Measure a child. Returns its size, honouring the layout cache.
     fn measure(&mut self, child: RenderId, c: Constraints) -> Size;
     /// Position a child relative to this node's content origin.
     fn place(&mut self, child: RenderId, at: Point);
     /// Fill in the window of the nearest enclosing `Viewport`, if any.
     fn enclosing_window(&self, info: LayoutInfo) -> LayoutInfo;
-    /// This node's scroll offset. Framework-owned: neither the application nor
-    /// the component declares it.
+    /// This node's scroll offset, as the framework holds it: where the wheel,
+    /// the bar and the anchor commands last put it — or, for a window whose
+    /// owner holds the offset ([`Scroll::At`](crate::desc::Scroll::At)),
+    /// where the description last said it is.
     fn scroll(&self) -> Point;
-    /// Move the offset. The one caller is a scrolling node applying the initial
-    /// value its description carried, once, at its first layout.
+    /// Move the offset. Called by a scrolling node applying the value its
+    /// description carries: once, at its first layout, for a framework-owned
+    /// offset; at every layout for one the owner holds; and to clamp a
+    /// framework-owned offset into its ceiling before the window is published.
     fn set_offset(&mut self, at: Point);
     /// Declare the window this node shows onto its content. The framework
     /// clamps the offset against it, chains the wheel off it, and a
@@ -91,6 +123,32 @@ pub trait LayoutCx {
     fn rebuild(&mut self, info: LayoutInfo);
     /// The element this render object belongs to, for diagnostics.
     fn element(&self) -> ElementId;
+}
+
+/// What an item-scrolled viewport says about the band one item sits in.
+///
+/// **The band is a fact of layout that the builder needs before it builds.**
+/// A window in items is index-addressable because every item is the same
+/// height; the builder has to give each item exactly that height, and when the
+/// height is [`ItemHeight::Measured`](crate::desc::ItemHeight::Measured) there
+/// is no number to hand it at build time. So the viewport asks first and tells
+/// afterwards, both within one layout pass — the builder never sees a frame
+/// built against a band that turned out to be wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Band {
+    /// Answer with one item's worth of content: whatever height the builder
+    /// returns is taken as the band. A builder whose items differ answers with
+    /// all of them laid one on top of another, so that the tallest is what
+    /// comes back.
+    ///
+    /// The window is left where it was while this is being asked — the
+    /// question is about the items, not about which of them are on screen — and
+    /// nothing built under it is painted, hit-tested or kept: the next thing
+    /// that happens is the second ask, with the answer.
+    Measuring,
+    /// One item is this many cells tall. Rows built now must be exactly this,
+    /// or the grid the index addresses slips.
+    Cells(u16),
 }
 
 /// What a scrolling node tells the framework about its window.
@@ -105,6 +163,24 @@ pub struct ScrollInfo {
     /// Whether children are moved by the offset. An index-scrolled window
     /// renders only what is inside it, so nothing is moved.
     pub translate: bool,
+    /// The band, for a window whose offset counts items. `None` for one whose
+    /// offset counts cells, where an item is not a thing.
+    pub band: Option<Band>,
+    /// How many of the node's declared pinned items sit above `window` — the
+    /// ones it honoured, which is at most one fewer than fit. Zero for a
+    /// window that pins nothing. See [`Node::pinned`](crate::Node::pinned).
+    pub pinned: u16,
+    /// Which axis this window's offset counts along. Published with the
+    /// window because everything that *moves* the window has to agree with it
+    /// — an `Anchor` command says "put this inside", and which way that is is
+    /// the window's answer, not the caller's.
+    pub axis: crate::event::Axis,
+    /// How far a cap press moves it; `0` is one windowful.
+    pub step: u16,
+    /// How wide one overflow cap is, in cells. See [`Node::scroll_cap_width`].
+    ///
+    /// [`Node::scroll_cap_width`]: crate::Node::scroll_cap_width
+    pub cap: u16,
 }
 
 /// What a constraint-dependent builder is told.
@@ -114,6 +190,12 @@ pub struct LayoutInfo {
     /// The window the nearest enclosing `Viewport` is showing, in its content's
     /// coordinates. `None` outside one.
     pub scroll_window: Option<Rect>,
+    /// That same viewport's band, when its offset counts items. See [`Band`].
+    pub band: Option<Band>,
+    /// How many pinned items that viewport holds above `scroll_window`: the
+    /// builder draws that many of the indices it declared, in order, and then
+    /// the run the window names. See [`Node::pinned`](crate::Node::pinned).
+    pub pinned: u16,
 }
 
 /// How a node that sits outside its parent's flow places itself, and what it
@@ -127,9 +209,17 @@ pub struct LayerGeom {
     pub anchor: Anchor,
     pub place: Place,
     pub fit: Fit,
+    /// See [`crate::desc::LayerProps::align`].
+    pub align: Option<crate::desc::Align>,
     pub modality: Modality,
     pub scrim: Option<Scrim>,
     pub dismiss: Dismiss,
+    /// See [`crate::desc::LayerProps::within`].
+    pub within: Option<crate::key::Key>,
+    /// See [`crate::desc::LayerProps::scope`].
+    pub scope: Option<crate::key::Key>,
+    /// See [`crate::desc::LayerProps::offset`].
+    pub offset: (i16, i16),
 }
 
 /// A node's focus registration, as the focus tree needs it.
@@ -137,7 +227,7 @@ pub struct LayerGeom {
 /// Read at mount and again on every description change, so a registration that
 /// changes shape reaches the tree without the framework knowing what produced
 /// it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct FocusReg {
     pub ordinal: Option<i32>,
     pub skip: bool,
@@ -146,6 +236,9 @@ pub struct FocusReg {
     pub focus_within: bool,
     /// Take focus when the enclosing scope opens.
     pub autofocus: bool,
+    /// This subtree is a *group* that traversal enters at the stop this key
+    /// names. See [`crate::Node::enters_at`].
+    pub entry: Option<crate::key::Key>,
 }
 
 /// Computed, retained geometry and the behaviour that produces it.
@@ -156,6 +249,19 @@ pub trait RenderObject {
     /// Emit display-list items. Never reads geometry back: everything this
     /// needs arrives in `g`.
     fn paint(&self, g: Geom, out: &mut DrawList) {
+        let _ = (g, out);
+    }
+
+    /// Emit display-list items *after* this node's children, so they land on
+    /// top of everything inside it.
+    ///
+    /// **A node's own paint is under its children**, which is right for a
+    /// ground and wrong for the two or three things that are genuinely on
+    /// top. An overlay scrollbar is the case this exists for: it floats over
+    /// the last column of its window rather than carving a gutter out of it,
+    /// and painted with the rest of the node's own output it would be covered
+    /// by the very rows it reports on.
+    fn paint_over(&self, g: Geom, out: &mut DrawList) {
         let _ = (g, out);
     }
 
@@ -175,6 +281,17 @@ pub trait RenderObject {
     /// Whether this node bounds what its descendants may paint and hit.
     fn clips(&self) -> bool {
         false
+    }
+
+    /// How far inside this node's own rectangle the bound sits, when
+    /// [`clips`](Self::clips) is true: `(x, y)` cells on each side.
+    ///
+    /// A viewport bounds its descendants at its edge and answers `(0, 0)`. A
+    /// bordered box bounds them at the *inside* of its frame, because the ring
+    /// is the box's own paint and content that reaches it has escaped. Ignored
+    /// entirely when `clips()` is false.
+    fn clip_inset(&self) -> (u16, u16) {
+        (0, 0)
     }
 
     /// Whether this node draws a scrollbar in its gutter — so the framework can
@@ -216,6 +333,18 @@ pub trait RenderObject {
         "RenderObject"
     }
 
+    /// The byte of this object's logical string under a cell of its own
+    /// rectangle, when it has one.
+    ///
+    /// Text answers; everything else is not text and says so by default. The
+    /// dispatcher asks the *target* of a pointer event, so a listener anywhere
+    /// up the chain reads `Event::text_byte` without knowing which leaf under
+    /// it holds the string — see that field for why the answer cannot be
+    /// reconstructed from a column outside the library.
+    fn text_byte_at(&self, _local: Point) -> Option<usize> {
+        None
+    }
+
     /// So the framework can push changed props into a live object rather than
     /// replacing it, which would discard its retained state.
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
@@ -244,9 +373,21 @@ pub(crate) struct RenderNode {
     /// The size request from the description chain above this node.
     pub w: Sizing,
     pub h: Sizing,
+    /// Floors on the resolved extent, from the same chain. `0` is no floor.
+    pub min_w: u16,
+    pub min_h: u16,
+    /// Who keeps its size when there is not enough room; higher yields last.
+    /// See `Node::priority`.
+    pub priority: u8,
+    /// Whether pointer hits stop here, when the description says so. `None`
+    /// leaves it to the render object.
+    pub pointer: Option<crate::desc::PointerMode>,
     /// Cached from the object so the framework can ask while the object itself
     /// is checked out for `layout`.
     pub clips: bool,
+    /// `(x, y)` inset of the clip bound inside `rect`; see
+    /// [`RenderObject::clip_inset`]. Meaningful only when `clips` is set.
+    pub clip_inset: (u16, u16),
     pub out_of_flow: bool,
     pub reads_window: bool,
     pub raw_input: bool,
@@ -254,6 +395,7 @@ pub(crate) struct RenderNode {
     /// Provenance and identity, resolved through the elements with no geometry
     /// between this node and its render parent.
     pub theme: Option<Rc<str>>,
+    pub classes: Option<Rc<str>>,
     pub key: Option<crate::key::Key>,
     pub data: RenderData,
 }
@@ -293,7 +435,20 @@ pub(crate) struct RenderData {
     pub scroll: Point,
     pub content: Size,
     pub window: Option<Rect>,
+    /// Published alongside `window`, and read by the same walk: a builder that
+    /// asks which items it holds asks in the same breath how tall one is.
+    pub band: Option<Band>,
+    /// Published with `window` too: the pinned items held above it.
+    pub pinned: u16,
     pub scroll_max: Point,
+    /// Which axis the offset counts along. See [`ScrollInfo::axis`].
+    pub scroll_axis: crate::event::Axis,
+    /// How far a cap press moves the window; `0` is one windowful. See
+    /// [`Node::scroll_step`](crate::Node::scroll_step).
+    pub scroll_step: u16,
+    /// How wide one overflow cap is. See
+    /// [`Node::scroll_cap_width`](crate::Node::scroll_cap_width).
+    pub scroll_cap: u16,
     pub translate: bool,
 
     /// How many times this node has been measured, and how many of those were a
@@ -426,3 +581,37 @@ impl HostLeaf for PlainHost {}
 
 /// So a description can carry either form.
 pub type HostObject = Rc<dyn Fn() -> Box<dyn HostLeaf>>;
+
+/// Where a horizontal window's two overflow caps are, and which of them has
+/// content behind it.
+///
+/// **One rule, asked twice.** The primitive lights the cap under the pointer
+/// and the hit walk steps the window when that cap is pressed — a button that
+/// lights where it cannot be pressed is not a button, so both ask here rather
+/// than each rebuilding the arithmetic from the window's offset.
+///
+/// `rect` is the window's box, `offset` its current scroll along the axis and
+/// `ceiling` the furthest it can go; `cap` is the width the measure reserved
+/// at each end (see [`Node::scroll_cap_width`](crate::Node::scroll_cap_width)).
+/// The rectangles are returned whether or not there is more that way, because
+/// the cells are reserved either way — `more` is what says a glyph goes in one.
+pub(crate) fn overflow_caps(
+    rect: Rect,
+    offset: i64,
+    ceiling: i64,
+    cap: u16,
+) -> [(crate::End, bool, Rect); 2] {
+    let cap = cap.max(1);
+    [
+        (
+            crate::End::Before,
+            offset > 0,
+            Rect::new(rect.x, rect.y, cap, rect.h),
+        ),
+        (
+            crate::End::After,
+            offset < ceiling,
+            Rect::new(rect.right() - cap as i32, rect.y, cap, rect.h),
+        ),
+    ]
+}

@@ -5,7 +5,7 @@
 //! mode from the command palette, scroll — and assert only on rendered cells
 //! in the scrollbar column.
 
-use crate::common::harness::{copy_plugin, copy_plugin_lib, EditorTestHarness};
+use crate::common::harness::{copy_plugin, copy_plugin_lib, EditorTestHarness, HarnessOptions};
 use crate::common::tracing::init_tracing_from_env;
 use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -51,11 +51,18 @@ fn compose_harness(md: &str) -> (EditorTestHarness, tempfile::TempDir) {
     let md_path = project_root.join("headings.md");
     std::fs::write(&md_path, md).unwrap();
 
-    let mut harness = EditorTestHarness::with_config_and_working_dir(
+    // `with_full_grammar_registry` is what makes the editor resolve embedded
+    // regions, which is how a line inside a fenced block reports `region`.
+    // Without it every line comes back unclassified and the marks are decided
+    // by the plugin's textual fence tracking alone — the fallback, not the path
+    // that runs in the editor.
+    let mut harness = EditorTestHarness::create(
         80,
         30,
-        Default::default(),
-        project_root.clone(),
+        HarnessOptions::new()
+            .with_working_dir(project_root.clone())
+            .without_empty_plugins_dir()
+            .with_full_grammar_registry(),
     )
     .unwrap();
 
@@ -212,44 +219,101 @@ fn only_top_level_headings_are_marked_by_default() {
 fn heading_marks_survive_exploring_the_document() {
     let (mut harness, _tmp) = compose_harness(&document_with_headings(20, 14));
 
-    harness
-        .wait_until(|h| !marker_rows(h).is_empty())
-        .expect("initial heading marks");
-    // The first mark is not the whole set: compose mode's pre-scan walks the
-    // document over the async plugin bridge (see
-    // `every_heading_is_marked_without_scrolling`), so the marks arrive over
-    // several ticks. Reading the set on the frame the first mark lands
-    // compares a partial set against the complete one later — a scroll that
-    // "added" marks is how this test failed on CI, with an `initial` of two
-    // rows against an `after` of eighteen. Wait for the plugin pipeline
-    // itself to go quiet; a screen-stability streak does not do, because a
-    // plugin thread that has fallen behind emits identical stale frames.
+    // What follows compares this set against the one after scrolling, so it
+    // has to be the *complete* set: read it early and the test compares two
+    // partial sets and proves nothing.
+    //
+    // Two marks is what the per-batch `lines_changed` pass publishes for the
+    // headings in the opening viewport; the rest of the document is marked by
+    // `prescanHeadingMarkers`, which reads the whole buffer over the async
+    // bridge and then publishes every heading in one whole-namespace call.
+    // So the complete set arrives in a single step, and waiting for *it* is
+    // the gate — `wait_until(|h| !marker_rows(h).is_empty())` resolves on the
+    // viewport pass, several ticks earlier.
+    //
+    // Quiescence is not that gate either, and that is how this test failed on
+    // CI with an `initial` of `[2, 3]`: the pre-scan is fire-and-forget
+    // (`void prescanHeadingMarkers(...)`), so while its `getBufferText` round
+    // trip is outstanding the editor reports no work for the tick and
+    // `wait_for_async_quiescence` returns with only the viewport's marks
+    // published. Gate on the marks themselves, the way
+    // `every_heading_is_marked_without_scrolling` does — the viewport pass
+    // cannot reach ten on a document this long, so the threshold is a real
+    // gate on the pre-scan having landed. Quiescence afterwards only settles
+    // any per-batch republish on top of a set that is already whole.
+    harness.wait_until(|h| marker_rows(h).len() >= 10).expect(
+        "the pre-scan should mark the whole document before scrolling starts, \
+             otherwise this test compares two partial sets and proves nothing",
+    );
     harness.wait_for_async_quiescence(8).unwrap();
     let initial = marker_rows(&harness);
-    assert!(
-        initial.len() >= 10,
-        "the pre-scan should have marked the whole document before scrolling \
-         starts, otherwise this test compares two partial sets and proves \
-         nothing; saw {initial:?}"
-    );
 
     // Page down through the document so later sections enter the viewport,
-    // letting the plugin's marks settle after each page.
-    for _ in 0..12 {
+    // settling the frame after each page rather than waiting for the whole
+    // async pipeline to fall silent.
+    //
+    // This loop is the only place in the file that settles per iteration, and
+    // it is the one test in the file that timed out on CI. Quiescence is
+    // bounded but not cheap: it needs several consecutive no-work ticks at
+    // 50ms apiece, and with the plugin re-decorating every newly visible page
+    // it measured over a second per call on a loaded runner — 13 calls, ~19s,
+    // against ~8s for the whole test unloaded — and gives up only after 30s
+    // when the pipeline never goes quiet.
+    //
+    // The property under test survives without the per-page settle: every
+    // page's `lines_changed` batch is queued by the scroll whether or not this
+    // thread waits for it, and a whole-namespace republish — the bug this test
+    // exists for — is still visible in the set the final settle below hands to
+    // the comparison.
+    //
+    // Not "wait for the screen to change", though: a PageDown at the end of
+    // the document is a no-op, and this sweep runs over a document only about
+    // thirteen pages deep, so that wait would be one viewport row away from
+    // never resolving. A settled frame is true whether or not the page moved.
+    //
+    // Six pages, not twelve. Compose mode sizes its window from the line
+    // breaks its conceals already swallow, so a scrolled-to page settles over
+    // a few frames rather than one — self-correcting by design, but it
+    // multiplies the renders each `wait_until_stable` has to sit through, and
+    // this test settles once per page. Twelve pages of that timed out at
+    // nextest's 180s cap on a loaded macOS runner while taking under three
+    // seconds unloaded. Six still carries the property: the marks under test
+    // are the ones for sections the viewport has left behind, and by page six
+    // most of the document is behind it.
+    for _ in 0..6 {
         harness
             .send_key(KeyCode::PageDown, KeyModifiers::NONE)
             .unwrap();
-        harness.wait_for_async_quiescence(4).unwrap();
+        harness.wait_until_stable(|_| true).unwrap();
     }
     harness.wait_for_async_quiescence(8).unwrap();
 
     // Each batch republishes only its own byte span, so the marks for the
     // sections scrolled past are left alone. With a whole-namespace replace
-    // per batch, only the headings near the viewport would survive.
+    // per batch, only the headings near the viewport would survive — the set
+    // would shrink to the last page's two or three marks and start well down
+    // the track instead of at its top.
+    //
+    // The count and the two ends, not the exact rows: the track's coordinate
+    // space is *visual* rows (`MarkerBasis::VisualRows`, chosen so marks and
+    // thumb agree), and compose mode reflows a paragraph by concealing the
+    // line breaks inside it — a conceal that only exists for the lines the
+    // plugin has decorated. Exploring the document therefore shortens it, by
+    // design, and every mark below the part already visited slides up a row or
+    // two as that happens. What must not change is which headings are marked.
     let after = marker_rows(&harness);
     assert_eq!(
-        after, initial,
-        "the marked rows should be identical before and after scrolling"
+        after.len(),
+        initial.len(),
+        "every heading should still be marked after exploring the document; \
+         before {initial:?}, after {after:?}"
+    );
+    assert_eq!(
+        (after.first(), after.last()),
+        (initial.first(), initial.last()),
+        "the marks should still span the whole track — the first heading is at \
+         the top of the document and the last at its end; \
+         before {initial:?}, after {after:?}"
     );
 }
 

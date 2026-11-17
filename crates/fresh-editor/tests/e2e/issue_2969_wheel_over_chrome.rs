@@ -20,6 +20,7 @@
 //! also wheels over a surface that should respond, so a fix that simply
 //! swallowed every wheel event could not pass.
 
+use crate::common::global_state::pin_posix_shell;
 use crate::common::harness::EditorTestHarness;
 use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -140,6 +141,9 @@ fn wheel_over_chrome_does_not_scroll_the_focused_editor() {
 #[test]
 #[cfg(not(windows))] // Uses a Unix shell to produce scrollback
 fn wheel_over_chrome_does_not_scroll_the_focused_terminal() {
+    // `$(seq ...)` below is POSIX; pin a shell rather than take the
+    // runner's login shell (see `pin_posix_shell`).
+    let _sh = pin_posix_shell();
     // Imported here rather than at module scope so the Windows build, which
     // cfg's this test out, doesn't carry an unused import.
     use portable_pty::{native_pty_system, PtySize};
@@ -266,9 +270,23 @@ fn wheel_over_the_tab_bar_pans_the_tab_strip() {
          otherwise there is nothing to pan. Tab row: {baseline_tabs:?}"
     );
 
-    // Wheel up over the bar walks the strip back toward the first tab.
-    for _ in 0..NOTCHES {
+    // Wheel up over the bar walks the strip back to the first tab.
+    //
+    // **Until it stops, not a fixed count.** `NOTCHES` used to be enough to
+    // reach the start, and the number of notches a strip takes to cross is not
+    // the claim here — it is a function of how wide the window is, and the
+    // window narrowed when the overflow caps became as wide as the `+` beside
+    // them. Five notches now land four columns short, which read as a failure
+    // of panning rather than of arithmetic. Pump until the strip stops moving,
+    // with a bound so a strip that never settles fails instead of hanging.
+    let mut before = tab_bar_text(&harness.screen_to_string());
+    for _ in 0..NOTCHES * 10 {
         harness.mouse_scroll_up(30, tab_row).unwrap();
+        let now = tab_bar_text(&harness.screen_to_string());
+        if now == before {
+            break;
+        }
+        before = now;
     }
     let panned = tab_bar_text(&harness.screen_to_string());
     assert!(
@@ -285,8 +303,14 @@ fn wheel_over_the_tab_bar_pans_the_tab_strip() {
 
     // ...and wheel down walks it forward again, stopping at the last tab
     // rather than running off into empty space.
-    for _ in 0..NOTCHES * 2 {
+    let mut before = tab_bar_text(&harness.screen_to_string());
+    for _ in 0..NOTCHES * 20 {
         harness.mouse_scroll_down(30, tab_row).unwrap();
+        let now = tab_bar_text(&harness.screen_to_string());
+        if now == before {
+            break;
+        }
+        before = now;
     }
     let returned = tab_bar_text(&harness.screen_to_string());
     assert!(

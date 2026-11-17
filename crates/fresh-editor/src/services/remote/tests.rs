@@ -6,6 +6,7 @@
 use super::connection::ConnectionParams;
 use super::protocol::*;
 use super::AGENT_SOURCE;
+use fresh_editor_core::model::host_path::AsHostPath;
 
 #[test]
 fn test_protocol_version() {
@@ -429,6 +430,56 @@ mod agent_integration {
         assert!(!path.contains('~'));
     }
 
+    /// `digest` hashes the file on the agent's side: its size and SHA-256
+    /// are the ones Rust computes over the same bytes, across several of
+    /// the agent's read chunks. A missing file is an error.
+    #[test]
+    fn test_agent_digest_command() {
+        use crate::model::filesystem::ContentDigest;
+        let Some((mut stdin, mut stdout)) = spawn_agent() else {
+            eprintln!("Skipping test: Python3 not available");
+            return;
+        };
+
+        // Read ready message
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        let content: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &content).unwrap();
+
+        let resp = send_request(
+            &mut stdin,
+            &mut stdout,
+            "digest",
+            digest_params(&path.to_string_lossy()),
+        )
+        .unwrap();
+        let result = resp.result.expect("digest result");
+        let expected = ContentDigest::of(&content);
+        assert_eq!(result["size"].as_u64(), Some(expected.size));
+        let hex: String = expected.sha256.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(result["sha256"].as_str(), Some(hex.as_str()));
+
+        let resp = send_request(
+            &mut stdin,
+            &mut stdout,
+            "digest",
+            digest_params(&dir.path().join("missing").to_string_lossy()),
+        )
+        .unwrap();
+        assert!(resp.result.is_none());
+        assert!(
+            resp.error
+                .as_deref()
+                .is_some_and(|e| e.contains("not found")),
+            "error was {:?}",
+            resp.error
+        );
+    }
+
     #[test]
     fn test_agent_unknown_method() {
         let Some((mut stdin, mut stdout)) = spawn_agent() else {
@@ -451,5 +502,137 @@ mod agent_integration {
         let resp = resp.unwrap();
         assert!(resp.error.is_some());
         assert!(resp.error.unwrap().contains("unknown method"));
+    }
+
+    /// A search over SSH finds what a local one does: the agent's
+    /// `search_file` and `default_search_file` give the same matches, with
+    /// the same lines, columns and context, on files of every kind it skips
+    /// or searches — across lines, CRLF, multibyte text, legacy encodings,
+    /// BOMs, Classic-Mac line breaks, whole words, case folding, empty
+    /// matches and the match cap.
+    #[test]
+    fn test_agent_search_file_matches_local() {
+        use crate::model::filesystem::{
+            default_search_file, FileSearchOptions, SearchMatch, StdFileSystem,
+        };
+        let Some((mut stdin, mut stdout)) = spawn_agent() else {
+            eprintln!("Skipping test: Python3 not available");
+            return;
+        };
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        // Lines longer than a match's context on each side, of multi-byte
+        // text, and one crossing the local search's 1 MB window.
+        let long_lines = format!(
+            "{}foo{}foo{}\n{}foo",
+            "x".repeat(5000),
+            "\u{20ac}".repeat(3000),
+            "y".repeat(10),
+            "\u{e9}".repeat(2500)
+        );
+        let past_a_window = format!(
+            "{}foo{}\nfoo\n",
+            "x".repeat((1 << 20) - 2),
+            "z".repeat(5000)
+        );
+        let files: &[(&str, &[u8])] = &[
+            ("long_lines.txt", long_lines.as_bytes()),
+            ("past_a_window.txt", past_a_window.as_bytes()),
+            ("plain.txt", b"foo bar\nfoobar foo\n  foo\nbar"),
+            ("crlf.txt", b"foo\r\nbar foo\r\n\r\nfoo"),
+            (
+                "utf8.txt",
+                "h\u{e9}llo foo \u{1f600} foo\n\u{e9}t\u{e9} FOO\n".as_bytes(),
+            ),
+            ("case.txt", b"Foo FOO foo fOO\nstra\xc3\x9fe STRASSE\n"),
+            ("words.txt", b"cat concat cat_ cats (cat) cat.cat\n"),
+            ("empty_matches.txt", b"aaa\n\nbab\n"),
+            ("latin1.txt", b"caf\xe9 foo\nfoo\n"),
+            ("bom.txt", b"\xef\xbb\xbffoo bar\nfoo\n"),
+            ("classic_mac.txt", b"foo\rbar foo\rfoo"),
+            ("utf16.txt", b"\xff\xfef\x00o\x00o\x00"),
+            ("control.txt", b"foo\x1abar foo\n"),
+            ("nul.txt", b"foo\x00foo\n"),
+            ("empty.txt", b""),
+            ("no_newline.txt", b"foo"),
+        ];
+        let patterns: &[(&str, bool)] = &[
+            ("foo", true),
+            ("cat", true),
+            ("a*", false),
+            ("^foo", false),
+            ("o+$", false),
+            (r"\w+", false),
+            ("foo\\nbar", false),
+            ("b.b", false),
+        ];
+        for (name, bytes) in files {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            for &(pattern, fixed_string) in patterns {
+                // Where the dialects differ: Python's `$` doesn't match
+                // before a `\r\n`, and an empty match is between characters
+                // there but between bytes here.
+                if (pattern.contains('$') && bytes.windows(2).any(|w| w == b"\r\n"))
+                    || (pattern == "a*" && !bytes.is_ascii())
+                {
+                    continue;
+                }
+                for case_sensitive in [true, false] {
+                    for whole_word in [false, true] {
+                        for max_matches in [2, 1000] {
+                            let opts = FileSearchOptions {
+                                fixed_string,
+                                case_sensitive,
+                                whole_word,
+                                max_matches,
+                            };
+                            let local =
+                                default_search_file(&StdFileSystem, path.as_host(), pattern, &opts)
+                                    .unwrap();
+                            let resp = send_request(
+                                &mut stdin,
+                                &mut stdout,
+                                "search_file",
+                                serde_json::json!({
+                                    "path": path.to_string_lossy(),
+                                    "pattern": pattern,
+                                    "fixed_string": fixed_string,
+                                    "case_sensitive": case_sensitive,
+                                    "whole_word": whole_word,
+                                    "max_matches": max_matches,
+                                    "max_file_size": crate::model::filesystem::MAX_PROJECT_SEARCH_FILE_SIZE,
+                                    "context_bytes": crate::model::buffer::MATCH_CONTEXT,
+                                }),
+                            )
+                            .unwrap();
+                            let result = resp.result.unwrap_or_else(|| {
+                                panic!("{name} {pattern:?}: error {:?}", resp.error)
+                            });
+                            let remote: Vec<SearchMatch> = result["matches"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|m| SearchMatch {
+                                    byte_offset: m["byte_offset"].as_u64().unwrap() as usize,
+                                    length: m["length"].as_u64().unwrap() as usize,
+                                    line: m["line"].as_u64().unwrap() as usize,
+                                    column: m["column"].as_u64().unwrap() as usize,
+                                    context: m["context"].as_str().unwrap().to_string(),
+                                    context_offset: m["context_offset"].as_u64().unwrap() as usize,
+                                })
+                                .collect();
+                            assert_eq!(
+                                remote, local,
+                                "{name}: {pattern:?} fixed={fixed_string} \
+                                 case={case_sensitive} word={whole_word} max={max_matches}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

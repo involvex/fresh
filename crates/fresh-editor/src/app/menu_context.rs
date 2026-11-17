@@ -31,8 +31,8 @@ impl Editor {
         self.all_menus_expanded()
     }
 
-    /// The exact menu list the TUI `MenuRenderer` renders: the configured menus
-    /// (`self.menus`, dynamic submenus expanded — reusing the renderer's
+    /// The exact menu list the shell describes: the configured menus
+    /// (`self.menus`, dynamic submenus expanded — reusing the
     /// `expanded_menus_cache` when populated) followed by the plugin-contributed
     /// menus (also expanded). This is the single expansion path shared by the
     /// TUI renderer and the web `menu_view()` projection, so the two frontends
@@ -64,9 +64,26 @@ impl Editor {
     /// Update all menu context values based on current editor state.
     /// This should be called before rendering the menu bar.
     pub fn update_menu_context(&mut self) {
-        // Window-scoped lookups delegated to `Window`.
-        let line_numbers = self.active_window().is_line_numbers_visible();
-        let line_wrap = self.active_window().is_line_wrap_enabled();
+        // One shared answer to "what can this buffer be asked to do", also used
+        // by the command palette so the two surfaces can't drift.
+        let caps = self.buffer_capabilities();
+        // Window-scoped lookups delegated to `Window`. The View menu's Line
+        // Numbers / Line Wrap toggles flip the global setting, so on a tab
+        // that isn't a text buffer (terminal, Welcome, plugin panels) the
+        // checkbox reports that setting: the tab's own view state there is
+        // whatever the tab chose for itself, not something the toggle
+        // controls (#3550).
+        let (line_numbers, line_wrap) = if caps.is_text_buffer {
+            (
+                self.active_window().is_line_numbers_visible(),
+                self.active_window().is_line_wrap_enabled(),
+            )
+        } else {
+            (
+                self.config.editor.line_numbers,
+                self.config.editor.line_wrap,
+            )
+        };
         let page_view = self.active_window().is_page_view();
         let file_explorer_visible = self.file_explorer_visible();
         let file_explorer_focused = self.active_window().is_file_explorer_focused();
@@ -78,9 +95,6 @@ impl Editor {
             .load(std::sync::atomic::Ordering::Relaxed);
         let mouse_hover = self.config.editor.mouse_hover_enabled;
         let inlay_hints = self.config.editor.enable_inlay_hints;
-        // One shared answer to "what can this buffer be asked to do", also used
-        // by the command palette so the two surfaces can't drift.
-        let caps = self.buffer_capabilities();
         let has_buffer = caps.has_buffer;
         let has_text_buffer = caps.is_text_buffer;
         let has_selection = has_buffer && self.has_active_selection();
@@ -171,37 +185,19 @@ impl Editor {
 }
 
 impl crate::app::window::Window {
-    /// Check if line numbers are visible in the active split.
+    /// Check if line numbers are visible for the buffer the user is on.
     pub(crate) fn is_line_numbers_visible(&self) -> bool {
-        let (mgr, vs) = self
-            .buffers
-            .splits()
-            .expect("active window must have a populated split layout");
-        vs.get(&mgr.active_split())
-            .map(|vs| vs.show_line_numbers)
-            .unwrap_or(true)
+        self.focused_view().show_line_numbers
     }
 
-    /// Check if line wrap is enabled in the active split.
+    /// Check if line wrap is enabled for the buffer the user is on.
     pub(crate) fn is_line_wrap_enabled(&self) -> bool {
-        let (mgr, vs) = self
-            .buffers
-            .splits()
-            .expect("active window must have a populated split layout");
-        vs.get(&mgr.active_split())
-            .map(|vs| vs.viewport.line_wrap_enabled)
-            .unwrap_or(false)
+        self.focused_view().viewport.line_wrap_enabled
     }
 
     /// Check if compose mode is active in the current buffer.
     pub(crate) fn is_page_view(&self) -> bool {
-        let (mgr, vs) = self
-            .buffers
-            .splits()
-            .expect("active window must have a populated split layout");
-        vs.get(&mgr.active_split())
-            .map(|vs| vs.view_mode == crate::state::ViewMode::PageView)
-            .unwrap_or(false)
+        self.focused_view().view_mode == crate::state::ViewMode::PageView
     }
 
     /// Check if the file explorer is currently focused.
@@ -246,19 +242,16 @@ impl crate::app::window::Window {
     }
 
     /// Check if the active buffer is shown in more than one visible split.
+    ///
+    /// Counted over the panes that show a buffer (`buffer_panes`): a pane
+    /// showing a group tab does not show the buffer behind it.
     pub(crate) fn has_same_buffer_splits(&self) -> bool {
-        let (mgr, vs) = self
-            .buffers
-            .splits()
-            .expect("active window must have a populated split layout");
-        let active_split = mgr.active_split();
-        let active_buf_id = mgr.buffer_for_split(active_split);
-        if let Some(buf_id) = active_buf_id {
-            vs.keys()
-                .any(|&s| s != active_split && mgr.buffer_for_split(s) == Some(buf_id))
-        } else {
-            false
-        }
+        let active = self.active_buffer();
+        self.buffer_panes()
+            .into_iter()
+            .filter(|(_, b)| *b == active)
+            .count()
+            > 1
     }
 
     /// Check if a formatter is configured for the current buffer's language.

@@ -4,7 +4,6 @@ use crate::common::harness::{copy_plugin, copy_plugin_lib, EditorTestHarness};
 use crossterm::event::{KeyCode, KeyModifiers};
 use fresh::input::commands::Suggestion;
 use fresh::input::keybindings::Action;
-use fresh::services::live_grep_state::{GrepMatch, LiveGrepLastState};
 use fresh::view::prompt::PromptType;
 use std::fs;
 
@@ -115,13 +114,96 @@ fn test_live_grep_git_grep_flow_finds_match_in_repo() {
     );
 }
 
+/// `file_explorer.custom_ignore_patterns` is the one list of what to leave
+/// out, so Live Grep honours it like the file explorer and Quick Open do: a
+/// tracked file under an ignored directory is not a result, while its
+/// sibling outside it is.
+#[test]
+fn test_live_grep_leaves_out_custom_ignore_patterns() {
+    let git_check = std::process::Command::new("git").arg("--version").output();
+    if git_check.is_err() || !git_check.as_ref().unwrap().status.success() {
+        eprintln!("Skipping test: `git` is not installed or not in PATH");
+        return;
+    }
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let project_root = temp_dir.path().canonicalize().unwrap().join("project_root");
+    fs::create_dir(&project_root).unwrap();
+    let run_git = |args: &[&str]| {
+        let out = git_command(&project_root).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run_git(&["init", "--quiet", "-b", "main"]);
+
+    let plugins_dir = project_root.join("plugins");
+    fs::create_dir(&plugins_dir).unwrap();
+    copy_plugin_lib(&plugins_dir);
+    copy_plugin(&plugins_dir, "live_grep");
+
+    let unique = "CUSTOM_IGNORE_TOKEN_5c1d";
+    fs::write(project_root.join("kept.rs"), format!("// {unique}\n")).unwrap();
+    fs::create_dir(project_root.join("generated")).unwrap();
+    fs::write(
+        project_root.join("generated/dropped.rs"),
+        format!("// {unique}\n"),
+    )
+    .unwrap();
+    run_git(&["add", "kept.rs", "generated/dropped.rs"]);
+    run_git(&["commit", "--quiet", "-m", "seed"]);
+
+    let start_file = project_root.join("start.txt");
+    fs::write(&start_file, "start\n").unwrap();
+
+    let mut config = fresh::config::Config::default();
+    config.file_explorer.custom_ignore_patterns = vec!["generated/".to_string()];
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(140, 30, config, project_root.clone())
+            .unwrap();
+    harness.open_file(&start_file).unwrap();
+    harness.render().unwrap();
+
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness.type_text("Live Grep").unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Live Grep"))
+        .unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    harness.type_text(unique).unwrap();
+
+    // One provider call returns every file hit at once, so once `kept.rs`
+    // is listed the ignored file would be too, were it searched.
+    harness
+        .wait_until(|h| {
+            let s = h.screen_to_string();
+            s.contains("kept.rs") && s.contains("git-grep")
+        })
+        .unwrap();
+    let screen = harness.screen_to_string();
+    assert!(
+        !screen.contains("dropped.rs"),
+        "a file under a custom_ignore_patterns directory must not be a result; got:\n{screen}"
+    );
+}
+
 /// The Buffers scope must find matches in *open* buffers, including
 /// unmodified ones, when it is the only file-backed scope active. The
 /// buffer scan is otherwise restricted to modified buffers (the disk grep
 /// covers saved ones) — but with Files off, that restriction left a
 /// buffers-only search finding nothing for content plainly in an open
 /// buffer. This drives the real plugin path (no subprocess: the buffer
-/// scan is pure JS over `listBuffers`/`getBufferText`).
+/// scan is `listBuffers` and the editor's `searchBuffer`).
 #[test]
 fn test_live_grep_buffers_scope_finds_unmodified_open_buffer() {
     let temp_dir = tempfile::TempDir::new().unwrap();
@@ -161,7 +243,7 @@ fn test_live_grep_buffers_scope_finds_unmodified_open_buffer() {
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
     harness
-        .wait_until(|h| h.screen_to_string().contains("Search in:"))
+        .wait_until(|h| h.screen_to_string().contains("Scope "))
         .unwrap();
 
     // Narrow to Buffers only: turn off Files (Alt+L) and Terminals (Alt+T),
@@ -183,6 +265,94 @@ fn test_live_grep_buffers_scope_finds_unmodified_open_buffer() {
     // `<file>:<line>` stays visible and only ever appears in a result row.
     harness
         .wait_until(|h| h.screen_to_string().contains("notes.txt:2"))
+        .unwrap();
+}
+
+/// Universal Search folds case by default, and its **Case** toggle is how
+/// you say otherwise (issue #3212).
+///
+/// The overlay used to decide this by smart-case — case-insensitive unless
+/// the query carried an uppercase letter — which is an unreachable setting:
+/// searching `Foo` could never find `foo`. Here the query is capitalised and
+/// the file spells the token in lower case, so the old rule would have found
+/// nothing. Drives the Buffers scope, which the editor searches (no rg/grep
+/// subprocess) and so is deterministic on any host.
+#[test]
+fn live_grep_folds_case_until_the_case_toggle_says_otherwise() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let project_root = temp_dir.path().canonicalize().unwrap().join("project_root");
+    fs::create_dir(&project_root).unwrap();
+
+    let plugins_dir = project_root.join("plugins");
+    fs::create_dir(&plugins_dir).unwrap();
+    copy_plugin_lib(&plugins_dir);
+    copy_plugin(&plugins_dir, "live_grep");
+
+    let target = project_root.join("notes.txt");
+    fs::write(&target, "alpha\ncasetoken_9f1 here\ngamma\n").unwrap();
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        140,
+        30,
+        Default::default(),
+        project_root.clone(),
+    )
+    .unwrap();
+    harness.open_file(&target).unwrap();
+    harness.render().unwrap();
+
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness.type_text("Live Grep (Find").unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Live Grep"))
+        .unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Scope "))
+        .unwrap();
+
+    // The toolbar offers the toggle, and it starts off.
+    let toolbar = harness.screen_to_string();
+    assert!(
+        toolbar.contains("[ ] Case"),
+        "the Match row should offer an unchecked Case toggle; got:\n{toolbar}"
+    );
+
+    // Buffers only: drop Files (Alt+L) and Terminals (Alt+T).
+    harness
+        .send_key(KeyCode::Char('l'), KeyModifiers::ALT)
+        .unwrap();
+    harness
+        .send_key(KeyCode::Char('t'), KeyModifiers::ALT)
+        .unwrap();
+    harness.render().unwrap();
+
+    // A capitalised query finds the lowercase token, which smart-case
+    // could not.
+    harness.type_text("CaseToken_9f1").unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("notes.txt:2"))
+        .unwrap();
+
+    // Alt+C turns matching case-sensitive, and the row goes away.
+    //
+    // Checked is `[v]` here, not `[x]`: this is a plugin widget toolbar
+    // (`lib/widgets.ts`'s `toggle`), not the core search-options row the
+    // find prompt draws. Waiting on the wrong glyph is a hang, not a
+    // failure — the wait just never resolves.
+    harness
+        .send_key(KeyCode::Char('c'), KeyModifiers::ALT)
+        .unwrap();
+    harness
+        .wait_until(|h| {
+            let screen = h.screen_to_string();
+            screen.contains("[v] Case") && !screen.contains("notes.txt:2")
+        })
         .unwrap();
 }
 
@@ -233,7 +403,7 @@ fn test_live_grep_preview_highlights_query_matches() {
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
     harness
-        .wait_until(|h| h.screen_to_string().contains("Search in:"))
+        .wait_until(|h| h.screen_to_string().contains("Scope "))
         .unwrap();
 
     // Buffers only: drop Files (Alt+L) and Terminals (Alt+T).
@@ -754,136 +924,23 @@ fn test_live_grep_uses_working_dir() {
     );
 }
 
-/// Regression test for issue #1796 (capture side): cancelling the
-/// Live Grep prompt with no input and no streamed results must NOT
-/// populate the Resume cache. Pre-fix, `cancel_prompt` stored
-/// `Some(LiveGrepLastState { cached_results: Some(vec![]), .. })`,
-/// which combined with the Resume gate's `cached_results.is_some()`
-/// check caused Resume to open an empty static popup.
-#[test]
-fn test_resume_live_grep_capture_skips_empty_dismissal() {
-    let mut harness = EditorTestHarness::new(80, 24).unwrap();
-
-    harness
-        .editor_mut()
-        .start_prompt("Live grep: ".to_string(), PromptType::LiveGrep);
-    // Press Esc immediately — no input typed, no results seeded.
-    harness.editor_mut().cancel_prompt();
-
-    assert!(
-        harness.editor().live_grep_last_state_for_tests().is_none(),
-        "Cancelling Live Grep with empty input must not populate the Resume cache; \
-         pre-fix this stored Some(LiveGrepLastState {{ cached_results: Some(vec![]), .. }}) \
-         which made Resume open an empty popup."
-    );
-}
-
-/// Regression test for the bug surfaced after the initial fix shipped:
-/// pressing Enter on a Live Grep result jumps to the file but loses
-/// the Resume cache, so Alt+r returns the user to a fresh-empty popup
-/// instead of their match list. Pre-fix `confirm_prompt` had no
-/// caching for Live Grep prompts; only `cancel_prompt` did. Post-fix
-/// the confirm path mirrors the cancel path's gates.
-#[test]
-fn test_resume_live_grep_capture_on_confirm_with_results() {
-    let mut harness = EditorTestHarness::new(80, 24).unwrap();
-
-    harness
-        .editor_mut()
-        .start_prompt("Live grep: ".to_string(), PromptType::LiveGrep);
-    if let Some(prompt) = harness.editor_mut().prompt_mut() {
-        prompt.set_input_plain("needle".to_string());
-        prompt.set_cursor_byte(prompt.input_str().len());
-        let mut s = Suggestion::new("src/foo.rs:42".to_string());
-        s.description = Some("fn needle() {}".to_string());
-        s.value = Some("src/foo.rs:42:1".to_string());
-        prompt.suggestions = vec![s];
-        prompt.selected_suggestion = Some(0);
-    }
-    let _ = harness.editor_mut().confirm_prompt();
-
-    let cached = harness
-        .editor()
-        .live_grep_last_state_for_tests()
-        .expect("Confirming Live Grep on a real result must populate the Resume cache");
-    assert_eq!(cached.query, "needle");
-    assert_eq!(cached.selected_index, Some(0));
-    let results = cached
-        .cached_results
-        .as_ref()
-        .expect("cached_results must be Some after confirm");
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].file, "src/foo.rs");
-    assert_eq!(results[0].line, 42);
-}
-
-/// Regression test for issue #1796 (replay side): even if a degenerate
-/// `Some(empty Vec)` cache is somehow present, `ResumeLiveGrep` must
-/// fall through to the fresh-start path rather than seeding an empty
-/// `PromptType::LiveGrep` overlay. Defends against any future code
-/// path that writes such a state, independent of the capture-side gate.
-#[test]
-fn test_resume_live_grep_replay_skips_empty_cache() {
-    let mut harness = EditorTestHarness::new(80, 24).unwrap();
-
-    harness
-        .editor_mut()
-        .set_live_grep_last_state_for_tests(Some(LiveGrepLastState {
-            query: String::new(),
-            selected_index: None,
-            cached_results: Some(Vec::<GrepMatch>::new()),
-            cached_at: None,
-            last_results_snapshot_id: None,
-        }));
-    harness
-        .editor_mut()
-        .dispatch_action_for_tests(Action::ResumeLiveGrep);
-
-    // Plugins aren't loaded in this minimal harness, so the fresh-start
-    // path can't create a plugin prompt. Pre-fix the replay branch would
-    // still seed a PromptType::LiveGrep overlay from the empty cache —
-    // post-fix the gate rejects empty results so no prompt opens.
-    let prompt_input = harness.editor().prompt_input();
-    assert!(
-        prompt_input.is_none(),
-        "Resume with an empty cached_results must fall through to the fresh-start \
-         path, not seed a PromptType::LiveGrep overlay from the empty cache. \
-         Got prompt_input = {:?}",
-        prompt_input
-    );
-}
-
 /// Resume runs the *same* flow as a fresh Live Grep (via the plugin's
 /// `resume_live_grep`), seeded with the last query — it no longer builds a
-/// bespoke core overlay from the Rust-side cache. In this minimal harness no
-/// plugins are loaded, so Resume opens no prompt even when a cache exists;
-/// that absence is the regression guard against the old bespoke path.
+/// bespoke core overlay. In this minimal harness no plugins are loaded, so
+/// Resume opens no prompt; that absence is the regression guard against the
+/// old core path.
 #[test]
-fn test_resume_live_grep_routes_through_plugin_not_core_cache() {
+fn test_resume_live_grep_routes_through_plugin() {
     let mut harness = EditorTestHarness::new(80, 24).unwrap();
 
-    harness
-        .editor_mut()
-        .set_live_grep_last_state_for_tests(Some(LiveGrepLastState {
-            query: "cached_query".to_string(),
-            selected_index: Some(0),
-            cached_results: Some(vec![GrepMatch {
-                file: "src/foo.rs".to_string(),
-                line: 42,
-                column: 1,
-                content: "fn cached_query() {}".to_string(),
-            }]),
-            cached_at: None,
-            last_results_snapshot_id: None,
-        }));
     harness
         .editor_mut()
         .dispatch_action_for_tests(Action::ResumeLiveGrep);
     assert_eq!(
         harness.editor().prompt_input(),
         None,
-        "Resume must route through the plugin flow, not seed a bespoke core \
-         overlay from the Rust cache (no plugins loaded here, so no prompt opens)"
+        "Resume must route through the plugin flow, not open a core overlay \
+         (no plugins loaded here, so no prompt opens)"
     );
 }
 
@@ -1069,9 +1126,10 @@ fn seed_overlay_results(harness: &mut EditorTestHarness, labels: &[&str], select
     let prompt = harness.editor_mut().prompt_mut().unwrap();
     prompt.suggestions = labels
         .iter()
-        .map(|l| Suggestion::new(l.to_string()))
-        .collect();
-    prompt.selected_suggestion = selected;
+        .map(|l| Suggestion::new(l.to_string(), l.to_string()))
+        .collect::<Vec<_>>()
+        .into();
+    prompt.select_suggestion(selected);
 }
 
 /// Issue #1: undo/redo must operate on the filter input box, not the
@@ -1085,7 +1143,7 @@ fn test_live_grep_input_undo_redo() {
     harness.type_text("ZQXJV").unwrap();
     harness.render().unwrap();
     assert!(
-        harness.screen_to_string().contains("Live grep: ZQXJV"),
+        harness.screen_to_string().contains("Live grep: [ZQXJV"),
         "input box should show the typed query; got:\n{}",
         harness.screen_to_string()
     );
@@ -1213,6 +1271,30 @@ fn test_live_grep_preview_wraps_long_lines() {
     );
 }
 
+/// A result in no file (a line on a terminal's screen) carries its index as
+/// its `value`: nothing is previewed for it, rather than its label being
+/// parsed as a path, which opened a buffer for a file that isn't there
+/// (issue #3645). The label here does name a real file, so a fallback to it
+/// would show that file's marker.
+#[test]
+fn test_live_grep_previews_nothing_for_a_result_in_no_file() {
+    let files = &[("scrollback.txt", "TERMPREVIEWMARKER\nmatch line here\n")];
+    let (mut harness, _tmp) = open_live_grep_overlay(files, Default::default());
+    {
+        let prompt = harness.editor_mut().prompt_mut().unwrap();
+        prompt.suggestions =
+            vec![Suggestion::new("0", "scrollback.txt:1".to_string()).with_value("0".to_string())]
+                .into();
+        prompt.select_suggestion(Some(0));
+    }
+    harness.render().unwrap();
+    assert!(
+        !harness.screen_to_string().contains("TERMPREVIEWMARKER"),
+        "a result whose value is no location must preview nothing. Screen:\n{}",
+        harness.screen_to_string()
+    );
+}
+
 /// Issue #5: non-file scopes (terminals, diagnostics, buffers) carry a
 /// source badge in the result-list label — e.g. `[term] …` — which makes
 /// the label unparseable as a `path:line:col`. The authoritative location
@@ -1232,9 +1314,13 @@ fn test_live_grep_preview_uses_value_not_badged_label() {
     // authoritative relative path:line:col.
     {
         let prompt = harness.editor_mut().prompt_mut().unwrap();
-        prompt.suggestions = vec![Suggestion::new("[term] not-a-real-file.txt:1".to_string())
-            .with_value("scrollback.txt:2:1".to_string())];
-        prompt.selected_suggestion = Some(0);
+        prompt.suggestions = vec![Suggestion::new(
+            "term:scrollback.txt:2:1",
+            "[term] not-a-real-file.txt:1".to_string(),
+        )
+        .with_value("scrollback.txt:2:1".to_string())]
+        .into();
+        prompt.select_suggestion(Some(0));
     }
     harness.render().unwrap();
 
@@ -1296,7 +1382,7 @@ fn test_live_grep_overlay_is_mouse_modal() {
         .unwrap();
     harness.render().unwrap();
     assert!(
-        harness.screen_to_string().contains("Live grep:"),
+        harness.screen_to_string().contains("Search "),
         "Live Grep overlay should be open; screen:\n{}",
         harness.screen_to_string()
     );
@@ -1350,7 +1436,457 @@ fn test_live_grep_overlay_is_mouse_modal() {
 
     // The overlay stays up through all of it (no stray dismissal).
     assert!(
-        harness.screen_to_string().contains("Live grep:"),
+        harness.screen_to_string().contains("Search "),
         "overlay should still be open after the clicks"
+    );
+}
+
+/// **The overlay toolbar is on the prompt's ring.** Tab moves the keyboard
+/// from the query input onto the first scope toggle, Space flips it, and a
+/// navigation key hands the keyboard back to the input along with itself —
+/// the ring `handle_overlay_toolbar_key` used to walk by hand, now the tree's
+/// one ring confined to the card (`prompt::keys_layer`, `overlay_prompt`).
+///
+/// Observed on the `Files` toggle's rendered background: it gains the focus
+/// highlight when tabbed to, and reverts once Down moves the keyboard back
+/// to the input.
+#[test]
+fn test_live_grep_toolbar_is_on_the_prompts_ring() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let project_root = temp_dir.path().join("project_root");
+    fs::create_dir(&project_root).unwrap();
+    let plugins_dir = project_root.join("plugins");
+    fs::create_dir(&plugins_dir).unwrap();
+    copy_plugin_lib(&plugins_dir);
+    copy_plugin(&plugins_dir, "live_grep");
+    let file = project_root.join("buf.txt");
+    fs::write(&file, "hello world\n").unwrap();
+
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(120, 30, Default::default(), project_root)
+            .unwrap();
+    harness.open_file(&file).unwrap();
+    harness.render().unwrap();
+
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness.type_text("Live Grep").unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Live Grep"))
+        .unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    // The plugin sets the toolbar after the prompt opens; wait for the
+    // described band to show its first row.
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Scope "))
+        .unwrap();
+
+    // The `Files` toggle is the first control on the ring. Sample its label
+    // cell: the focus highlight covers the whole control.
+    let (col, row) = harness
+        .find_text_on_screen("Files")
+        .expect("the Files toggle is in the toolbar");
+    let files_bg = move |h: &EditorTestHarness| h.get_cell_style(col, row).and_then(|s| s.bg);
+    let unfocused = files_bg(&harness);
+    assert!(
+        harness.screen_to_string().contains("[v] Files"),
+        "files scope starts enabled; screen:\n{}",
+        harness.screen_to_string()
+    );
+
+    // Tab: input → first toggle.
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+    harness
+        .wait_until(|h| files_bg(h) != unfocused)
+        .expect("Tab focuses the Files toggle");
+
+    // Space on the focused toggle flips it; the plugin re-emits the toolbar
+    // with the new state, and the control keeps the keyboard.
+    harness
+        .send_key(KeyCode::Char(' '), KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("[ ] Files"))
+        .expect("Space unchecks the toggle");
+    assert!(
+        files_bg(&harness) != unfocused,
+        "the toggle keeps the keyboard after Space"
+    );
+
+    // Down is the results' key: the keyboard goes back to the input with it,
+    // and the toggle's highlight goes.
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness
+        .wait_until(|h| files_bg(h) == unfocused)
+        .expect("Down hands the keyboard back to the input");
+
+    // And typing edits the query.
+    harness.type_text("hel").unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("[hel"))
+        .expect("typing after Down edits the query");
+}
+
+/// The provider dropdown in the toolbar: while its option list is up the
+/// arrows stay with the list (rather than stepping the results, which is
+/// what they do on any other toolbar control), and Esc closes only the list
+/// — the overlay stays open until a second Esc.
+#[test]
+fn test_live_grep_provider_dropdown_keeps_its_keys_while_open() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let project_root = temp_dir.path().join("project_root");
+    fs::create_dir(&project_root).unwrap();
+    let plugins_dir = project_root.join("plugins");
+    fs::create_dir(&plugins_dir).unwrap();
+    copy_plugin_lib(&plugins_dir);
+    copy_plugin(&plugins_dir, "live_grep");
+    let file = project_root.join("buf.txt");
+    fs::write(&file, "hello world\n").unwrap();
+
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(120, 30, Default::default(), project_root)
+            .unwrap();
+    harness.open_file(&file).unwrap();
+    harness.render().unwrap();
+
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness.type_text("Live Grep").unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Live Grep"))
+        .unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .wait_until(|h| {
+            h.screen_to_string().contains("Provider ") && h.screen_to_string().contains("▼]")
+        })
+        .expect("the provider dropdown is in the toolbar");
+
+    // Shift+Tab from the input walks the ring backwards onto its last
+    // control, the dropdown; Enter opens the list.
+    harness
+        .send_key(KeyCode::BackTab, KeyModifiers::SHIFT)
+        .unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("▲]"))
+        .expect("Enter opens the provider list");
+
+    // Down moves within the list; it does not hand the keyboard back to the
+    // input (which would close the list).
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+    assert!(
+        harness.screen_to_string().contains("▲]"),
+        "Down keeps the list open; screen:\n{}",
+        harness.screen_to_string()
+    );
+
+    // Esc closes the list and nothing else.
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("▼]"))
+        .expect("Esc closes the provider list");
+    assert!(
+        harness.screen_to_string().contains("Scope "),
+        "the overlay stays open after the first Esc; screen:\n{}",
+        harness.screen_to_string()
+    );
+}
+
+/// Seed `n` results named `r000.txt:1` … and select the first.
+fn seed_many_results(harness: &mut EditorTestHarness, n: usize) {
+    let labels: Vec<String> = (0..n).map(|i| format!("r{i:03}.txt:1")).collect();
+    let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+    seed_overlay_results(harness, &labels, Some(0));
+    harness.render().unwrap();
+}
+
+/// The results on screen, by index, top to bottom.
+fn results_on_screen(harness: &EditorTestHarness) -> Vec<usize> {
+    harness
+        .screen_to_string()
+        .lines()
+        .filter_map(|l| {
+            let at = l.find(" r")? + 2;
+            l.get(at..at + 3)?.parse().ok()
+        })
+        .collect()
+}
+
+fn selected_result(harness: &EditorTestHarness) -> Option<usize> {
+    harness
+        .editor()
+        .active_window()
+        .prompt
+        .as_ref()
+        .and_then(|p| p.selected_suggestion())
+}
+
+/// **PageDown in Live Grep moves by the results on screen.** It moved a
+/// fixed ten rows, whatever the results band's height; the list records the
+/// window its layout placed, and a page is that.
+#[test]
+fn test_live_grep_page_down_moves_by_the_results_window() {
+    let (mut harness, _tmp) = open_live_grep_overlay(&[], Default::default());
+    seed_many_results(&mut harness, 200);
+    let rows = results_on_screen(&harness).len();
+    assert!(
+        rows > 10,
+        "the band shows more than ten results:\n{}",
+        harness.screen_to_string()
+    );
+
+    harness
+        .send_key(KeyCode::PageDown, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    assert_eq!(selected_result(&harness), Some(rows));
+    assert!(
+        results_on_screen(&harness).contains(&rows),
+        "the window follows the selection:\n{}",
+        harness.screen_to_string()
+    );
+    harness
+        .send_key(KeyCode::PageUp, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    assert_eq!(selected_result(&harness), Some(0));
+}
+
+/// **The results window follows its selection inside the list, and a wheel
+/// scroll stays.** Moving the selection past the band's last row scrolls
+/// the window by one row; a wheel scroll afterwards moves the window away
+/// from the selection and later frames, including more results streaming
+/// in, leave it there until the keyboard moves the selection again
+/// (issue #2119).
+#[test]
+fn test_live_grep_results_window_follows_selection_and_keeps_the_wheel() {
+    use crossterm::event::{MouseEvent, MouseEventKind};
+    let (mut harness, _tmp) = open_live_grep_overlay(&[], Default::default());
+    seed_many_results(&mut harness, 100);
+    let rows = results_on_screen(&harness).len();
+
+    for _ in 0..rows {
+        harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    }
+    harness.render().unwrap();
+    let shown = results_on_screen(&harness);
+    assert_eq!(selected_result(&harness), Some(rows));
+    assert_eq!(
+        (shown.first().copied(), shown.last().copied()),
+        (Some(1), Some(rows)),
+        "the window moved one row to show the selection:\n{}",
+        harness.screen_to_string()
+    );
+
+    // Wheel down over the results, past the selection.
+    let screen = harness.screen_to_string();
+    let (row, line) = screen
+        .lines()
+        .enumerate()
+        .find(|(_, l)| l.contains(&format!(" r{:03}.txt", rows / 2)))
+        .expect("a result on screen");
+    let column = line.find(" r").unwrap() as u16 + 2;
+    for _ in 0..20 {
+        harness
+            .send_mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column,
+                row: row as u16,
+                modifiers: KeyModifiers::NONE,
+            })
+            .unwrap();
+    }
+    // The config passed above keeps animations on, so each notch's lines
+    // are walked out by the wall clock across later frames. Let the walk
+    // finish before recording the window, or a slow runner's later frames
+    // still carry wheel lines and move it.
+    harness
+        .wait_until(|h| !h.editor().has_pending_wheel_scroll())
+        .unwrap();
+    let wheeled = results_on_screen(&harness);
+    assert!(
+        !wheeled.contains(&rows),
+        "the wheel moved the window off the selection:\n{}",
+        harness.screen_to_string()
+    );
+
+    // More results stream in; the selection stays on its result.
+    let labels: Vec<String> = (0..120).map(|i| format!("r{i:03}.txt:1")).collect();
+    let prompt = harness.editor_mut().prompt_mut().unwrap();
+    prompt.suggestions = labels
+        .iter()
+        .map(|l| Suggestion::new(l.clone(), l.clone()))
+        .collect::<Vec<_>>()
+        .into();
+    harness.render().unwrap();
+    harness.render().unwrap();
+    assert_eq!(selected_result(&harness), Some(rows));
+    assert_eq!(
+        results_on_screen(&harness),
+        wheeled,
+        "later frames leave the wheel's window:\n{}",
+        harness.screen_to_string()
+    );
+
+    // The keyboard brings it back.
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+    assert!(
+        results_on_screen(&harness).contains(&(rows + 1)),
+        "{}",
+        harness.screen_to_string()
+    );
+}
+
+/// The Terminals scope finds text still on a terminal's screen, not only
+/// lines that have scrolled into its history, and finds it without writing:
+/// the terminal stays in terminal mode, and its backing file stays as the
+/// read loop left it (issue #3645).
+#[test]
+#[cfg_attr(target_os = "windows", ignore)] // `printf` in a Unix shell
+fn live_grep_finds_text_still_on_a_terminal_screen() {
+    use portable_pty::{native_pty_system, PtySize};
+    let pty = native_pty_system().openpty(PtySize {
+        rows: 1,
+        cols: 1,
+        pixel_width: 0,
+        pixel_height: 0,
+    });
+    if pty.is_err() {
+        eprintln!("Skipping test: PTY not available in this environment");
+        return;
+    }
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let project_root = temp_dir.path().canonicalize().unwrap().join("project_root");
+    fs::create_dir(&project_root).unwrap();
+    let plugins_dir = project_root.join("plugins");
+    fs::create_dir(&plugins_dir).unwrap();
+    copy_plugin_lib(&plugins_dir);
+    copy_plugin(&plugins_dir, "live_grep");
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        140,
+        30,
+        Default::default(),
+        project_root.clone(),
+    )
+    .unwrap();
+    harness.editor_mut().open_terminal();
+    // `\x5a` is `Z`: the marker is only ever on screen as output, never as
+    // the typed command
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .send_terminal_input(b"printf '\\x5aEBRA_3645\\n'\n");
+    harness
+        .wait_until(|h| h.screen_to_string().contains("ZEBRA_3645"))
+        .unwrap();
+
+    harness
+        .run_palette_command("Live Grep (Find in Files)")
+        .unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Scope "))
+        .unwrap();
+    harness.type_text("ZEBRA_3645").unwrap();
+
+    // A Terminals result row for the screen's line
+    harness
+        .wait_until(|h| h.screen_to_string().contains("[term] "))
+        .unwrap();
+
+    // The search read the screen; it wrote no file
+    let terminals = harness
+        .editor()
+        .dir_context()
+        .terminal_dir_for(&project_root);
+    for entry in fs::read_dir(&terminals).unwrap().flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "txt") {
+            let text = fs::read_to_string(&path).unwrap();
+            assert!(
+                !text.contains("ZEBRA_3645"),
+                "{} holds the screen after a search: {text:?}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// A Terminals hit from a terminal's history (its backing file, not its
+/// screen) is listed under the terminal's name, like a hit on its screen,
+/// rather than under the backing file's path.
+#[test]
+#[cfg_attr(target_os = "windows", ignore)] // `printf`/`seq` in a Unix shell
+fn live_grep_names_a_terminal_history_hit_after_its_terminal() {
+    use portable_pty::{native_pty_system, PtySize};
+    let pty = native_pty_system().openpty(PtySize {
+        rows: 1,
+        cols: 1,
+        pixel_width: 0,
+        pixel_height: 0,
+    });
+    if pty.is_err() {
+        eprintln!("Skipping test: PTY not available in this environment");
+        return;
+    }
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let project_root = temp_dir.path().canonicalize().unwrap().join("project_root");
+    fs::create_dir(&project_root).unwrap();
+    let plugins_dir = project_root.join("plugins");
+    fs::create_dir(&plugins_dir).unwrap();
+    copy_plugin_lib(&plugins_dir);
+    copy_plugin(&plugins_dir, "live_grep");
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        140,
+        30,
+        Default::default(),
+        project_root.clone(),
+    )
+    .unwrap();
+    harness.editor_mut().open_terminal();
+    // The marker, then enough lines to push it off the screen into history
+    harness
+        .editor_mut()
+        .active_window_mut()
+        .send_terminal_input(b"printf '\\x5aEBRA_HISTORY\\n'; seq 1000 1100\n");
+    harness
+        .wait_until(|h| {
+            let s = h.screen_to_string();
+            s.contains("1100") && !s.contains("ZEBRA_HISTORY")
+        })
+        .unwrap();
+
+    harness
+        .run_palette_command("Live Grep (Find in Files)")
+        .unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Scope "))
+        .unwrap();
+    harness.type_text("ZEBRA_HISTORY").unwrap();
+    // One result, the history line
+    harness
+        .wait_until(|h| h.screen_to_string().contains("] 1 / 1"))
+        .unwrap();
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("[term] ") && !screen.contains("fresh-terminal-"),
+        "the row names the terminal, not its backing file:\n{screen}"
     );
 }

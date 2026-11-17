@@ -1,352 +1,247 @@
 //! File Recovery Service
 //!
-//! This module provides Emacs-style file recovery for the Fresh editor.
-//! It automatically saves buffer contents periodically and can recover
-//! them if the editor crashes.
+//! Emacs-style recovery for the Fresh editor: modified buffers are written
+//! to the recovery store every few seconds, kept there over a clean exit
+//! (hot exit), and brought back the next time their workspace is shown —
+//! whichever way the editor is launched. A crash leaves them there too.
 //!
 //! ## How it works
 //!
-//! 1. **Session Lock**: On startup, creates a lock file with the process ID
-//! 2. **Auto-Save**: Periodically saves modified buffers to recovery directory
-//! 3. **Crash Detection**: On startup, checks if lock file exists without running process
-//! 4. **Recovery**: If crash detected, offers to recover unsaved changes
-//!
-//! ## File Layout
-//!
-//! ```text
-//! ~/.local/share/fresh/recovery/
-//! ├── session.lock           # Session info (PID, start time)
-//! ├── {hash}.meta.json       # Recovery metadata with chunk index
-//! ├── {hash}.chunk.0         # Chunk 0 binary content
-//! ├── {hash}.chunk.1         # Chunk 1 binary content
-//! └── ...
-//! ```
+//! 1. **One store per project root** (see [`store`]), shared by every launch
+//!    mode, so any editor showing a workspace finds its unsaved work.
+//! 2. **Each running editor holds a lock** and writes only under its own
+//!    directory, so other editors leave its live buffers alone, and what it
+//!    held becomes recoverable the moment it stops, however it stops.
+//! 3. **Each buffer has its own entry**, with a random id and the file it
+//!    is for recorded inside, so two buffers on one file never share one.
+//! 4. **A save records itself in the entry** before writing the file
+//!    ([`types::SaveIntent`]), so a crash on either side of the write is
+//!    settled with one `stat`.
 //!
 //! ## Storage Format
 //!
 //! All recovery data uses a chunked format:
 //! - For small files/new buffers: single chunk containing full content
 //! - For large files: only modified regions stored as chunks
-//!
-//! ## Usage
-//!
-//! ```rust,ignore
-//! use fresh::services::recovery::RecoveryService;
-//!
-//! // On startup
-//! let mut recovery = RecoveryService::new()?;
-//! if recovery.should_offer_recovery()? {
-//!     let entries = recovery.list_recoverable()?;
-//!     // Show recovery prompt to user
-//! }
-//! recovery.start_session()?;
-//!
-//! // During editing (call periodically)
-//! // For small files/new buffers:
-//! recovery.save_buffer("id", chunks, Some(&path), None, Some(10), 0, content_len)?;
-//!
-//! // On clean shutdown
-//! recovery.end_session()?;
-//! ```
 
+mod file_locks;
 mod storage;
-pub mod types;
+mod store;
+// The on-disk record types live in `fresh-editor-core`: `model::buffer::save`
+// writes them for in-place-write recovery and cannot depend on `services`.
+pub use fresh_editor_core::recovery_types as types;
 
-pub use storage::{RecoveryScope, RecoveryStorage};
+pub use file_locks::FileLock;
+pub use storage::RecoveryStorage;
+pub use store::{all_entries, entries_dir, entries_for_root};
 pub use types::{
     generate_buffer_id, path_hash, ChunkMeta, ChunkedRecoveryData, ChunkedRecoveryIndex,
-    InplaceWriteRecovery, RecoveryChunk, RecoveryEntry, RecoveryMetadata, RecoveryResult,
-    SessionInfo, MAX_CHUNK_SIZE,
+    HotExitEntry, InplaceWriteRecovery, RecoveryChunk, RecoveryEntry, RecoveryMetadata,
+    RecoveryResult, SaveOutcome, SessionInfo, MAX_CHUNK_SIZE,
 };
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use store::Store;
 
 /// Configuration for the recovery service
 #[derive(Debug, Clone)]
 pub struct RecoveryConfig {
     /// Whether recovery is enabled
     pub enabled: bool,
-    /// Maximum age of recovery files before cleanup (in seconds)
-    pub max_recovery_age_secs: u64,
 }
 
 impl Default for RecoveryConfig {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            max_recovery_age_secs: 7 * 24 * 60 * 60, // 7 days
-        }
+        Self { enabled: true }
     }
 }
 
-/// The main recovery service
-///
-/// This is the high-level interface for the recovery system.
-/// It manages the session lock and coordinates buffer recovery.
+/// The main recovery service: this editor's view of the recovery store.
 #[derive(Debug)]
 pub struct RecoveryService {
-    /// Storage backend
-    storage: RecoveryStorage,
-    /// Configuration
-    config: RecoveryConfig,
-    /// Last auto-recovery-save time per buffer
-    last_save_times: HashMap<String, Instant>,
-    /// Session started flag
-    session_started: bool,
+    /// `None` when recovery is off, or this editor could not take its lock
+    /// (an unwritable store): without the lock, what it wrote would look
+    /// abandoned to every other editor, so it writes nothing.
+    store: Option<Store>,
 }
 
 impl RecoveryService {
-    /// Create a new recovery service
-    pub fn new() -> io::Result<Self> {
-        Ok(Self {
-            storage: RecoveryStorage::new()?,
-            config: RecoveryConfig::default(),
-            last_save_times: HashMap::new(),
-            session_started: false,
-        })
-    }
-
-    /// Create a new recovery service with custom config
-    pub fn with_config(config: RecoveryConfig) -> io::Result<Self> {
-        Ok(Self {
-            storage: RecoveryStorage::new()?,
-            config,
-            last_save_times: HashMap::new(),
-            session_started: false,
-        })
-    }
-
-    /// Create a new recovery service with a custom storage directory
-    /// This is useful for testing with isolated temporary directories
-    pub fn with_storage_dir(storage_dir: PathBuf) -> Self {
-        Self {
-            storage: RecoveryStorage::with_dir(storage_dir),
-            config: RecoveryConfig::default(),
-            last_save_times: HashMap::new(),
-            session_started: false,
-        }
-    }
-
-    /// Create a new recovery service with custom config and storage directory
-    pub fn with_config_and_dir(config: RecoveryConfig, storage_dir: PathBuf) -> Self {
-        Self {
-            storage: RecoveryStorage::with_dir(storage_dir),
-            config,
-            last_save_times: HashMap::new(),
-            session_started: false,
-        }
-    }
-
-    /// Create a new recovery service scoped to a named daemon or working directory.
-    ///
-    /// Performs one-time migration of old flat-layout recovery files if needed.
-    pub fn with_scope(
-        config: RecoveryConfig,
-        base_recovery_dir: &Path,
-        scope: &RecoveryScope,
-    ) -> Self {
-        // Attempt migration of old flat layout
-        if let Err(e) = RecoveryStorage::migrate_flat_layout(base_recovery_dir, scope) {
-            tracing::warn!("Failed to migrate recovery files: {}", e);
-        }
-        Self {
-            storage: RecoveryStorage::with_scope(base_recovery_dir, scope),
-            config,
-            last_save_times: HashMap::new(),
-            session_started: false,
-        }
+    /// The service over the recovery store in `base_recovery_dir`.
+    pub fn new(config: RecoveryConfig, base_recovery_dir: &Path) -> Self {
+        let store = if config.enabled {
+            match Store::open(base_recovery_dir) {
+                Ok(store) => Some(store),
+                Err(e) => {
+                    tracing::warn!(
+                        "Recovery is off: could not take a lock in {}: {}",
+                        base_recovery_dir.display(),
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Self { store }
     }
 
     /// Check if recovery is enabled
     pub fn is_enabled(&self) -> bool {
-        self.config.enabled
+        self.store.is_some()
     }
 
-    /// Get the storage backend
-    pub fn storage(&self) -> &RecoveryStorage {
-        &self.storage
+    /// This editor's id in the store, while recovery is on.
+    pub fn editor_id(&self) -> Option<&str> {
+        self.store.as_ref().map(Store::editor_id)
     }
 
-    // ========================================================================
-    // Session management
-    // ========================================================================
-
-    /// Check if we should offer recovery (crash detected)
-    pub fn should_offer_recovery(&self) -> io::Result<bool> {
-        if !self.config.enabled {
-            return Ok(false);
-        }
-
-        // Check for crash
-        if self.storage.detect_crash()? {
-            // Also check if there are any recovery files
-            let entries = self.storage.list_entries()?;
-            return Ok(!entries.is_empty());
-        }
-
-        Ok(false)
+    /// A new entry id, for a buffer that has none yet or whose last entry
+    /// was resolved (saved, discarded): an id is never reused, so a delete
+    /// still on its way can't remove the next backup.
+    pub fn new_entry_id() -> String {
+        generate_buffer_id()
     }
 
-    /// Start a new session (call on editor startup after recovery handling)
-    pub fn start_session(&mut self) -> io::Result<()> {
-        if !self.config.enabled {
-            return Ok(());
-        }
-
-        self.storage.create_session_lock()?;
-        self.session_started = true;
-        tracing::info!("Recovery session started");
-        Ok(())
-    }
-
-    /// End the session cleanly (call on normal editor shutdown)
-    ///
-    /// When `preserve_ids` is provided, recovery files matching those IDs
-    /// are kept (used to persist unnamed buffer contents across sessions).
-    pub fn end_session_preserving(&mut self, preserve_ids: &[String]) -> io::Result<()> {
-        if !self.config.enabled || !self.session_started {
-            return Ok(());
-        }
-
-        if preserve_ids.is_empty() {
-            // No IDs to preserve - clean up everything (original behavior)
-            let cleaned = self.storage.cleanup_all()?;
-            tracing::info!("Cleaned up {} recovery files", cleaned);
-        } else {
-            // Selectively clean up, preserving unnamed buffer recovery files
-            let entries = self.storage.list_entries()?;
-            let mut cleaned = 0;
-            for entry in entries {
-                if !preserve_ids.contains(&entry.id)
-                    && self.storage.delete_recovery(&entry.id).is_ok()
-                {
-                    cleaned += 1;
-                }
-            }
-            tracing::info!(
-                "Cleaned up {} recovery files, preserved {} unnamed buffer(s)",
-                cleaned,
-                preserve_ids.len()
-            );
-        }
-
-        // Remove session lock
-        self.storage.remove_session_lock()?;
-        self.session_started = false;
-        tracing::info!("Recovery session ended");
-        Ok(())
-    }
-
-    /// End the session cleanly (call on normal editor shutdown)
-    pub fn end_session(&mut self) -> io::Result<()> {
-        self.end_session_preserving(&[])
-    }
-
-    /// Update session heartbeat (call periodically)
-    pub fn heartbeat(&self) -> io::Result<()> {
-        if self.config.enabled && self.session_started {
-            self.storage.update_session_lock()?;
-        }
-        Ok(())
-    }
-
-    // ========================================================================
-    // Buffer tracking
-    // ========================================================================
-
-    /// Check if a buffer needs auto-recovery-save
-    ///
-    /// Returns true if recovery_pending is true. The recovery_pending flag is now
-    /// tracked on the buffer itself (TextBuffer.recovery_pending) rather than in this service.
-    pub fn needs_auto_recovery_save(&self, _buffer_id: &str, recovery_pending: bool) -> bool {
-        if !self.config.enabled {
-            return false;
-        }
-
-        // Must have pending recovery changes to need auto-save
-        recovery_pending
-    }
-
-    /// Get buffer ID for a path
-    pub fn get_buffer_id(&self, path: Option<&Path>) -> String {
-        self.storage.get_buffer_id(path)
-    }
-
-    // ========================================================================
-    // Recovery operations
-    // ========================================================================
-
-    /// Save a buffer's content for recovery
-    ///
-    /// All recovery uses the chunked format:
-    /// - For small files/new buffers: pass a single chunk containing full content
-    ///   with offset=0, original_len=0, original_file_size=0
-    /// - For large files: pass only the modified chunks with their offsets
-    ///
-    /// ## Parameters
-    ///
-    /// - `buffer_id`: Unique identifier for the buffer
-    /// - `chunks`: The content chunks to save
-    /// - `original_path`: Path to the original file (None for new buffers)
-    /// - `buffer_name`: Display name for the buffer
-    /// - `line_count`: Number of lines in the buffer
-    /// - `original_file_size`: Size of the original file (0 for new buffers)
-    /// - `final_size`: Total size after applying all modifications
+    /// Write buffer content to entry `id`, for a buffer in a window on
+    /// `root`, and return the handle the buffer keeps.
     #[allow(clippy::too_many_arguments)]
     pub fn save_buffer(
         &mut self,
-        buffer_id: &str,
+        root: &Path,
+        id: &str,
         chunks: Vec<RecoveryChunk>,
         original_path: Option<&Path>,
         buffer_name: Option<&str>,
         line_count: Option<usize>,
         original_file_size: usize,
         final_size: usize,
-    ) -> io::Result<()> {
-        if !self.config.enabled {
-            return Ok(());
-        }
-
-        self.storage.save_recovery(
-            buffer_id,
+        host: Option<&str>,
+    ) -> io::Result<Option<HotExitEntry>> {
+        let Some(store) = self.store.as_mut() else {
+            return Ok(None);
+        };
+        // Canonicalized as workspace files are, so one root is one hint
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        store.own_entry(id).save_recovery_owned(
+            id,
             chunks,
             original_path,
             buffer_name,
             line_count,
             original_file_size,
             final_size,
+            None,
+            Some(&root),
+            host,
         )?;
-        self.last_save_times
-            .insert(buffer_id.to_string(), Instant::now());
-
-        tracing::trace!(
-            "Saved recovery for buffer {} (original: {} bytes, final: {} bytes)",
-            buffer_id,
-            original_file_size,
-            final_size
-        );
-        Ok(())
+        Ok(Some(store.own_handle(id)))
     }
 
-    /// Delete recovery for a buffer (call when buffer is saved normally or closed)
-    pub fn delete_buffer_recovery(&mut self, buffer_id: &str) -> io::Result<()> {
-        if !self.config.enabled {
-            return Ok(());
+    /// Where this editor keeps entry `id`, so it can be deleted off the main
+    /// loop ([`Self::delete_entry_dir`]).
+    pub fn entry_dir(&self, id: &str) -> Option<PathBuf> {
+        self.store.as_ref().map(|s| s.own_entry_dir(id))
+    }
+
+    /// Delete an entry this editor holds, given [`Self::entry_dir`].
+    pub fn delete_entry_dir(dir: &Path) -> io::Result<()> {
+        match std::fs::remove_dir_all(dir) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
         }
-
-        self.storage.delete_recovery(buffer_id)?;
-        self.last_save_times.remove(buffer_id);
-
-        tracing::debug!("Deleted recovery for buffer {}", buffer_id);
-        Ok(())
     }
 
-    /// List all recoverable entries
-    pub fn list_recoverable(&self) -> io::Result<Vec<RecoveryEntry>> {
-        self.storage.list_entries()
+    /// Let go of entry `id`: it stays as unsaved work, held by no editor,
+    /// for whoever opens its buffer next. For a workspace closed with
+    /// unsaved work.
+    pub fn release(&mut self, id: &str) -> io::Result<()> {
+        match &mut self.store {
+            Some(store) => store.release(id),
+            None => Ok(()),
+        }
+    }
+
+    /// Let go of entry `id`, taken but not restored, and don't offer it
+    /// again this session.
+    pub fn give_back(&mut self, id: &str) -> io::Result<()> {
+        match &mut self.store {
+            Some(store) => store.give_back(id),
+            None => Ok(()),
+        }
+    }
+
+    /// The ids of the workspaces on `root`: those with a workspace file,
+    /// and `open` — this editor's windows on it. What decides which of an
+    /// earlier version's shared store's entries are that project's.
+    pub fn known_workspace_ids(
+        root: &Path,
+        open: impl IntoIterator<Item = String>,
+    ) -> HashSet<String> {
+        let mut ids = crate::workspace::workspace_ids_for_root(root);
+        ids.extend(open);
+        ids
+    }
+
+    /// The unsaved work no running editor holds, newest first: for a window
+    /// on host `Some(host)` (`Some(None)` for this machine), or anywhere
+    /// (`None`). With `legacy` — a root and its
+    /// [`Self::known_workspace_ids`] — also earlier versions' entries for it.
+    pub fn list_recoverable(
+        &self,
+        legacy: Option<(&Path, &HashSet<String>)>,
+        host: Option<Option<&str>>,
+    ) -> Vec<RecoveryEntry> {
+        let Some(store) = &self.store else {
+            return Vec::new();
+        };
+        let mut entries = store.recoverable(legacy);
+        if let Some(host) = host {
+            entries.retain(|entry| {
+                entry.metadata.remote == host.is_some() && entry.metadata.host.as_deref() == host
+            });
+        }
+        entries
+    }
+
+    /// Take `entry` (from [`Self::list_recoverable`]) over for a buffer of
+    /// this editor. Returns it as it now is, or `None` if another editor
+    /// took it first.
+    pub fn claim(&mut self, entry: &RecoveryEntry) -> io::Result<Option<RecoveryEntry>> {
+        match self.store.as_mut() {
+            Some(store) => store.claim(entry),
+            None => Ok(None),
+        }
+    }
+
+    /// Take this editor's lock on local file `path` (canonical), which it
+    /// has open, or say which editor has it: one there may change it.
+    pub fn lock_file(&mut self, path: &Path) -> FileLock {
+        match self.store.as_mut() {
+            Some(store) => store.files.acquire(path),
+            None => FileLock::Ours,
+        }
+    }
+
+    /// Let go of the locks on the files this editor no longer has open.
+    pub fn keep_file_locks(&mut self, open: &HashSet<PathBuf>) {
+        if let Some(store) = self.store.as_mut() {
+            store.files.keep_only(open);
+        }
+    }
+
+    /// End the session cleanly (call on normal editor shutdown): of the
+    /// entries this editor holds, those in `keep` — buffers still holding
+    /// unsaved work, for hot exit — stay as unsaved work no editor holds,
+    /// and the rest are deleted: their buffers were saved, discarded or
+    /// closed. Nothing any other editor holds or left is touched (issue
+    /// #3189).
+    pub fn end_session(&mut self, keep: &HashSet<String>) {
+        if let Some(store) = self.store.take() {
+            store.end(keep);
+        }
     }
 
     /// Load recovery content for a specific entry
@@ -355,6 +250,15 @@ impl RecoveryService {
     /// can apply chunks directly to the buffer (more efficient than full reconstruction).
     /// For new buffer entries (original_file_size == 0), the full content is in the chunks.
     pub fn load_recovery(&self, entry: &RecoveryEntry) -> io::Result<RecoveryResult> {
+        let storage = RecoveryStorage::with_dir(
+            entry
+                .metadata_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .to_path_buf(),
+        );
+        // A remote file's path names nothing on this host
+        let local = !entry.metadata.remote;
         // Check if we need the original file for reconstruction
         if entry.metadata.original_file_size > 0 {
             // Large file recovery - return chunks to apply on top of original
@@ -367,7 +271,7 @@ impl RecoveryService {
                     });
                 }
 
-                if !original_path.exists() {
+                if local && !original_path.exists() {
                     return Ok(RecoveryResult::Corrupted {
                         id: entry.id.clone(),
                         reason: format!(
@@ -378,12 +282,9 @@ impl RecoveryService {
                 }
 
                 // Load chunks and return them for direct application
-                let chunked_data =
-                    self.storage
-                        .read_chunked_content(&entry.id)?
-                        .ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::NotFound, "Chunk content not found")
-                        })?;
+                let chunked_data = storage.read_chunked_content(&entry.id)?.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "Chunk content not found")
+                })?;
 
                 return Ok(RecoveryResult::RecoveredChunks {
                     original_path: original_path.clone(),
@@ -407,16 +308,28 @@ impl RecoveryService {
         }
 
         // Load the chunk data directly
-        let chunked_data = self
-            .storage
+        let chunked_data = storage
             .read_chunked_content(&entry.id)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Chunk content not found"))?;
 
         // For original_file_size == 0, we expect exactly one chunk with offset=0
         if chunked_data.chunks.len() == 1 && chunked_data.chunks[0].offset == 0 {
+            let content = chunked_data.chunks[0].content.clone();
+            // The metadata recorded how big the buffer was. Checking it is
+            // the difference between handing back the user's work and
+            // handing back a prefix of it that looks just as complete.
+            let expected = entry.metadata.content_size as usize;
+            if content.len() < expected {
+                return Ok(RecoveryResult::RecoveredPartial {
+                    original_path: entry.metadata.original_path.clone(),
+                    found: content.len(),
+                    expected,
+                    content,
+                });
+            }
             Ok(RecoveryResult::Recovered {
                 original_path: entry.metadata.original_path.clone(),
-                content: chunked_data.chunks[0].content.clone(),
+                content,
             })
         } else {
             Ok(RecoveryResult::Corrupted {
@@ -425,87 +338,6 @@ impl RecoveryService {
             })
         }
     }
-
-    /// Load recovery with a provided original file path
-    ///
-    /// Use this when the original file has moved or you want to specify a different source.
-    pub fn load_recovery_with_original(
-        &self,
-        entry: &RecoveryEntry,
-        original_file: &Path,
-    ) -> io::Result<RecoveryResult> {
-        let content = self
-            .storage
-            .reconstruct_from_chunks(&entry.id, original_file)?;
-        Ok(RecoveryResult::Recovered {
-            original_path: Some(original_file.to_path_buf()),
-            content,
-        })
-    }
-
-    /// Accept recovery for an entry (load and delete recovery file)
-    pub fn accept_recovery(&mut self, entry: &RecoveryEntry) -> io::Result<RecoveryResult> {
-        let result = self.load_recovery(entry)?;
-        // Delete the recovery file after successful load
-        if matches!(result, RecoveryResult::Recovered { .. }) {
-            self.storage.delete_recovery(&entry.id)?;
-        }
-        Ok(result)
-    }
-
-    /// Discard recovery for an entry
-    pub fn discard_recovery(&mut self, entry: &RecoveryEntry) -> io::Result<()> {
-        self.storage.delete_recovery(&entry.id)
-    }
-
-    /// Discard all recovery files
-    pub fn discard_all_recovery(&mut self) -> io::Result<usize> {
-        self.storage.cleanup_all()
-    }
-
-    // ========================================================================
-    // Maintenance
-    // ========================================================================
-
-    /// Clean up old recovery files (older than max_recovery_age_secs)
-    pub fn cleanup_old(&self) -> io::Result<usize> {
-        if !self.config.enabled {
-            return Ok(0);
-        }
-
-        let entries = self.storage.list_entries()?;
-        let mut cleaned = 0;
-
-        for entry in entries {
-            if entry.age_seconds() > self.config.max_recovery_age_secs
-                && self.storage.delete_recovery(&entry.id).is_ok()
-            {
-                cleaned += 1;
-            }
-        }
-
-        if cleaned > 0 {
-            tracing::info!("Cleaned up {} old recovery files", cleaned);
-        }
-
-        Ok(cleaned)
-    }
-
-    /// Clean up orphaned files
-    pub fn cleanup_orphans(&self) -> io::Result<usize> {
-        self.storage.cleanup_orphans()
-    }
-}
-
-impl Default for RecoveryService {
-    fn default() -> Self {
-        Self::new().unwrap_or_else(|_| Self {
-            storage: RecoveryStorage::default(),
-            config: RecoveryConfig::default(),
-            last_save_times: HashMap::new(),
-            session_started: false,
-        })
-    }
 }
 
 #[cfg(test)]
@@ -513,130 +345,283 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn create_test_service() -> (RecoveryService, TempDir) {
-        let temp_dir = TempDir::new().unwrap();
-        let storage = RecoveryStorage::with_dir(temp_dir.path().to_path_buf());
-        let service = RecoveryService {
-            storage,
-            config: RecoveryConfig::default(),
-            last_save_times: HashMap::new(),
-            session_started: false,
-        };
-        (service, temp_dir)
+    fn service(base: &TempDir) -> RecoveryService {
+        RecoveryService::new(RecoveryConfig::default(), base.path())
     }
 
-    #[test]
-    fn test_session_lifecycle() {
-        let (mut service, _temp) = create_test_service();
-
-        // Start session
-        service.start_session().unwrap();
-        assert!(service.session_started);
-
-        // End session
-        service.end_session().unwrap();
-        assert!(!service.session_started);
+    fn project(base: &TempDir) -> PathBuf {
+        let root = base.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        root
     }
 
-    #[test]
-    fn test_save_and_recover() {
-        let (mut service, _temp) = create_test_service();
-        service.start_session().unwrap();
-
-        let content = b"Test content for recovery";
-        let path = Path::new("/test/file.txt");
-        let id = service.get_buffer_id(Some(path));
-
-        // Save recovery - create a single chunk with full content (new buffer style)
-        let chunks = vec![RecoveryChunk::new(0, 0, content.to_vec())];
+    /// Back up `text` for a buffer in a window on `root`; returns its handle.
+    fn back_up(
+        service: &mut RecoveryService,
+        root: &Path,
+        path: Option<&Path>,
+        text: &[u8],
+    ) -> HotExitEntry {
+        let id = RecoveryService::new_entry_id();
+        let chunks = vec![RecoveryChunk::new(0, 0, text.to_vec())];
         service
-            .save_buffer(&id, chunks, Some(path), None, Some(1), 0, content.len())
-            .unwrap();
-
-        // List recoverable
-        let entries = service.list_recoverable().unwrap();
-        assert_eq!(entries.len(), 1);
-
-        // Load recovery
-        let entry = &entries[0];
-        let result = service.load_recovery(entry).unwrap();
-        match result {
-            RecoveryResult::Recovered {
-                original_path,
-                content: loaded,
-            } => {
-                assert_eq!(original_path, Some(path.to_path_buf()));
-                assert_eq!(loaded, content);
-            }
-            _ => panic!("Expected Recovered result"),
-        }
+            .save_buffer(root, &id, chunks, path, None, Some(1), 0, text.len(), None)
+            .unwrap()
+            .unwrap()
     }
 
+    /// Everything recoverable on this machine: the store is one for every
+    /// root, and each test has its own.
+    fn recoverable(service: &RecoveryService, _root: &Path) -> Vec<RecoveryEntry> {
+        service.list_recoverable(None, Some(None))
+    }
+
+    // The crash tests below stop a save between its steps — record the save
+    // in the entry, write the file, delete the entry — and drop the editor
+    // without ending its session, as a crash would; the next editor over
+    // the store is the next launch.
+
+    /// Crash after the write, before the delete (issue #3626's entry, left
+    /// by a crash instead of a missing delete): the content is in the file,
+    /// so the entry must not come back as an unsaved buffer, and is cleared
+    /// away.
     #[test]
-    fn test_needs_auto_recovery_save() {
-        let (service, _temp) = create_test_service();
-        let id = "test-buffer";
+    fn crash_after_the_save_wrote_leaves_nothing_to_recover() {
+        let base = TempDir::new().unwrap();
+        let root = project(&base);
+        let target = root.join("input-23.txt");
+        {
+            let mut crashed = service(&base);
+            let entry = back_up(&mut crashed, &root, None, b"footnotes");
+            assert!(entry.begin_save(&target, 9).unwrap());
+            std::fs::write(&target, b"footnotes").unwrap();
+        }
 
-        // Not recovery_pending - doesn't need save
-        assert!(!service.needs_auto_recovery_save(id, false));
+        let next = service(&base);
+        assert!(recoverable(&next, &root).is_empty());
+        assert!(recoverable(&next, &root).is_empty());
+    }
 
-        // recovery_pending=true - needs save (instant)
-        assert!(service.needs_auto_recovery_save(id, true));
+    /// The same for a save over an existing file: it changed, so the save
+    /// wrote it.
+    #[test]
+    fn crash_after_saving_over_a_file_leaves_nothing_to_recover() {
+        let base = TempDir::new().unwrap();
+        let root = project(&base);
+        let target = root.join("notes.txt");
+        std::fs::write(&target, b"old").unwrap();
+        {
+            let mut crashed = service(&base);
+            let entry = back_up(&mut crashed, &root, Some(&target), b"new text");
+            assert!(entry.begin_save(&target, 8).unwrap());
+            std::fs::write(&target, b"new text").unwrap();
+        }
 
-        // After save, if recovery_pending becomes false, it doesn't need save
-        assert!(!service.needs_auto_recovery_save(id, false));
+        assert!(recoverable(&service(&base), &root).is_empty());
+    }
+
+    /// Crash after recording the save, before the write: nothing reached the
+    /// file, so the entry is the only copy of the work and comes back, with
+    /// the record cleared so that a later change to the file — by anyone —
+    /// can't read as that save having happened.
+    #[test]
+    fn crash_before_the_save_wrote_keeps_the_unsaved_work() {
+        let base = TempDir::new().unwrap();
+        let root = project(&base);
+        let target = root.join("input-23.txt");
+        {
+            let mut crashed = service(&base);
+            let entry = back_up(&mut crashed, &root, None, b"footnotes");
+            assert!(entry.begin_save(&target, 9).unwrap());
+        }
+
+        let next = service(&base);
+        let entries = recoverable(&next, &root);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].metadata.saving.is_none());
+        assert!(matches!(
+            next.load_recovery(&entries[0]).unwrap(),
+            RecoveryResult::Recovered { content, .. } if content == b"footnotes"
+        ));
+        std::fs::write(&target, b"someone else's").unwrap();
+        assert_eq!(recoverable(&next, &root).len(), 1);
+    }
+
+    /// Crash during a save that writes the file in place (one owned by
+    /// someone else, or with hard links): the file is torn, holding only the
+    /// start of what the save was writing. It changed, but not to what the
+    /// save writes, so the entry is still the unsaved work.
+    #[test]
+    fn crash_during_an_in_place_write_keeps_the_unsaved_work() {
+        let base = TempDir::new().unwrap();
+        let root = project(&base);
+        let target = root.join("notes.txt");
+        std::fs::write(&target, b"old content").unwrap();
+        {
+            let mut crashed = service(&base);
+            let entry = back_up(&mut crashed, &root, Some(&target), b"new content!");
+            assert!(entry.begin_save(&target, 12).unwrap());
+            // Truncated, then cut off part-way through the new content
+            std::fs::write(&target, b"new co").unwrap();
+        }
+
+        let next = service(&base);
+        assert_eq!(recoverable(&next, &root).len(), 1);
+        assert_eq!(recoverable(&next, &root).len(), 1);
+    }
+
+    /// A recovery write after a save was recorded is newer content than that
+    /// save wrote, so it clears the record: the entry is unsaved work again,
+    /// whatever the file does next.
+    #[test]
+    fn a_recovery_write_clears_a_recorded_save() {
+        let base = TempDir::new().unwrap();
+        let root = project(&base);
+        let target = root.join("input-23.txt");
+        {
+            let mut crashed = service(&base);
+            let entry = back_up(&mut crashed, &root, None, b"first");
+            assert!(entry.begin_save(&target, 5).unwrap());
+            let chunks = vec![RecoveryChunk::new(0, 0, b"second".to_vec())];
+            crashed
+                .save_buffer(&root, entry.id(), chunks, None, None, Some(1), 0, 6, None)
+                .unwrap();
+        }
+
+        std::fs::write(&target, b"first").unwrap();
+        let entries = recoverable(&service(&base), &root);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].metadata.saving.is_none());
+    }
+
+    /// Issue #3189: a clean exit deletes only what this editor held and
+    /// resolved. Unsaved work it keeps survives as anyone's; work another
+    /// editor holds, or left, is never touched — however old it is.
+    #[test]
+    fn a_clean_exit_deletes_only_what_it_held_and_resolved() {
+        let base = TempDir::new().unwrap();
+        let root = project(&base);
+        let mut other = service(&base);
+        back_up(&mut other, &root, None, b"another editor's");
+        let mut left = service(&base);
+        back_up(&mut left, &root, None, b"left by a crash");
+        drop(left);
+
+        let mut this = service(&base);
+        let kept = back_up(&mut this, &root, None, b"still unsaved");
+        back_up(&mut this, &root, None, b"saved since");
+        this.end_session(&HashSet::from([kept.id().to_string()]));
+
+        let mut texts: Vec<Vec<u8>> = recoverable(&service(&base), &root)
+            .iter()
+            .map(|e| match service(&base).load_recovery(e).unwrap() {
+                RecoveryResult::Recovered { content, .. } => content,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        texts.sort();
+        assert_eq!(
+            texts,
+            [b"left by a crash".to_vec(), b"still unsaved".to_vec()]
+        );
+        drop(other);
+        assert_eq!(recoverable(&service(&base), &root).len(), 3);
+    }
+
+    /// An entry records the root it was last edited under, canonicalized:
+    /// where its work is offered when no open file or layout claims it.
+    #[test]
+    fn an_entry_records_the_root_it_was_edited_under() {
+        let base = TempDir::new().unwrap();
+        let root = project(&base);
+        let mut crashed = service(&base);
+        back_up(&mut crashed, &root, None, b"x");
+        drop(crashed);
+        let entry = recoverable(&service(&base), &root).remove(0);
+        assert_eq!(entry.metadata.root, Some(root.canonicalize().unwrap()));
+        assert_eq!(entry.metadata.workspace_id, None);
+    }
+
+    /// A remote buffer's entry is restored only into a window on its host,
+    /// and a local one only into a local window: the paths name files on
+    /// different hosts.
+    #[test]
+    fn remote_and_local_entries_stay_apart() {
+        let base = TempDir::new().unwrap();
+        let root = project(&base);
+        let mut crashed = service(&base);
+        let chunks = vec![RecoveryChunk::new(0, 0, b"remote".to_vec())];
+        crashed
+            .save_buffer(
+                &root,
+                "r",
+                chunks,
+                Some(Path::new("/srv/app.txt")),
+                None,
+                Some(1),
+                0,
+                6,
+                Some("srv"),
+            )
+            .unwrap();
+        drop(crashed);
+
+        let next = service(&base);
+        assert!(next.list_recoverable(None, Some(None)).is_empty());
+        let remote = next.list_recoverable(None, Some(Some("srv")));
+        assert_eq!(remote.len(), 1);
+        assert_eq!(remote[0].metadata.original_mtime, None);
+        assert!(
+            next.list_recoverable(None, Some(Some("other-host")))
+                .is_empty(),
+            "the same path on another host is another file"
+        );
     }
 
     #[test]
     fn test_disabled_service() {
-        let (mut service, _temp) = create_test_service();
-        service.config.enabled = false;
-
-        // needs_auto_recovery_save returns false when disabled
-        assert!(!service.needs_auto_recovery_save("test", true));
-
-        // save_buffer doesn't error when disabled
+        let base = TempDir::new().unwrap();
+        let root = project(&base);
+        let mut service = RecoveryService::new(RecoveryConfig { enabled: false }, base.path());
+        assert!(!service.is_enabled());
         let chunks = vec![RecoveryChunk::new(0, 0, b"content".to_vec())];
-        service
-            .save_buffer("test", chunks, None, None, None, 0, 7)
-            .unwrap();
+        assert!(service
+            .save_buffer(&root, "test", chunks, None, None, None, 0, 7, None)
+            .unwrap()
+            .is_none());
+        assert!(!base.path().join("entries").exists());
     }
 
     #[test]
     fn test_load_recovery_returns_chunks_for_large_files() {
-        use std::fs;
-
-        let (mut service, temp_dir) = create_test_service();
-        service.start_session().unwrap();
-
-        // Create an original file
+        let base = TempDir::new().unwrap();
+        let root = project(&base);
         let original_content = b"Hello, this is the original content!";
-        let original_path = temp_dir.path().join("original.txt");
-        fs::write(&original_path, original_content).unwrap();
+        let original_path = root.join("original.txt");
+        std::fs::write(&original_path, original_content).unwrap();
+        {
+            let mut crashed = service(&base);
+            // Chunk: insert "PREFIX: " at offset 0
+            let chunks = vec![RecoveryChunk::new(0, 0, b"PREFIX: ".to_vec())];
+            crashed
+                .save_buffer(
+                    &root,
+                    "big",
+                    chunks,
+                    Some(&original_path),
+                    None,
+                    Some(1),
+                    original_content.len(), // original_file_size > 0
+                    original_content.len() + 8,
+                    None,
+                )
+                .unwrap();
+        }
 
-        let id = service.get_buffer_id(Some(&original_path));
-
-        // Save recovery with original_file_size > 0 (simulating large file recovery)
-        // Chunk: insert "PREFIX: " at offset 0
-        let chunks = vec![RecoveryChunk::new(0, 0, b"PREFIX: ".to_vec())];
-        service
-            .save_buffer(
-                &id,
-                chunks,
-                Some(&original_path),
-                None,
-                Some(1),
-                original_content.len(), // original_file_size > 0
-                original_content.len() + 8,
-            )
-            .unwrap();
-
-        // Load recovery - should return RecoveredChunks, not Recovered
-        let entries = service.list_recoverable().unwrap();
+        let next = service(&base);
+        let entries = recoverable(&next, &root);
         assert_eq!(entries.len(), 1);
-
-        let result = service.load_recovery(&entries[0]).unwrap();
-        match result {
+        match next.load_recovery(&entries[0]).unwrap() {
             RecoveryResult::RecoveredChunks {
                 original_path: path,
                 chunks,
@@ -647,7 +632,56 @@ mod tests {
                 assert_eq!(chunks[0].original_len, 0);
                 assert_eq!(chunks[0].content, b"PREFIX: ");
             }
-            _ => panic!("Expected RecoveredChunks result, got {:?}", result),
+            other => panic!("Expected RecoveredChunks result, got {other:?}"),
+        }
+    }
+
+    /// A chunk file shorter than the metadata says must not come back as if
+    /// it were the whole buffer.
+    ///
+    /// Each recovery file is written with its own atomic rename, so a crash
+    /// can leave a chunk that is in place but incomplete. The sizes to check
+    /// it against are right there in the metadata; without that check the
+    /// editor hands back a buffer that looks like the user's unsaved work
+    /// minus the end, with nothing saying so, and the next save writes that
+    /// over the real thing.
+    #[test]
+    fn a_truncated_chunk_is_not_reported_as_whole_content() {
+        let base = TempDir::new().unwrap();
+        let root = project(&base);
+        let content = b"COMPLETE-UNSAVED-WORK".to_vec();
+        {
+            let mut crashed = service(&base);
+            let entry = back_up(&mut crashed, &root, None, &content);
+            // Truncate the chunk on disk, leaving the metadata's sizes intact.
+            let chunk_path = crashed
+                .entry_dir(entry.id())
+                .unwrap()
+                .join(format!("{}.chunk.0", entry.id()));
+            let whole = std::fs::read(&chunk_path).unwrap();
+            assert_eq!(whole, content, "the chunk holds the content verbatim");
+            std::fs::write(&chunk_path, &whole[..8]).unwrap();
+        }
+
+        let next = service(&base);
+        let entry = recoverable(&next, &root)
+            .pop()
+            .expect("a truncated entry is still listed");
+        match next.load_recovery(&entry).unwrap() {
+            RecoveryResult::Recovered { content: got, .. } => panic!(
+                "silently returned {} of {} bytes as a complete recovery: {:?}",
+                got.len(),
+                content.len(),
+                String::from_utf8_lossy(&got)
+            ),
+            other => {
+                let text = format!("{other:?}");
+                assert!(
+                    text.contains('8') && text.contains(&content.len().to_string()),
+                    "the result should say how much was found against how much \
+                     was expected, got: {text}"
+                );
+            }
         }
     }
 }

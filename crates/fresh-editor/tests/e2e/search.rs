@@ -334,12 +334,11 @@ fn test_search_highlight_does_not_extend_on_adjacent_insert() {
         .and_then(|s| s.bg)
         .expect("matched char should have a highlight background");
 
-    // Move just past the match and type a character.
-    for _ in 0..3 {
-        harness
-            .send_key(KeyCode::Right, KeyModifiers::NONE)
-            .unwrap();
-    }
+    // Move just past the match and type a character. The search selected the
+    // match, so Right collapses the selection to its end.
+    harness
+        .send_key(KeyCode::Right, KeyModifiers::NONE)
+        .unwrap();
     harness.type_text("X").unwrap();
     harness.render().unwrap();
 
@@ -393,7 +392,9 @@ fn test_search_highlight_clears_when_edit_breaks_match() {
         .expect("matched char should have a highlight background");
 
     // Move one char into the match and type a character, breaking the match
-    // ("def" -> "dXef").
+    // ("def" -> "dXef"). The search selected the match, so Left first
+    // collapses the selection to the match start.
+    harness.send_key(KeyCode::Left, KeyModifiers::NONE).unwrap();
     harness
         .send_key(KeyCode::Right, KeyModifiers::NONE)
         .unwrap();
@@ -446,13 +447,12 @@ fn test_search_highlight_clears_when_whole_word_boundary_breaks() {
         .and_then(|s| s.bg)
         .expect("matched char should have a highlight background");
 
-    // Move just past the match (3 chars) and type a character. "def" -> "defX"
-    // is no longer a whole word, so the highlight must clear.
-    for _ in 0..3 {
-        harness
-            .send_key(KeyCode::Right, KeyModifiers::NONE)
-            .unwrap();
-    }
+    // Move just past the match and type a character. "def" -> "defX" is no
+    // longer a whole word, so the highlight must clear. The search selected
+    // the match, so Right collapses the selection to its end.
+    harness
+        .send_key(KeyCode::Right, KeyModifiers::NONE)
+        .unwrap();
     harness.type_text("X").unwrap();
     harness.process_async_and_render().unwrap();
 
@@ -1394,6 +1394,174 @@ fn test_search_options_bar_appears() {
     );
 }
 
+/// A search with nothing configured folds case: typing `hello` into a
+/// buffer that spells it three ways finds all three (issue #3212).
+///
+/// This is the shipped default, not a workspace leftover — the harness
+/// starts on `Config::default()`, so what this pins is
+/// `editor.search.case_sensitive`'s own value.
+#[test]
+fn search_folds_case_by_default() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("test.txt");
+    std::fs::write(&file_path, "Hello HELLO hello").unwrap();
+
+    let mut harness = EditorTestHarness::new(100, 24).unwrap();
+    harness.open_file(&file_path).unwrap();
+    harness.render().unwrap();
+
+    harness
+        .send_key(KeyCode::Char('f'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness.type_text("hello").unwrap();
+    harness.render().unwrap();
+
+    assert!(
+        harness.screen_to_string().contains("[ ] Case Sensitive"),
+        "nothing should have checked the Case box; got:\n{}",
+        harness.screen_to_string()
+    );
+
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.process_async_and_render().unwrap();
+
+    assert_eq!(
+        harness.count_search_highlights(),
+        3,
+        "an unconfigured search should match every spelling of `hello`"
+    );
+}
+
+/// `editor.search.case_sensitive = true` is the preset issue #3212 asked
+/// for: the window opens with the toggle already checked, and the same
+/// search finds only the exact spelling.
+#[test]
+fn the_case_sensitive_config_preset_seeds_the_toggle() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("test.txt");
+    std::fs::write(&file_path, "Hello HELLO hello").unwrap();
+
+    let mut config = Config::default();
+    config.editor.search.case_sensitive = true;
+    let mut harness = EditorTestHarness::with_config(100, 24, config).unwrap();
+    harness.open_file(&file_path).unwrap();
+    harness.render().unwrap();
+
+    harness
+        .send_key(KeyCode::Char('f'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness.type_text("hello").unwrap();
+    harness.render().unwrap();
+
+    assert!(
+        harness.screen_to_string().contains("[x] Case Sensitive"),
+        "the preset should arrive already checked; got:\n{}",
+        harness.screen_to_string()
+    );
+    // The preset is a starting point, not a lock: Alt+C still frees it.
+    harness
+        .send_key(KeyCode::Char('c'), KeyModifiers::ALT)
+        .unwrap();
+    harness.render().unwrap();
+    assert!(
+        harness.screen_to_string().contains("[ ] Case Sensitive"),
+        "Alt+C must still override the preset"
+    );
+
+    // Back on the preset, the same query matches only the exact spelling.
+    harness
+        .send_key(KeyCode::Char('c'), KeyModifiers::ALT)
+        .unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.process_async_and_render().unwrap();
+    assert_eq!(
+        harness.count_search_highlights(),
+        1,
+        "case-sensitive `hello` should match only the lowercase spelling"
+    );
+}
+
+/// A workspace only remembers a search choice once it *differs* from the
+/// config preset.
+///
+/// Saving the live flags unconditionally is what v1 did, and it turned "the
+/// user never touched the toggles" into a saved decision at the first
+/// checkpoint — after which that workspace ignored its own `editor.search`
+/// preset forever. Nothing to remember means nothing written, so the preset
+/// keeps applying; a real flip is written and wins.
+#[test]
+fn a_workspace_persists_only_a_choice_that_leaves_the_preset() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("test.txt");
+    std::fs::write(&file_path, "Hello hello").unwrap();
+
+    let mut harness = EditorTestHarness::new(100, 24).unwrap();
+    harness.open_file(&file_path).unwrap();
+    harness.render().unwrap();
+
+    assert!(
+        harness
+            .editor()
+            .capture_workspace()
+            .search_overrides
+            .is_none(),
+        "an untouched window has made no choice to save"
+    );
+
+    // Flip case sensitivity on, away from the (off) preset.
+    harness
+        .send_key(KeyCode::Char('f'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Char('c'), KeyModifiers::ALT)
+        .unwrap();
+    harness.render().unwrap();
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+
+    let saved = harness
+        .editor()
+        .capture_workspace()
+        .search_overrides
+        .expect("a flip away from the preset is a choice worth saving");
+    assert_eq!(saved.case_sensitive, Some(true));
+    assert_eq!(
+        (saved.whole_word, saved.use_regex, saved.confirm_each),
+        (None, None, None),
+        "flipping one toggle must not pin the three that never left the preset"
+    );
+
+    // Flip it back: it matches the preset again, so there is nothing left
+    // to remember and the workspace stops pinning it.
+    harness
+        .send_key(KeyCode::Char('f'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Char('c'), KeyModifiers::ALT)
+        .unwrap();
+    harness.render().unwrap();
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+
+    assert!(
+        harness
+            .editor()
+            .capture_workspace()
+            .search_overrides
+            .is_none(),
+        "back on the preset, the workspace has nothing of its own to say"
+    );
+}
+
 /// Test toggling case sensitivity with Alt+C during search
 #[test]
 fn test_toggle_case_sensitive_in_search() {
@@ -1411,16 +1579,15 @@ fn test_toggle_case_sensitive_in_search() {
         .unwrap();
     harness.render().unwrap();
 
-    // Type search query (case-sensitive by default)
+    // Type search query (case-insensitive by default — `editor.search`
+    // leaves the Case toggle off, so "hello" finds all three spellings).
     harness.type_text("hello").unwrap();
     harness.render().unwrap();
 
-    // By default, case-sensitive is ON, so search for "hello" should match only "hello" (lowercase)
-    // Verify the [x] checkbox is shown for case sensitive
     let screen = harness.screen_to_string();
     assert!(
-        screen.contains("[x] Case Sensitive") || screen.contains("[x]"),
-        "Case Sensitive should be checked by default"
+        screen.contains("[ ] Case Sensitive"),
+        "Case Sensitive should start unchecked; got:\n{screen}"
     );
 
     // Toggle case sensitivity with Alt+C
@@ -1429,11 +1596,11 @@ fn test_toggle_case_sensitive_in_search() {
         .unwrap();
     harness.render().unwrap();
 
-    // Verify checkbox is now unchecked
+    // Verify checkbox is now checked
     let screen_after_toggle = harness.screen_to_string();
     assert!(
-        screen_after_toggle.contains("[ ] Case Sensitive") || screen_after_toggle.contains("[ ]"),
-        "Case Sensitive should be unchecked after Alt+C"
+        screen_after_toggle.contains("[x] Case Sensitive"),
+        "Case Sensitive should be checked after Alt+C; got:\n{screen_after_toggle}"
     );
 
     // Cancel search
@@ -1888,10 +2055,10 @@ fn test_find_selection_invalidates_on_cursor_move() {
         "First Ctrl+F3 should move to second 'hello'"
     );
 
-    // Now manually move cursor to "world" at position 18 using End then Home to go to second line
-    // Actually, let's use arrow keys to move to position 18 (start of second "world")
-    // From position 12, we need to move 6 positions right
-    for _ in 0..6 {
+    // Now move the cursor to "world" at position 18 (start of second "world")
+    // with arrow keys. The found "hello" (12..17) is selected, so the first
+    // Right collapses the selection to its end (17); one more reaches 18.
+    for _ in 0..2 {
         harness
             .send_key(KeyCode::Right, KeyModifiers::NONE)
             .unwrap();
@@ -2668,7 +2835,9 @@ fn test_regex_caret_anchor_matches_every_line() {
     )
     .unwrap();
 
-    let mut harness = EditorTestHarness::new(100, 24).unwrap();
+    // Wide enough that the "Found N matches" message is not elided behind
+    // the status bar's `{search_nav}` arrows.
+    let mut harness = EditorTestHarness::new(120, 24).unwrap();
     harness.open_file(&file_path).unwrap();
     harness.render().unwrap();
 
@@ -2700,7 +2869,7 @@ fn test_regex_caret_anchor_matches_every_line() {
 
 /// Reproduce the performance issue where editor_tick takes ~700ms after a large
 /// search completes with many matches. This test uses tracing to identify the
-/// bottleneck. Run with: RUST_LOG=info cargo test -p fresh-editor --test e2e_tests
+/// bottleneck. Run with: RUST_LOG=info cargo test -p fresh-editor --test all_tests
 ///     test_search_large_file_tick_performance -- --nocapture
 #[test]
 fn test_search_large_file_tick_performance() {
@@ -3110,4 +3279,260 @@ fn test_clear_search_action() {
     harness
         .wait_until(|h| h.count_search_highlights() == 0)
         .expect("Search should be cleared");
+}
+
+/// Run Ctrl+R replace of `search` with `replacement` on a buffer holding
+/// `text`, after pressing each of `toggles` (Alt+letter search options) in the
+/// prompt. Returns the harness for further keys.
+fn replace_in_buffer(
+    text: &str,
+    toggles: &[char],
+    search: &str,
+    replacement: &str,
+) -> (TempDir, EditorTestHarness) {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("test.txt");
+    std::fs::write(&file_path, text).unwrap();
+
+    let mut harness = EditorTestHarness::new(100, 24).unwrap();
+    harness.open_file(&file_path).unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Char('r'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness.assert_screen_contains("Replace: ");
+    for &t in toggles {
+        harness
+            .send_key(KeyCode::Char(t), KeyModifiers::ALT)
+            .unwrap();
+    }
+    harness.type_text(search).unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.type_text(replacement).unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    (temp_dir, harness)
+}
+
+/// Issue #3575: with case sensitivity off (the default), plain-text replace
+/// replaces every occurrence the search highlights, in either case — not only
+/// the byte-exact ones.
+#[test]
+fn test_plain_replace_honors_case_insensitive_search() {
+    let (_tmp, harness) = replace_in_buffer("BBB bbb Bbb\nBBB bbb\n", &[], "BBB", "x");
+    assert_eq!(harness.get_buffer_content().unwrap(), "x x x\nx x\n");
+}
+
+/// Issue #3575: with case sensitivity on (Alt+C), only the exact case is
+/// replaced — the byte-exact path still applies.
+#[test]
+fn test_plain_replace_case_sensitive_replaces_exact_case_only() {
+    let (_tmp, harness) = replace_in_buffer("BBB bbb Bbb\n", &['c'], "BBB", "x");
+    assert_eq!(harness.get_buffer_content().unwrap(), "x bbb Bbb\n");
+}
+
+/// Plain-text replace that goes through a case-folding regex still treats the
+/// search and the replacement literally: regex metacharacters match as text,
+/// and `$1` / `\n` are inserted as typed.
+#[test]
+fn test_plain_replace_case_insensitive_stays_literal() {
+    let (_tmp, harness) = replace_in_buffer("a.B a.b axb\n", &[], "A.B", "$1\\n");
+    assert_eq!(harness.get_buffer_content().unwrap(), "$1\\n $1\\n axb\n");
+}
+
+/// Issue #3575: whole-word (Alt+W) applies to plain-text replace too.
+#[test]
+fn test_plain_replace_honors_whole_word() {
+    let (_tmp, harness) = replace_in_buffer("cat concat cat\n", &['w'], "cat", "dog");
+    assert_eq!(harness.get_buffer_content().unwrap(), "dog concat dog\n");
+}
+
+/// Issue #3575: confirm-each replace (Alt+I) walks every case-insensitive
+/// match, not only the byte-exact ones.
+#[test]
+fn test_interactive_plain_replace_honors_case_insensitive_search() {
+    let (_tmp, mut harness) = replace_in_buffer("BBB bbb\nBBB bbb\n", &['i'], "bbb", "x");
+    for _ in 0..4 {
+        harness.assert_screen_contains("Replace? ");
+        harness
+            .send_key(KeyCode::Char('y'), KeyModifiers::NONE)
+            .unwrap();
+        harness.render().unwrap();
+    }
+    assert_eq!(harness.get_buffer_content().unwrap(), "x x\nx x\n");
+}
+
+/// Issue #3575 on a lazily loaded large file: plain-text replace with case
+/// folding (the default) goes through the windowed search, so it reaches every
+/// occurrence in parts of the file not yet loaded, in either case.
+#[test]
+fn test_plain_replace_case_insensitive_in_a_large_file() {
+    const LINES: usize = 20_000;
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("big.txt");
+    let content: String = (0..LINES)
+        .map(|i| {
+            let word = if i % 2 == 0 { "Source" } else { "sOURCE" };
+            format!("line {i:05}: some {word} code here\n")
+        })
+        .collect();
+    std::fs::write(&file_path, &content).unwrap();
+
+    let config = Config {
+        editor: fresh::config::EditorConfig {
+            large_file_threshold_bytes: 1000,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut harness = EditorTestHarness::with_config(100, 24, config).unwrap();
+    harness.open_file(&file_path).unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Char('r'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.wait_for_screen_contains("Replace: ").unwrap();
+    harness.type_text("source").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .wait_for_screen_contains("Replace 'source' with: ")
+        .unwrap();
+    harness.type_text("SRC").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .wait_for_screen_contains(&format!("Replaced {LINES} occurrence"))
+        .unwrap();
+
+    harness
+        .send_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness
+        .wait_until(|_| {
+            std::fs::read_to_string(&file_path).is_ok_and(|s| s.matches("SRC").count() == LINES)
+        })
+        .unwrap();
+    let saved = std::fs::read_to_string(&file_path).unwrap();
+    assert_eq!(saved.to_lowercase().matches("source").count(), 0);
+}
+
+/// Confirm-each replace on a lazily loaded large file prompts for every
+/// occurrence, including those in parts of the file not loaded yet, and
+/// never stops early.
+#[test]
+fn test_interactive_replace_prompts_for_every_match_in_a_large_file() {
+    const MATCHES: usize = 40;
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("big.txt");
+    // Matches spread through ~4MB, so most of them sit in chunks that are
+    // not loaded when the replace starts.
+    let filler = "x".repeat(100_000);
+    let content: String = (0..MATCHES)
+        .map(|i| {
+            let word = if i % 2 == 0 { "Source" } else { "sOURCE" };
+            format!("{filler}\n{word}\n")
+        })
+        .collect();
+    std::fs::write(&file_path, &content).unwrap();
+
+    let config = Config {
+        editor: fresh::config::EditorConfig {
+            large_file_threshold_bytes: 1000,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut harness = EditorTestHarness::with_config(100, 24, config).unwrap();
+    harness.open_file(&file_path).unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Char('r'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.wait_for_screen_contains("Replace: ").unwrap();
+    harness
+        .send_key(KeyCode::Char('i'), KeyModifiers::ALT)
+        .unwrap();
+    harness.type_text("source").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .wait_for_screen_contains("Replace 'source' with: ")
+        .unwrap();
+    harness.type_text("SRC").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    for n in 0..MATCHES {
+        harness
+            .wait_for_screen_contains("Replace? ")
+            .unwrap_or_else(|_| panic!("prompt for match {n} of {MATCHES}"));
+        harness
+            .send_key(KeyCode::Char('y'), KeyModifiers::NONE)
+            .unwrap();
+        harness.render().unwrap();
+    }
+    harness
+        .wait_for_screen_contains(&format!("{MATCHES}"))
+        .unwrap();
+
+    harness
+        .send_key(KeyCode::Char('s'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness
+        .wait_until(|_| {
+            std::fs::read_to_string(&file_path).is_ok_and(|s| s.matches("SRC").count() == MATCHES)
+        })
+        .unwrap();
+}
+
+/// Confirm-each with a pattern that matches empty text (`^`): `n` moves on to
+/// the next line instead of finding the same empty match again, and `a`
+/// replaces the rest without looping.
+#[test]
+fn test_interactive_regex_replace_of_empty_matches() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("test.txt");
+    std::fs::write(&file_path, "one\ntwo\nthree\nfour\n").unwrap();
+
+    let mut harness = EditorTestHarness::new(100, 24).unwrap();
+    harness.open_file(&file_path).unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Char('r'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.wait_for_screen_contains("Replace: ").unwrap();
+    for t in ['r', 'i'] {
+        harness
+            .send_key(KeyCode::Char(t), KeyModifiers::ALT)
+            .unwrap();
+    }
+    harness.type_text("^").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.type_text("// ").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.wait_for_screen_contains("Replace? ").unwrap();
+    // Replace on "one", skip "two", then all the rest.
+    for key in ['y', 'n', 'a'] {
+        harness
+            .send_key(KeyCode::Char(key), KeyModifiers::NONE)
+            .unwrap();
+        harness.render().unwrap();
+    }
+    assert_eq!(
+        harness.get_buffer_content().unwrap(),
+        "// one\ntwo\n// three\n// four\n// "
+    );
 }

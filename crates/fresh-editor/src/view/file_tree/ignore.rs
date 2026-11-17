@@ -37,8 +37,8 @@ pub struct IgnorePatterns {
     /// external edits and deletions during the file-tree poll.
     gitignore_mtimes: HashMap<PathBuf, SystemTime>,
 
-    /// Custom glob patterns to ignore
-    custom_patterns: Vec<String>,
+    /// `file_explorer.custom_ignore_patterns`, matched with `.gitignore` syntax.
+    custom: CustomIgnore,
 
     /// Whether to show hidden files (starting with .)
     show_hidden: bool,
@@ -46,9 +46,9 @@ pub struct IgnorePatterns {
     /// Whether to show gitignored files
     show_gitignored: bool,
 
-    /// Whether `.gitignore` rules apply at all (`file_explorer.respect_gitignore`).
-    /// When false the loaded rules are kept but never consulted, so gitignored
-    /// entries are neither hidden nor marked, whatever `show_gitignored` says.
+    /// Whether `.gitignore` rules hide entries at all (`file_explorer.respect_gitignore`).
+    /// When false the rules are not consulted for visibility, but the render
+    /// status still reports `GitIgnored` so shown entries are dimmed (#3283).
     respect_gitignore: bool,
 
     /// Whether to show custom ignored files
@@ -61,7 +61,7 @@ impl IgnorePatterns {
         Self {
             gitignores: Vec::new(),
             gitignore_mtimes: HashMap::new(),
-            custom_patterns: Vec::new(),
+            custom: CustomIgnore::default(),
             show_hidden: false,
             show_gitignored: false,
             respect_gitignore: true,
@@ -121,18 +121,11 @@ impl IgnorePatterns {
         self.gitignore_mtimes.get(dir).copied()
     }
 
-    /// Add a custom glob pattern to ignore
+    /// Set the custom ignore patterns: `.gitignore` lines relative to `root`.
     ///
     /// Examples: "*.o", "target/", "node_modules/"
-    pub fn add_custom_pattern(&mut self, pattern: String) {
-        if !self.custom_patterns.contains(&pattern) {
-            self.custom_patterns.push(pattern);
-        }
-    }
-
-    /// Remove a custom pattern
-    pub fn remove_custom_pattern(&mut self, pattern: &str) {
-        self.custom_patterns.retain(|p| p != pattern);
+    pub fn set_custom_patterns(&mut self, root: &Path, patterns: &[String]) {
+        self.custom = CustomIgnore::new(root, patterns);
     }
 
     /// Check if a path should be ignored
@@ -145,7 +138,7 @@ impl IgnorePatterns {
         if !self.show_hidden && is_hidden_name(path) {
             return true;
         }
-        if !self.show_custom_ignored && self.matches_custom_pattern(path) {
+        if !self.show_custom_ignored && self.custom.matches(path, is_dir) {
             return true;
         }
         if !self.show_gitignored && self.matches_gitignore(path, is_dir) {
@@ -154,21 +147,31 @@ impl IgnorePatterns {
         false
     }
 
-    /// Get the ignore status of a path
+    /// How an entry stands with the ignore rules, for the row that draws it.
     ///
-    /// This is useful for rendering (e.g., gray out ignored files)
+    /// This is the render-time counterpart of [`is_ignored`](Self::is_ignored):
+    /// that one answers *whether the tree shows the entry*, this one answers
+    /// *what the entry is*, so a shown entry can still be reported as
+    /// `GitIgnored` or `CustomIgnored` and drawn recessed (issue #3283). It
+    /// therefore reads the `.gitignore` rules directly, past the
+    /// `respect_gitignore` visibility gate that `is_ignored` honours.
+    ///
+    /// It was `#[cfg(test)]` for as long as nothing but the tests asked, which
+    /// made the one thing it exists for — rendering — the one thing it could
+    /// not be used for.
     pub fn get_status(&self, path: &Path, is_dir: bool) -> IgnoreStatus {
         if is_hidden_name(path) {
             return IgnoreStatus::Hidden;
         }
 
         // Check custom patterns
-        if self.matches_custom_pattern(path) {
+        if self.custom.matches(path, is_dir) {
             return IgnoreStatus::CustomIgnored;
         }
 
-        // Check gitignore
-        if self.matches_gitignore(path, is_dir) {
+        // Check gitignore — always against the real rules, whatever the
+        // visibility gate says, so a shown entry can be rendered dimmed.
+        if self.matches_gitignore_rules(path, is_dir) {
             return IgnoreStatus::GitIgnored;
         }
 
@@ -177,11 +180,16 @@ impl IgnorePatterns {
 
     /// Check if path matches any .gitignore rules
     fn matches_gitignore(&self, path: &Path, is_dir: bool) -> bool {
-        // Single gate for the whole feature: with `respect_gitignore` off, both
-        // the visibility filter and the render status see "no rules matched".
-        if !self.respect_gitignore {
-            return false;
-        }
+        // Visibility gate: with `respect_gitignore` off the rules are not
+        // consulted for hiding. The render status deliberately bypasses this
+        // gate via `matches_gitignore_rules` so ignored entries can still be
+        // dimmed when shown (issue #3283).
+        self.respect_gitignore && self.matches_gitignore_rules(path, is_dir)
+    }
+
+    /// Consult the loaded `.gitignore` rules, independent of the
+    /// `respect_gitignore` visibility gate.
+    fn matches_gitignore_rules(&self, path: &Path, is_dir: bool) -> bool {
         // Find the most specific .gitignore (deepest directory)
         // that could apply to this path
         for (gitignore_dir, gitignore) in &self.gitignores {
@@ -192,34 +200,6 @@ impl IgnorePatterns {
                 let matched = gitignore.matched(relative_path, is_dir);
 
                 if matched.is_ignore() {
-                    return true;
-                }
-            }
-        }
-
-        false
-    }
-
-    /// Check if path matches any custom patterns
-    fn matches_custom_pattern(&self, path: &Path) -> bool {
-        let path_str = path.to_string_lossy();
-
-        for pattern in &self.custom_patterns {
-            // Simple pattern matching (could be improved with glob crate)
-            if pattern.ends_with('/') {
-                // Directory pattern
-                if path_str.contains(pattern.trim_end_matches('/')) {
-                    return true;
-                }
-            } else if pattern.starts_with('*') {
-                // Extension pattern like "*.o"
-                let ext = pattern.trim_start_matches('*');
-                if path_str.ends_with(ext) {
-                    return true;
-                }
-            } else {
-                // Exact match
-                if path_str.contains(pattern) {
                     return true;
                 }
             }
@@ -258,11 +238,6 @@ impl IgnorePatterns {
         self.respect_gitignore
     }
 
-    /// Set whether to show custom ignored files
-    pub fn set_show_custom_ignored(&mut self, show: bool) {
-        self.show_custom_ignored = show;
-    }
-
     /// Toggle showing gitignored files
     pub fn toggle_show_gitignored(&mut self) {
         self.show_gitignored = !self.show_gitignored;
@@ -273,18 +248,8 @@ impl IgnorePatterns {
         self.show_hidden = !self.show_hidden;
     }
 
-    /// Clear all gitignore rules
-    pub fn clear_gitignores(&mut self) {
-        self.gitignores.clear();
-        self.gitignore_mtimes.clear();
-    }
-
-    /// Clear all custom patterns
-    pub fn clear_custom_patterns(&mut self) {
-        self.custom_patterns.clear();
-    }
-
     /// Get number of loaded .gitignore files
+    #[cfg(test)]
     pub fn gitignore_count(&self) -> usize {
         self.gitignores.len()
     }
@@ -294,6 +259,90 @@ impl Default for IgnorePatterns {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// `file_explorer.custom_ignore_patterns`, read as `.gitignore` lines relative
+/// to a root. The explorer and Quick Open both match with it, so a pattern
+/// means the same thing in each.
+#[derive(Debug, Default)]
+pub struct CustomIgnore {
+    root: PathBuf,
+    matcher: Option<Gitignore>,
+    /// Directory names a pattern ignores at every depth, so a walk can skip
+    /// them instead of entering them and discarding everything inside. Left
+    /// empty when any pattern negates, since a `!` line can re-include a name.
+    prune_dirs: Vec<String>,
+}
+
+impl CustomIgnore {
+    pub fn new(root: &Path, patterns: &[String]) -> Self {
+        if patterns.is_empty() {
+            return Self::default();
+        }
+        let mut builder = GitignoreBuilder::new(root);
+        for pattern in patterns {
+            if let Err(e) = builder.add_line(None, pattern) {
+                tracing::warn!("Skipping custom ignore pattern {pattern:?}: {e}");
+            }
+        }
+        let matcher = builder
+            .build()
+            .map_err(|e| tracing::warn!("Failed to build custom ignore patterns: {e}"))
+            .ok();
+        // As `.gitignore` reads lines: leading blanks are part of the pattern.
+        let negates = patterns.iter().any(|p| p.starts_with('!'));
+        let prune_dirs = if matcher.is_none() || negates {
+            Vec::new()
+        } else {
+            patterns.iter().filter_map(|p| any_depth_name(p)).collect()
+        };
+        Self {
+            root: root.to_path_buf(),
+            matcher,
+            prune_dirs,
+        }
+    }
+
+    /// Whether `path` is ignored. It is either relative to the root or a
+    /// rooted path under it; anything else, the root included, is not.
+    pub fn matches(&self, path: &Path, is_dir: bool) -> bool {
+        let Some(matcher) = &self.matcher else {
+            return false;
+        };
+        // `has_root`, not `is_absolute`: on Windows `\foo` is rooted but not
+        // absolute, and the matcher panics on any path that keeps a root.
+        let rel = if path.has_root() {
+            match path.strip_prefix(&self.root) {
+                Ok(rel) => rel,
+                Err(_) => return false,
+            }
+        } else {
+            path
+        };
+        if rel.as_os_str().is_empty() {
+            return false;
+        }
+        matcher.matched_path_or_any_parents(rel, is_dir).is_ignore()
+    }
+
+    /// Directory names to skip outright during a walk.
+    pub fn prune_dirs(&self) -> &[String] {
+        &self.prune_dirs
+    }
+}
+
+/// The name a `.gitignore` pattern matches at any depth: `name` or `name/` with
+/// no other slash and no glob. Such a pattern ignores every directory of that
+/// name, which is exactly what a walk's `skip_dirs` does.
+fn any_depth_name(pattern: &str) -> Option<String> {
+    // `.gitignore` drops trailing blanks only; a leading one is part of the
+    // name, which `contains(' ')` below then keeps out of `skip_dirs`.
+    let pattern = pattern.trim_end();
+    let name = pattern.strip_suffix('/').unwrap_or(pattern);
+    let plain = !name.is_empty()
+        && !name.starts_with('#')
+        && !name.contains(['/', '\\', '*', '?', '[', ' ']);
+    plain.then(|| name.to_string())
 }
 
 fn is_hidden_name(path: &Path) -> bool {
@@ -335,9 +384,10 @@ mod tests {
     #[test]
     fn test_custom_patterns() {
         let mut patterns = IgnorePatterns::new();
-
-        patterns.add_custom_pattern("*.o".to_string());
-        patterns.add_custom_pattern("target/".to_string());
+        patterns.set_custom_patterns(
+            Path::new("/foo"),
+            &["*.o".to_string(), "target/".to_string()],
+        );
 
         assert_eq!(
             patterns.get_status(Path::new("/foo/main.o"), false),
@@ -353,6 +403,62 @@ mod tests {
             patterns.get_status(Path::new("/foo/src/main.rs"), false),
             IgnoreStatus::Visible
         );
+    }
+
+    /// Custom patterns follow `.gitignore` rules, not substring matching: a
+    /// plain name matches that name only, a leading `/` anchors to the root,
+    /// and `!` re-includes.
+    #[test]
+    fn test_custom_patterns_use_gitignore_rules() {
+        let root = Path::new("/foo");
+        let mut patterns = IgnorePatterns::new();
+        patterns.set_custom_patterns(
+            root,
+            &[
+                "build".to_string(),
+                "/dist".to_string(),
+                "*.log".to_string(),
+                "!keep.log".to_string(),
+            ],
+        );
+        let ignored = |p: &str, is_dir| patterns.is_ignored(&root.join(p), is_dir);
+
+        assert!(ignored("build", true));
+        assert!(ignored("src/build/out.o", false));
+        assert!(!ignored("rebuild.txt", false), "substring of a pattern");
+        assert!(!ignored("src/builder.rs", false), "substring of a pattern");
+        assert!(ignored("dist", true));
+        assert!(!ignored("src/dist", true), "/dist is anchored to the root");
+        assert!(ignored("debug.log", false));
+        assert!(!ignored("keep.log", false));
+        assert!(!patterns.is_ignored(Path::new("/elsewhere/build"), true));
+        assert!(!patterns.is_ignored(root, true));
+    }
+
+    /// Only a pattern that names a directory at any depth is pruned from a
+    /// walk, and none is once a pattern negates.
+    #[test]
+    fn test_custom_ignore_prunes_only_any_depth_names() {
+        let root = Path::new("/project");
+        let patterns = |ps: &[&str]| ps.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+
+        let ignore = CustomIgnore::new(
+            root,
+            &patterns(&[".cache/", "build", "*.o", "/dist", "a/b/", "# note", ""]),
+        );
+        assert_eq!(ignore.prune_dirs(), [".cache", "build"]);
+
+        let ignore = CustomIgnore::new(root, &patterns(&[".cache/", "!.cache/keep"]));
+        assert!(ignore.prune_dirs().is_empty());
+        assert!(ignore.matches(Path::new(".cache/other"), false));
+
+        // Blanks as `.gitignore` reads them: trailing ones are dropped, a
+        // leading one is part of the name, so ` build` is not `build`.
+        let ignore = CustomIgnore::new(root, &patterns(&["out  ", " build"]));
+        assert_eq!(ignore.prune_dirs(), ["out"]);
+        assert!(!ignore.matches(Path::new("build/x"), false));
+        let ignore = CustomIgnore::new(root, &patterns(&["build", " !build/keep"]));
+        assert_eq!(ignore.prune_dirs(), ["build"], "` !x` is not a negation");
     }
 
     #[test]

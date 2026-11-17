@@ -29,7 +29,6 @@ use crate::model::event::{BufferId, ContainerId, LeafId, SplitDirection, SplitId
 use crate::model::marker::MarkerList;
 use crate::state::ViewMode;
 use crate::view::folding::FoldManager;
-use crate::view::ui::view_pipeline::Layout;
 use crate::view::viewport::Viewport;
 use ratatui::layout::Rect;
 use serde::{Deserialize, Serialize};
@@ -52,13 +51,6 @@ impl TabTarget {
         match self {
             Self::Buffer(id) => Some(id),
             Self::Group(_) => None,
-        }
-    }
-
-    pub fn as_group(self) -> Option<LeafId> {
-        match self {
-            Self::Buffer(_) => None,
-            Self::Group(id) => Some(id),
         }
     }
 }
@@ -239,6 +231,7 @@ pub struct BufferViewState {
 /// [`BufferViewState::apply_config_defaults`]. Grouping the flags into one
 /// struct keeps the call under the argument-count limit and names each
 /// boolean at every call site.
+#[derive(Clone)]
 pub struct ViewConfigDefaults {
     pub line_numbers: bool,
     pub highlight_current_line: bool,
@@ -247,6 +240,24 @@ pub struct ViewConfigDefaults {
     pub wrap_column: Option<usize>,
     pub rulers: Vec<usize>,
     pub scroll_offset: usize,
+}
+
+impl ViewConfigDefaults {
+    /// The global `editor.*` display settings, for a seeding path with no
+    /// buffer to hand: `line_wrap` and `wrap_column` come from the global keys.
+    /// A path that has the buffer resolves those two against its language
+    /// instead — see `Window::view_config_defaults_for_buffer`.
+    pub fn from_editor_config(editor: &crate::config::EditorConfig) -> Self {
+        Self {
+            line_numbers: editor.line_numbers,
+            highlight_current_line: editor.highlight_current_line,
+            line_wrap: editor.line_wrap,
+            wrap_indent: editor.wrap_indent,
+            wrap_column: editor.wrap_column,
+            rulers: editor.rulers.clone(),
+            scroll_offset: editor.scroll_offset,
+        }
+    }
 }
 
 impl BufferViewState {
@@ -367,6 +378,28 @@ impl BufferViewState {
             self.compose_width = Some(width as u16);
         }
     }
+
+    /// Whether this view is in page view (compose mode), which is what decides
+    /// whether compose's decorations — soft breaks, `composeOnly` lines — are
+    /// drawn in it, and so whether its scroll math counts them.
+    pub fn is_page_view(&self) -> bool {
+        self.view_mode == ViewMode::PageView
+    }
+
+    /// Whether this view takes part in horizontal scroll sync: gives its
+    /// column to, and takes one from, the panes it is scroll-synced with.
+    ///
+    /// A wrapped view has no horizontal scroll, nor does one with horizontal
+    /// scroll switched off (a plugin widget panel). Page view turns builtin
+    /// wrap off, but only because the compose plugin wraps every line to the
+    /// page width itself: a column copied from a source pane would shift those
+    /// rows off screen, and its own column (normally 0) would drag the source
+    /// pane back.
+    pub fn shares_horizontal_scroll(&self) -> bool {
+        !self.viewport.line_wrap_enabled
+            && self.viewport.horizontal_scroll_enabled
+            && self.view_mode != ViewMode::PageView
+    }
 }
 
 impl Clone for BufferViewState {
@@ -399,6 +432,57 @@ impl Clone for BufferViewState {
     }
 }
 
+/// Which of its tabs a pane is showing.
+///
+/// **A pane shows exactly one tab.** It is a buffer, or it is a buffer group
+/// — and a pane showing a group keeps the buffer tab it showed before, to go
+/// back to when the group is left. That buffer is *behind* the group: kept
+/// with its view state, and not on screen. The enum is the one statement of
+/// which: there is no buffer field that reads as shown while a group is, no
+/// group without a focused panel for keys to go to, and no focused panel
+/// without a group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shown {
+    /// The pane shows this buffer.
+    Buffer(BufferId),
+    /// The pane shows a buffer group.
+    Group {
+        /// The group's leaf — `TabTarget::Group(group)`, and the key of its
+        /// layout in the window's grouped subtrees.
+        group: LeafId,
+        /// The group's panel that has the keyboard: a leaf of the group's
+        /// own layout, with a view state of its own.
+        panel: LeafId,
+        /// The pane's buffer tab, not on screen while the group is.
+        behind: BufferId,
+    },
+}
+
+impl Shown {
+    /// The pane's buffer tab: the one shown, or the one behind the group.
+    pub fn buffer_tab(self) -> BufferId {
+        match self {
+            Self::Buffer(b) | Self::Group { behind: b, .. } => b,
+        }
+    }
+
+    /// The buffer on screen in the pane — `None` while a group is.
+    pub fn buffer(self) -> Option<BufferId> {
+        match self {
+            Self::Buffer(b) => Some(b),
+            Self::Group { .. } => None,
+        }
+    }
+
+    /// The tab this is, as the tab bar names it.
+    pub fn target(self) -> TabTarget {
+        match self {
+            Self::Buffer(b) => TabTarget::Buffer(b),
+            Self::Group { group, .. } => TabTarget::Group(group),
+        }
+    }
+}
+
 /// Per-split view state (independent of buffer content)
 ///
 /// Following the Emacs model where each window (split) has its own:
@@ -406,34 +490,26 @@ impl Clone for BufferViewState {
 /// - Window-start (scroll position) - independent per split
 /// - Tabs (open buffers) - independent per split
 ///
-/// Buffer-specific state (cursors, viewport, view_mode, compose settings) is stored
-/// in the `keyed_states` map, keyed by `BufferId`. The active buffer's state is
-/// accessible via `Deref`/`DerefMut` (so `vs.cursors` transparently accesses the
-/// active buffer's cursors), or explicitly via `active_state()`/`active_state_mut()`.
+/// Buffer-specific state (cursors, viewport, view_mode, compose settings) is
+/// kept per buffer, keyed by `BufferId`. **None of it is reached implicitly.**
+/// A pane showing a group tab still has a buffer tab behind the group, and
+/// that buffer's cursors and viewport are not on screen; so the pane's
+/// buffer state is asked for by name — `shown_state` for the buffer on
+/// screen (none while a group is), `buffer_tab_state` for the pane's buffer
+/// tab whether or not it is on screen.
 #[derive(Debug, Clone)]
 pub struct SplitViewState {
-    /// Which buffer is currently active in this split
-    pub active_buffer: BufferId,
+    /// Which tab this pane shows (`Shown`).
+    shown: Shown,
 
-    /// Per-buffer view state map. The active buffer always has an entry.
-    pub keyed_states: HashMap<BufferId, BufferViewState>,
+    /// Per-buffer view state map. The buffer tab always has an entry, which
+    /// is why the map is private: nothing outside can drop it.
+    keyed_states: HashMap<BufferId, BufferViewState>,
 
     /// List of tab targets open in this split's tab bar (in order).
     /// Each entry is either a regular buffer or a grouped subtree.
-    /// The currently displayed target is tracked by `active_buffer`
-    /// (for buffer tabs) or by walking the tree for the active leaf
-    /// (for group tabs).
+    /// The one displayed is `shown`.
     pub open_buffers: Vec<TabTarget>,
-
-    /// Horizontal scroll offset for the tabs in this split
-    pub tab_scroll_offset: usize,
-
-    /// Computed layout for this view
-    /// This is View state - each split has its own Layout
-    pub layout: Option<Layout>,
-
-    /// Whether the layout needs to be rebuilt (buffer changed, transform changed, etc.)
-    pub layout_dirty: bool,
 
     /// Focus history stack for this split (most recent at end).
     /// Tracks both buffer tabs and group tabs so that "Switch to Previous
@@ -458,28 +534,10 @@ pub struct SplitViewState {
     /// Used for panels where empty space should be blank, not marked.
     pub hide_tilde: bool,
 
-    /// When `Some(leaf_id)`, the currently "active tab" of this split is the
-    /// buffer group identified by `leaf_id` (i.e., `TabTarget::Group(leaf_id)`).
-    /// When `None`, the active tab is a regular buffer (`TabTarget::Buffer(active_buffer)`).
-    pub active_group_tab: Option<LeafId>,
-
-    /// When a group tab is active, this tracks which inner leaf inside the
-    /// group's subtree has keyboard focus.
-    pub focused_group_leaf: Option<LeafId>,
-}
-
-impl std::ops::Deref for SplitViewState {
-    type Target = BufferViewState;
-
-    fn deref(&self) -> &BufferViewState {
-        self.active_state()
-    }
-}
-
-impl std::ops::DerefMut for SplitViewState {
-    fn deref_mut(&mut self) -> &mut BufferViewState {
-        self.active_state_mut()
-    }
+    /// Groups shown in a buffer's tab instead of the buffer (`show_in_tab`):
+    /// `(buffer, group, panel)`, `panel` being the group's panel to give the
+    /// keyboard to when the tab is shown again.
+    tab_groups: Vec<(BufferId, LeafId, LeafId)>,
 }
 
 impl SplitViewState {
@@ -489,56 +547,157 @@ impl SplitViewState {
         let mut keyed_states = HashMap::new();
         keyed_states.insert(buffer_id, buf_state);
         Self {
-            active_buffer: buffer_id,
+            shown: Shown::Buffer(buffer_id),
             keyed_states,
             open_buffers: vec![TabTarget::Buffer(buffer_id)],
-            tab_scroll_offset: 0,
-            layout: None,
-            layout_dirty: true,
             focus_history: Vec::new(),
             sync_group: None,
             composite_view: None,
             suppress_chrome: false,
             hide_tilde: false,
-            active_group_tab: None,
-            focused_group_leaf: None,
+            tab_groups: Vec::new(),
         }
     }
 
-    /// Get the active buffer's view state
-    pub fn active_state(&self) -> &BufferViewState {
-        self.keyed_states
-            .get(&self.active_buffer)
-            .expect("active_buffer must always have an entry in keyed_states")
+    /// Which tab this pane shows.
+    pub fn shown(&self) -> Shown {
+        self.shown
     }
 
-    /// Get a mutable reference to the active buffer's view state
-    pub fn active_state_mut(&mut self) -> &mut BufferViewState {
-        self.keyed_states
-            .get_mut(&self.active_buffer)
-            .expect("active_buffer must always have an entry in keyed_states")
+    /// The buffer on screen in this pane — `None` while it shows a group.
+    pub fn shown_buffer(&self) -> Option<BufferId> {
+        self.shown.buffer()
     }
 
-    /// Switch the active buffer in this split.
+    /// This pane's buffer tab: the buffer it shows, or — while it shows a
+    /// group — the one behind the group, which is **not on screen**. For
+    /// what is on screen, `shown_buffer`.
+    pub fn buffer_tab(&self) -> BufferId {
+        self.shown.buffer_tab()
+    }
+
+    /// The group this pane shows and the panel of it that has the keyboard.
+    pub fn shown_group(&self) -> Option<(LeafId, LeafId)> {
+        match self.shown {
+            Shown::Group { group, panel, .. } => Some((group, panel)),
+            Shown::Buffer(_) => None,
+        }
+    }
+
+    /// The group this pane shows, if it shows one.
+    pub fn shown_group_tab(&self) -> Option<LeafId> {
+        self.shown_group().map(|(group, _)| group)
+    }
+
+    /// The view state of the buffer on screen — `None` while the pane shows
+    /// a group, whose panels have view states of their own.
+    pub fn shown_state(&self) -> Option<&BufferViewState> {
+        let b = self.shown.buffer()?;
+        self.keyed_states.get(&b)
+    }
+
+    /// The same, mutably.
+    pub fn shown_state_mut(&mut self) -> Option<&mut BufferViewState> {
+        let b = self.shown.buffer()?;
+        self.keyed_states.get_mut(&b)
+    }
+
+    /// The view state of this pane's buffer tab (`buffer_tab`) — on screen
+    /// only when no group is.
+    pub fn buffer_tab_state(&self) -> &BufferViewState {
+        self.keyed_states
+            .get(&self.shown.buffer_tab())
+            .expect("the buffer tab always has an entry in keyed_states")
+    }
+
+    /// The same, mutably.
+    pub fn buffer_tab_state_mut(&mut self) -> &mut BufferViewState {
+        self.keyed_states
+            .get_mut(&self.shown.buffer_tab())
+            .expect("the buffer tab always has an entry in keyed_states")
+    }
+
+    /// Make `new_buffer_id` this pane's buffer tab, **without leaving a
+    /// group with a tab of its own**: while one is shown, the new buffer goes
+    /// behind it. Otherwise the pane is on the new buffer's tab, which shows
+    /// the buffer or the group shown in it (`show_in_tab`). To leave a group
+    /// with a tab of its own, `show_buffer`.
     ///
-    /// If the new buffer has a saved state in `keyed_states`, it is restored.
-    /// Otherwise a default `BufferViewState` is created with the split's current
+    /// If the new buffer has a saved state, it is restored. Otherwise a
+    /// default `BufferViewState` is created with the split's current
     /// viewport dimensions.
-    pub fn switch_buffer(&mut self, new_buffer_id: BufferId) {
-        if new_buffer_id == self.active_buffer {
+    pub fn set_buffer_tab(&mut self, new_buffer_id: BufferId) {
+        if new_buffer_id == self.buffer_tab() {
             return;
         }
-        // Ensure the new buffer has keyed state (create default if first time)
-        if !self.keyed_states.contains_key(&new_buffer_id) {
-            let active = self.active_state();
-            let width = active.viewport.width;
-            let height = active.viewport.height;
-            self.keyed_states
-                .insert(new_buffer_id, BufferViewState::new(width, height));
+        self.ensure_buffer_state(new_buffer_id);
+        self.shown = match self.shown {
+            // A group with a tab of its own stays on screen.
+            Shown::Group { group, panel, .. } if self.tab_of_group(group).is_none() => {
+                Shown::Group {
+                    group,
+                    panel,
+                    behind: new_buffer_id,
+                }
+            }
+            // Otherwise the pane is on the new buffer's tab.
+            _ => self.on_tab(new_buffer_id),
+        };
+    }
+
+    /// Show `buffer_id`'s tab in this pane: it becomes the buffer tab, and a
+    /// group the pane was showing in a tab of its own is left. The tab shows
+    /// the buffer, or the group shown in it (`show_in_tab`).
+    pub fn show_buffer(&mut self, buffer_id: BufferId) {
+        self.set_buffer_tab(buffer_id);
+        self.shown = self.on_tab(buffer_id);
+    }
+
+    /// Show group `group` in this pane, with `panel` — one of the group's
+    /// leaves — taking the keyboard: in its own tab, the buffer tab going
+    /// behind it, or in the buffer's tab it is shown in.
+    pub fn show_group(&mut self, group: LeafId, panel: LeafId) {
+        if let Some(buffer) = self.tab_of_group(group) {
+            self.set_buffer_tab(buffer);
         }
-        self.active_buffer = new_buffer_id;
-        // Invalidate layout since we're now showing different buffer content
-        self.layout_dirty = true;
+        self.shown = Shown::Group {
+            group,
+            panel,
+            behind: self.buffer_tab(),
+        };
+        self.focus_group_panel(panel);
+    }
+
+    /// Give the keyboard to `panel` of the group this pane shows. Nothing
+    /// happens when the pane shows no group: a panel is only focused inside
+    /// one.
+    pub fn focus_group_panel(&mut self, panel: LeafId) {
+        if let Shown::Group {
+            group, panel: p, ..
+        } = &mut self.shown
+        {
+            *p = panel;
+            let group = *group;
+            for (_, g, p) in &mut self.tab_groups {
+                if *g == group {
+                    *p = panel;
+                }
+            }
+        }
+    }
+
+    /// Stop showing `group`, if this pane shows it: the buffer tab behind it
+    /// comes back on screen.
+    pub fn leave_group(&mut self, group: LeafId) {
+        if let Shown::Group {
+            group: g, behind, ..
+        } = self.shown
+        {
+            if g == group {
+                // Back to what the buffer's tab shows.
+                self.shown = self.on_tab(behind);
+            }
+        }
     }
 
     /// Get the view state for a specific buffer (if it exists)
@@ -551,57 +710,52 @@ impl SplitViewState {
         self.keyed_states.get_mut(&buffer_id)
     }
 
+    /// Every buffer this pane keeps a view state for, with that state.
+    pub fn buffer_states(&self) -> impl Iterator<Item = (&BufferId, &BufferViewState)> {
+        self.keyed_states.iter()
+    }
+
+    /// The same, mutably.
+    pub fn buffer_states_mut(&mut self) -> impl Iterator<Item = (&BufferId, &mut BufferViewState)> {
+        self.keyed_states.iter_mut()
+    }
+
+    /// Whether this pane keeps a view state for `buffer_id`.
+    pub fn has_buffer_state(&self, buffer_id: BufferId) -> bool {
+        self.keyed_states.contains_key(&buffer_id)
+    }
+
+    /// Put `state` in as `buffer_id`'s view state, replacing any.
+    pub fn insert_buffer_state(&mut self, buffer_id: BufferId, state: BufferViewState) {
+        self.keyed_states.insert(buffer_id, state);
+    }
+
+    /// Take `buffer_id`'s view state out — never the buffer tab's, which
+    /// the pane needs to keep.
+    pub fn take_buffer_state(&mut self, buffer_id: BufferId) -> Option<BufferViewState> {
+        if buffer_id == self.buffer_tab() {
+            return None;
+        }
+        self.keyed_states.remove(&buffer_id)
+    }
+
+    /// Keep only the view states `keep` accepts — and the buffer tab's,
+    /// always.
+    pub fn retain_buffer_states(&mut self, mut keep: impl FnMut(BufferId) -> bool) {
+        let tab = self.buffer_tab();
+        self.keyed_states.retain(|b, _| *b == tab || keep(*b));
+    }
+
     /// Ensure a buffer has keyed state, creating a default if needed.
     /// Returns a mutable reference to the buffer's view state.
     pub fn ensure_buffer_state(&mut self, buffer_id: BufferId) -> &mut BufferViewState {
         let (width, height) = {
-            let active = self.active_state();
-            (active.viewport.width, active.viewport.height)
+            let tab = self.buffer_tab_state();
+            (tab.viewport.width, tab.viewport.height)
         };
         self.keyed_states
             .entry(buffer_id)
             .or_insert_with(|| BufferViewState::new(width, height))
-    }
-
-    /// Remove keyed state for a buffer (when buffer is closed from this split)
-    pub fn remove_buffer_state(&mut self, buffer_id: BufferId) {
-        if buffer_id != self.active_buffer {
-            self.keyed_states.remove(&buffer_id);
-        }
-    }
-
-    /// Mark layout as needing rebuild (call after buffer changes)
-    pub fn invalidate_layout(&mut self) {
-        self.layout_dirty = true;
-    }
-
-    /// Ensure layout is valid, rebuilding if needed.
-    /// Returns the Layout - never returns None. Following VSCode's ViewModel pattern.
-    ///
-    /// # Arguments
-    /// * `tokens` - ViewTokenWire array built from the buffer
-    /// * `source_range` - The byte range this layout covers
-    /// * `tab_size` - Tab width for rendering
-    pub fn ensure_layout(
-        &mut self,
-        tokens: &[fresh_core::api::ViewTokenWire],
-        source_range: std::ops::Range<usize>,
-        tab_size: usize,
-    ) -> &Layout {
-        if self.layout.is_none() || self.layout_dirty {
-            self.layout = Some(Layout::from_tokens(tokens, source_range, tab_size));
-            self.layout_dirty = false;
-        }
-        self.layout.as_ref().unwrap()
-    }
-
-    /// Get the current layout if it exists and is valid
-    pub fn get_layout(&self) -> Option<&Layout> {
-        if self.layout_dirty {
-            None
-        } else {
-            self.layout.as_ref()
-        }
     }
 
     /// Add a buffer to this split's tabs (if not already present)
@@ -624,11 +778,18 @@ impl SplitViewState {
     pub fn remove_buffer(&mut self, buffer_id: BufferId) {
         self.open_buffers
             .retain(|t| *t != TabTarget::Buffer(buffer_id));
-        self.remove_from_history(buffer_id);
-        // Clean up keyed state (but never remove the active buffer's state)
-        if buffer_id != self.active_buffer {
-            self.keyed_states.remove(&buffer_id);
+        // A group shown in the tab goes with it (the editor then closes it:
+        // `Editor::close_groups_out_of_tabs`), and off the screen if it was
+        // on: the pane is back on the buffer, as if it had shown the buffer.
+        if let Some(group) = self.group_in_tab(buffer_id) {
+            self.tab_groups.retain(|(_, g, _)| *g != group);
+            if self.shown_group_tab() == Some(group) {
+                self.shown = Shown::Buffer(buffer_id);
+            }
         }
+        self.remove_from_history(buffer_id);
+        // Clean up keyed state (but never the buffer tab's)
+        self.take_buffer_state(buffer_id);
     }
 
     /// Check if a buffer is open in this split
@@ -643,15 +804,60 @@ impl SplitViewState {
         }
     }
 
-    /// Remove a group tab from this split's tabs
+    /// Remove a group from this split — its tab, or the buffer tab it is
+    /// shown in, which shows the buffer again — and stop showing it, if this
+    /// pane does.
     pub fn remove_group(&mut self, leaf_id: LeafId) {
         self.open_buffers
             .retain(|t| *t != TabTarget::Group(leaf_id));
+        self.tab_groups.retain(|(_, g, _)| *g != leaf_id);
+        self.leave_group(leaf_id);
     }
 
-    /// Check if a group tab is open in this split
+    /// Show `group` in `buffer`'s tab, instead of the buffer, with `panel`
+    /// taking the keyboard; and show that tab. The tab stays the buffer's in
+    /// every way (its name, its place, closing it): only what it shows
+    /// changes. `remove_group` gives the tab back to the buffer.
+    pub fn show_in_tab(&mut self, buffer: BufferId, group: LeafId, panel: LeafId) {
+        self.tab_groups
+            .retain(|(b, g, _)| *b != buffer && *g != group);
+        self.tab_groups.push((buffer, group, panel));
+        self.show_buffer(buffer);
+    }
+
+    /// The buffer whose tab `group` is shown in here, if it is.
+    pub fn tab_of_group(&self, group: LeafId) -> Option<BufferId> {
+        self.tab_groups
+            .iter()
+            .find(|(_, g, _)| *g == group)
+            .map(|(b, _, _)| *b)
+    }
+
+    /// The group shown in `buffer`'s tab here, if one is.
+    pub fn group_in_tab(&self, buffer: BufferId) -> Option<LeafId> {
+        self.tab_groups
+            .iter()
+            .find(|(b, _, _)| *b == buffer)
+            .map(|(_, g, _)| *g)
+    }
+
+    /// What `buffer`'s tab shows: the group shown in it, or the buffer.
+    fn on_tab(&self, buffer: BufferId) -> Shown {
+        match self.tab_groups.iter().find(|(b, _, _)| *b == buffer) {
+            Some(&(_, group, panel)) => Shown::Group {
+                group,
+                panel,
+                behind: buffer,
+            },
+            None => Shown::Buffer(buffer),
+        }
+    }
+
+    /// Whether this split holds `leaf_id`: in a tab of its own, or in a
+    /// buffer's tab (`show_in_tab`).
     pub fn has_group(&self, leaf_id: LeafId) -> bool {
         self.open_buffers.contains(&TabTarget::Group(leaf_id))
+            || self.tab_of_group(leaf_id).is_some()
     }
 
     /// Iterate over only the buffer-tab ids in open_buffers (skipping groups).
@@ -665,35 +871,15 @@ impl SplitViewState {
         self.buffer_tab_ids().collect()
     }
 
-    /// Count only buffer tabs (ignoring group tabs).
-    pub fn buffer_tab_count(&self) -> usize {
-        self.open_buffers
-            .iter()
-            .filter(|t| matches!(t, TabTarget::Buffer(_)))
-            .count()
-    }
-
-    /// Return the effective active tab target for this split.
-    /// If a group tab is marked active, returns `TabTarget::Group`. Otherwise
-    /// returns `TabTarget::Buffer(active_buffer)`.
+    /// The tab this pane shows, as the tab bar names it.
     pub fn active_target(&self) -> TabTarget {
-        match self.active_group_tab {
-            Some(leaf_id) => TabTarget::Group(leaf_id),
-            None => TabTarget::Buffer(self.active_buffer),
+        match self.shown {
+            // A group shown in a buffer's tab is on that tab.
+            Shown::Group { group, behind, .. } if self.tab_of_group(group).is_some() => {
+                TabTarget::Buffer(behind)
+            }
+            shown => shown.target(),
         }
-    }
-
-    /// Switch the active tab to a regular buffer target. Clears any
-    /// active group tab marker.
-    pub fn set_active_buffer_tab(&mut self, buffer_id: BufferId) {
-        self.active_group_tab = None;
-        self.focused_group_leaf = None;
-        self.switch_buffer(buffer_id);
-    }
-
-    /// Switch the active tab to a group target.
-    pub fn set_active_group_tab(&mut self, leaf_id: LeafId) {
-        self.active_group_tab = Some(leaf_id);
     }
 
     /// Push a tab target to the focus history (LRU-style).
@@ -731,15 +917,6 @@ impl SplitNode {
             buffer_id,
             split_id: LeafId(split_id),
             role: None,
-        }
-    }
-
-    /// Create a new leaf node with a role tag.
-    pub fn leaf_with_role(buffer_id: BufferId, split_id: SplitId, role: SplitRole) -> Self {
-        Self::Leaf {
-            buffer_id,
-            split_id: LeafId(split_id),
-            role: Some(role),
         }
     }
 
@@ -855,189 +1032,29 @@ impl SplitNode {
         }
     }
 
-    /// Find the Grouped ancestor node that contains a given target id (by walking
-    /// into Grouped subtrees). Returns the Grouped node's own `split_id` if found.
-    pub fn grouped_ancestor_of(&self, target_id: SplitId) -> Option<LeafId> {
-        match self {
-            Self::Leaf { .. } => None,
-            Self::Split { first, second, .. } => first
-                .grouped_ancestor_of(target_id)
-                .or_else(|| second.grouped_ancestor_of(target_id)),
-            Self::Grouped {
-                split_id, layout, ..
-            } => {
-                if layout.find(target_id).is_some() {
-                    Some(*split_id)
-                } else {
-                    layout.grouped_ancestor_of(target_id)
-                }
-            }
-        }
-    }
-
-    /// Find the Grouped node whose `split_id` matches `target`. Returns
-    /// a reference to the Grouped node (or None).
-    pub fn find_grouped(&self, target: LeafId) -> Option<&Self> {
-        match self {
-            Self::Leaf { .. } => None,
-            Self::Split { first, second, .. } => first
-                .find_grouped(target)
-                .or_else(|| second.find_grouped(target)),
-            Self::Grouped {
-                split_id, layout, ..
-            } => {
-                if *split_id == target {
-                    Some(self)
-                } else {
-                    layout.find_grouped(target)
-                }
-            }
-        }
-    }
-
-    /// Get all leaf nodes (buffer views) with their rectangles.
+    /// The leaves this subtree shows, in the tree's order — first child before
+    /// second, so left to right and top to bottom — without their rectangles.
     ///
-    /// Grouped nodes always recurse into their inner layout — the layout's
-    /// leaves get the full rect that would have been given to the Grouped
-    /// node. Visibility (which group is "active") is applied elsewhere.
-    pub fn get_leaves_with_rects(&self, rect: Rect) -> Vec<(LeafId, BufferId, Rect)> {
+    /// **The model answers which; layout answers where.** This subtree used
+    /// to lay itself out to say where its leaves are, in a scratch `Ui<()>`
+    /// that was a second layout of the grid the frame had already laid out.
+    /// Where a pane is comes off that frame's tree now
+    /// (`view::shell::geometry::PaneRects`, retained per window), and the
+    /// partition never changes which leaves there are — so what the model
+    /// still answers is this.
+    pub fn visible_leaves(&self) -> Vec<(LeafId, BufferId)> {
         match self {
             Self::Leaf {
                 buffer_id,
                 split_id,
                 ..
-            } => {
-                vec![(*split_id, *buffer_id, rect)]
+            } => vec![(*split_id, *buffer_id)],
+            Self::Split { first, second, .. } => {
+                let mut out = first.visible_leaves();
+                out.extend(second.visible_leaves());
+                out
             }
-            Self::Split {
-                direction,
-                first,
-                second,
-                ratio,
-                fixed_first,
-                fixed_second,
-                ..
-            } => {
-                let (first_rect, second_rect) =
-                    split_rect_ext(rect, *direction, *ratio, *fixed_first, *fixed_second);
-                let mut leaves = first.get_leaves_with_rects(first_rect);
-                leaves.extend(second.get_leaves_with_rects(second_rect));
-                leaves
-            }
-            Self::Grouped { layout, .. } => layout.get_leaves_with_rects(rect),
-        }
-    }
-
-    /// Walk the tree using an "active group" predicate. For each Grouped node
-    /// encountered, the predicate is called with the Grouped node's split_id;
-    /// if it returns `true`, the node's layout is recursed into (with the
-    /// Grouped node's rect). If `false`, the Grouped node and its subtree are
-    /// skipped entirely (not rendered).
-    pub fn get_visible_leaves_with_rects<F>(
-        &self,
-        rect: Rect,
-        is_group_active: &F,
-    ) -> Vec<(LeafId, BufferId, Rect)>
-    where
-        F: Fn(LeafId) -> bool,
-    {
-        match self {
-            Self::Leaf {
-                buffer_id,
-                split_id,
-                ..
-            } => {
-                vec![(*split_id, *buffer_id, rect)]
-            }
-            Self::Split {
-                direction,
-                first,
-                second,
-                ratio,
-                fixed_first,
-                fixed_second,
-                ..
-            } => {
-                let (first_rect, second_rect) =
-                    split_rect_ext(rect, *direction, *ratio, *fixed_first, *fixed_second);
-                let mut leaves = first.get_visible_leaves_with_rects(first_rect, is_group_active);
-                leaves.extend(second.get_visible_leaves_with_rects(second_rect, is_group_active));
-                leaves
-            }
-            Self::Grouped {
-                split_id, layout, ..
-            } => {
-                if is_group_active(*split_id) {
-                    layout.get_visible_leaves_with_rects(rect, is_group_active)
-                } else {
-                    Vec::new()
-                }
-            }
-        }
-    }
-
-    /// Get all split separator lines (for rendering borders)
-    /// Returns (direction, x, y, length) tuples
-    pub fn get_separators(&self, rect: Rect) -> Vec<(SplitDirection, u16, u16, u16)> {
-        self.get_separators_with_ids(rect)
-            .into_iter()
-            .map(|(_, dir, x, y, len)| (dir, x, y, len))
-            .collect()
-    }
-
-    /// Get all split separator lines with their split IDs (for mouse hit testing)
-    /// Returns (split_id, direction, x, y, length) tuples
-    pub fn get_separators_with_ids(
-        &self,
-        rect: Rect,
-    ) -> Vec<(ContainerId, SplitDirection, u16, u16, u16)> {
-        match self {
-            Self::Leaf { .. } => vec![],
-            Self::Grouped { layout, .. } => layout.get_separators_with_ids(rect),
-            Self::Split {
-                direction,
-                first,
-                second,
-                ratio,
-                split_id,
-                fixed_first,
-                fixed_second,
-            } => {
-                let (first_rect, second_rect) =
-                    split_rect_ext(rect, *direction, *ratio, *fixed_first, *fixed_second);
-                let mut separators = Vec::new();
-
-                // Add separator for this split (in the 1-char gap between first and second)
-                match direction {
-                    SplitDirection::Horizontal => {
-                        // Horizontal split: separator line is between first and second
-                        // y position is at the end of first rect (the gap line)
-                        separators.push((
-                            *split_id,
-                            SplitDirection::Horizontal,
-                            rect.x,
-                            first_rect.y + first_rect.height,
-                            rect.width,
-                        ));
-                    }
-                    SplitDirection::Vertical => {
-                        // Vertical split: separator line is between first and second
-                        // x position is at the end of first rect (the gap column)
-                        separators.push((
-                            *split_id,
-                            SplitDirection::Vertical,
-                            first_rect.x + first_rect.width,
-                            rect.y,
-                            rect.height,
-                        ));
-                    }
-                }
-
-                // Recursively get separators from children
-                separators.extend(first.get_separators_with_ids(first_rect));
-                separators.extend(second.get_separators_with_ids(second_rect));
-                separators
-            }
+            Self::Grouped { layout, .. } => layout.visible_leaves(),
         }
     }
 
@@ -1079,33 +1096,6 @@ impl SplitNode {
             Self::Leaf { .. } => 1,
             Self::Split { first, second, .. } => first.count_leaves() + second.count_leaves(),
             Self::Grouped { layout, .. } => layout.count_leaves(),
-        }
-    }
-
-    /// Collect display names for all Grouped nodes in the tree, keyed by
-    /// their LeafId (which is what `TabTarget::Group` points to).
-    pub fn collect_group_names(&self) -> HashMap<LeafId, String> {
-        let mut map = HashMap::new();
-        self.collect_group_names_into(&mut map);
-        map
-    }
-
-    fn collect_group_names_into(&self, map: &mut HashMap<LeafId, String>) {
-        match self {
-            Self::Leaf { .. } => {}
-            Self::Split { first, second, .. } => {
-                first.collect_group_names_into(map);
-                second.collect_group_names_into(map);
-            }
-            Self::Grouped {
-                split_id,
-                name,
-                layout,
-                ..
-            } => {
-                map.insert(*split_id, name.clone());
-                layout.collect_group_names_into(map);
-            }
         }
     }
 }
@@ -1156,7 +1146,7 @@ fn split_rect(rect: Rect, direction: SplitDirection, ratio: f32) -> (Rect, Rect)
     split_rect_ext(rect, direction, ratio, None, None)
 }
 
-fn split_rect_ext(
+pub(crate) fn split_rect_ext(
     rect: Rect,
     direction: SplitDirection,
     ratio: f32,
@@ -1232,6 +1222,16 @@ fn split_rect_ext(
 }
 
 /// Manager for the split view system
+///
+/// **The buffers it names are buffer *tabs*, not what is on screen.** A
+/// leaf's `buffer_id` is its pane's buffer tab (`SplitViewState::buffer_tab`),
+/// kept in step with the view state by `Window::set_pane_buffer`. While the
+/// pane shows a buffer group the tab is behind the group, and the tree cannot
+/// tell: it holds no view states. So `visible_leaves`, `splits_for_buffer`,
+/// `buffer_for_split`, `get_buffer_id` and `active_buffer_id` answer "which
+/// buffer tab", and a caller asking what a pane *shows* asks the view state
+/// (`SplitViewState::shown`) or the window (`Window::panes`,
+/// `Window::buffer_panes`, `Window::effective_active_pair`).
 #[derive(Debug)]
 pub struct SplitManager {
     /// Root of the split tree
@@ -1289,18 +1289,6 @@ impl SplitManager {
         id
     }
 
-    /// Replace the root split tree. The new tree must have unique IDs
-    /// (allocated via `allocate_split_id`). The caller must also provide
-    /// the new active leaf ID.
-    pub fn replace_root(&mut self, new_root: SplitNode, new_active: LeafId) {
-        self.root = new_root;
-        self.active_split = new_active;
-        // None of the previously-tracked focus-history ids exist in
-        // the new tree. Reseed with just the new active.
-        self.focus_history.clear();
-        self.focus_history.push(new_active);
-    }
-
     /// Get the currently active split ID
     pub fn active_split(&self) -> LeafId {
         self.active_split
@@ -1351,14 +1339,16 @@ impl SplitManager {
             .find(|leaf| self.root.find((*leaf).into()).is_some() && predicate(*leaf))
     }
 
-    /// Get the buffer ID of the active split (if it's a leaf)
+    /// The buffer tab of the active split (if it's a leaf) — behind the
+    /// group, not on screen, while the split shows one. See `SplitManager`.
     pub fn active_buffer_id(&self) -> Option<BufferId> {
         self.root
             .find(self.active_split.into())
             .and_then(|node| node.buffer_id())
     }
 
-    /// Get the buffer ID for a specific split (if it's a leaf)
+    /// The buffer tab of a specific split (if it's a leaf) — not what it
+    /// shows while it shows a group. See `SplitManager`.
     pub fn get_buffer_id(&self, split_id: SplitId) -> Option<BufferId> {
         self.root.find(split_id).and_then(|node| node.buffer_id())
     }
@@ -1402,17 +1392,6 @@ impl SplitManager {
         ratio: f32,
     ) -> Result<LeafId, String> {
         self.split_active_positioned(direction, new_buffer_id, ratio, false)
-    }
-
-    /// Split the active pane, placing the new buffer before (left/top) the existing content.
-    /// `ratio` still controls the first child's proportion of space.
-    pub fn split_active_before(
-        &mut self,
-        direction: SplitDirection,
-        new_buffer_id: BufferId,
-        ratio: f32,
-    ) -> Result<LeafId, String> {
-        self.split_active_positioned(direction, new_buffer_id, ratio, true)
     }
 
     pub fn split_active_positioned(
@@ -1600,26 +1579,6 @@ impl SplitManager {
         }
     }
 
-    /// Remove a Grouped node from the tree by its split_id. Unlike
-    /// `close_split` which requires a leaf, this removes a whole Grouped
-    /// subtree (tab) from the split structure. The Grouped node is
-    /// replaced with... well, nothing — so this can only succeed if the
-    /// Grouped is inside a Split (so we can replace the Split with its
-    /// sibling) or if the root itself is the Grouped (which we can't
-    /// remove without a replacement).
-    pub fn remove_grouped(&mut self, target: LeafId) -> Result<(), String> {
-        let target_id: SplitId = target.into();
-        if self.root.id() == target_id {
-            return Err("Cannot remove root Grouped node".to_string());
-        }
-        let result = Self::remove_child_static(&mut self.root, target_id);
-        if result.is_ok() {
-            // Same invariant as `close_split` (#2415).
-            self.clear_root_leaf_role();
-        }
-        result
-    }
-
     /// Adjust the split ratio of a container
     pub fn adjust_ratio(&mut self, container_id: ContainerId, delta: f32) {
         match self.root.find_mut(container_id.into()) {
@@ -1646,9 +1605,19 @@ impl SplitManager {
         self.root.parent_container_of(leaf_id.into())
     }
 
-    /// Get all visible buffer views with their rectangles
-    pub fn get_visible_buffers(&self, viewport_rect: Rect) -> Vec<(LeafId, BufferId, Rect)> {
-        // If a split is maximized, only show that split taking up the full viewport
+    /// Which leaves are visible, in the tree's order, without asking where
+    /// they are: only the maximized leaf when one is maximized (and it still
+    /// exists), otherwise every leaf of the tree.
+    ///
+    /// **The set does not depend on the box.** Which leaves show is a fact
+    /// about the tree and the maximized split alone; where they are is the
+    /// layout's answer, read off the shell tree that placed them
+    /// (`view::shell::geometry::PaneRects`, which `Window::visible_panes`
+    /// pairs with this list). The model used to answer both at once by laying
+    /// the grid out again in a box the caller supplied, and a caller that
+    /// wanted only the set had to invent a rectangle to get it — an invented
+    /// input whose value cannot matter is a claim that it might.
+    pub fn visible_leaves(&self) -> Vec<(LeafId, BufferId)> {
         if let Some(maximized_id) = self.maximized_split {
             if let Some(SplitNode::Leaf {
                 buffer_id,
@@ -1656,34 +1625,10 @@ impl SplitManager {
                 ..
             }) = self.root.find(maximized_id)
             {
-                return vec![(*split_id, *buffer_id, viewport_rect)];
+                return vec![(*split_id, *buffer_id)];
             }
-            // Maximized split no longer exists, clear it and fall through
         }
-        self.root.get_leaves_with_rects(viewport_rect)
-    }
-
-    /// Get all split separator positions for rendering borders
-    /// Returns (direction, x, y, length) tuples
-    pub fn get_separators(&self, viewport_rect: Rect) -> Vec<(SplitDirection, u16, u16, u16)> {
-        // No separators when a split is maximized
-        if self.maximized_split.is_some() {
-            return vec![];
-        }
-        self.root.get_separators(viewport_rect)
-    }
-
-    /// Get all split separator positions with their split IDs (for mouse hit testing)
-    /// Returns (container_id, direction, x, y, length) tuples
-    pub fn get_separators_with_ids(
-        &self,
-        viewport_rect: Rect,
-    ) -> Vec<(ContainerId, SplitDirection, u16, u16, u16)> {
-        // No separators when a split is maximized
-        if self.maximized_split.is_some() {
-            return vec![];
-        }
-        self.root.get_separators_with_ids(viewport_rect)
+        self.root.visible_leaves()
     }
 
     /// Get the current ratio of a split container
@@ -1713,25 +1658,6 @@ impl SplitManager {
             true
         } else {
             false
-        }
-    }
-
-    /// Set a fixed size on a split container's first or second child.
-    /// When set, the child gets exactly this many rows/cols instead of using the ratio.
-    pub fn set_fixed_size(
-        &mut self,
-        container_id: ContainerId,
-        first: Option<u16>,
-        second: Option<u16>,
-    ) {
-        if let Some(SplitNode::Split {
-            fixed_first,
-            fixed_second,
-            ..
-        }) = self.root.find_mut(container_id.into())
-        {
-            *fixed_first = first;
-            *fixed_second = second;
         }
     }
 
@@ -1793,33 +1719,51 @@ impl SplitManager {
         }
     }
 
-    /// Get all split IDs that display a specific buffer
-    pub fn splits_for_buffer(&self, target_buffer_id: BufferId) -> Vec<LeafId> {
-        self.root
-            .get_leaves_with_rects(Rect {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-            })
+    /// The buffer group each visible pane is showing, by the pane showing
+    /// it — the shape `view::shell::splits::Splits::groups` takes.
+    ///
+    /// A group's layout lives in `grouped_subtrees`, keyed by the *group's*
+    /// leaf, and a pane names the group it shows through its view state's
+    /// `shown_group_tab`. This is the one join of the two; the frame's
+    /// description and the session preview's offscreen layout both take it.
+    pub fn pane_groups(
+        &self,
+        view_states: &HashMap<LeafId, SplitViewState>,
+        grouped_subtrees: &HashMap<LeafId, SplitNode>,
+    ) -> HashMap<LeafId, SplitNode> {
+        self.visible_leaves()
             .into_iter()
-            .filter(|(_, buffer_id, _)| *buffer_id == target_buffer_id)
-            .map(|(split_id, _, _)| split_id)
+            .filter_map(|(leaf, _)| {
+                let group = view_states.get(&leaf)?.shown_group_tab()?;
+                Some((leaf, grouped_subtrees.get(&group)?.clone()))
+            })
             .collect()
     }
 
-    /// Get the buffer ID for a specific leaf split
+    /// Get all split IDs that display a specific buffer.
+    ///
+    /// A question about the leaf set, answered from the leaf set. It used to
+    /// lay the grid out in a 1×1 probe to get the same list — which put a
+    /// scratch layout on the render path once per pane per frame, through
+    /// `update_menu_context`'s "same buffer in another split" check.
+    pub fn splits_for_buffer(&self, target_buffer_id: BufferId) -> Vec<LeafId> {
+        self.root
+            .visible_leaves()
+            .into_iter()
+            .filter(|(_, buffer_id)| *buffer_id == target_buffer_id)
+            .map(|(split_id, _)| split_id)
+            .collect()
+    }
+
+    /// Get the buffer ID for a specific leaf split. See
+    /// [`Self::splits_for_buffer`] for why this walks the tree rather than
+    /// laying it out.
     pub fn buffer_for_split(&self, target_split_id: LeafId) -> Option<BufferId> {
         self.root
-            .get_leaves_with_rects(Rect {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-            })
+            .visible_leaves()
             .into_iter()
-            .find(|(split_id, _, _)| *split_id == target_split_id)
-            .map(|(_, buffer_id, _)| buffer_id)
+            .find(|(split_id, _)| *split_id == target_split_id)
+            .map(|(_, buffer_id)| buffer_id)
     }
 
     /// Maximize the active split (hide all other splits temporarily)
@@ -2015,6 +1959,202 @@ impl SplitManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only an unwrapped Source view with horizontal scroll on shares its
+    /// column: scroll sync copies a column to (and from) nothing else.
+    #[test]
+    fn only_an_unwrapped_scrollable_source_view_shares_horizontal_scroll() {
+        let unwrapped = || {
+            let mut state = BufferViewState::new(80, 24);
+            state.viewport.line_wrap_enabled = false;
+            state
+        };
+        assert!(unwrapped().shares_horizontal_scroll());
+
+        let mut wrapped = unwrapped();
+        wrapped.viewport.line_wrap_enabled = true;
+        assert!(!wrapped.shares_horizontal_scroll());
+
+        let mut panel = unwrapped();
+        panel.viewport.horizontal_scroll_enabled = false;
+        assert!(!panel.shares_horizontal_scroll());
+
+        let mut page = unwrapped();
+        page.activate_page_view(None);
+        assert!(!page.shares_horizontal_scroll());
+    }
+
+    /// **A pane shows one tab, and the buffer behind a group is not on
+    /// screen.** Showing a group leaves no shown buffer and no shown view
+    /// state; the buffer tab stays behind it, with its state, to come back
+    /// to — and a buffer tab changed meanwhile goes behind the group rather
+    /// than onto the screen.
+    #[test]
+    fn a_pane_showing_a_group_shows_no_buffer() {
+        let file = BufferId(1);
+        let other = BufferId(2);
+        let group = LeafId(SplitId(50));
+        let panel = LeafId(SplitId(51));
+        let mut vs = SplitViewState::with_buffer(80, 24, file);
+        vs.show_group(group, panel);
+
+        assert_eq!(vs.shown_buffer(), None);
+        assert!(vs.shown_state().is_none());
+        assert_eq!(vs.shown_group(), Some((group, panel)));
+        assert_eq!(vs.active_target(), TabTarget::Group(group));
+        assert_eq!(vs.buffer_tab(), file, "the file is behind the group");
+
+        vs.set_buffer_tab(other);
+        assert_eq!(vs.shown_buffer(), None, "a new buffer tab goes behind");
+        assert_eq!(vs.buffer_tab(), other);
+
+        vs.leave_group(group);
+        assert_eq!(vs.shown_buffer(), Some(other));
+        assert!(vs.shown_state().is_some());
+    }
+
+    /// There is no focused panel without a group, and closing the group
+    /// takes its focus with it.
+    #[test]
+    fn a_group_panel_is_focused_only_inside_a_shown_group() {
+        let file = BufferId(1);
+        let group = LeafId(SplitId(50));
+        let mut vs = SplitViewState::with_buffer(80, 24, file);
+        vs.focus_group_panel(LeafId(SplitId(51)));
+        assert_eq!(vs.shown(), Shown::Buffer(file));
+
+        vs.add_group(group);
+        vs.show_group(group, LeafId(SplitId(51)));
+        vs.focus_group_panel(LeafId(SplitId(52)));
+        assert_eq!(vs.shown_group(), Some((group, LeafId(SplitId(52)))));
+
+        vs.remove_group(group);
+        assert_eq!(vs.shown(), Shown::Buffer(file));
+        assert_eq!(vs.shown_group(), None);
+    }
+
+    /// **A group shown in a buffer's tab leaves the tab the buffer's.** The
+    /// pane's tabs are the buffers' only, and the active one is the file's
+    /// while its tab shows the group; going to another tab and back shows the
+    /// group again, with the panel last focused; removing the group gives the
+    /// tab back to the file.
+    #[test]
+    fn a_group_shown_in_a_buffers_tab_leaves_the_tab_the_buffers() {
+        let file = BufferId(1);
+        let other = BufferId(2);
+        let group = LeafId(SplitId(50));
+        let (source, preview) = (LeafId(SplitId(51)), LeafId(SplitId(52)));
+        let mut vs = SplitViewState::with_buffer(80, 24, other);
+        vs.add_buffer(file);
+        vs.show_in_tab(file, group, source);
+
+        assert_eq!(
+            vs.open_buffers,
+            [TabTarget::Buffer(other), TabTarget::Buffer(file)]
+        );
+        assert_eq!(vs.active_target(), TabTarget::Buffer(file));
+        assert_eq!(vs.shown_group(), Some((group, source)));
+        assert!(vs.has_group(group));
+
+        vs.focus_group_panel(preview);
+        vs.show_buffer(other);
+        assert_eq!(vs.shown(), Shown::Buffer(other));
+        vs.show_buffer(file);
+        assert_eq!(vs.shown_group(), Some((group, preview)));
+        assert_eq!(vs.active_target(), TabTarget::Buffer(file));
+
+        // Switching tabs underneath (`set_buffer_tab`) leaves the tab's group.
+        vs.set_buffer_tab(other);
+        assert_eq!(vs.shown(), Shown::Buffer(other));
+
+        vs.show_buffer(file);
+        vs.remove_group(group);
+        assert_eq!(vs.shown(), Shown::Buffer(file));
+        assert!(!vs.has_group(group));
+        vs.show_buffer(other);
+        vs.show_buffer(file);
+        assert_eq!(
+            vs.shown(),
+            Shown::Buffer(file),
+            "the tab is the file's again"
+        );
+    }
+
+    /// A group with a tab of its own is not on a buffer's tab, and a group
+    /// in a buffer's tab is gone from the pane with that tab.
+    #[test]
+    fn a_group_in_a_tab_goes_with_the_tab() {
+        let file = BufferId(1);
+        let other = BufferId(2);
+        let (own, in_tab) = (LeafId(SplitId(50)), LeafId(SplitId(60)));
+        let mut vs = SplitViewState::with_buffer(80, 24, file);
+        vs.add_buffer(other);
+        vs.add_group(own);
+        vs.show_group(own, LeafId(SplitId(51)));
+        assert_eq!(vs.active_target(), TabTarget::Group(own));
+
+        vs.show_in_tab(file, in_tab, LeafId(SplitId(61)));
+        assert_eq!(vs.group_in_tab(file), Some(in_tab));
+        vs.show_buffer(other);
+        vs.remove_buffer(file);
+        assert_eq!(vs.group_in_tab(file), None);
+        assert!(!vs.has_group(in_tab));
+        assert!(vs.has_group(own), "the group with its own tab stays");
+    }
+
+    /// A group with a tab of its own opened over a buffer's tab that shows
+    /// a group: closing it goes back to what that tab shows, the group.
+    #[test]
+    fn leaving_a_group_goes_back_to_what_the_tab_shows() {
+        let file = BufferId(1);
+        let (in_tab, own) = (LeafId(SplitId(50)), LeafId(SplitId(60)));
+        let mut vs = SplitViewState::with_buffer(80, 24, file);
+        vs.show_in_tab(file, in_tab, LeafId(SplitId(51)));
+        vs.add_group(own);
+        vs.show_group(own, LeafId(SplitId(61)));
+        assert_eq!(vs.active_target(), TabTarget::Group(own));
+
+        vs.remove_group(own);
+        assert_eq!(vs.shown_group(), Some((in_tab, LeafId(SplitId(51)))));
+        assert_eq!(vs.active_target(), TabTarget::Buffer(file));
+    }
+
+    /// Removing the tab a group is shown in takes the group off the screen
+    /// with it: the next tab is shown, not the group behind it.
+    #[test]
+    fn removing_a_tab_takes_its_group_off_the_screen() {
+        let file = BufferId(1);
+        let other = BufferId(2);
+        let group = LeafId(SplitId(50));
+        let mut vs = SplitViewState::with_buffer(80, 24, other);
+        vs.add_buffer(file);
+        vs.show_in_tab(file, group, LeafId(SplitId(51)));
+
+        vs.remove_buffer(file);
+        assert_eq!(vs.shown_group(), None);
+        vs.set_buffer_tab(other);
+        assert_eq!(vs.shown(), Shown::Buffer(other));
+        assert!(!vs.has_group(group));
+    }
+
+    /// The buffer tab's view state cannot be dropped from outside, whether
+    /// the tab is shown or behind a group.
+    #[test]
+    fn the_buffer_tab_keeps_its_view_state() {
+        let file = BufferId(1);
+        let other = BufferId(2);
+        let mut vs = SplitViewState::with_buffer(80, 24, file);
+        vs.ensure_buffer_state(other);
+        vs.show_group(LeafId(SplitId(50)), LeafId(SplitId(51)));
+
+        assert!(vs.take_buffer_state(file).is_none());
+        vs.retain_buffer_states(|_| false);
+        vs.remove_buffer(file);
+        assert!(vs.has_buffer_state(file));
+        assert!(!vs.has_buffer_state(other));
+        // Still reachable by name, for switching back.
+        let _ = vs.buffer_tab_state();
+    }
 
     /// The two fold-indicator overrides are a precedence, not a single flag:
     /// a plugin supplies the default, the user's own toggle overrules it, and

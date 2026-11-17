@@ -21,22 +21,146 @@ use crate::render::geom::Point;
 
 use super::Behavior;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Command {
     ScrollTo(Point),
     /// Move the window so that this index is inside it.
     Reveal(u32),
+    /// Move the window so that the descendant with this key is inside it.
+    RevealKey(crate::key::Key),
+    /// Move the window so that the descendant with this key is at its top.
+    TopKey(crate::key::Key),
+    /// Move the window so that one row *inside* the keyed descendant is in
+    /// it: `(key, rows from that band's top)`.
+    RevealKeyAt(crate::key::Key, u32),
+    RevealByte(crate::key::Key, usize),
+    /// Move the window by this many rows (negative: up), clamped.
+    ScrollBy(i32),
+    /// Move the window by this many of its own heights (negative: up),
+    /// clamped — a page key, in whatever unit the window counts.
+    ScrollByPages(i32),
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Anchor {
     bound: Cell<Option<ElementId>>,
     queue: RefCell<Vec<Command>>,
+    /// A standing [`Anchor::follow`] request: the index the window keeps in
+    /// view on every layout until the reader scrolls it away.
+    follow: Cell<Option<u32>>,
+    /// Whether the window records its children's bands for
+    /// [`Anchor::page_key`]; see [`Anchor::paged`].
+    paged: bool,
+    /// What the last layout placed, when `paged`: `None` until the window is
+    /// laid out, and again once it is gone.
+    bands: RefCell<Option<Bands>>,
+}
+
+/// The keyed children of a paged window's content, in order, with the bands
+/// the last layout gave them, and the window's own extent and offset — all
+/// along the axis it scrolls.
+#[derive(Debug, Clone)]
+pub(crate) struct Bands {
+    pub(crate) window: i32,
+    pub(crate) offset: i32,
+    pub(crate) run: Vec<(crate::key::Key, i32, i32)>,
+}
+
+/// Where a paged window starts, as the last layout left it. See
+/// [`Anchor::start`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Start {
+    /// How far along the axis it scrolls the window starts.
+    pub offset: i32,
+    /// The keyed child holding the window's first row; `None` when every
+    /// child ends above it.
+    pub first: Option<crate::key::Key>,
 }
 
 impl Anchor {
     pub fn new() -> Rc<Anchor> {
         Rc::new(Anchor::default())
+    }
+
+    /// An anchor whose window also answers [`Anchor::page_key`]: at each
+    /// layout it records where its content's keyed children sit.
+    ///
+    /// For a window over a column of things of different heights — a page
+    /// of setting cards — where a page is not a count of items but a
+    /// window's height of content, and only layout knows which child that
+    /// lands on.
+    pub fn paged() -> Rc<Anchor> {
+        Rc::new(Anchor {
+            paged: true,
+            ..Anchor::default()
+        })
+    }
+
+    pub(crate) fn wants_bands(&self) -> bool {
+        self.paged
+    }
+
+    pub(crate) fn record_bands(&self, bands: Bands) {
+        *self.bands.borrow_mut() = Some(bands);
+    }
+
+    /// The element this anchor addressed is gone: nothing is bound, and a
+    /// paged window has no bands.
+    pub(crate) fn unbind(&self, id: ElementId) {
+        if self.bound.get() == Some(id) {
+            self.bound.set(None);
+            *self.bands.borrow_mut() = None;
+        }
+    }
+
+    /// The keyed child a page from `from` (negative: up): the one whose band
+    /// holds the point a window's height of content past the start of
+    /// `from`'s, clamped to the first and last. A child taller than the
+    /// window still moves: a page from it is at least the next one.
+    ///
+    /// `None` when the window was not built [`paged`](Anchor::paged), has not
+    /// been laid out, is gone, or `from` is not one of its children.
+    pub fn page_key(&self, from: &crate::key::Key, pages: i32) -> Option<crate::key::Key> {
+        let bands = self.bands.borrow();
+        let b = bands.as_ref()?;
+        let at = b.run.iter().position(|(k, _, _)| k == from)?;
+        let last = b.run.len() - 1;
+        let want = b.run[at].1 + pages * b.window.max(1);
+        let holding = b
+            .run
+            .iter()
+            .rposition(|(_, top, _)| *top <= want)
+            .unwrap_or(0);
+        let to = match pages.cmp(&0) {
+            std::cmp::Ordering::Greater => holding.max((at + 1).min(last)),
+            std::cmp::Ordering::Less => holding.min(at.saturating_sub(1)),
+            std::cmp::Ordering::Equal => at,
+        };
+        Some(b.run[to].0.clone())
+    }
+
+    /// Where the window starts: its offset, and the keyed child whose band
+    /// holds its first row — the first child that reaches past the window's
+    /// top, so a card scrolled half away is still the one the window is on.
+    ///
+    /// For an owner whose own state follows what the reader is looking at
+    /// (a list of sections beside a page of cards): which card that is is
+    /// layout's answer, as a page is.
+    ///
+    /// `None` when the window was not built [`paged`](Anchor::paged), has not
+    /// been laid out, or is gone.
+    pub fn start(&self) -> Option<Start> {
+        let bands = self.bands.borrow();
+        let b = bands.as_ref()?;
+        let first = b
+            .run
+            .iter()
+            .find(|(_, top, h)| top + h > b.offset)
+            .map(|(k, _, _)| k.clone());
+        Some(Start {
+            offset: b.offset,
+            first,
+        })
     }
 
     /// The element this anchor addresses, once it has mounted.
@@ -57,10 +181,114 @@ impl Anchor {
         self.queue.borrow_mut().push(Command::ScrollTo(p));
     }
 
+    /// Move the target's window by `rows` (negative: up), clamped to its
+    /// content. The arrow keys of a page that scrolls as a whole.
+    pub fn scroll_by(&self, rows: i32) {
+        self.queue.borrow_mut().push(Command::ScrollBy(rows));
+    }
+
+    /// Move the target's window by `pages` of its own height (negative:
+    /// up), clamped. The page keys of a page that scrolls as a whole.
+    pub fn scroll_by_pages(&self, pages: i32) {
+        self.queue.borrow_mut().push(Command::ScrollByPages(pages));
+    }
+
     /// Move the target's window so that `index` is inside it, by the shortest
     /// distance. Nothing happens if it already is.
     pub fn reveal(&self, index: u32) {
         self.queue.borrow_mut().push(Command::Reveal(index));
+    }
+
+    /// **Keep** `index` inside the target's window — a [`Anchor::reveal`]
+    /// that is re-applied on every layout, against the window's real height,
+    /// until the reader scrolls the window themselves (a wheel over it clears
+    /// the request) or the owner asks again.
+    ///
+    /// For a caret: a one-shot reveal answers the frame it is asked on, and a
+    /// window that changes height a frame later (a box that grows with its
+    /// text) or content that re-wraps under an unchanged row can leave the
+    /// caret out of sight. Standing, the request is answered by whichever
+    /// layout is current. A wheel is the reader saying where they want to look,
+    /// so it wins until the owner's next request — the caret's next move.
+    pub fn follow(&self, index: u32) {
+        self.follow.set(Some(index));
+    }
+
+    /// Drop a standing [`Anchor::follow`] request.
+    pub fn unfollow(&self) {
+        self.follow.set(None);
+    }
+
+    /// The standing follow request, if any.
+    pub(crate) fn following(&self) -> Option<u32> {
+        self.follow.get()
+    }
+
+    /// Move the target's window so that the descendant carrying `key` is
+    /// inside it, by the shortest distance. Nothing happens if it already is,
+    /// or if nothing under the target carries that key.
+    ///
+    /// **The companion [`Anchor::reveal`] cannot answer for content whose
+    /// items differ in height**: it takes an index and treats it as a content
+    /// row, which is the same thing only when every row is one cell. A column
+    /// of cards — a settings page, a diff, a feed — knows *which* card to
+    /// show and has no idea what row it landed on; the framework, which laid
+    /// the column out, does. So the caller names the card and the window is
+    /// moved by what was measured, rather than by a second measurement the
+    /// caller would have to keep in step.
+    ///
+    /// A band taller than the window is shown from its top: the alternative
+    /// (its bottom edge flush with the window's) scrolls past the very thing
+    /// the caller asked to see.
+    pub fn reveal_key(&self, key: impl Into<crate::key::Key>) {
+        self.queue.borrow_mut().push(Command::RevealKey(key.into()));
+    }
+
+    /// Move the target's window so that the descendant carrying `key` is at
+    /// the *top* of it, however far that is.
+    ///
+    /// The difference from [`Anchor::reveal_key`] is what "show me this" means
+    /// when the caller is jumping rather than following. Revealing moves as
+    /// little as possible, which leaves the target at the bottom edge — right
+    /// for a cursor that walked there, wrong for "take me to this section",
+    /// where everything under the heading is what the reader wants and a
+    /// tight viewport clips it away entirely.
+    pub fn top_key(&self, key: impl Into<crate::key::Key>) {
+        self.queue.borrow_mut().push(Command::TopKey(key.into()));
+    }
+
+    /// Move the target's window so that the row `row` rows into the keyed
+    /// descendant's band is inside it.
+    ///
+    /// **For an offset the caller owns inside content the framework placed.**
+    /// A text editor knows its caret is on its own line seventeen; it does
+    /// not know, and should not compute, which row of the column that lands
+    /// on. Naming the band and the offset within it splits the question at
+    /// the one place each side has an answer for.
+    pub fn reveal_key_at(&self, key: impl Into<crate::key::Key>, row: u32) {
+        self.queue
+            .borrow_mut()
+            .push(Command::RevealKeyAt(key.into(), row));
+    }
+
+    /// Move the target's window so that the row holding `byte` of the keyed
+    /// **wrapped text run** is inside it.
+    ///
+    /// **The same split as [`Anchor::reveal_key_at`], one step further** (L5).
+    /// There the caller owns an offset *in rows* inside content the framework
+    /// placed; here it does not have rows at all. A document view knows where
+    /// its caret is as a byte of the string it handed over, and which row that
+    /// byte landed on is the wrap's answer — it changes with the width, and
+    /// the caller would have to re-shape the text to find it, which is the
+    /// second layout this design exists to remove. So the caller names the
+    /// byte and the framework, which shaped the rows, does the rest.
+    ///
+    /// The keyed descendant must be a text run; naming anything else moves
+    /// nothing, as an unknown key does.
+    pub fn reveal_byte(&self, key: impl Into<crate::key::Key>, byte: usize) {
+        self.queue
+            .borrow_mut()
+            .push(Command::RevealByte(key.into(), byte));
     }
 }
 

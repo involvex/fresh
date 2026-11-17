@@ -34,6 +34,19 @@ use crate::input::input_history::get_data_dir;
 /// Current workspace file format version
 pub const WORKSPACE_VERSION: u32 = 1;
 
+/// The search-option defaults a window started on before `editor.search`
+/// existed, and so the values a pre-`search_overrides` workspace file
+/// carries when the user never touched the toggles.
+///
+/// A field of [`Workspace::legacy_search_options`] equal to its value here
+/// says nothing; a field that differs is a choice the user made.
+pub const LEGACY_SEARCH_DEFAULTS: SearchOptions = SearchOptions {
+    case_sensitive: true,
+    whole_word: false,
+    use_regex: false,
+    confirm_each: false,
+};
+
 /// Current per-file workspace version
 pub const FILE_WORKSPACE_VERSION: u32 = 1;
 
@@ -66,13 +79,68 @@ pub struct Workspace {
     #[serde(default)]
     pub histories: WorkspaceHistories,
 
-    /// Search options (persist across searches within workspace)
-    #[serde(default)]
-    pub search_options: SearchOptions,
+    /// The match options this workspace overrides the `editor.search`
+    /// config preset with, field by field, or `None` when it has nothing
+    /// of its own to say and the preset applies in full.
+    ///
+    /// Per field, not per struct: a workspace where the user turned regex
+    /// on has an opinion about regex and none about the other three, so a
+    /// later change to `editor.search.case_sensitive` still reaches it.
+    /// Persisting all four the moment one of them diverges would freeze
+    /// the other three against every future config change, silently and
+    /// with nothing in the UI to explain it — which is the trap the
+    /// superseded `search_options` key fell into.
+    ///
+    /// **Not** that key, and deliberately not named it. That one was
+    /// written on every save whether or not the user had chosen anything,
+    /// from a window that started case-sensitive, so a `case_sensitive:
+    /// true` in it cannot be told from "nobody ever touched this".
+    /// Reading those as choices would have left the fold-case default
+    /// (issue #3212) reaching only workspaces nobody had ever opened.
+    /// [`Workspace::legacy_search_options`] is how the old key is still
+    /// read, for the parts of it that *are* unambiguous.
+    ///
+    /// The alternative was a `WORKSPACE_VERSION` bump plus a migration,
+    /// which is a much bigger hammer than this is worth: `load_from_path`
+    /// rejects any file whose version is newer than it knows, so bumping
+    /// would mean an older Fresh refusing to open the whole workspace —
+    /// splits, tabs, terminals, bookmarks — over one search field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_overrides: Option<SearchOverrides>,
+
+    /// The superseded `search_options` key, read only so its *unambiguous*
+    /// parts can be carried across, and never written back — it drops out
+    /// of the file on the next save.
+    ///
+    /// `case_sensitive: true` is the ambiguous one: it was the old window
+    /// default, so it is equally likely to mean "the user chose this" and
+    /// "nobody ever touched it", and reading it as a choice is what would
+    /// keep the fold-case default (issue #3212) away from every workspace
+    /// a user has ever opened. A field that *differs* from
+    /// [`LEGACY_SEARCH_DEFAULTS`] is better evidence: for `whole_word` and
+    /// `use_regex` nothing but the toggle could have set it, so a
+    /// whole-word or regex search the user set up survives.
+    ///
+    /// `confirm_each` is weaker evidence than its neighbours — Query
+    /// Replace sets it programmatically (`Action::QueryReplace`) and
+    /// nothing clears it — so a `true` there may only mean the user once
+    /// ran that command. It is still carried across, because that is what
+    /// the old code would have restored, and because a per-field override
+    /// keeps it from speaking for the other three.
+    ///
+    /// See [`SearchOptions::legacy_overrides`] for the rule.
+    #[serde(default, rename = "search_options", skip_serializing)]
+    pub legacy_search_options: Option<SearchOptions>,
 
     /// Bookmarks (character key -> file position)
     #[serde(default)]
     pub bookmarks: HashMap<char, SerializedBookmark>,
+
+    /// Files recently closed in this workspace, most recent first (for
+    /// "Recent Files"). Relative to `working_dir` when inside it,
+    /// otherwise absolute.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub closed_files: Vec<PathBuf>,
 
     /// Open terminal workspaces (for restoration)
     #[serde(default)]
@@ -100,6 +168,20 @@ pub struct Workspace {
 
     /// Timestamp when workspace was saved (Unix epoch seconds)
     pub saved_at: u64,
+
+    /// When this workspace was last the foreground one, in Unix epoch
+    /// milliseconds. Stamped on activation — not on save — so it answers
+    /// "which workspace was I last working in", which `saved_at` cannot:
+    /// every materialized window is written at quit, so their save times
+    /// are all the same instant.
+    ///
+    /// Read at boot by Orchestrator mode, which reopens the highest one
+    /// regardless of the launch directory. `None` in files written before
+    /// this existed; such a workspace simply never wins the comparison,
+    /// which degrades to the launch-directory rule rather than to nothing.
+    /// Milliseconds because two switches inside one second are ordinary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_focused_at: Option<u64>,
 
     /// Display label for this session (orchestrator). Defaults to the
     /// root basename when absent. Since windows.json was dropped, the
@@ -138,6 +220,19 @@ pub struct Workspace {
     /// duplicate).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stable_id: Option<String>,
+}
+
+/// Now, in Unix epoch milliseconds — the clock behind
+/// [`Workspace::last_focused_at`].
+///
+/// Milliseconds rather than the seconds `saved_at` uses: switching
+/// workspaces twice inside one second is an ordinary thing to do, and at
+/// second resolution the second switch would not outrank the first.
+pub fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// Mint a new durable workspace identity: creation-time nanoseconds plus a
@@ -238,19 +333,17 @@ pub struct SerializedSplitViewState {
     /// Per-file cursor and scroll state
     #[serde(default)]
     pub file_states: HashMap<PathBuf, SerializedFileState>,
-
-    /// Tab scroll offset
-    #[serde(default)]
-    pub tab_scroll_offset: usize,
-
-    /// View mode
-    #[serde(default)]
-    pub view_mode: SerializedViewMode,
-
-    /// Compose width if in compose mode
-    #[serde(default)]
-    pub compose_width: Option<u16>,
 }
+
+// **A split has no view mode and no compose width.** Both were written here
+// as a copy of whatever buffer happened to be active when the session was
+// saved, and read back onto whatever buffer happened to come up active — so a
+// session saved with a composed page in front handed that page's column to an
+// unrelated buffer, margins and all. They are per-buffer values with exactly
+// one owner each (`SerializedFileState`), and a buffer with no saved state of
+// its own has no view mode and no compose width to restore, rather than
+// inheriting a neighbour's. Old sessions carrying the two fields still load;
+// the fields are simply ignored.
 
 /// Per-file state within a split
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -424,6 +517,12 @@ pub struct WorkspaceConfigOverrides {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileExplorerState {
     pub visible: bool,
+    /// The explorer is closed because the user closed it here (Toggle File
+    /// Explorer, the explorer's ×), not merely never opened. `fresh DIR`
+    /// opens the tree unless this is set. Only ever `true` with `visible`
+    /// off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub closed_by_user: bool,
     /// File explorer width. See [`crate::config::ExplorerWidth`] for
     /// the accepted wire formats (percent string, column string, legacy
     /// numeric forms). The `width_percent` alias preserves read
@@ -442,26 +541,122 @@ pub struct FileExplorerState {
     /// Scroll offset
     #[serde(default)]
     pub scroll_offset: usize,
-    /// Show hidden files (fixes #569)
+    /// Show Hidden Files as this workspace's explorer had it (fixes #569),
+    /// `false` included, or `None` when it has no say and the config default
+    /// applies.
+    ///
+    /// Not the superseded `show_hidden` key: that one was also written as
+    /// `false` whenever the explorer had never been built, so a `false` in it
+    /// cannot be told from "nobody looked". See [`Self::restored_show_hidden`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_hidden_files: Option<bool>,
+    /// Show Gitignored Files, as [`Self::show_hidden_files`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_gitignored_files: Option<bool>,
+    /// The superseded `show_hidden` key, read only for its unambiguous `true`.
+    /// Written only as `true` (see [`Self::with_legacy_keys`]), so an older
+    /// build reading this file keeps a toggle that is on; for one that is off
+    /// it falls back to `false`, its default, which is the same thing.
+    #[serde(
+        default,
+        rename = "show_hidden",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub legacy_show_hidden: bool,
+    /// The superseded `show_gitignored` key, as [`Self::legacy_show_hidden`].
+    #[serde(
+        default,
+        rename = "show_gitignored",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub legacy_show_gitignored: bool,
+    /// The sidebar's sections, top to bottom. Empty — every workspace
+    /// written before sections existed — restores as exactly one explorer
+    /// section filling the column.
     #[serde(default)]
-    pub show_hidden: bool,
-    /// Show gitignored files (fixes #569)
-    #[serde(default)]
-    pub show_gitignored: bool,
+    pub sections: Vec<SectionState>,
 }
 
 impl Default for FileExplorerState {
     fn default() -> Self {
         Self {
             visible: false,
+            closed_by_user: false,
             width: crate::config::default_explorer_width_value(),
             side: crate::config::FileExplorerSide::Left,
             expanded_dirs: Vec::new(),
             scroll_offset: 0,
-            show_hidden: false,
-            show_gitignored: false,
+            show_hidden_files: None,
+            show_gitignored_files: None,
+            legacy_show_hidden: false,
+            legacy_show_gitignored: false,
+            sections: Vec::new(),
         }
     }
+}
+
+impl FileExplorerState {
+    /// This state with the superseded keys set from the current ones, for
+    /// writing: older builds read only those.
+    pub fn with_legacy_keys(self) -> Self {
+        Self {
+            legacy_show_hidden: self.show_hidden_files == Some(true),
+            legacy_show_gitignored: self.show_gitignored_files == Some(true),
+            ..self
+        }
+    }
+
+    /// The Show Hidden Files this workspace restores, or `None` to leave the
+    /// config default. A file from before `show_hidden_files` only speaks
+    /// for `true`.
+    pub fn restored_show_hidden(&self) -> Option<bool> {
+        self.show_hidden_files
+            .or(self.legacy_show_hidden.then_some(true))
+    }
+
+    /// The Show Gitignored Files this workspace restores, as
+    /// [`Self::restored_show_hidden`].
+    pub fn restored_show_gitignored(&self) -> Option<bool> {
+        self.show_gitignored_files
+            .or(self.legacy_show_gitignored.then_some(true))
+    }
+}
+
+/// One sidebar section as the workspace file records it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SectionState {
+    pub kind: SectionStateKind,
+    /// `window` (the default, and what every file written before scopes
+    /// existed means) or `editor`. Buffer-scoped sections are not written.
+    #[serde(default)]
+    pub scope: SectionScopeState,
+    /// A plugin section's title, so a section whose plugin has not loaded
+    /// can still show its header.
+    #[serde(default)]
+    pub title: String,
+    /// Requested body rows; `0` shares the remainder.
+    #[serde(default)]
+    pub rows: u16,
+    #[serde(default)]
+    pub collapsed: bool,
+}
+
+/// What a persisted section holds: the explorer, or a plugin panel by its
+/// composite `(plugin, id)` identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SectionStateKind {
+    Explorer,
+    Panel { plugin: String, id: u64 },
+}
+
+/// The persisted half of `app::sidebar::SectionScope`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SectionScopeState {
+    #[default]
+    Window,
+    Editor,
 }
 
 /// Per-workspace input histories
@@ -479,6 +674,27 @@ pub struct WorkspaceHistories {
     pub open_file: Vec<String>,
 }
 
+impl WorkspaceHistories {
+    /// `newer` layered over `self`: each list keeps this one's entries as
+    /// the older ones and `newer`'s as the most recent, an entry in both
+    /// appearing once, in its `newer` position. Capped like the live rings.
+    pub fn merged_with(&self, newer: &WorkspaceHistories) -> WorkspaceHistories {
+        fn merge(older: &[String], newer: &[String]) -> Vec<String> {
+            let mut ring = crate::input::input_history::InputHistory::new();
+            ring.merge_newer(older);
+            ring.merge_newer(newer);
+            ring.items().to_vec()
+        }
+        WorkspaceHistories {
+            search: merge(&self.search, &newer.search),
+            replace: merge(&self.replace, &newer.replace),
+            command_palette: merge(&self.command_palette, &newer.command_palette),
+            goto_line: merge(&self.goto_line, &newer.goto_line),
+            open_file: merge(&self.open_file, &newer.open_file),
+        }
+    }
+}
+
 /// Search options that persist across searches within a workspace
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchOptions {
@@ -490,6 +706,73 @@ pub struct SearchOptions {
     pub use_regex: bool,
     #[serde(default)]
     pub confirm_each: bool,
+}
+
+/// What a workspace says about the match toggles, field by field.
+///
+/// A `Some` field overrides the `editor.search` preset for that option; a
+/// `None` field has no opinion and the preset stands. Keeping each option
+/// separate is what lets a workspace remember the one toggle its user
+/// flipped without also freezing the three they never touched.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_sensitive: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whole_word: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_regex: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_each: Option<bool>,
+}
+
+impl SearchOverrides {
+    /// Nothing to say — every option defers to the preset. A workspace
+    /// holding this writes no key at all.
+    pub fn is_empty(&self) -> bool {
+        *self == SearchOverrides::default()
+    }
+
+    /// The options a window on `preset` would have to be told to reach
+    /// `live`: each field that differs, and nothing else.
+    pub fn between(preset: &crate::config::SearchConfig, live: &SearchOptions) -> Self {
+        let diff = |theirs: bool, base: bool| (theirs != base).then_some(theirs);
+        SearchOverrides {
+            case_sensitive: diff(live.case_sensitive, preset.case_sensitive),
+            whole_word: diff(live.whole_word, preset.whole_word),
+            use_regex: diff(live.use_regex, preset.regex),
+            confirm_each: diff(live.confirm_each, preset.confirm_each),
+        }
+    }
+}
+
+impl SearchOptions {
+    /// Read a superseded `search_options` value as per-field overrides,
+    /// keeping only the fields it can be evidence for.
+    ///
+    /// That key was written on every save whether or not the user had
+    /// chosen anything, so a field still at its [`LEGACY_SEARCH_DEFAULTS`]
+    /// value says nothing and yields `None` — the preset stands. A field
+    /// that differs is carried across.
+    ///
+    /// Concretely: `case_sensitive: true` was the old default and is
+    /// dropped, which is what lets the fold-case default of issue #3212
+    /// reach a workspace the user has opened before, while a whole-word or
+    /// regex search they set up survives, as does a deliberate
+    /// `case_sensitive: false`. Unlike the old `sift_legacy`, this needs
+    /// no seed: a field with no evidence simply has no opinion, rather
+    /// than being resolved against the preset here.
+    pub fn legacy_overrides(&self) -> SearchOverrides {
+        SearchOverrides::between(
+            &crate::config::SearchConfig {
+                case_sensitive: LEGACY_SEARCH_DEFAULTS.case_sensitive,
+                whole_word: LEGACY_SEARCH_DEFAULTS.whole_word,
+                regex: LEGACY_SEARCH_DEFAULTS.use_regex,
+                confirm_each: LEGACY_SEARCH_DEFAULTS.confirm_each,
+            },
+            self,
+        )
+    }
 }
 
 /// Serialized bookmark (file path + byte offset)
@@ -554,6 +837,22 @@ pub struct SerializedTerminalWorkspace {
     /// re-derive their name the same way after restore.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The name an *auto-named* tab last carried (`bash`, or
+    /// `bash — user@host: ~/dir`), for a terminal whose process had already
+    /// quit at save time.
+    ///
+    /// An auto-named tab re-derives its name from its foreground process, so
+    /// it normally needs nothing persisted — but a terminal restored *dead*
+    /// has no process to read, and fell back to `*Terminal N*`, which also
+    /// makes two dead terminals indistinguishable (#3074). This is that name,
+    /// kept so the restored tab reads as it did before the restart.
+    ///
+    /// Deliberately not `title`: that one means "explicitly titled" and opts
+    /// the tab out of auto-naming for good, so a restart would never pick its
+    /// name back up from the reborn process. Absent for explicitly-titled
+    /// tabs, for live terminals (they re-derive), and in older workspaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_title: Option<String>,
     /// Whether this terminal's child was granted editor control — the
     /// Orchestrator's `allowScript`, which stamps a `FRESH_CMD_TOKEN`
     /// capability token into the agent's environment.
@@ -765,65 +1064,23 @@ pub fn get_workspaces_dir() -> io::Result<PathBuf> {
     Ok(get_data_dir()?.join("workspaces"))
 }
 
-/// Encode a path into a filesystem-safe filename using percent encoding
-///
-/// Keeps alphanumeric chars, `-`, `.`, `_` as-is.
-/// Replaces `/` with `_` for readability.
-/// Percent-encodes other special characters as %XX.
-///
-/// Example: `/home/user/my project` -> `home_user_my%20project`
-pub fn encode_path_for_filename(path: &Path) -> String {
-    let path_str = path.to_string_lossy();
-    let mut result = String::with_capacity(path_str.len() * 2);
-
-    for c in path_str.chars() {
-        match c {
-            // Path separators become underscores for readability
-            '/' | '\\' => result.push('_'),
-            // Safe chars pass through
-            c if c.is_ascii_alphanumeric() => result.push(c),
-            '-' | '.' => result.push(c),
-            // Underscore needs special handling to avoid collision with /
-            '_' => result.push_str("%5F"),
-            // Everything else gets percent-encoded
-            c => {
-                for byte in c.to_string().as_bytes() {
-                    result.push_str(&format!("%{:02X}", byte));
-                }
-            }
-        }
-    }
-
-    // Remove leading underscores (from leading /)
-    let result = result.trim_start_matches('_').to_string();
-
-    // Collapse multiple underscores
-    let mut final_result = String::with_capacity(result.len());
-    let mut last_was_underscore = false;
-    for c in result.chars() {
-        if c == '_' {
-            if !last_was_underscore {
-                final_result.push(c);
-            }
-            last_was_underscore = true;
-        } else {
-            final_result.push(c);
-            last_was_underscore = false;
-        }
-    }
-
-    if final_result.is_empty() {
-        final_result = "root".to_string();
-    }
-
-    final_result
-}
+// The encoder lives in `fresh-editor-core` (`config_io` needs it to name
+// per-workspace config files); re-exported here so the old path resolves.
+pub use fresh_editor_core::path_encode::encode_path_for_filename;
 
 /// Decode a filename back to the original path (for debugging/tooling)
 #[allow(dead_code)]
 pub fn decode_filename_to_path(encoded: &str) -> Option<PathBuf> {
     if encoded == "root" {
         return Some(PathBuf::from("/"));
+    }
+    // A name the encoder had to fold to fit `NAME_MAX` keeps only the head of
+    // the path plus a digest, so there is no path to give back. The encoder
+    // can never emit a literal `~` (a real one becomes `%7E`), which is what
+    // makes its presence a reliable answer rather than a guess. Callers
+    // already handle `None` by falling back to the name itself.
+    if encoded.contains('~') {
+        return None;
     }
 
     let mut result = String::with_capacity(encoded.len() + 1);
@@ -901,6 +1158,92 @@ pub fn workspace_path_for(working_dir: &Path, stable_id: &str) -> io::Result<Pat
     Ok(get_workspaces_dir()?.join(filename))
 }
 
+/// The stable ids of the workspaces saved for `root`: read from the names
+/// of its `<encoded root>.<id>.json` files (an id never holds a dot, which
+/// keeps `/a`'s files apart from `/a.b`'s), plus the id recorded inside a
+/// pre-stable-id `<encoded root>.json`. Recovery uses it to leave an entry
+/// stamped for one of them to that workspace.
+pub fn workspace_ids_for_root(root: &Path) -> std::collections::HashSet<String> {
+    let mut ids = std::collections::HashSet::new();
+    let Ok(dir) = get_workspaces_dir() else {
+        return ids;
+    };
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let encoded = encode_path_for_filename(&canonical);
+    let id_prefix = format!("{encoded}.");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return ids;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(rest) = name
+            .strip_prefix(&id_prefix)
+            .and_then(|rest| rest.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        if !rest.is_empty() && !rest.contains('.') {
+            ids.insert(rest.to_string());
+        }
+    }
+    let legacy = dir.join(format!("{encoded}.json"));
+    if let Some(id) = std::fs::read_to_string(legacy)
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .and_then(|val| val.get("stable_id")?.as_str().map(str::to_string))
+    {
+        ids.insert(id);
+    }
+    ids
+}
+
+/// The unnamed buffers the saved workspaces on `root` other than `except`
+/// place in their layouts, by recovery id: the unsaved work those
+/// workspaces come back with, which another window on the root leaves to
+/// them.
+pub fn unnamed_refs_for_root(root: &Path, except: &str) -> std::collections::HashSet<String> {
+    let mut refs = std::collections::HashSet::new();
+    for id in workspace_ids_for_root(root) {
+        if id == except {
+            continue;
+        }
+        let Ok(path) = workspace_path_for(root, &id) else {
+            continue;
+        };
+        if let Ok(Some(workspace)) = Workspace::load_from_path(&path, root) {
+            refs.extend(workspace.unnamed_buffers.into_iter().map(|r| r.recovery_id));
+        }
+    }
+    refs
+}
+
+/// The stable ids of every saved workspace, whatever its root, read from
+/// the names of the `<encoded root>.<id>.json` files: an id never holds a
+/// dot, and an encoded root never ends in one. Recovery uses it to tell an
+/// entry stamped for some other project's workspace from one whose
+/// workspace was never saved.
+pub fn all_workspace_ids() -> std::collections::HashSet<String> {
+    let mut ids = std::collections::HashSet::new();
+    let Ok(entries) = get_workspaces_dir().and_then(std::fs::read_dir) else {
+        return ids;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
+            continue;
+        };
+        if let Some((_, id)) = stem.rsplit_once('.') {
+            if !id.is_empty() {
+                ids.insert(id.to_string());
+            }
+        }
+    }
+    ids
+}
+
 /// Identity fields of a candidate workspace file for one directory.
 struct WorkspaceFileIdentity {
     path: PathBuf,
@@ -953,6 +1296,17 @@ fn candidate_files_for_root(working_dir: &Path) -> io::Result<Vec<WorkspaceFileI
                 path,
                 working_dir
             );
+            // Move it out of the way, keeping every byte under a new name.
+            // Left where it is, it is a file this directory can never use
+            // again and never stops finding: the window takes a fresh
+            // identity and saves beside it, so each damaged start leaves
+            // another dead file claiming the same root. Renaming is also
+            // what lets a reader tell the live workspace from the wreckage.
+            let aside = path.with_extension("json.corrupt");
+            match std::fs::rename(&path, &aside) {
+                Ok(()) => tracing::warn!("Moved it aside to {:?}", aside),
+                Err(e) => tracing::warn!("Could not move {:?} aside: {e}", path),
+            }
             continue;
         };
         // Authoritative check: the file must itself claim this directory.
@@ -1021,16 +1375,6 @@ pub fn find_workspace_file_by_root(working_dir: &Path) -> io::Result<Option<Path
         }
     }
     Ok(best.map(|b| b.path))
-}
-
-/// The retired daemon-scoped workspace directory.
-///
-/// Workspaces are one set now, shared by direct mode and every daemon, so
-/// nothing writes here any more. The path survives only so boot migration can
-/// find pre-existing snapshots and fold them into the real store — see
-/// `orchestrator_persistence::migrate_session_workspaces_into_store`.
-pub fn get_session_workspaces_dir() -> io::Result<PathBuf> {
-    Ok(get_data_dir()?.join("session-workspaces"))
 }
 
 /// Workspace error types
@@ -1348,8 +1692,10 @@ impl Workspace {
             config_overrides: WorkspaceConfigOverrides::default(),
             file_explorer: FileExplorerState::default(),
             histories: WorkspaceHistories::default(),
-            search_options: SearchOptions::default(),
+            search_overrides: None,
+            legacy_search_options: None,
             bookmarks: HashMap::new(),
+            closed_files: Vec::new(),
             terminals: Vec::new(),
             external_files: Vec::new(),
             read_only_files: Vec::new(),
@@ -1359,6 +1705,7 @@ impl Workspace {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            last_focused_at: None,
             label: None,
             session_plugin_state: HashMap::new(),
             authority_spec: crate::services::authority::SessionAuthoritySpec::Local,
@@ -1593,6 +1940,194 @@ mod tests {
         assert!(restored.confirm_each);
     }
 
+    /// Reading a superseded value, field by field: a field at the old
+    /// default yields no opinion; anything else is carried across.
+    ///
+    /// `case_sensitive` is the field the whole design turns on. It was the
+    /// old default, so `true` there is indistinguishable from "untouched"
+    /// and must yield `None` — otherwise the fold-case default of issue
+    /// #3212 reaches only workspaces nobody has ever opened. Its
+    /// neighbours are the opposite case: discarding them would throw away
+    /// information the file plainly carries.
+    #[test]
+    fn reading_a_legacy_value_keeps_only_what_it_is_evidence_for() {
+        // Untouched by the user: every field at its old default, so the
+        // file is evidence of nothing and every option defers.
+        let untouched = LEGACY_SEARCH_DEFAULTS.legacy_overrides();
+        assert!(
+            untouched.is_empty(),
+            "an untouched old file must claim nothing, `case_sensitive: true` included"
+        );
+
+        // Deliberately turned OFF: differs from the old default, so it is
+        // carried across even though it happens to match today's preset.
+        let case_off = SearchOptions {
+            case_sensitive: false,
+            ..LEGACY_SEARCH_DEFAULTS
+        }
+        .legacy_overrides();
+        assert_eq!(case_off.case_sensitive, Some(false));
+
+        // Each unambiguous toggle survives on its own, and — the point of
+        // per-field overrides — without dragging its neighbours along.
+        let word = SearchOptions {
+            whole_word: true,
+            ..LEGACY_SEARCH_DEFAULTS
+        }
+        .legacy_overrides();
+        assert_eq!(
+            word.whole_word,
+            Some(true),
+            "a whole-word search they set up"
+        );
+        assert_eq!(
+            word.case_sensitive, None,
+            "its ambiguous neighbour still has no opinion"
+        );
+        assert_eq!(word.use_regex, None);
+        assert_eq!(word.confirm_each, None);
+
+        assert_eq!(
+            SearchOptions {
+                use_regex: true,
+                ..LEGACY_SEARCH_DEFAULTS
+            }
+            .legacy_overrides()
+            .use_regex,
+            Some(true)
+        );
+        assert_eq!(
+            SearchOptions {
+                confirm_each: true,
+                ..LEGACY_SEARCH_DEFAULTS
+            }
+            .legacy_overrides()
+            .confirm_each,
+            Some(true)
+        );
+    }
+
+    /// A workspace remembers the option its user changed and *only* that
+    /// one, so a later `editor.search` change still reaches the rest.
+    ///
+    /// Persisting all four whenever one diverges is the trap the
+    /// superseded key fell into: the three nobody touched would be frozen
+    /// against every future config change, silently. `Action::QueryReplace`
+    /// sets `confirm_each` programmatically and nothing clears it, so
+    /// running that command once would have been enough to freeze a
+    /// workspace's case sensitivity against the very default this all
+    /// exists to deliver.
+    #[test]
+    fn a_workspace_remembers_only_the_options_that_left_the_preset() {
+        let preset = crate::config::SearchConfig::default();
+
+        // Query Replace has been run: confirm_each is on, nothing else
+        // was touched.
+        let after_query_replace = SearchOptions {
+            confirm_each: true,
+            ..SearchOptions::default()
+        };
+        let o = SearchOverrides::between(&preset, &after_query_replace);
+        assert_eq!(o.confirm_each, Some(true));
+        assert_eq!(
+            (o.case_sensitive, o.whole_word, o.use_regex),
+            (None, None, None),
+            "the three untouched options must stay open to the preset"
+        );
+
+        // Nothing diverges at all: no key is written.
+        assert!(SearchOverrides::between(&preset, &SearchOptions::default()).is_empty());
+
+        // And a preset that is itself case-sensitive makes `true` the
+        // unremarkable value and `false` the choice.
+        let cs = crate::config::SearchConfig {
+            case_sensitive: true,
+            ..crate::config::SearchConfig::default()
+        };
+        assert_eq!(
+            SearchOverrides::between(
+                &cs,
+                &SearchOptions {
+                    case_sensitive: true,
+                    ..SearchOptions::default()
+                }
+            )
+            .case_sensitive,
+            None
+        );
+        assert_eq!(
+            SearchOverrides::between(&cs, &SearchOptions::default()).case_sensitive,
+            Some(false)
+        );
+    }
+
+    /// The superseded `search_options` key is read, but never as a
+    /// wholesale choice: it survives into `legacy_search_options` for the
+    /// restore to sift, and is never written back.
+    ///
+    /// Driven through the real `load_from_path`, because "serde reads the
+    /// old name into the legacy field and skips it on write" is a property
+    /// of the whole load path, not of a hand-built value.
+    #[test]
+    fn the_superseded_key_is_read_but_never_written() {
+        let temp = std::env::temp_dir().join(format!(
+            "fresh_search_overrides_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let workspace_file = temp.join("workspace.json");
+
+        let mut old = serde_json::to_value(Workspace::new(temp.clone())).unwrap();
+        old.as_object_mut().unwrap().insert(
+            "search_options".to_string(),
+            serde_json::json!({
+                "case_sensitive": true,
+                "whole_word": true,
+                "use_regex": false,
+                "confirm_each": false,
+            }),
+        );
+        std::fs::write(&workspace_file, serde_json::to_string(&old).unwrap()).unwrap();
+
+        let loaded = Workspace::load_from_path(&workspace_file, &temp)
+            .expect("an old file still loads — the version did not move")
+            .expect("and is not empty");
+        assert!(
+            loaded.search_overrides.is_none(),
+            "the old key is not an override on its own"
+        );
+        let legacy = loaded
+            .legacy_search_options
+            .as_ref()
+            .expect("but it is read, so the restore can sift it");
+        assert!(legacy.case_sensitive && legacy.whole_word);
+
+        // And it is never written back, so it drops out of the file.
+        let round_tripped = serde_json::to_value(&loaded).unwrap();
+        assert!(
+            !round_tripped
+                .as_object()
+                .unwrap()
+                .contains_key("search_options"),
+            "the superseded key must not be re-emitted"
+        );
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// Nothing of its own to say serialises to nothing at all, so the key
+    /// is absent rather than present-and-null — an older Fresh reading
+    /// this file sees no `search_options` and falls back to its own
+    /// defaults instead of tripping over an unexpected shape.
+    #[test]
+    fn a_workspace_with_no_override_writes_no_key() {
+        let json = serde_json::to_value(Workspace::new(PathBuf::from("/home/user/proj"))).unwrap();
+        assert!(
+            !json.as_object().unwrap().contains_key("search_overrides"),
+            "an absent override must not be written at all"
+        );
+    }
+
     #[test]
     fn test_full_workspace_round_trip() {
         let mut workspace = Workspace::new(PathBuf::from("/home/user/myproject"));
@@ -1631,9 +2166,6 @@ mod tests {
                 open_files: vec![PathBuf::from("README.md"), PathBuf::from("src/lib.rs")],
                 active_file_index: 0,
                 file_states: HashMap::new(),
-                tab_scroll_offset: 0,
-                view_mode: SerializedViewMode::Source,
-                compose_width: None,
             },
         );
 
@@ -1647,8 +2179,11 @@ mod tests {
         );
 
         // Set search options
-        workspace.search_options.case_sensitive = true;
-        workspace.search_options.use_regex = true;
+        workspace.search_overrides = Some(SearchOverrides {
+            case_sensitive: Some(true),
+            use_regex: Some(true),
+            ..SearchOverrides::default()
+        });
 
         // Serialize and deserialize
         let json = serde_json::to_string_pretty(&workspace).unwrap();
@@ -1659,8 +2194,9 @@ mod tests {
         assert_eq!(restored.working_dir, PathBuf::from("/home/user/myproject"));
         assert_eq!(restored.active_split_id, 1);
         assert!(restored.bookmarks.contains_key(&'m'));
-        assert!(restored.search_options.case_sensitive);
-        assert!(restored.search_options.use_regex);
+        let restored_options = restored.search_overrides.expect("saved search options");
+        assert_eq!(restored_options.case_sensitive, Some(true));
+        assert_eq!(restored_options.use_regex, Some(true));
 
         // Verify split state
         let split_state = restored.split_states.get(&1).unwrap();
@@ -1681,7 +2217,10 @@ mod tests {
 
         // Create a workspace
         let mut workspace = Workspace::new(temp_dir.clone());
-        workspace.search_options.case_sensitive = true;
+        workspace.search_overrides = Some(SearchOverrides {
+            case_sensitive: Some(true),
+            ..SearchOverrides::default()
+        });
         workspace.bookmarks.insert(
             'x',
             SerializedBookmark {
@@ -1704,7 +2243,13 @@ mod tests {
 
         // Verify
         assert_eq!(loaded.working_dir, temp_dir);
-        assert!(loaded.search_options.case_sensitive);
+        assert_eq!(
+            loaded
+                .search_overrides
+                .expect("saved search options")
+                .case_sensitive,
+            Some(true)
+        );
         assert_eq!(loaded.bookmarks.get(&'x').unwrap().position, 42);
 
         // Cleanup
@@ -1753,8 +2298,9 @@ mod tests {
                 PathBuf::from("tests"),
             ],
             scroll_offset: 5,
-            show_hidden: true,
-            show_gitignored: false,
+            show_hidden_files: Some(true),
+            show_gitignored_files: Some(false),
+            ..FileExplorerState::default()
         };
 
         let json = serde_json::to_string(&state).unwrap();
@@ -1764,8 +2310,92 @@ mod tests {
         assert_eq!(restored.width, crate::config::ExplorerWidth::Percent(25));
         assert_eq!(restored.expanded_dirs.len(), 3);
         assert_eq!(restored.scroll_offset, 5);
-        assert!(restored.show_hidden);
-        assert!(!restored.show_gitignored);
+        assert_eq!(restored.restored_show_hidden(), Some(true));
+        assert_eq!(restored.restored_show_gitignored(), Some(false));
+    }
+
+    /// A saved `false` is restored as `false` (overriding a config default of
+    /// `true`), not dropped in favour of the config.
+    #[test]
+    fn test_file_explorer_state_saved_false_round_trips() {
+        let state = FileExplorerState {
+            show_hidden_files: Some(false),
+            show_gitignored_files: Some(false),
+            ..FileExplorerState::default()
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("\"show_hidden_files\":false"), "{json}");
+        let restored: FileExplorerState = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.restored_show_hidden(), Some(false));
+        assert_eq!(restored.restored_show_gitignored(), Some(false));
+    }
+
+    /// A workspace with nothing to say about the toggles leaves them to the
+    /// config default, and writes nothing for them.
+    #[test]
+    fn test_file_explorer_state_missing_toggles_fall_back_to_config() {
+        let restored: FileExplorerState =
+            serde_json::from_str(r#"{ "visible": true, "expanded_dirs": [], "scroll_offset": 0 }"#)
+                .unwrap();
+        assert_eq!(restored.restored_show_hidden(), None);
+        assert_eq!(restored.restored_show_gitignored(), None);
+
+        let json = serde_json::to_string(&FileExplorerState::default().with_legacy_keys()).unwrap();
+        assert!(!json.contains("show_hidden"), "{json}");
+        assert!(!json.contains("show_gitignored"), "{json}");
+    }
+
+    /// An older build reads only the superseded keys, defaulting to `false`:
+    /// writing them for a toggle that is on keeps it on across a downgrade.
+    #[test]
+    fn test_file_explorer_state_writes_legacy_keys_for_older_builds() {
+        let state = FileExplorerState {
+            show_hidden_files: Some(true),
+            show_gitignored_files: Some(false),
+            ..FileExplorerState::default()
+        }
+        .with_legacy_keys();
+        let json = serde_json::to_string(&state).unwrap();
+
+        #[derive(serde::Deserialize)]
+        struct OlderBuild {
+            #[serde(default)]
+            show_hidden: bool,
+            #[serde(default)]
+            show_gitignored: bool,
+        }
+        let older: OlderBuild = serde_json::from_str(&json).unwrap();
+        assert!(older.show_hidden, "{json}");
+        assert!(!older.show_gitignored, "{json}");
+
+        let restored: FileExplorerState = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.restored_show_hidden(), Some(true));
+        assert_eq!(restored.restored_show_gitignored(), Some(false));
+    }
+
+    /// The superseded `show_hidden` / `show_gitignored` keys were written as
+    /// `false` even when the explorer had never been built, so only their
+    /// `true` is restored; their `false` leaves the config default.
+    #[test]
+    fn test_file_explorer_state_legacy_toggle_keys() {
+        let restored: FileExplorerState = serde_json::from_str(
+            r#"{ "visible": true, "expanded_dirs": [], "scroll_offset": 0,
+                 "show_hidden": true, "show_gitignored": false }"#,
+        )
+        .unwrap();
+        assert_eq!(restored.restored_show_hidden(), Some(true));
+        assert_eq!(restored.restored_show_gitignored(), None);
+
+        // The new keys win over the old ones, and the next save rewrites the
+        // old ones from them.
+        let restored: FileExplorerState = serde_json::from_str(
+            r#"{ "visible": true, "expanded_dirs": [], "scroll_offset": 0,
+                 "show_hidden": true, "show_hidden_files": false }"#,
+        )
+        .unwrap();
+        assert_eq!(restored.restored_show_hidden(), Some(false));
+        let json = serde_json::to_string(&restored.with_legacy_keys()).unwrap();
+        assert!(!json.contains("\"show_hidden\""), "{json}");
     }
 
     #[test]
@@ -1776,8 +2406,7 @@ mod tests {
             side: crate::config::FileExplorerSide::Left,
             expanded_dirs: vec![],
             scroll_offset: 0,
-            show_hidden: false,
-            show_gitignored: false,
+            ..FileExplorerState::default()
         };
         let json = serde_json::to_string(&state).unwrap();
         let restored: FileExplorerState = serde_json::from_str(&json).unwrap();

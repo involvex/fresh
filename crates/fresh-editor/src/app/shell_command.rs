@@ -11,7 +11,7 @@ use super::Editor;
 use crate::model::event::Event;
 use crate::services::process_hidden::HideWindow;
 use crate::view::prompt::PromptType;
-use rust_i18n::t;
+use fresh_i18n::t;
 
 impl Editor {
     /// Start a shell command prompt.
@@ -36,8 +36,7 @@ impl Editor {
         let shell = detect_shell();
 
         // Execute the command
-        let mut child = Command::new(&shell)
-            .args(["-c", command])
+        let mut child = shell_command(&shell, command)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -109,7 +108,7 @@ impl Editor {
 
         // Now get the deleted text if there's a selection
         let selection_info = if let Some((start, end)) = selection_range {
-            let deleted_text = self.active_state_mut().get_text_range(start, end);
+            let deleted_text = self.active_state_mut().get_edit_text(start, end);
             Some((start, end, deleted_text))
         } else {
             None
@@ -135,7 +134,7 @@ impl Editor {
         &mut self,
         output: &str,
         has_selection: bool,
-        selection_info: Option<(usize, usize, String)>,
+        selection_info: Option<(usize, usize, crate::model::event::EditText)>,
     ) {
         let cursor_id = self.active_cursors().primary_id();
 
@@ -155,7 +154,7 @@ impl Editor {
                 };
                 let insert_event = Event::Insert {
                     position: start,
-                    text: output.to_string(),
+                    text: output.to_string().into(),
                     cursor_id,
                 };
 
@@ -170,8 +169,12 @@ impl Editor {
                 self.apply_event_to_active_buffer(&batch);
             }
         } else {
-            // Replace entire buffer
-            let buffer_content = self.active_state().buffer.to_string().unwrap_or_default();
+            // Replace entire buffer: delete its exact bytes, for undo (#3652)
+            let buffer_content = {
+                let state = self.active_state_mut();
+                let len = state.buffer.len();
+                state.get_edit_text(0, len)
+            };
             let buffer_len = buffer_content.len();
 
             // Delete all content and insert new
@@ -182,7 +185,7 @@ impl Editor {
             };
             let insert_event = Event::Insert {
                 position: 0,
-                text: output.to_string(),
+                text: output.to_string().into(),
                 cursor_id,
             };
 
@@ -231,7 +234,7 @@ impl Editor {
         let cursor_id = self.active_cursors().primary_id();
         let insert_event = Event::Insert {
             position: 0,
-            text: output.to_string(),
+            text: output.to_string().into(),
             cursor_id,
         };
         self.apply_event_to_active_buffer(&insert_event);
@@ -242,49 +245,6 @@ impl Editor {
         }
 
         self.set_status_message(t!("shell.output_in", buffer = buffer_name).to_string());
-    }
-
-    /// Execute a shell command blocking the UI.
-    /// This is used for commands like `sudo` where we might need to wait for completion.
-    #[allow(dead_code)]
-    pub(crate) fn run_shell_command_blocking(&mut self, command: &str) -> anyhow::Result<()> {
-        use crossterm::terminal::{
-            disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-        };
-        use crossterm::ExecutableCommand;
-        use std::io::stdout;
-
-        // Suspend TUI — best-effort, nothing useful to do on failure.
-        #[allow(clippy::let_underscore_must_use)]
-        let _ = disable_raw_mode();
-        #[allow(clippy::let_underscore_must_use)]
-        let _ = stdout().execute(LeaveAlternateScreen);
-
-        let shell = detect_shell();
-        let mut child = Command::new(&shell)
-            .args(["-c", command])
-            .hide_window()
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("Failed to spawn shell: {}", e))?;
-
-        let status = child
-            .wait()
-            .map_err(|e| anyhow::anyhow!("Failed to wait for command: {}", e))?;
-
-        // Resume TUI — best-effort, nothing useful to do on failure.
-        #[allow(clippy::let_underscore_must_use)]
-        let _ = stdout().execute(EnterAlternateScreen);
-        #[allow(clippy::let_underscore_must_use)]
-        let _ = enable_raw_mode();
-
-        // Request a full hard redraw to clear any ghost text from the external command
-        self.request_full_redraw();
-
-        if status.success() {
-            Ok(())
-        } else {
-            anyhow::bail!("Command failed with exit code: {:?}", status.code())
-        }
     }
 }
 
@@ -320,6 +280,35 @@ fn detect_shell() -> String {
     "sh".to_string()
 }
 
+/// Build a `Command` that runs `command` through `shell` and exits.
+///
+/// cmd.exe takes `/c`, not `-c`, and parses its own command line, so the
+/// command is passed raw rather than with Rust's argv escaping.
+pub(super) fn shell_command(shell: &str, command: &str) -> Command {
+    let mut cmd = Command::new(shell);
+    if is_cmd_shell(shell) {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // `/S` makes cmd strip exactly the outer quotes, keeping inner ones.
+            cmd.args(["/S", "/C"]).raw_arg(format!("\"{}\"", command));
+        }
+        #[cfg(not(windows))]
+        cmd.args(["/c", command]);
+    } else {
+        cmd.args(["-c", command]);
+    }
+    cmd
+}
+
+fn is_cmd_shell(shell: &str) -> bool {
+    let name = shell.rsplit(['/', '\\']).next().unwrap_or(shell);
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "cmd" | "cmd.exe" | "command.com"
+    )
+}
+
 /// Truncate a command string for display purposes.
 ///
 /// Counts characters (not bytes) so non-ASCII commands like
@@ -338,7 +327,17 @@ fn truncate_command(command: &str, max_len: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_command;
+    use super::{is_cmd_shell, truncate_command};
+
+    #[test]
+    fn is_cmd_shell_detects_cmd_by_file_name() {
+        assert!(is_cmd_shell("cmd.exe"));
+        assert!(is_cmd_shell(r"C:\Windows\System32\CMD.EXE"));
+        assert!(is_cmd_shell("cmd"));
+        assert!(!is_cmd_shell("/bin/bash"));
+        assert!(!is_cmd_shell(r"C:\Program Files\Git\bin\bash.exe"));
+        assert!(!is_cmd_shell("/usr/bin/cmdshell"));
+    }
 
     #[test]
     fn truncate_command_ascii_fits() {

@@ -22,7 +22,7 @@
 //! ## Usage Example
 //!
 //! ```
-//! use fresh::input_history::InputHistory;
+//! use fresh::input::input_history::InputHistory;
 //!
 //! let mut history = InputHistory::new();
 //!
@@ -116,7 +116,7 @@ impl InputHistory {
     ///
     /// # Example
     /// ```
-    /// # use fresh::input_history::InputHistory;
+    /// # use fresh::input::input_history::InputHistory;
     /// let mut history = InputHistory::new();
     /// history.push("first".to_string());
     /// history.push("second".to_string());
@@ -161,7 +161,7 @@ impl InputHistory {
     ///
     /// # Example
     /// ```
-    /// # use fresh::input_history::InputHistory;
+    /// # use fresh::input::input_history::InputHistory;
     /// let mut history = InputHistory::new();
     /// history.push("first".to_string());
     /// history.push("second".to_string());
@@ -211,7 +211,7 @@ impl InputHistory {
     ///
     /// # Example
     /// ```
-    /// # use fresh::input_history::InputHistory;
+    /// # use fresh::input::input_history::InputHistory;
     /// let mut history = InputHistory::new();
     /// history.push("first".to_string());
     /// history.push("second".to_string());
@@ -267,7 +267,7 @@ impl InputHistory {
     ///
     /// # Example
     /// ```
-    /// # use fresh::input_history::InputHistory;
+    /// # use fresh::input::input_history::InputHistory;
     /// let mut history = InputHistory::new();
     /// history.push("last search".to_string());
     /// assert_eq!(history.last(), Some("last search"));
@@ -284,7 +284,7 @@ impl InputHistory {
     ///
     /// # Example
     /// ```
-    /// # use fresh::input_history::InputHistory;
+    /// # use fresh::input::input_history::InputHistory;
     /// let mut history = InputHistory::new();
     /// history.push("first".to_string());
     /// history.push("second".to_string());
@@ -329,16 +329,27 @@ impl InputHistory {
         &self.items
     }
 
-    /// Create a history from existing items
+    /// Fold `newer` in on top of this history, as the most recent entries.
     ///
-    /// Useful for session restoration.
-    pub fn from_items(items: Vec<String>) -> Self {
-        let mut history = Self::new();
-        // Add items respecting deduplication rules
-        for item in items {
-            history.push(item);
+    /// Unlike [`Self::push`], an item already present anywhere in the history
+    /// is moved rather than repeated. This is how two copies of one history
+    /// (the global ring and a workspace's, or the file on disk and the live
+    /// ring) are combined: merging them repeatedly must not multiply the
+    /// entries they share.
+    ///
+    /// # Example
+    /// ```
+    /// # use fresh::input::input_history::InputHistory;
+    /// let mut history = InputHistory::new();
+    /// history.merge_newer(&["a".to_string(), "b".to_string()]);
+    /// history.merge_newer(&["a".to_string(), "c".to_string()]);
+    /// assert_eq!(history.items(), ["b", "a", "c"]);
+    /// ```
+    pub fn merge_newer(&mut self, newer: &[String]) {
+        for item in newer {
+            self.items.retain(|existing| existing != item);
+            self.push(item.clone());
         }
-        history
     }
 
     // ========================================================================
@@ -355,7 +366,13 @@ impl InputHistory {
             std::fs::create_dir_all(parent)?;
         }
 
-        std::fs::write(path, json)?;
+        // Temp file + rename, so an editor starting up while another one is
+        // quitting reads either the old ring or the new one, never half of
+        // one. The temp name is per process so two quitting editors don't
+        // write into the same temp file.
+        let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        std::fs::write(&temp_path, json)?;
+        std::fs::rename(&temp_path, path)?;
         Ok(())
     }
 
@@ -383,26 +400,19 @@ impl InputHistory {
 
 /// Get the data directory for Fresh editor state
 /// Returns $XDG_DATA_HOME/fresh or ~/.local/share/fresh on Linux
-/// Returns ~/Library/Application Support/fresh on macOS
-pub fn get_data_dir() -> std::io::Result<std::path::PathBuf> {
-    let data_dir = dirs::data_dir().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "Could not determine data directory",
-        )
-    })?;
-    Ok(data_dir.join("fresh"))
-}
+/// Returns ~/Library/Application Support/fresh on macOS, or `$XDG_DATA_HOME/fresh`
+/// when that variable is absolute and no older install is still in use
+// `get_data_dir` lives in `fresh-editor-core` (model::buffer::save needs it
+// for the in-place-write recovery directory); re-exported here so the old
+// path keeps working.
+pub use fresh_editor_core::data_dir::get_data_dir;
 
-/// Get the path for search history file
-pub fn get_search_history_path() -> std::io::Result<std::path::PathBuf> {
-    Ok(get_data_dir()?.join("search_history.json"))
-}
-
-/// Get the path for replace history file
-pub fn get_replace_history_path() -> std::io::Result<std::path::PathBuf> {
-    Ok(get_data_dir()?.join("replace_history.json"))
-}
+/// Test-only hook that redirects [`get_data_dir`] on the calling thread;
+/// re-exported alongside it so integration tests (which cannot name
+/// `fresh_editor_core`) can reach it. See
+/// `fresh_editor_core::data_dir::set_data_dir_override`.
+#[doc(hidden)]
+pub use fresh_editor_core::data_dir::set_data_dir_override;
 
 impl Default for InputHistory {
     fn default() -> Self {
@@ -635,5 +645,21 @@ mod tests {
         // Should only keep the most recent item
         assert_eq!(history.len(), 1);
         assert_eq!(history.last(), Some("third"));
+    }
+
+    #[test]
+    fn test_merge_newer_does_not_multiply_shared_entries() {
+        // The global ring and a workspace's copy overlap; merging one into
+        // the other on every launch must reach a fixed point, not grow.
+        let shared = vec!["a".to_string(), "b".to_string()];
+        let mut history = InputHistory::new();
+        history.merge_newer(&shared);
+        for _ in 0..3 {
+            history.merge_newer(&shared);
+        }
+        assert_eq!(history.items(), ["a", "b"]);
+
+        history.merge_newer(&["c".to_string(), "a".to_string()]);
+        assert_eq!(history.items(), ["b", "c", "a"]);
     }
 }

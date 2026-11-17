@@ -6,13 +6,15 @@ Some keybindings may not work or may differ on your system due to differences in
 
 ## Smart Editing
 
-- **Smart Home** — Home toggles between first non-whitespace character and column 0.
+- **Smart Home** — Home toggles between first non-whitespace character and column 0; Shift+Home extends the selection the same way (`select_smart_home`).
 - **Smart Backspace** — Backspace in leading whitespace removes one indent level instead of a single character.
 - **Auto-indent** — Enter preserves the current indentation level. After `{`, `(`, or `:`, an extra indent level is added.
-- **Auto-close** — Typing an opening bracket or quote inserts the closing pair. Controlled by `auto_close` (default: on), independent of `auto_indent`. Per-language overrides via `languages.<lang>.auto_close`.
-- **Surround selection** — With text selected, typing an opening delimiter wraps the selection (e.g. select `hello`, type `(` → `(hello)`). Controlled by `auto_surround` (default: on) with per-language overrides.
+- **Auto-close** — Typing an opening bracket or quote inserts the closing pair. Controlled by `auto_close` (default: on), independent of `auto_indent`. Per-language overrides via `languages.<lang>.auto_close`. Plain text files never auto-close quotes, only brackets.
+- **Surround selection** — With text selected, typing an opening delimiter wraps the selection (e.g. select `hello`, type `(` → `(hello)`). Controlled by `auto_surround` (default: on) with per-language overrides. It is independent of `auto_close`: either can be on with the other off.
+- **Markdown types delimiters literally** — Markdown ships with both `languages.markdown.auto_close` and `languages.markdown.auto_surround` set to `false`, because prose types backticks, quotes and brackets as literal text far more often than as pairs. Set either to `true` to opt back in.
 - **Smart quote suppression** — Quotes typed inside an existing string don't auto-close.
 - **Bracket matching** — Matching brackets are highlighted. Use "Go to Matching Bracket" from the command palette to jump. Enabled by default; toggle via `highlight_matching_brackets` in settings.
+- **Paragraph motion** — "Go to Next Paragraph" / "Go to Previous Paragraph" (command palette, or **Go → Next/Previous Paragraph**) move the cursor to the next or previous empty line. The default keymap gives them no key (the emacs keymap binds them to M-} / M-{); bind `move_to_paragraph_down` / `move_to_paragraph_up` in the [Keybinding Editor](./keybinding-editor.md) if you want one. Ctrl+Shift+Down/Up extend the selection the same way.
 
 ## Vertical Rulers
 
@@ -53,11 +55,15 @@ Every occurrence of the word under the cursor is highlighted in the viewport. Wh
 
 ## Post-EOF Background
 
-Rows past the end of the buffer render with a distinct background color (`post_eof_bg` theme key) so the "end of file" boundary is obvious even without `~` tildes. Works alongside `show_tilde`.
+Rows past the end of the buffer keep the theme's editor background, so the empty space below a short file reads as the same surface as the text above it; the end of the buffer is marked by the `~` tildes (`show_tilde`, on by default). A theme that wants that space called out with a shade of its own sets the `editor.after_eof_bg` key - in a custom theme JSON, or in the graphical theme editor under **Editor -> After End-of-File Background** - and those rows use it instead.
 
 ## Auto-Save
 
 Enable `auto_save_enabled` in settings to automatically save modified buffers to disk at a configurable interval (default 30 seconds). This is separate from the crash-recovery auto-save, which runs independently every 2 seconds to a recovery directory.
+
+## Interrupted Saves
+
+A file that can't be replaced by a new one without losing something (it belongs to another user, has other hard links, or carries attributes that can't be copied) is overwritten in place. Before truncating it, Fresh keeps a complete copy of the new content in its recovery directory. If the write fails part-way, or Fresh dies during it, the file may be left damaged; the next session then opens an **Interrupted Save** dialog for it: **Restore** writes the kept copy into the file (and reloads any open buffer of it that has no unsaved changes), **Show Diff** closes the dialog and opens the file on disk beside the kept copy (keeping the copy, so the diff can be read at leisure), **Discard** deletes the copy, and **Later** keeps it and shows where it is. A copy that is still waiting is asked about again at the next start, or any time with **Review Interrupted Saves** from the command palette, including one kept by a save earlier in the same session. While such a copy is kept, or after a save of it failed part-way in this session, a large file (opened without loading it whole) can't be saved again, not even under another name, since its unchanged parts would be read back from the damaged file.
 
 ## Code Folding
 
@@ -90,6 +96,8 @@ Diagnostic messages can be displayed at the end of each line, right-aligned, wit
 
 When line wrap is enabled (`line_wrap` in settings), wrapped continuation lines preserve the indentation of their parent line (hanging indent).
 
+Lines wrap at the window edge, or at `wrap_column` when it is set and the window is wider. `wrap_column` counts text columns, not the line-number gutter: `"wrap_column": 80` fits 80 characters on a row with or without line numbers. It can be set per language, e.g. to wrap Markdown at 80 while code wraps at the window edge.
+
 **Per-buffer overrides** — **Toggle Line Wrap (Current Buffer)** and **Toggle Line Numbers (Current Buffer)** flip these for the active buffer only, leaving the global default and other buffers untouched. The override persists across restarts; the editor-wide **Toggle Line Wrap** / **Toggle Line Numbers** commands still change the default for everything else and save it to your config. See [Per-Buffer Overrides](../configuration/index.md#per-buffer-overrides) for the naming convention every settings toggle follows.
 
 ## Multiple Cursors
@@ -108,14 +116,14 @@ Edit multiple locations simultaneously:
 | Shortcut | Action |
 |----------|--------|
 | `Ctrl+W` | Select word under cursor |
-| Double-click + drag | Extend selection word-by-word (after double-clicking a word) |
 | `Ctrl+L` | Select current line |
 | `Ctrl+A` | Select all |
 | `Shift+Arrow` | Extend selection in direction |
 | `Ctrl+Shift+←/→` | Select word left/right |
-| `Shift+Home/End` | Select to line start/end |
+| `Shift+Home/End` | Select to line start (smart, like Home) / line end |
 | `Ctrl+Shift+Home/End` | Select to document start/end |
 | `Shift+PgUp/PgDn` | Select page up/down |
+| Double-click, then drag | Extend the selection a whole word at a time (a plain click-drag extends it by single characters) |
 
 Selected line breaks are drawn too: every line break inside the selection highlights the single column it occupies — column 0 on an empty line, just past the text otherwise — so a selection that spans blank lines is visible instead of leaving them looking untouched. Whitespace inside the selection also gets its `·` / `→` indicators (see [Whitespace Indicators](#whitespace-indicators)).
 
@@ -206,7 +214,7 @@ A recorded macro lives only in its register until you persist it:
 - **Macro: Save to init.ts** writes the macro to your [`init.ts`](../configuration/init.md) as an editable `editor.defineMacro("0", [...])` block. Saved macros are seeded back into their registers at startup.
 - **Macro: Promote to command** turns the macro into a `registerCommand` handler in `init.ts`, seeded with the recorded steps — a starting point you can extend with loops, conditionals, or any plugin API.
 
-Both write a sentinel-delimited block and reload `init.ts` immediately.
+Both write a sentinel-delimited block and reload `init.ts` immediately. Each step is `{ action, args?, count? }`; the [Actions reference](../configuration/actions.md) lists every action name and the args it takes.
 
 To bind a custom key to play a macro, follow the example below to add a `keybindings` section to your local `config.json`. 
 
@@ -255,6 +263,125 @@ Smart editing for Markdown files (provided by the built-in `markdown_source` plu
 ### Compose Mode
 
 "Markdown: Toggle Compose" from the command palette enables a distraction-free mode that conceals markup (`**`, `*`, `[]()`), applies soft line breaks at a configurable width, and renders tables. Use "Markdown: Set Compose Width" to adjust the width. Open the same file in a vertical split to see source and composed views side by side.
+
+Three commands switch the pane in focus between views of a Markdown file:
+
+| Command | View |
+|---------|------|
+| Markdown: Source Mode | The raw Markdown |
+| Markdown: Rendered Mode | The composed document |
+| Markdown: Source/Compose Dual Mode | The source and the composed document side by side, in the file's tab; the two scroll together |
+
+"Markdown: Cycle View Mode" steps through Source, Rendered and dual mode, and "Markdown: Toggle Source/Compose Dual Mode" switches dual mode on and off. Dual mode shows in the file's own tab, so the file still has one tab, and you can edit it in either side. Leaving dual mode brings the tab back to the plain file; closing the tab closes the file, as usual. Other panes you have open on the file are left alone.
+
+Compose mode reads the document the way markdown defines it, so a paragraph, list item or quote written across several source lines is re-flowed into one block at the page width — a hard-wrapped file reads as prose rather than as its source layout. The things markdown treats as their own block still are: a blank line, a heading, a thematic break, a table row, a fenced code block, a new list marker, and a hard break (two trailing spaces or a trailing backslash).
+
+### Previews of diagrams, math and other code blocks
+
+Compose mode can show a code block as a drawing instead of its source. It doesn't draw anything itself: the `renderers` setting maps a code block's language to a command and its arguments, and compose shows what that command prints, framed, in place of the block. The frame's title names the language and the program, such as `mermaid · termaid`.
+
+![A Markdown file in compose mode: inline math, a formula drawn by utftex, and a Mermaid flowchart drawn by termaid](/images/markdown-preview-rendered.png)
+
+The defaults cover Mermaid diagrams and LaTeX math:
+
+| Language | Command | Install |
+|---|---|---|
+| `mermaid` | `termaid {file} --width {width}` | [`termaid`](https://github.com/fasouto/termaid): `pip install termaid` |
+| `math`, `latex`, `katex` | `utftex --line-width {width} -- {source}` | [`utftex`](https://github.com/bartp5/libtexprintf) |
+
+The `math` entry also draws math written in the delimiters MathJax, KaTeX, GitHub and GitLab use:
+- inline: `$x^2$`, `\(x^2\)`, or GitLab's ``$`x^2`$``;
+- display: `$$ … $$`, or `\[ … \]` (on one line, or with `\[` and `\]` on lines of their own).
+
+Inline math is replaced only when the command draws it on one row, since a stacked fraction can't sit inside a sentence. Prices such as "$10 and $20" are not taken for math.
+
+When a language has no command, the command isn't installed, or it fails on a block, the source is shown as written: a fenced block as a code block, display math as its lines. The first time a missing command is needed, the status bar says what to install.
+
+Put the cursor in a drawn block to edit its source; it is drawn again when the cursor leaves. In Source/Compose dual mode, the source side shows the Markdown and the compose side the drawings.
+
+![Source/Compose dual mode: the Markdown source on the left, the drawn formula and diagram on the right](/images/markdown-preview-dual.png)
+
+#### Configuring the commands
+
+Change the commands in Settings, under *Plugins → markdown_compose → Renderers*. There is a row per language, showing its command:
+
+![The Renderers setting in the Settings UI: a row per language with its command](/images/markdown-preview-settings.png)
+
+A row opens to edit the command and its arguments. The help under the fields lists the placeholders the arguments can use:
+
+![Editing the mermaid entry: its command, its arguments as a list, and the placeholders help](/images/markdown-preview-settings-entry.png)
+
+| Placeholder | Replaced with |
+|---|---|
+| `{file}` | a temporary file holding the block's text, named with the language as its extension (`fresh-md-….mermaid`) |
+| `{source}` | the block's text itself |
+| `{width}` | the number of columns available inside the frame |
+| `{lang}` | the block's language, as written after the fence |
+
+In `config.json` the setting is `plugins.markdown_compose.settings.renderers`, a map from language to `command` and `args`. These are the defaults:
+
+```json
+{
+  "plugins": {
+    "markdown_compose": {
+      "settings": {
+        "renderers": {
+          "mermaid": { "command": "termaid", "args": ["{file}", "--width", "{width}"] },
+          "math":    { "command": "utftex",  "args": ["--line-width", "{width}", "--", "{source}"] },
+          "latex":   { "command": "utftex",  "args": ["--line-width", "{width}", "--", "{source}"] },
+          "katex":   { "command": "utftex",  "args": ["--line-width", "{width}", "--", "{source}"] }
+        }
+      }
+    }
+  }
+}
+```
+
+A map set in `config.json` replaces the defaults as a whole, so list every language you want drawn. Some changes, each shown as the `renderers` value:
+
+Draw Graphviz ` ```dot ` blocks too, with [`graph-easy`](https://metacpan.org/pod/Graph::Easy):
+
+```json
+"renderers": {
+  "mermaid": { "command": "termaid", "args": ["{file}", "--width", "{width}"] },
+  "math":    { "command": "utftex",  "args": ["--line-width", "{width}", "--", "{source}"] },
+  "dot":     { "command": "graph-easy", "args": ["--as=boxart", "{file}"] }
+}
+```
+
+Use [`mmaid`](https://github.com/aaronsb/mmaid-go) for Mermaid instead, and stop drawing math (an empty command shows that language as code):
+
+```json
+"renderers": {
+  "mermaid": { "command": "mmaid", "args": ["{file}"] },
+  "math":    { "command": "", "args": [] }
+}
+```
+
+A command not on your `PATH` can be given by its full path, e.g. `"command": "/opt/tools/bin/utftex"`. Put `--` before `{source}` when the tool takes options, as the defaults do, so a formula starting with `-` is not read as one.
+
+Any program that prints its drawing as text works. `mmaid` covers 31 Mermaid diagram types, but has no width option, so a pie chart can run wider than the page.
+
+### Contents Panel
+
+The `markdown_toc` plugin adds a **Contents** section to the sidebar, under the file explorer, listing the headings of the active Markdown file as a tree — one row per heading, indented by level, with the `#` markers stripped. Headings inside fenced code blocks are not listed. The section belongs to the file it lists: it shows while that file is the active one in its window, waits out of sight while another file or workspace is active, and goes away when the file closes — another workspace's outline never appears in yours. "Markdown: Toggle Table of Contents" opens or closes it by hand, showing the sidebar if it was hidden; "Markdown: Focus Contents" shows it and moves the keyboard into it, and `Alt+Shift+N` / `Alt+Shift+P` cycle the keyboard through the sidebar's sections from anywhere.
+
+- The highlighted row is the heading whose section contains the cursor. When the pane showing the file does not have the keyboard (you are in the file explorer or a sidebar section, or reading the file in another split), the row follows the top of the viewport instead. "Markdown: Contents — Follow Cursor/Scroll" pins one or the other for the session.
+- Click a row to put the cursor on that heading and centre it in the pane; focus stays in the sidebar. Press Enter on a row to jump and move focus to the pane. Up/Down browse the rows, Left/Right fold and unfold them.
+- The disclosure glyphs collapse and expand the outline. With `foldBuffer` on, collapsing a heading also folds its section in the buffer.
+
+The panel works the same way in source and compose mode: compose conceals the markers and re-flows the text but does not move it, so the rows, the highlight and the jump target are identical in both.
+
+Settings live under *Plugins → markdown_toc* (`plugins.markdown_toc.settings` in `config.json`):
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `follow` | `"cursor"` | `"cursor"` highlights the heading containing the cursor; `"scroll"` the one at the top of the viewport |
+| `foldBuffer` | `false` | Collapsing a heading in the panel also folds its section in the buffer |
+| `autoOpen` | `true` | Open the panel for Markdown files and close it for other files automatically |
+| `rows` | `10` | Rows the section asks for; dragging the section divider overrides it |
+
+Files above the `editor.large_file_threshold_bytes` limit keep the headings last scanned and the section title reads "Contents (stale)".
 
 ## Shell Integration
 

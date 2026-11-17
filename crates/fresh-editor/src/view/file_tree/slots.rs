@@ -7,7 +7,6 @@ use ratatui::style::Color;
 
 use super::{cache::insert_with_aliases, decorations::FileExplorerDecorationCache};
 
-pub const COMPATIBILITY_TRAILING_SLOT_HIT_WIDTH: u16 = 2;
 pub const DEFAULT_LEADING_SLOT_MIN_WIDTH: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +19,10 @@ pub struct ExplorerTooltipSummary {
 pub struct ExplorerLeadingSlotPayload {
     pub text: String,
     pub fg: Color,
+    /// The theme key `fg` was resolved from, when it was one — so the slot is
+    /// drawn with that key's text attributes too, and the inspector can name
+    /// it. `None` for a literal color.
+    pub fg_key: Option<String>,
     pub min_width: usize,
 }
 
@@ -33,6 +36,8 @@ impl ExplorerLeadingSlotPayload {
 pub struct ExplorerTrailingSlotPayload {
     pub text: String,
     pub fg: Color,
+    /// See [`ExplorerLeadingSlotPayload::fg_key`].
+    pub fg_key: Option<String>,
     pub tooltip: Option<ExplorerTooltipSummary>,
 }
 
@@ -46,6 +51,8 @@ impl ExplorerTrailingSlotPayload {
 pub struct ExplorerTrailingSlotResolution {
     pub payload: Option<ExplorerTrailingSlotPayload>,
     pub name_color_hint: Option<Color>,
+    /// The theme key `name_color_hint` was resolved from, when it was one.
+    pub name_color_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,11 +60,15 @@ pub struct ExplorerSlotResolution {
     pub leading: Option<ExplorerLeadingSlotPayload>,
     pub trailing: Option<ExplorerTrailingSlotPayload>,
     pub name_color_hint: Option<Color>,
+    /// See [`ExplorerTrailingSlotResolution::name_color_key`].
+    pub name_color_key: Option<String>,
 }
 
 pub struct ExplorerSlotContext<'a> {
     pub path: &'a Path,
     pub is_dir: bool,
+    /// A directory drawn open (its file-type icon is the open folder).
+    pub is_expanded: bool,
     pub has_unsaved: bool,
     pub is_symlink: bool,
     pub is_hidden: bool,
@@ -73,10 +84,6 @@ pub trait ExplorerLeadingSlotProvider {
 
 pub trait ExplorerTrailingSlotProvider {
     fn resolve(&self, context: &ExplorerSlotContext<'_>) -> ExplorerTrailingSlotResolution;
-
-    fn hit_test_width(&self) -> u16 {
-        COMPATIBILITY_TRAILING_SLOT_HIT_WIDTH
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -118,11 +125,8 @@ impl<'a> ExplorerSlotResolver<'a> {
             leading: self.leading.resolve(context),
             trailing: trailing.payload,
             name_color_hint: trailing.name_color_hint,
+            name_color_key: trailing.name_color_key,
         }
-    }
-
-    pub fn trailing_hit_test_width(&self) -> u16 {
-        self.trailing.hit_test_width()
     }
 }
 
@@ -270,20 +274,70 @@ pub static DEFAULT_LEADING_SLOT_PROVIDER: DefaultLeadingSlotProvider = DefaultLe
 
 impl ExplorerLeadingSlotProvider for DefaultLeadingSlotProvider {
     fn resolve(&self, context: &ExplorerSlotContext<'_>) -> Option<ExplorerLeadingSlotPayload> {
-        context
+        let Some(override_entry) = context
             .slot_overrides
             .leading_override_for_path(context.path)
-            .and_then(|override_entry| {
-                override_entry
-                    .slot
-                    .as_ref()
-                    .map(|slot| ExplorerLeadingSlotPayload {
-                        text: slot.text.clone(),
-                        fg: resolve_overlay_color(&slot.color, context.theme, context.neutral_fg),
-                        min_width: slot.min_width,
-                    })
+        else {
+            return file_icon(context);
+        };
+        // A plugin that claimed the slot owns it, even to leave it empty.
+        override_entry
+            .slot
+            .as_ref()
+            .map(|slot| ExplorerLeadingSlotPayload {
+                text: slot.text.clone(),
+                fg: resolve_overlay_color(&slot.color, context.theme, context.neutral_fg),
+                fg_key: overlay_color_key(&slot.color),
+                min_width: slot.min_width,
             })
     }
+}
+
+/// A file's type icon, in the leading slot no plugin claimed: drawn while
+/// the user's `editor.nerd_font_icons` is on (the theme's chrome carries the
+/// flag, settled each frame). A folder's is the open or closed folder, in the
+/// explorer's directory color; a file's is its type's, in that type's color.
+/// Both give way to the theme's `ui.file_icon_fg` when it names one. Through
+/// the same slot, so folder and file icons at one depth share a column.
+fn file_icon(context: &ExplorerSlotContext<'_>) -> Option<ExplorerLeadingSlotPayload> {
+    if !context.theme.chrome.nerd_font {
+        return None;
+    }
+    let theme = context.theme;
+    let (icon, own_key) = if context.is_dir {
+        (
+            crate::view::file_icons::resolve_folder(
+                &theme.file_icons,
+                context.is_expanded,
+                theme.file_explorer_directory_fg,
+            ),
+            // Named only while the theme leaves the folder's color alone.
+            theme
+                .file_icons
+                .folder
+                .as_ref()
+                .and_then(|o| o.color)
+                .is_none()
+                .then_some("ui.file_explorer_directory_fg"),
+        )
+    } else {
+        let name = context.path.file_name()?.to_string_lossy();
+        (
+            crate::view::file_icons::resolve(&theme.file_icons, &name),
+            None,
+        )
+    };
+    let (glyph, own_color) = (icon.glyph, icon.color);
+    let (fg, fg_key) = match theme.file_icon_fg {
+        Some(c) => (c, Some("ui.file_icon_fg")),
+        None => (own_color, own_key),
+    };
+    Some(ExplorerLeadingSlotPayload {
+        text: glyph,
+        fg,
+        fg_key: fg_key.map(str::to_string),
+        min_width: DEFAULT_LEADING_SLOT_MIN_WIDTH,
+    })
 }
 
 pub struct DefaultTrailingSlotProvider;
@@ -315,6 +369,7 @@ impl ExplorerTrailingSlotProvider for DefaultTrailingSlotProvider {
                                 context.theme,
                                 context.neutral_fg,
                             ),
+                            fg_key: overlay_color_key(&slot.color),
                             tooltip: slot.tooltip.clone(),
                         })
                 }
@@ -327,11 +382,19 @@ impl ExplorerTrailingSlotProvider for DefaultTrailingSlotProvider {
                     .map(|color| resolve_overlay_color(color, context.theme, context.neutral_fg)),
                 None => compatibility.name_color_hint,
             },
+            name_color_key: match override_name_color {
+                Some(override_entry) => override_entry.color.as_ref().and_then(overlay_color_key),
+                None => compatibility.name_color_key,
+            },
         }
     }
+}
 
-    fn hit_test_width(&self) -> u16 {
-        COMPATIBILITY_TRAILING_SLOT_HIT_WIDTH
+/// The theme key a color spec names, if it names one.
+pub(crate) fn overlay_color_key(spec: &OverlayColorSpec) -> Option<String> {
+    match spec {
+        OverlayColorSpec::Rgb(..) => None,
+        OverlayColorSpec::ThemeKey(key) => Some(key.clone()),
     }
 }
 
@@ -423,6 +486,7 @@ mod tests {
         let context = ExplorerSlotContext {
             path: &path,
             is_dir: false,
+            is_expanded: false,
             has_unsaved: false,
             is_symlink: false,
             is_hidden: false,

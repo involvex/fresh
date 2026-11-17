@@ -72,6 +72,7 @@ export default defineConfig({
           { text: "Language Support", link: "/features/languages" },
           { text: "LSP Integration", link: "/features/lsp" },
           { text: "Git", link: "/features/git" },
+          { text: "Compare Files", link: "/features/compare-files" },
           { text: "Themes", link: "/features/themes" },
           { text: "Encoding", link: "/features/encoding" },
           { text: "Workspace Trust", link: "/features/workspace-trust" },
@@ -80,6 +81,7 @@ export default defineConfig({
           { text: "Daemon Mode", link: "/features/session-persistence" },
           { text: "Keybinding Editor", link: "/features/keybinding-editor" },
           { text: "Dashboard", link: "/features/dashboard" },
+          { text: "Workboard", link: "/features/workboard" },
         ],
       },
       {
@@ -96,6 +98,7 @@ export default defineConfig({
           { text: "Overview", link: "/configuration/" },
           { text: "Startup Script (init.ts)", link: "/configuration/init" },
           { text: "Keyboard", link: "/configuration/keyboard" },
+          { text: "Actions", link: "/configuration/actions" },
         ],
       },
       {
@@ -107,8 +110,10 @@ export default defineConfig({
             collapsed: true,
             items: [
               { text: "Introduction", link: "/plugins/development/" },
+              { text: "Project Setup (TypeScript)", link: "/plugins/development/setup" },
               { text: "Language Packs", link: "/plugins/development/language-packs" },
               { text: "Common Patterns", link: "/plugins/development/patterns" },
+              { text: "Asking for Input", link: "/plugins/examples/asking-for-input/" },
               { text: "Utilities Library", link: "/plugins/development/utilities" },
               { text: "Internationalization", link: "/plugins/development/i18n" },
             ],
@@ -117,13 +122,21 @@ export default defineConfig({
             text: "API Reference",
             collapsed: true,
             items: [
-              { text: "Core Concepts & Types", link: "/plugins/api/" },
-              { text: "Status & Logging", link: "/plugins/api/status-logging" },
-              { text: "Buffer Operations", link: "/plugins/api/buffer" },
-              { text: "Overlays & Virtual Text", link: "/plugins/api/overlays" },
-              { text: "Filesystem & Paths", link: "/plugins/api/filesystem" },
+              { text: "Overview & Core Concepts", link: "/plugins/api/" },
+              // Generated pages: keep in the order of METHOD_PAGES in
+              // crates/fresh-plugin-runtime/src/api_docs.rs (a test checks).
+              { text: "Plugin Runtime", link: "/plugins/api/runtime" },
+              { text: "Status, Logging & Translation", link: "/plugins/api/status-logging" },
+              { text: "Buffers & Editing", link: "/plugins/api/buffer" },
+              { text: "Commands, Prompts & Dialogs", link: "/plugins/api/ui" },
+              { text: "Decorations", link: "/plugins/api/overlays" },
+              { text: "Virtual Buffers & Panels", link: "/plugins/api/virtual-buffers" },
+              { text: "Windows, Splits & Terminals", link: "/plugins/api/windows" },
+              { text: "Files, Paths & Environment", link: "/plugins/api/filesystem" },
+              { text: "Processes, Timers & Network", link: "/plugins/api/processes" },
+              { text: "Config, Themes & Languages", link: "/plugins/api/config" },
               { text: "Events & Hooks", link: "/plugins/api/events" },
-              { text: "Virtual Buffers", link: "/plugins/api/virtual-buffers" },
+              { text: "Types", link: "/plugins/api/types" },
             ],
           },
         ],
@@ -158,7 +171,7 @@ export default defineConfig({
     },
 
     footer: {
-      message: "Released under the Apache 2.0 License",
+      message: "Released under the GNU General Public License v3.0 or later",
     },
   },
 });

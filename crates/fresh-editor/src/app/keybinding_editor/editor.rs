@@ -10,7 +10,7 @@ use crate::input::keybindings::{
     format_keybinding, normalize_key, Action, KeyContext, KeybindingResolver,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use rust_i18n::t;
+use fresh_i18n::t;
 use std::collections::{HashMap, HashSet};
 
 /// The main keybinding editor state
@@ -18,12 +18,20 @@ use std::collections::{HashMap, HashSet};
 pub struct KeybindingEditor {
     /// All resolved bindings
     pub bindings: Vec<ResolvedBinding>,
+    /// Issues the rows' ids; see `BindingId`.
+    binding_ids: BindingIds,
     /// Indices into `bindings` after filtering/searching
     pub filtered_indices: Vec<usize>,
-    /// Currently selected index (within filtered list)
-    pub selected: usize,
-    /// Scroll state (offset, viewport, content_height) — shared with render
-    pub scroll: crate::view::ui::ScrollState,
+    /// The selected display row, held by what the row is (see
+    /// [`RowKey`]) so it stays on its binding when a filter or an edit
+    /// rebuilds the rows. Read and written through [`Self::selected`] and
+    /// [`Self::select`].
+    selection: crate::view::keyed_selection::KeyedSelection<RowKey>,
+    /// The table's page handle. The window is the table viewport's own;
+    /// the table records how many rows it holds here, and PageUp/PageDown
+    /// ask it for the row a page away — the page is layout's number, not
+    /// a rectangle read back or a height written down beside it.
+    pub pager: std::rc::Rc<fresh_ui::behavior::Pager>,
 
     /// Whether search is active (search bar visible)
     pub search_active: bool,
@@ -81,12 +89,6 @@ pub struct KeybindingEditor {
     pub display_rows: Vec<DisplayRow>,
     /// Sections that are manually collapsed (by plugin name, None = builtin)
     pub collapsed_sections: HashSet<Option<String>>,
-
-    /// Layout info for mouse hit testing (updated during render)
-    pub layout: KeybindingEditorLayout,
-
-    /// Mouse interaction state for the table scrollbar (press/drag/release).
-    pub scrollbar_mouse: crate::view::ui::scrollbar::ScrollbarMouse,
 }
 
 impl KeybindingEditor {
@@ -104,8 +106,14 @@ impl KeybindingEditor {
         config_file_path: String,
         menu_names: &[String],
     ) -> Self {
-        let bindings =
-            Self::resolve_all_bindings(config, resolver, mode_registry, command_registry);
+        let mut binding_ids = BindingIds::default();
+        let bindings = Self::resolve_all_bindings(
+            config,
+            resolver,
+            mode_registry,
+            command_registry,
+            &mut binding_ids,
+        );
         let filtered_indices: Vec<usize> = (0..bindings.len()).collect();
 
         // Collect available action names (include plugin action names from plugin defaults)
@@ -168,9 +176,10 @@ impl KeybindingEditor {
 
         let mut editor = Self {
             bindings,
+            binding_ids,
             filtered_indices,
-            selected: 0,
-            scroll: crate::view::ui::ScrollState::default(),
+            selection: Default::default(),
+            pager: fresh_ui::behavior::Pager::new(),
             search_active: false,
             search_focused: false,
             search_query: String::new(),
@@ -194,8 +203,6 @@ impl KeybindingEditor {
             mode_contexts,
             display_rows: Vec::new(),
             collapsed_sections,
-            layout: KeybindingEditorLayout::default(),
-            scrollbar_mouse: crate::view::ui::scrollbar::ScrollbarMouse::default(),
         };
 
         editor.apply_filters();
@@ -208,9 +215,27 @@ impl KeybindingEditor {
         resolver: &KeybindingResolver,
         mode_registry: &crate::input::buffer_mode::ModeRegistry,
         command_registry: &CommandRegistry,
+        ids: &mut BindingIds,
     ) -> Vec<ResolvedBinding> {
-        let mut bindings = Vec::new();
+        let mut bindings: Vec<ResolvedBinding> = Vec::new();
         let mut seen: HashMap<(String, String), usize> = HashMap::new(); // (key_display, context) -> index
+
+        // `unbind` entries remove built-in rows; they are not rows themselves.
+        let removed: HashSet<(String, String)> = config
+            .keybindings
+            .iter()
+            .filter(|kb| kb.is_unbind())
+            .filter_map(|kb| {
+                // Only compared, never a row: its id is never seen.
+                Self::keybinding_to_resolved(
+                    kb,
+                    BindingSource::Custom,
+                    resolver,
+                    &mut BindingIds::default(),
+                )
+            })
+            .map(|entry| (entry.key_display, entry.context))
+            .collect();
 
         // First, load bindings from the active keymap. `resolve_keymap`
         // returns the inheritance chain parent-first, and the resolver takes
@@ -220,9 +245,16 @@ impl KeybindingEditor {
         // "Ctrl+S → Save file" and "Ctrl+S → Find", only one of which fires.
         let map_bindings = config.resolve_keymap(&config.active_keybinding_map);
         for kb in &map_bindings {
-            if let Some(entry) = Self::keybinding_to_resolved(kb, BindingSource::Keymap, resolver) {
+            if let Some(mut entry) =
+                Self::keybinding_to_resolved(kb, BindingSource::Keymap, resolver, ids)
+            {
                 let key = (entry.key_display.clone(), entry.context.clone());
+                if removed.contains(&key) {
+                    continue;
+                }
                 if let Some(&existing_idx) = seen.get(&key) {
+                    // The same row, rebound: it keeps its identity.
+                    entry.id = bindings[existing_idx].id;
                     bindings[existing_idx] = entry;
                 } else {
                     let idx = bindings.len();
@@ -233,11 +265,15 @@ impl KeybindingEditor {
         }
 
         // Then, load custom bindings (these override keymap bindings)
-        for kb in &config.keybindings {
-            if let Some(entry) = Self::keybinding_to_resolved(kb, BindingSource::Custom, resolver) {
+        for kb in config.keybindings.iter().filter(|kb| !kb.is_unbind()) {
+            if let Some(mut entry) =
+                Self::keybinding_to_resolved(kb, BindingSource::Custom, resolver, ids)
+            {
                 let key = (entry.key_display.clone(), entry.context.clone());
                 if let Some(&existing_idx) = seen.get(&key) {
-                    // Override the existing binding
+                    // Override the existing binding: the same row, so the
+                    // same identity.
+                    entry.id = bindings[existing_idx].id;
                     bindings[existing_idx] = entry;
                 } else {
                     let idx = bindings.len();
@@ -259,8 +295,9 @@ impl KeybindingEditor {
                 for ((key_code, modifiers), action) in context_bindings {
                     let key_display = format_keybinding(key_code, modifiers);
                     let seen_key = (key_display.clone(), context_str.clone());
-                    // Skip if already overridden by a user custom binding
-                    if seen.contains_key(&seen_key) {
+                    // Skip if already overridden by a user custom binding,
+                    // or removed with an `unbind` entry.
+                    if seen.contains_key(&seen_key) || removed.contains(&seen_key) {
                         continue;
                     }
                     let command = action.to_qualified_action_str();
@@ -268,6 +305,7 @@ impl KeybindingEditor {
                     let idx = bindings.len();
                     seen.insert(seen_key, idx);
                     bindings.push(ResolvedBinding {
+                        id: ids.issue(),
                         key_display,
                         action: command,
                         action_display,
@@ -292,6 +330,7 @@ impl KeybindingEditor {
             if !bound_actions.contains(&action_name) {
                 let action_display = KeybindingResolver::format_action_from_str(&action_name);
                 bindings.push(ResolvedBinding {
+                    id: ids.issue(),
                     key_display: String::new(),
                     action: action_name,
                     action_display,
@@ -317,6 +356,7 @@ impl KeybindingEditor {
                         _ => None,
                     };
                     bindings.push(ResolvedBinding {
+                        id: ids.issue(),
                         key_display: String::new(),
                         action: action_name.clone(),
                         action_display: cmd.get_localized_name(),
@@ -377,6 +417,7 @@ impl KeybindingEditor {
         kb: &Keybinding,
         source: BindingSource,
         _resolver: &KeybindingResolver,
+        ids: &mut BindingIds,
     ) -> Option<ResolvedBinding> {
         // Canonicalise the `when` spelling. `KeyContext` accepts aliases
         // (`file_explorer` / `fileExplorer`, `search_prompt` / `searchPrompt`,
@@ -402,6 +443,7 @@ impl KeybindingEditor {
                 None
             };
             Some(ResolvedBinding {
+                id: ids.issue(),
                 key_display,
                 action: qualified_action,
                 action_display,
@@ -428,6 +470,7 @@ impl KeybindingEditor {
                 None
             };
             Some(ResolvedBinding {
+                id: ids.issue(),
                 key_display,
                 action: qualified_action,
                 action_display,
@@ -591,11 +634,7 @@ impl KeybindingEditor {
         // Build display rows with section headers
         self.build_display_rows();
 
-        // Reset selection if it's out of bounds
-        if self.selected >= self.display_rows.len() {
-            self.selected = self.display_rows.len().saturating_sub(1);
-        }
-        self.ensure_visible();
+        self.reselect_after_rebuild();
     }
 
     /// Build display rows from filtered indices, inserting section headers
@@ -646,10 +685,52 @@ impl KeybindingEditor {
         }
     }
 
+    /// What display row `i` is, if there is one.
+    fn row_key(&self, i: usize) -> Option<RowKey> {
+        match self.display_rows.get(i)? {
+            DisplayRow::SectionHeader { plugin_name, .. } => {
+                Some(RowKey::Section(plugin_name.clone()))
+            }
+            DisplayRow::Binding(idx) => self.bindings.get(*idx).map(|b| RowKey::Binding(b.id)),
+        }
+    }
+
+    /// The selected display row. Rows move only when they are rebuilt, and
+    /// every rebuild re-finds the selection by its key
+    /// ([`Self::reselect_after_rebuild`]), so between rebuilds the row it
+    /// was last found at is exact.
+    pub fn selected(&self) -> usize {
+        self.selection.last_index()
+    }
+
+    /// Re-find the selected row by its key after the rows were rebuilt.
+    ///
+    /// **The editor always has a selected row**, so a row the rebuild
+    /// dropped (a binding deleted, or filtered out by a search) hands the
+    /// selection to the row now where it was: a stated rule for an item
+    /// that is gone, not a stand-in for an identity the row lacks.
+    fn reselect_after_rebuild(&mut self) {
+        let n = self.display_rows.len();
+        let at = self
+            .selection
+            .find(n, |i, key| self.row_key(i).as_ref() == Some(key))
+            .unwrap_or(self.selection.last_index());
+        self.select(at);
+    }
+
+    /// Select display row `i` (clamped to the rows there are).
+    pub fn select(&mut self, i: usize) {
+        let i = i.min(self.display_rows.len().saturating_sub(1));
+        self.selection = match self.row_key(i) {
+            Some(key) => crate::view::keyed_selection::KeyedSelection::at(i, key),
+            None => Default::default(),
+        };
+    }
+
     /// Toggle the collapsed state of the section at the current selection
     pub fn toggle_section_at_selected(&mut self) {
         if let Some(DisplayRow::SectionHeader { plugin_name, .. }) =
-            self.display_rows.get(self.selected)
+            self.display_rows.get(self.selected())
         {
             let key = plugin_name.clone();
             if self.collapsed_sections.contains(&key) {
@@ -658,33 +739,21 @@ impl KeybindingEditor {
                 self.collapsed_sections.insert(key);
             }
             self.build_display_rows();
-            // Keep selected in bounds
-            if self.selected >= self.display_rows.len() {
-                self.selected = self.display_rows.len().saturating_sub(1);
-            }
-            self.ensure_visible();
+            self.reselect_after_rebuild();
         }
     }
 
     /// Check if the currently selected display row is a section header
     pub fn selected_is_section_header(&self) -> bool {
         matches!(
-            self.display_rows.get(self.selected),
+            self.display_rows.get(self.selected()),
             Some(DisplayRow::SectionHeader { .. })
         )
     }
 
-    /// Get the currently selected binding (None if a section header is selected)
-    pub fn selected_binding(&self) -> Option<&ResolvedBinding> {
-        match self.display_rows.get(self.selected) {
-            Some(DisplayRow::Binding(idx)) => self.bindings.get(*idx),
-            _ => None,
-        }
-    }
-
     /// Get the binding index in `self.bindings` for the current selection
     fn selected_binding_index(&self) -> Option<usize> {
-        match self.display_rows.get(self.selected) {
+        match self.display_rows.get(self.selected()) {
             Some(DisplayRow::Binding(idx)) => Some(*idx),
             _ => None,
         }
@@ -692,46 +761,40 @@ impl KeybindingEditor {
 
     /// Move selection up
     pub fn select_prev(&mut self) {
-        if self.selected > 0 {
-            self.selected -= 1;
-            self.ensure_visible();
+        let at = self.selected();
+        if at > 0 {
+            self.select(at - 1);
         }
     }
 
     /// Move selection down
     pub fn select_next(&mut self) {
-        if self.selected + 1 < self.display_rows.len() {
-            self.selected += 1;
-            self.ensure_visible();
+        let at = self.selected();
+        if at + 1 < self.display_rows.len() {
+            self.select(at + 1);
         }
     }
 
-    /// Page up
+    /// Move the selection a page up. The table's viewport shows it.
     pub fn page_up(&mut self) {
-        let page = self.scroll.viewport as usize;
-        if self.selected > page {
-            self.selected -= page;
-        } else {
-            self.selected = 0;
-        }
-        self.ensure_visible();
+        self.page(-1);
     }
 
-    /// Page down
+    /// Move the selection a page down.
     pub fn page_down(&mut self) {
-        let page = self.scroll.viewport as usize;
-        self.selected = (self.selected + page).min(self.display_rows.len().saturating_sub(1));
-        self.ensure_visible();
+        self.page(1);
     }
 
-    /// Ensure the selected item is visible (public version)
-    pub fn ensure_visible_public(&mut self) {
-        self.ensure_visible();
-    }
-
-    /// Ensure the selected item is visible
-    fn ensure_visible(&mut self) {
-        self.scroll.ensure_visible(self.selected as u16, 1);
+    /// Move the selection `pages` pages, by the window the table was last
+    /// laid out with. Before the table has been laid out there is no page,
+    /// and nothing moves.
+    fn page(&mut self, pages: i32) {
+        if let Some(to) = self
+            .pager
+            .target(self.selected(), pages, self.display_rows.len())
+        {
+            self.select(to);
+        }
     }
 
     /// Start text search (preserves existing query when re-focusing)
@@ -832,18 +895,16 @@ impl KeybindingEditor {
         }
     }
 
-    /// Close the edit dialog
-    pub fn close_edit_dialog(&mut self) {
-        self.edit_dialog = None;
-    }
-
-    /// Delete the selected binding.
+    /// Delete the selected binding: it is gone, and the key falls through to
+    /// whatever else binds it.
     ///
     /// * **Custom** bindings are removed outright (tracked in `pending_removes`
     ///   or dropped from `pending_adds` when added in the same session).
-    /// * **Keymap** bindings cannot be removed from the built-in map, so a
-    ///   custom `noop` override is created for the same key, which shadows the
-    ///   default binding in the resolver.
+    /// * **Keymap** and **plugin** bindings live in read-only maps, so the
+    ///   removal is recorded as an `unbind` entry in the user config, which
+    ///   the resolver applies by taking the built-in binding out of scope.
+    ///
+    /// To make a key do *nothing* instead, see [`Self::disable_selected`].
     ///
     /// Returns `DeleteResult` indicating what happened.
     pub fn delete_selected(&mut self) -> DeleteResult {
@@ -853,9 +914,29 @@ impl KeybindingEditor {
 
         match self.bindings[idx].source {
             BindingSource::Custom => self.delete_custom_binding(idx),
-            // Keymap and plugin defaults can't be removed from their source
-            // map, so both shadow the key with a custom `noop` override —
-            // identical handling, hence one arm.
+            BindingSource::Keymap | BindingSource::Plugin => self.remove_builtin_binding(idx),
+            BindingSource::Unbound => DeleteResult::CannotDelete,
+        }
+    }
+
+    /// Disable the selected binding: a `noop` override for the same
+    /// key+context, so the key does nothing there — including whatever a
+    /// broader context or the parent keymap bound underneath it. That is the
+    /// difference from [`Self::delete_selected`], which lets the key fall
+    /// through. A custom binding is rewritten to `noop` in place.
+    pub fn disable_selected(&mut self) -> DeleteResult {
+        let Some(idx) = self.selected_binding_index() else {
+            return DeleteResult::NothingSelected;
+        };
+
+        match self.bindings[idx].source {
+            BindingSource::Custom => {
+                if self.bindings[idx].action == "noop" {
+                    return DeleteResult::CannotDelete;
+                }
+                self.retire_custom_config_entry(idx);
+                self.override_binding_with_noop(idx)
+            }
             BindingSource::Keymap | BindingSource::Plugin => self.override_binding_with_noop(idx),
             BindingSource::Unbound => DeleteResult::CannotDelete,
         }
@@ -865,8 +946,22 @@ impl KeybindingEditor {
     /// when it was added this session, otherwise record it in `pending_removes`
     /// so the save drops it from the persisted config.
     fn delete_custom_binding(&mut self, idx: usize) -> DeleteResult {
+        let action_name = self.bindings[idx].action.clone();
+        self.retire_custom_config_entry(idx);
+
+        self.bindings.remove(idx);
+        self.has_changes = true;
+
+        self.readd_as_unbound_if_orphaned(action_name);
+        self.apply_filters();
+        DeleteResult::CustomRemoved
+    }
+
+    /// Take the config entry behind the custom row at `idx` out of the save:
+    /// drop it from `pending_adds` when it was added this session, otherwise
+    /// queue it in `pending_removes`. The row itself is left to the caller.
+    fn retire_custom_config_entry(&mut self, idx: usize) {
         let binding = &self.bindings[idx];
-        let action_name = binding.action.clone();
 
         // Use the original config-level Keybinding if available (for bindings
         // loaded from config), otherwise reconstruct it. This avoids lossy
@@ -891,28 +986,17 @@ impl KeybindingEditor {
         } else {
             self.pending_removes.push(config_kb);
         }
-
-        self.bindings.remove(idx);
-        self.has_changes = true;
-
-        self.readd_as_unbound_if_orphaned(action_name);
-        self.apply_filters();
-        DeleteResult::CustomRemoved
     }
 
-    /// Shadow a built-in keymap or plugin binding with a custom `noop` override
-    /// for the same key+context — the underlying map can't be edited in place,
-    /// so the override masks the default in the resolver.
-    fn override_binding_with_noop(&mut self, idx: usize) -> DeleteResult {
+    /// The config entry that addresses the built-in binding at `idx`
+    /// (same key or chord, same context) with `action`.
+    fn config_entry_for_builtin(&self, idx: usize, action: &str) -> Keybinding {
         let binding = &self.bindings[idx];
-        let action_name = binding.action.clone();
-
-        // Build a noop custom override for the same key+context. A chord is
-        // written back as its `keys` sequence — a chord has no single
-        // key/modifiers pair, and emitting an empty one produced a binding
-        // the resolver drops, so the keymap chord stayed live (the editor
-        // reported it disabled and nothing changed).
-        let noop_kb = Keybinding {
+        // A chord is written back as its `keys` sequence — a chord has no
+        // single key/modifiers pair, and emitting an empty one produced an
+        // entry the resolver drops, so the keymap chord stayed live (the
+        // editor reported it disabled and nothing changed).
+        Keybinding {
             key: if binding.is_chord {
                 String::new()
             } else {
@@ -924,19 +1008,47 @@ impl KeybindingEditor {
                 modifiers_to_config_names(binding.modifiers)
             },
             keys: binding.chord_keys.clone(),
-            action: "noop".to_string(),
+            chord: String::new(),
+            action: action.to_string(),
             args: HashMap::new(),
             when: if binding.context.is_empty() {
                 None
             } else {
                 Some(binding.context.clone())
             },
-        };
+        }
+    }
+
+    /// Remove a built-in keymap or plugin binding: queue an `unbind` entry for
+    /// its key+context and drop the row. The resolver takes the binding out
+    /// of scope when the config is saved, so the key falls through to
+    /// whatever else binds it.
+    fn remove_builtin_binding(&mut self, idx: usize) -> DeleteResult {
+        let action_name = self.bindings[idx].action.clone();
+        let unbind_kb = self.config_entry_for_builtin(idx, Keybinding::UNBIND_ACTION);
+        self.pending_adds.push(unbind_kb);
+
+        self.bindings.remove(idx);
+        self.has_changes = true;
+
+        self.readd_as_unbound_if_orphaned(action_name);
+        self.apply_filters();
+        DeleteResult::KeymapRemoved
+    }
+
+    /// Shadow the binding at `idx` with a custom `noop` override for the same
+    /// key+context: the key does nothing there, and the row shows the
+    /// override so it can be deleted again.
+    fn override_binding_with_noop(&mut self, idx: usize) -> DeleteResult {
+        let action_name = self.bindings[idx].action.clone();
+        let noop_kb = self.config_entry_for_builtin(idx, "noop");
         self.pending_adds.push(noop_kb);
 
         // Replace the entry with a noop custom entry in the display.
         let noop_display = KeybindingResolver::format_action_from_str("noop");
         self.bindings[idx] = ResolvedBinding {
+            // Disabled in place: the same row.
+            id: self.bindings[idx].id,
             key_display: self.bindings[idx].key_display.clone(),
             action: "noop".to_string(),
             action_display: noop_display,
@@ -954,7 +1066,7 @@ impl KeybindingEditor {
 
         self.readd_as_unbound_if_orphaned(action_name);
         self.apply_filters();
-        DeleteResult::KeymapOverridden
+        DeleteResult::Disabled
     }
 
     /// After a delete/override, if no binding remains for `action_name`, push an
@@ -965,7 +1077,9 @@ impl KeybindingEditor {
             return;
         }
         let action_display = KeybindingResolver::format_action_from_str(&action_name);
+        let id = self.binding_ids.issue();
         self.bindings.push(ResolvedBinding {
+            id,
             key_display: String::new(),
             action: action_name,
             action_display,
@@ -996,6 +1110,7 @@ impl KeybindingEditor {
                 modifiers_to_config_names(binding.modifiers)
             },
             keys: binding.chord_keys.clone(),
+            chord: String::new(),
             action,
             args,
             when: if binding.context.is_empty() {
@@ -1069,6 +1184,7 @@ impl KeybindingEditor {
             key: key_name,
             modifiers: modifier_names,
             keys: chord_keys.clone(),
+            chord: String::new(),
             action: bare_action.clone(),
             args: args.clone(),
             when: Some(dialog.context.clone()),
@@ -1094,7 +1210,13 @@ impl KeybindingEditor {
             .and_then(|idx| self.bindings.get(idx))
             .and_then(|b| b.plugin_name.clone());
 
+        // Editing keeps the row's identity; adding makes a new row.
+        let id = match dialog.editing_index.and_then(|idx| self.bindings.get(idx)) {
+            Some(b) => b.id,
+            None => self.binding_ids.issue(),
+        };
         let resolved = ResolvedBinding {
+            id,
             key_display,
             action: dialog.action_text,
             action_display,
@@ -1308,6 +1430,7 @@ mod tests {
         // written to config as `{action: "menu_open", args: {name: "File"}}`.
         let editor = make_editor(&[]);
         let rb = ResolvedBinding {
+            id: BindingId(0),
             key_display: "Alt+F".to_string(),
             action: "menu_open:File".to_string(),
             action_display: String::new(),
@@ -1349,6 +1472,25 @@ mod tests {
             .expect("the emacs keymap binds save to the C-x C-s chord")
     }
 
+    /// Searching rebuilds the rows, and the selected binding moves up the
+    /// list with the rows filtered out above it; the selection goes with
+    /// it rather than staying on the row number.
+    #[test]
+    fn a_search_keeps_the_selected_binding_selected() {
+        let mut editor = make_emacs_editor();
+        let idx = emacs_save_chord(&editor);
+        let before = select_row(&editor, idx);
+        editor.select(before);
+
+        editor.start_search();
+        editor.search_query = "save".to_string();
+        editor.apply_filters();
+
+        let after = select_row(&editor, idx);
+        assert_ne!(after, before, "the search must move the row");
+        assert_eq!(editor.selected(), after);
+    }
+
     #[test]
     fn chord_rows_keep_their_key_sequence() {
         let editor = make_emacs_editor();
@@ -1365,14 +1507,86 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_keymap_chord_writes_an_unbind_entry_and_drops_the_row() {
+        let mut editor = make_emacs_editor();
+        let idx = emacs_save_chord(&editor);
+        editor.select(select_row(&editor, idx));
+        assert_eq!(editor.delete_selected(), DeleteResult::KeymapRemoved);
+
+        assert!(
+            !editor
+                .bindings
+                .iter()
+                .any(|b| b.is_chord && b.action == "save"),
+            "a deleted keymap row must be gone, not shown as an override"
+        );
+        let unbind = editor
+            .get_custom_bindings()
+            .into_iter()
+            .find(|kb| kb.is_unbind())
+            .expect("deleting a keymap binding queues an unbind entry");
+        assert!(unbind.key.is_empty(), "a chord entry has no single key");
+        assert_eq!(
+            unbind
+                .keys
+                .iter()
+                .map(|k| k.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["x", "s"],
+            "the entry must name the chord it removes"
+        );
+        assert_eq!(unbind.when.as_deref(), Some("normal"));
+        assert!(
+            !editor
+                .get_custom_bindings()
+                .iter()
+                .any(|kb| kb.action == "noop"),
+            "delete must not write a noop override"
+        );
+    }
+
+    #[test]
+    fn an_unbind_entry_hides_the_keymap_row_on_reload() {
+        // What the editor shows after the save above is persisted: the
+        // removed chord is absent, and the unbind entry is not a row.
+        let mut config = Config {
+            active_keybinding_map: "emacs".into(),
+            ..Config::default()
+        };
+        config.keybindings.push(
+            serde_json::from_value(serde_json::json!({
+                "keys": [{"key": "x", "modifiers": ["ctrl"]}, {"key": "s", "modifiers": ["ctrl"]}],
+                "action": "unbind", "when": "normal"
+            }))
+            .unwrap(),
+        );
+        let editor = make_editor_with_config(config, &[]);
+        assert!(
+            !editor
+                .bindings
+                .iter()
+                .any(|b| b.is_chord && b.action == "save"),
+            "the removed chord must not come back on reload"
+        );
+        assert!(
+            !editor.bindings.iter().any(|b| b.action == "unbind"),
+            "an unbind entry is a removal, not a binding row"
+        );
+        assert!(
+            editor.bindings.iter().any(|b| b.action == "save"),
+            "the action stays listed (single-key or unbound) so it can be rebound"
+        );
+    }
+
+    #[test]
     fn disabling_a_chord_writes_a_chord_shaped_noop() {
         // Regression: the noop override was written with an empty `key` and
         // no `keys`, so the resolver dropped it as an invalid binding — the
         // editor said "disabled" and C-x C-s kept saving.
         let mut editor = make_emacs_editor();
         let idx = emacs_save_chord(&editor);
-        editor.selected = select_row(&editor, idx);
-        assert_eq!(editor.delete_selected(), DeleteResult::KeymapOverridden);
+        editor.select(select_row(&editor, idx));
+        assert_eq!(editor.disable_selected(), DeleteResult::Disabled);
 
         let noop = editor
             .get_custom_bindings()

@@ -11,7 +11,8 @@
 //! sibling impl Editor block. A future phase will collapse the
 //! boilerplate into a single SettingsPromptBuilder<T>.
 
-use rust_i18n::t;
+use fresh_editor_core::model::host_path::AsHostPath;
+use fresh_i18n::t;
 
 use crate::config_io::{ConfigLayer, ConfigResolver};
 use crate::view::prompt::PromptType;
@@ -41,6 +42,7 @@ impl Editor {
             .map(|(le, name, desc)| {
                 let is_current = *le == current_line_ending;
                 crate::input::commands::Suggestion {
+                    id: name.to_string(),
                     description_spans: None,
                     text: format!("{} ({})", name, desc),
                     description: if is_current {
@@ -56,7 +58,7 @@ impl Editor {
             })
             .collect();
 
-        self.active_window_mut().prompt = Some(crate::view::prompt::Prompt::with_suggestions(
+        self.set_prompt(crate::view::prompt::Prompt::with_suggestions(
             "Line ending: ".to_string(),
             PromptType::SetLineEnding,
             suggestions,
@@ -64,7 +66,7 @@ impl Editor {
 
         if let Some(prompt) = self.active_window_mut().prompt.as_mut() {
             if !prompt.suggestions.is_empty() {
-                prompt.selected_suggestion = Some(current_index);
+                prompt.select_suggestion(Some(current_index));
                 let (_, name, desc) = options[current_index];
                 prompt.set_input_selected(format!("{} ({})", name, desc));
             }
@@ -82,6 +84,7 @@ impl Editor {
             .map(|enc| {
                 let is_current = *enc == current_encoding;
                 crate::input::commands::Suggestion {
+                    id: enc.display_name().to_string(),
                     description_spans: None,
                     text: format!("{} ({})", enc.display_name(), enc.description()),
                     description: if is_current {
@@ -102,7 +105,7 @@ impl Editor {
             .position(|enc| *enc == current_encoding)
             .unwrap_or(0);
 
-        self.active_window_mut().prompt = Some(crate::view::prompt::Prompt::with_suggestions(
+        self.set_prompt(crate::view::prompt::Prompt::with_suggestions(
             "Encoding: ".to_string(),
             PromptType::SetEncoding,
             suggestions,
@@ -110,7 +113,7 @@ impl Editor {
 
         if let Some(prompt) = self.active_window_mut().prompt.as_mut() {
             if !prompt.suggestions.is_empty() {
-                prompt.selected_suggestion = Some(current_index);
+                prompt.select_suggestion(Some(current_index));
                 let enc = Encoding::all()[current_index];
                 prompt.set_input_selected(format!(
                     "{} ({})",
@@ -161,6 +164,7 @@ impl Editor {
             .map(|enc| {
                 let is_current = *enc == current_encoding;
                 crate::input::commands::Suggestion {
+                    id: enc.display_name().to_string(),
                     description_spans: None,
                     text: format!("{} ({})", enc.display_name(), enc.description()),
                     description: if is_current {
@@ -181,7 +185,7 @@ impl Editor {
             .position(|enc| *enc == current_encoding)
             .unwrap_or(0);
 
-        self.active_window_mut().prompt = Some(crate::view::prompt::Prompt::with_suggestions(
+        self.set_prompt(crate::view::prompt::Prompt::with_suggestions(
             "Reload with encoding: ".to_string(),
             PromptType::ReloadWithEncoding,
             suggestions,
@@ -189,7 +193,7 @@ impl Editor {
 
         if let Some(prompt) = self.active_window_mut().prompt.as_mut() {
             if !prompt.suggestions.is_empty() {
-                prompt.selected_suggestion = Some(current_index);
+                prompt.select_suggestion(Some(current_index));
                 let enc = Encoding::all()[current_index];
                 prompt.set_input_selected(format!(
                     "{} ({})",
@@ -222,6 +226,7 @@ impl Editor {
         let mut suggestions: Vec<crate::input::commands::Suggestion> = vec![
             // Plain Text option (no syntax highlighting)
             crate::input::commands::Suggestion {
+                id: "text".to_string(),
                 description_spans: None,
                 text: "Plain Text".to_string(),
                 description: if current_language == "text" || current_language == "Plain Text" {
@@ -290,6 +295,10 @@ impl Editor {
             };
 
             suggestions.push(crate::input::commands::Suggestion {
+                // The row picks a catalog entry, by its display name (the
+                // row's `value`). The config key is no identity: a config
+                // language can point a second entry at the same key.
+                id: entry.display_name.clone(),
                 description_spans: None,
                 text: entry.display_name.clone(),
                 description: Some(description),
@@ -303,7 +312,7 @@ impl Editor {
         // Find current language index
         let current_index = current_index_found.unwrap_or(0);
 
-        self.active_window_mut().prompt = Some(crate::view::prompt::Prompt::with_suggestions(
+        self.set_prompt(crate::view::prompt::Prompt::with_suggestions(
             "Language: ".to_string(),
             PromptType::SetLanguage,
             suggestions,
@@ -311,7 +320,7 @@ impl Editor {
 
         if let Some(prompt) = self.active_window_mut().prompt.as_mut() {
             if !prompt.suggestions.is_empty() {
-                prompt.selected_suggestion = Some(current_index);
+                prompt.select_suggestion(Some(current_index));
                 // Don't set input - keep it empty so typing filters the list
                 // The selected suggestion shows the current language
             }
@@ -369,6 +378,7 @@ impl Editor {
                     Some(display_key.to_string())
                 };
                 crate::input::commands::Suggestion {
+                    id: info.key.clone(),
                     description_spans: None,
                     text: info.name.clone(),
                     description,
@@ -380,7 +390,7 @@ impl Editor {
             })
             .collect();
 
-        self.active_window_mut().prompt = Some(crate::view::prompt::Prompt::with_suggestions(
+        self.set_prompt(crate::view::prompt::Prompt::with_suggestions(
             "Select theme: ".to_string(),
             PromptType::SelectTheme {
                 original_theme: current_theme_key.to_string(),
@@ -390,7 +400,7 @@ impl Editor {
 
         if let Some(prompt) = self.active_window_mut().prompt.as_mut() {
             if !prompt.suggestions.is_empty() {
-                prompt.selected_suggestion = Some(current_index);
+                prompt.select_suggestion(Some(current_index));
                 // Set input to match selected theme key
                 if let Some(suggestion) = prompt.suggestions.get(current_index) {
                     let synced = suggestion.get_value().to_string();
@@ -430,10 +440,9 @@ impl Editor {
         if !key_or_name.is_empty() {
             if let Some(theme) = self.theme_registry.get_cloned(key_or_name) {
                 *self.theme.write().unwrap() = theme;
+                // A chosen theme ends any live preview for good.
+                self.theme_before_preview = None;
                 self.start_theme_transition_animation();
-
-                // Set terminal cursor color to match theme
-                self.theme.read().unwrap().set_terminal_cursor_color();
 
                 // Re-apply all overlays so colors match the new theme
                 // (diagnostic and semantic token overlays bake RGB at creation time).
@@ -546,7 +555,6 @@ impl Editor {
                     // a new transition replaces the in-flight one and
                     // fades from whatever is on screen right now.
                     self.start_theme_transition_animation();
-                    self.theme.read().unwrap().set_terminal_cursor_color();
                     self.reapply_all_overlays();
                 }
             }
@@ -559,7 +567,7 @@ impl Editor {
         if let Err(e) = self
             .authority()
             .filesystem
-            .create_dir_all(&self.dir_context.config_dir)
+            .create_dir_all(self.dir_context.config_dir.as_host())
         {
             tracing::warn!("Failed to create config directory: {}", e);
             return;
@@ -631,6 +639,7 @@ impl Editor {
             .map(|map_name| {
                 let is_current = *map_name == current_map;
                 crate::input::commands::Suggestion {
+                    id: map_name.to_string(),
                     description_spans: None,
                     text: map_name.to_string(),
                     description: if is_current {
@@ -646,7 +655,7 @@ impl Editor {
             })
             .collect();
 
-        self.active_window_mut().prompt = Some(crate::view::prompt::Prompt::with_suggestions(
+        self.set_prompt(crate::view::prompt::Prompt::with_suggestions(
             "Select keybinding map: ".to_string(),
             PromptType::SelectKeybindingMap,
             suggestions,
@@ -654,7 +663,7 @@ impl Editor {
 
         if let Some(prompt) = self.active_window_mut().prompt.as_mut() {
             if !prompt.suggestions.is_empty() {
-                prompt.selected_suggestion = Some(current_index);
+                prompt.select_suggestion(Some(current_index));
                 prompt.set_input_selected(current_map.clone());
             }
         }
@@ -696,7 +705,7 @@ impl Editor {
         if let Err(e) = self
             .authority()
             .filesystem
-            .create_dir_all(&self.dir_context.config_dir)
+            .create_dir_all(self.dir_context.config_dir.as_host())
         {
             tracing::warn!("Failed to create config directory: {}", e);
             return;
@@ -723,6 +732,7 @@ impl Editor {
             .map(|(style_name, description)| {
                 let is_current = *style_name == current_style.as_str();
                 crate::input::commands::Suggestion {
+                    id: style_name.to_string(),
                     description_spans: None,
                     text: description.to_string(),
                     description: if is_current {
@@ -744,7 +754,7 @@ impl Editor {
             .position(|s| *s == current_style.as_str())
             .unwrap_or(0);
 
-        self.active_window_mut().prompt = Some(crate::view::prompt::Prompt::with_suggestions(
+        self.set_prompt(crate::view::prompt::Prompt::with_suggestions(
             "Select cursor style: ".to_string(),
             PromptType::SelectCursorStyle,
             suggestions,
@@ -752,7 +762,7 @@ impl Editor {
 
         if let Some(prompt) = self.active_window_mut().prompt.as_mut() {
             if !prompt.suggestions.is_empty() {
-                prompt.selected_suggestion = Some(current_index);
+                prompt.select_suggestion(Some(current_index));
                 prompt.set_input_selected(CursorStyle::DESCRIPTIONS[current_index].to_string());
             }
         }
@@ -797,21 +807,12 @@ impl Editor {
 
     /// Start the remove ruler prompt with current rulers as suggestions
     pub(super) fn start_remove_ruler_prompt(&mut self) {
-        let active_split = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split();
+        let active_split = self.effective_active_split();
         let rulers = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
+            .active_window()
+            .split_view_states()
             .get(&active_split)
-            .map(|vs| vs.rulers.clone())
+            .map(|vs| vs.buffer_tab_state().rulers.clone())
             .unwrap_or_default();
 
         if rulers.is_empty() {
@@ -822,6 +823,7 @@ impl Editor {
         let suggestions: Vec<crate::input::commands::Suggestion> = rulers
             .iter()
             .map(|&col| crate::input::commands::Suggestion {
+                id: col.to_string(),
                 description_spans: None,
                 text: format!("Column {}", col),
                 description: None,
@@ -832,7 +834,7 @@ impl Editor {
             })
             .collect();
 
-        self.active_window_mut().prompt = Some(crate::view::prompt::Prompt::with_suggestions(
+        self.set_prompt(crate::view::prompt::Prompt::with_suggestions(
             t!("rulers.remove_prompt").to_string(),
             PromptType::RemoveRuler,
             suggestions,
@@ -845,7 +847,7 @@ impl Editor {
         if let Err(e) = self
             .authority()
             .filesystem
-            .create_dir_all(&self.dir_context.config_dir)
+            .create_dir_all(self.dir_context.config_dir.as_host())
         {
             tracing::warn!("Failed to create config directory: {}", e);
             return;
@@ -901,6 +903,7 @@ impl Editor {
                     }
                 };
                 crate::input::commands::Suggestion {
+                    id: locale_name.to_string(),
                     description_spans: None,
                     text: locale_name.to_string(),
                     description: if description.is_empty() {
@@ -916,7 +919,7 @@ impl Editor {
             })
             .collect();
 
-        self.active_window_mut().prompt = Some(crate::view::prompt::Prompt::with_suggestions(
+        self.set_prompt(crate::view::prompt::Prompt::with_suggestions(
             t!("locale.select_prompt").to_string(),
             PromptType::SelectLocale,
             suggestions,
@@ -924,7 +927,7 @@ impl Editor {
 
         if let Some(prompt) = self.active_window_mut().prompt.as_mut() {
             if !prompt.suggestions.is_empty() {
-                prompt.selected_suggestion = Some(current_index);
+                prompt.select_suggestion(Some(current_index));
                 // Start with empty input to show all options initially
                 prompt.set_input_plain(String::new());
             }
@@ -961,7 +964,7 @@ impl Editor {
         if let Err(e) = self
             .authority()
             .filesystem
-            .create_dir_all(&self.dir_context.config_dir)
+            .create_dir_all(self.dir_context.config_dir.as_host())
         {
             tracing::warn!("Failed to create config directory: {}", e);
             return;

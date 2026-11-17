@@ -16,26 +16,11 @@
 //! index; subsequent calls (the steady state during a drag) are pure
 //! lookups.
 
-use crate::model::buffer::Buffer;
 use crate::primitives::line_wrapping::WrapConfig;
 use crate::state::EditorState;
 use crate::view::line_wrap_cache::CacheViewMode;
 use crate::view::wrap_index::WrapIndexGeometry;
 use crate::view::wrap_machine::WrapRule;
-
-/// Width estimate of the gutter, used to build the wrap config. Kept in
-/// sync with the real gutter sizing in the render path (indicator +
-/// digits + separator) — see `Viewport::gutter_width`, which uses the same
-/// formula with `MIN_LINE_NUMBER_DIGITS` as the floor.  Returns 0 when
-/// `show_line_numbers` is false (compose mode etc.) — the renderer's
-/// `state.margins.left_total_width()` returns 0 there too, and any
-/// divergence makes scroll math wrap at a different column than the
-/// renderer.
-fn estimated_gutter_width(buffer: &Buffer, _show_line_numbers: bool) -> usize {
-    let line_count = buffer.line_count().unwrap_or(1);
-    let digits = (line_count as f64).log10().floor() as usize + 1;
-    1 + digits.max(crate::view::margin::MIN_LINE_NUMBER_DIGITS) + 3
-}
 
 /// Geometry scroll math uses for these viewport dimensions, and the wrap index
 /// built for it.
@@ -49,16 +34,23 @@ fn estimated_gutter_width(buffer: &Buffer, _show_line_numbers: bool) -> usize {
 fn scroll_geometry(
     state: &EditorState,
     wrap_width: usize,
-    show_line_numbers: bool,
     grid_cols: Option<usize>,
     fold_signature: u64,
+    view_mode: CacheViewMode,
 ) -> WrapIndexGeometry {
     let rule = if let Some(cols) = grid_cols {
         // Terminal scroll-back counts exact-column rows at the grid width — the
         // same row model the renderer and the viewport scroll math use.
         WrapRule::Grid { cols: cols.max(1) }
     } else {
-        let gutter_width = estimated_gutter_width(&state.buffer, show_line_numbers);
+        // The renderer's gutter, not an estimate of it: `render_buffer` and
+        // `split_rendering::scrollbar` build their `WrapConfig` around this
+        // same number, and a gutter one cell off here wraps the scroll math at
+        // a different column than the pane.
+        let gutter_width = crate::view::viewport::gutter_width(
+            &state.buffer,
+            state.margins.gutter_separator_drawn(),
+        );
         let wrap_config = WrapConfig::new(wrap_width, gutter_width, true, true);
         let effective_width = wrap_config
             .first_line_width
@@ -71,10 +63,10 @@ fn scroll_geometry(
         }
     };
     WrapIndexGeometry {
-        // Scroll math runs without access to the view mode; `Source` is the
-        // fixed convention, matching what the renderer's queries use.
+        // The pane's own mode: a composing pane counts compose's frame lines
+        // and soft breaks, a source pane beside it (dual mode) does not.
         rule,
-        view_mode: CacheViewMode::Source,
+        view_mode,
         fold_signature,
     }
 }
@@ -110,17 +102,17 @@ pub(crate) fn scrollbar_jump_visual(
     ratio: f64,
     viewport_height: usize,
     wrap_width: usize,
-    show_line_numbers: bool,
     grid_cols: Option<usize>,
     pipeline_inputs_ver: crate::view::line_wrap_cache::PipelineInputs,
     fold_ranges: Vec<std::ops::Range<usize>>,
+    view_mode: CacheViewMode,
 ) -> (usize, usize) {
     if state.buffer.is_empty() || viewport_height == 0 {
         return (0, 0);
     }
 
     let fold_sig = crate::view::wrap_index::fold_signature(&fold_ranges);
-    let geometry = scroll_geometry(state, wrap_width, show_line_numbers, grid_cols, fold_sig);
+    let geometry = scroll_geometry(state, wrap_width, grid_cols, fold_sig, view_mode);
     let total_visual_rows = total_rows(state, geometry, pipeline_inputs_ver, fold_ranges);
     if total_visual_rows == 0 {
         return (0, 0);
@@ -159,17 +151,17 @@ pub(crate) fn scrollbar_drag_relative_visual(
     drag_start_view_line_offset: usize,
     viewport_height: usize,
     wrap_width: usize,
-    show_line_numbers: bool,
     grid_cols: Option<usize>,
     pipeline_inputs_ver: crate::view::line_wrap_cache::PipelineInputs,
     fold_ranges: Vec<std::ops::Range<usize>>,
+    view_mode: CacheViewMode,
 ) -> (usize, usize) {
     if state.buffer.is_empty() || viewport_height == 0 || scrollbar_height <= 1 {
         return (0, 0);
     }
 
     let fold_sig = crate::view::wrap_index::fold_signature(&fold_ranges);
-    let geometry = scroll_geometry(state, wrap_width, show_line_numbers, grid_cols, fold_sig);
+    let geometry = scroll_geometry(state, wrap_width, grid_cols, fold_sig, view_mode);
     let total_visual_rows = total_rows(state, geometry, pipeline_inputs_ver, fold_ranges);
     if total_visual_rows == 0 {
         return (0, 0);

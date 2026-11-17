@@ -204,7 +204,9 @@ fn test_flow_b_cli_files_additive_to_workspace() {
         )
         .unwrap();
 
-        let restored = harness.startup(true, &[file_cli.clone()]).unwrap();
+        let restored = harness
+            .startup(true, std::slice::from_ref(&file_cli))
+            .unwrap();
         assert!(restored, "Workspace should be restored");
         harness.render().unwrap();
 
@@ -271,7 +273,7 @@ fn test_flow_b_cli_file_already_in_workspace_no_duplicate() {
         )
         .unwrap();
 
-        harness.startup(true, &[file1.clone()]).unwrap();
+        harness.startup(true, std::slice::from_ref(&file1)).unwrap();
         harness.render().unwrap();
 
         // There should be exactly one tab for shared.txt, no duplicates.
@@ -349,7 +351,9 @@ fn test_flow_b_hot_exit_recovery_with_cli_files() {
         )
         .unwrap();
 
-        harness.startup(true, &[file_cli.clone()]).unwrap();
+        harness
+            .startup(true, std::slice::from_ref(&file_cli))
+            .unwrap();
         harness.render().unwrap();
 
         // The unsaved change should have been recovered
@@ -395,7 +399,10 @@ fn test_flow_c_session_scoped_recovery_isolation() {
     std::fs::write(&file_a, "Session A content").unwrap();
     std::fs::write(&file_b, "Session B content").unwrap();
 
-    // Use separate dir contexts to simulate separate sessions
+    // Use separate dir contexts to simulate separate sessions. No plugins:
+    // this is about recovery storage, and the embedded set would start ~60
+    // plugins in each of the four editors below, each one more source of
+    // async work for every key press and every teardown to wait out.
     let dir_context_a = DirectoryContext::for_testing(&temp_dir.path().join("session_a"));
     let dir_context_b = DirectoryContext::for_testing(&temp_dir.path().join("session_b"));
 
@@ -411,7 +418,7 @@ fn test_flow_c_session_scoped_recovery_isolation() {
                 .with_config(config)
                 .with_working_dir(project_dir.clone())
                 .with_shared_dir_context(dir_context_a.clone())
-                .without_empty_plugins_dir(),
+                .with_empty_plugins_dir(),
         )
         .unwrap();
 
@@ -441,7 +448,7 @@ fn test_flow_c_session_scoped_recovery_isolation() {
                 .with_config(config)
                 .with_working_dir(project_dir.clone())
                 .with_shared_dir_context(dir_context_b.clone())
-                .without_empty_plugins_dir(),
+                .with_empty_plugins_dir(),
         )
         .unwrap();
 
@@ -471,7 +478,7 @@ fn test_flow_c_session_scoped_recovery_isolation() {
                 .with_config(config)
                 .with_working_dir(project_dir.clone())
                 .with_shared_dir_context(dir_context_a.clone())
-                .without_empty_plugins_dir(),
+                .with_empty_plugins_dir(),
         )
         .unwrap();
 
@@ -499,7 +506,7 @@ fn test_flow_c_session_scoped_recovery_isolation() {
                 .with_config(config)
                 .with_working_dir(project_dir.clone())
                 .with_shared_dir_context(dir_context_b.clone())
-                .without_empty_plugins_dir(),
+                .with_empty_plugins_dir(),
         )
         .unwrap();
 
@@ -576,7 +583,9 @@ fn test_flow_d_cli_files_added_to_restored_session() {
         .unwrap();
 
         harness.editor_mut().set_session_mode(true);
-        let restored = harness.startup(true, &[file_cli.clone()]).unwrap();
+        let restored = harness
+            .startup(true, std::slice::from_ref(&file_cli))
+            .unwrap();
         assert!(restored, "Session workspace should be restored");
         harness.render().unwrap();
 
@@ -772,12 +781,10 @@ fn test_flow_e_active_tab_preserved_across_restart() {
 // Flow F: File changed on disk since hot exit (mtime mismatch)
 // =========================================================================
 
-/// When a file is modified on disk between shutdown and restore, the recovery
-/// should be skipped and the user should be warned (not silently discarded).
-///
-/// Currently fails because recovery is applied regardless of mtime changes,
-/// silently overwriting external edits. Will pass after implementing mtime
-/// check with user warning (Phase 4, Task 4.2 of the plan).
+/// When a file is modified on disk between shutdown and restore, the unsaved
+/// version must neither overwrite the newer file nor be dropped: the file
+/// shows what is on disk, and the unsaved version comes back beside it as an
+/// unsaved copy.
 #[test]
 fn test_flow_f_mtime_mismatch_skips_recovery() {
     let temp_dir = TempDir::new().unwrap();
@@ -842,7 +849,13 @@ fn test_flow_f_mtime_mismatch_skips_recovery() {
         harness.startup(true, &[]).unwrap();
         harness.render().unwrap();
 
-        // The buffer should show the new on-disk content, not the stale recovery
+        // The unsaved version is back, as a copy beside the file
+        harness.assert_screen_contains("changing.txt (unsaved copy)");
+        harness.assert_screen_contains("original on disk UNSAVED_EDIT");
+
+        // The file itself shows the new on-disk content, not the stale recovery
+        harness.open_file(&file1).unwrap();
+        harness.render().unwrap();
         harness.assert_screen_contains("externally modified on disk");
         harness.assert_screen_not_contains("UNSAVED_EDIT");
     }
@@ -930,7 +943,9 @@ fn test_multiple_unnamed_buffers_preserved() {
     }
 }
 
-/// Hot exit disabled: modified buffers should NOT be recovered.
+/// Hot exit disabled: modified buffers the user discards at the quit prompt
+/// are not recovered. Discarding is the user's choice to make; an exit that
+/// asks nothing keeps the work (see `recovery_across_launch_modes`).
 #[test]
 fn test_hot_exit_disabled_no_recovery() {
     let temp_dir = TempDir::new().unwrap();
@@ -959,7 +974,7 @@ fn test_hot_exit_disabled_no_recovery() {
         )
         .unwrap();
 
-        harness.editor_mut().set_session_mode(true);
+        // Not a daemon session: there Ctrl+Q first asks Detach or Quit
         harness.open_file(&file1).unwrap();
         harness.render().unwrap();
 
@@ -967,10 +982,20 @@ fn test_hot_exit_disabled_no_recovery() {
         harness.type_text(" SHOULD_NOT_RECOVER").unwrap();
         harness.render().unwrap();
 
+        harness
+            .send_key(KeyCode::Char('q'), KeyModifiers::CONTROL)
+            .unwrap();
+        harness.render().unwrap();
+        harness
+            .send_key(KeyCode::Char('d'), KeyModifiers::NONE)
+            .unwrap();
+        harness.render().unwrap();
+        assert!(harness.should_quit(), "Discard and Quit quits");
+
         harness.shutdown(true).unwrap();
     }
 
-    // Session 2: restore — with hot_exit off, no recovery data should exist
+    // Session 2: restore — the discarded edit left no recovery data
     {
         let mut config = Config::default();
         config.editor.hot_exit = false;
@@ -1230,5 +1255,277 @@ fn test_unnamed_buffer_survives_use_in_another_folder() {
 
         harness.assert_screen_contains("FOLDER_B_UNSAVED");
         harness.assert_screen_not_contains("FOLDER_A_UNSAVED");
+    }
+}
+
+/// **Restoring hot-exit content without the session adds no empty tab**
+/// (issue #3401). After "Quit (recoverable)" with an unnamed buffer,
+/// `fresh a.txt` skips the session restore but brings the buffer back — into
+/// a new buffer beside the launch's own empty scratch buffer, leaving an
+/// extra, empty "[No Name] 1".
+#[test]
+fn test_hot_exit_restore_without_session_reuses_the_scratch_buffer() {
+    let temp_dir = TempDir::new().unwrap();
+    let project_dir = temp_dir.path().join("project");
+    std::fs::create_dir(&project_dir).unwrap();
+    let file = project_dir.join("a.txt");
+    std::fs::write(&file, "original\n").unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
+    let harness_for = |config: Config| {
+        EditorTestHarness::create(
+            120,
+            24,
+            HarnessOptions::new()
+                .with_config(config)
+                .with_working_dir(project_dir.clone())
+                .with_shared_dir_context(dir_context.clone())
+                .without_empty_plugins_dir(),
+        )
+        .unwrap()
+    };
+
+    // Session 1: an unnamed buffer with text; quit keeping it for hot exit.
+    // (An edited file restored *before* it would take over the scratch buffer
+    // itself and hide the bug, and the restore order is the recovery
+    // directory's, so the file is left unedited to keep this deterministic.)
+    {
+        let mut config = Config::default();
+        config.editor.hot_exit = true;
+        let mut harness = harness_for(config);
+        harness.editor_mut().set_session_mode(true);
+        harness.new_buffer().unwrap();
+        harness.type_text("scratch notes").unwrap();
+        harness.open_file(&file).unwrap();
+        harness.render().unwrap();
+        harness.shutdown(true).unwrap();
+    }
+
+    // Session 2: `fresh a.txt` — file arguments skip the session restore
+    // (`skip_session_restore_when_files_passed`), which is the same branch
+    // `restore_previous_session = false` takes; hot-exit content still
+    // comes back.
+    {
+        let mut config = Config::default();
+        config.editor.hot_exit = true;
+        config.editor.restore_previous_session = false;
+        let mut harness = harness_for(config);
+        harness.startup(true, std::slice::from_ref(&file)).unwrap();
+        harness.render().unwrap();
+
+        let tab_bar = harness.screen_row_text(layout::TAB_BAR_ROW as u16);
+        assert!(
+            tab_bar.contains("a.txt"),
+            "the file argument is open.\nTab bar: {tab_bar}"
+        );
+        assert_eq!(
+            tab_bar.matches("[No Name]").count(),
+            1,
+            "only the restored unnamed buffer, no empty one beside it.\nTab bar: {tab_bar}"
+        );
+        assert!(
+            tab_bar.contains("[No Name] 1*") || tab_bar.contains("[No Name]*"),
+            "and that one is the restored, modified buffer.\nTab bar: {tab_bar}"
+        );
+    }
+}
+
+/// **A restored unnamed buffer follows the `editor.*` display settings**
+/// (issue #3426). A file buffer is stamped with them as `open_file_internal`
+/// opens it, but an unnamed (hot-exit) buffer never passes that way: the
+/// workspace restore seeds its view state itself, and used to leave it on
+/// `BufferViewState::new`'s hard-coded defaults — so a restored `[No Name]`
+/// buffer highlighted the current line and drew a line-number gutter whatever
+/// the config said.
+#[test]
+fn test_restored_unnamed_buffer_follows_display_config() {
+    let temp_dir = TempDir::new().unwrap();
+    let project_dir = temp_dir.path().join("project");
+    std::fs::create_dir(&project_dir).unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
+
+    // Every display default flipped away from the value
+    // `BufferViewState::new` hard-codes, so a view state that missed the
+    // stamp is unmistakable rather than accidentally right.
+    let config = || {
+        let mut config = Config::default();
+        config.editor.hot_exit = true;
+        config.editor.highlight_current_line = false;
+        config.editor.line_numbers = false;
+        config.editor.rulers = vec![80];
+        // This test reads a single settled frame; a mid-slide open frame could
+        // still carry a current-line background (see
+        // `rendering::test_current_line_highlight_spans_full_width`).
+        config.editor.animations = false;
+        config
+    };
+    let harness_for = |config: Config| {
+        EditorTestHarness::create(
+            100,
+            24,
+            HarnessOptions::new()
+                .with_config(config)
+                .with_working_dir(project_dir.clone())
+                .with_shared_dir_context(dir_context.clone())
+                .without_empty_plugins_dir(),
+        )
+        .unwrap()
+    };
+
+    // Session 1: an unnamed buffer with content, kept for hot exit.
+    {
+        let mut harness = harness_for(config());
+        harness.editor_mut().set_session_mode(true);
+        harness.new_buffer().unwrap();
+        harness.type_text("scratch notes").unwrap();
+        harness.render().unwrap();
+        harness.shutdown(true).unwrap();
+    }
+
+    // Session 2: the restored buffer's view state carries the config.
+    {
+        let mut harness = harness_for(config());
+        assert!(
+            harness.startup(true, &[]).unwrap(),
+            "the saved workspace should restore"
+        );
+        harness.render().unwrap();
+
+        let tab_bar = harness.screen_row_text(layout::TAB_BAR_ROW as u16);
+        assert!(
+            tab_bar.contains("[No Name]*"),
+            "the restored, modified unnamed buffer is the tab.\nTab bar: {tab_bar}"
+        );
+
+        let window = harness.editor().active_window();
+        let (mgr, view_states) = window.buffers.splits().unwrap();
+        let view = view_states
+            .get(&mgr.active_split())
+            .unwrap()
+            .buffer_tab_state();
+        assert!(
+            !view.highlight_current_line,
+            "highlight_current_line: false must survive the restore"
+        );
+        assert!(
+            !view.show_line_numbers,
+            "line_numbers: false must survive the restore"
+        );
+        assert_eq!(
+            view.rulers,
+            vec![80],
+            "the configured rulers must survive the restore"
+        );
+
+        // …and the frame agrees: the flag is what the renderer reads, so prove
+        // the paint rather than only the state it paints from. Compared row to
+        // row at one column, which needs no theme colour: with the highlight
+        // off the cursor's row has the same background as any other.
+        let (content_row, _) = harness.content_area_rows();
+        let cursor_row_bg = harness
+            .get_cell_style(2, content_row as u16)
+            .expect("cursor row cell")
+            .bg;
+        let other_row_bg = harness
+            .get_cell_style(2, content_row as u16 + 1)
+            .expect("next row cell")
+            .bg;
+        assert_eq!(
+            cursor_row_bg, other_row_bg,
+            "with the highlight off the cursor's row must paint like the rest"
+        );
+    }
+}
+
+/// **A per-buffer pin still wins over the config after a restore** — the other
+/// half of the seeding the test above covers (#3426). `apply_config_defaults`
+/// keeps a field whose override is set, so stamping the config onto a restored
+/// view state must not undo "Toggle Current Line Highlight (Current Buffer)".
+#[test]
+fn test_restored_unnamed_buffer_keeps_its_per_buffer_pin() {
+    let temp_dir = TempDir::new().unwrap();
+    let project_dir = temp_dir.path().join("project");
+    std::fs::create_dir(&project_dir).unwrap();
+    let dir_context = DirectoryContext::for_testing(temp_dir.path());
+
+    let config = || {
+        let mut config = Config::default();
+        config.editor.hot_exit = true;
+        // Off globally, so a pin that survives is the only way the restored
+        // buffer can come back highlighting its current line.
+        config.editor.highlight_current_line = false;
+        config
+    };
+    let harness_for = |config: Config| {
+        EditorTestHarness::create(
+            100,
+            24,
+            HarnessOptions::new()
+                .with_config(config)
+                .with_working_dir(project_dir.clone())
+                .with_shared_dir_context(dir_context.clone())
+                .without_empty_plugins_dir(),
+        )
+        .unwrap()
+    };
+
+    // Session 1: an unnamed buffer, pinned to highlight against the global
+    // default, kept for hot exit.
+    {
+        let mut harness = harness_for(config());
+        harness.editor_mut().set_session_mode(true);
+        harness.new_buffer().unwrap();
+        harness.type_text("scratch notes").unwrap();
+        harness
+            .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+            .unwrap();
+        harness.render().unwrap();
+        harness
+            .type_text("Toggle Current Line Highlight (Current Buffer)")
+            .unwrap();
+        harness.render().unwrap();
+        harness
+            .send_key(KeyCode::Enter, KeyModifiers::NONE)
+            .unwrap();
+        harness.render().unwrap();
+
+        let window = harness.editor().active_window();
+        let (mgr, view_states) = window.buffers.splits().unwrap();
+        let view = view_states
+            .get(&mgr.active_split())
+            .unwrap()
+            .buffer_tab_state();
+        assert_eq!(
+            view.highlight_current_line_override,
+            Some(true),
+            "the palette command should pin the highlight on for this buffer"
+        );
+
+        harness.shutdown(true).unwrap();
+    }
+
+    // Session 2: the pin comes back, and the config stamp leaves it alone.
+    {
+        let mut harness = harness_for(config());
+        assert!(
+            harness.startup(true, &[]).unwrap(),
+            "the saved workspace should restore"
+        );
+        harness.render().unwrap();
+
+        let window = harness.editor().active_window();
+        let (mgr, view_states) = window.buffers.splits().unwrap();
+        let view = view_states
+            .get(&mgr.active_split())
+            .unwrap()
+            .buffer_tab_state();
+        assert_eq!(
+            view.highlight_current_line_override,
+            Some(true),
+            "the per-buffer pin must survive the restore"
+        );
+        assert!(
+            view.highlight_current_line,
+            "and must win over the global default the restore stamps"
+        );
     }
 }

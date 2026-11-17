@@ -10,7 +10,7 @@ This doc replaces the retired `UNIFIED_SCENE_DESIGN.md` and `NON_TERMINAL_UI_RES
 
 ## 1. What ships today — IMPLEMENTED
 
-The architecture is described operationally in `crates/fresh-editor/web-ui/README.md` and, for the render-pipeline side, in [rendering-and-layout.md](rendering-and-layout.md). The short version:
+The architecture is described operationally in `crates/fresh-editor/web-ui/README.md` and, for the render side, in [retained-mode-ui.md](retained-mode-ui.md) (the chrome both frontends consume) and [rendering-and-layout.md](rendering-and-layout.md) (the text inside panes and the `Scene` projections). The short version:
 
 - **One semantic model, two renderers.** Everything semantic — menu trees with enabled/checked state and accelerators, tabs, status segments, palette, popups, file explorer, the file browser behind Open File / Save As / Switch Project, trust dialog, plugin widget specs, context menus, the keybinding editor, the full Settings tree — is derived once in the core (`Scene` projections on `Editor`) and consumed by both the TUI cell renderer and the web bridge. A Rust parity test drives one editor through both and fails if they disagree on what the chrome *is*.
 - **Buffer interiors are the real pipeline's cells.** The bridge runs the actual `Editor::render` into an in-memory buffer with chrome-cell drawing suppressed (`suppress_chrome_cells`), slices pane interiors (line-number gutter as its own block), and the frontend draws them as SVG text with every glyph pinned to its exact cell column. Layout, wrapping, highlighting, folding, scrollbars and split geometry are all the pipeline's own.
@@ -25,6 +25,32 @@ Strengths to preserve through any of the work below:
 - **Theme fidelity with taste** — chrome colors seed from the editor theme, but surfaces/hairlines are derived (`color-mix`), so even high-contrast terminal palettes read as a designed UI.
 - **DOM hygiene** — when nothing changed, no frame arrives at all (the server diffs before pushing, §3.1), so the DOM is never touched; scroll positions of natively-scrolled panels survive rebuilds; wheel events over natively-scrolled chrome are deliberately not forwarded.
 - The **gutter/text split** in the bridge output, which exists precisely so a future native selection/copy layer can cover code without line numbers.
+
+### 1.1 Native layout of the shell's surfaces — IMPLEMENTED (opt-in per web theme)
+
+The display list (`regions.tree`) ships what the shell's layout *drew*: items at character cells, labels padded and elided to the cell width. A page that folds it faithfully looks like a terminal because it is one, which is right for Cosmos and Winamp and wrong for an app that wants to look native (Fresh Desktop, the Compact and macOS themes). So the same surfaces are also projected one step earlier, as **content** (`regions.native`, `view::native`):
+
+- **The confirmation card** as its `Confirm` model: title, question, detail, buttons with tone, accelerator, selection, and each button's tree key.
+- **Plugin panels** (dock, floating panel, sidebar sections, and panels mounted into a pane — Search & Replace, the welcome page, a review diff) as their mounted `WidgetSpec` plus the host's instance state (text values and carets, selections, expanded rows, …), the interior's rect, and for a floating panel its frame rect, title and close key. Every style in the spec also carries its colours resolved to CSS (`fgCss`/`bgCss`): a plugin colours text by theme key, and only the host knows the theme in use.
+
+The page lays those out itself (`js/73-native.js`, the toolbar's `widgetEl` renderer, `css/46-native.css`) and hides the display-list items they replace — hides, never removes: the tree still lays them out.
+
+**The parity discipline holds, because input never stops being the tree's:**
+
+- **By key** (`node` messages): a control that mirrors a tree node (a confirm button, a panel's close box) names that node's key, and the bridge presses it where the shell's layout put it (`Editor::node_rect`). The node's own handler decides what the press means. `scene_parity` checks that every key a projection hands out resolves to a laid-out node.
+- **By identity** (`widget` messages, `surface: "panel"`): a panel control names its widget key, the event its kind answers a press with, and the row. `app::native_panels` rebuilds the very `WidgetEvent` the tree's description builds for that control — from the mounted spec and instance state, never from the page — and applies it as the same `UiFact`. A name that matches nothing in the spec is dropped. This also resolves rows the terminal has scrolled out of its window, which a natively scrolled list renders.
+
+Some specs are written as terminal layouts, and the renderer reads them for what they are rather than copying their cells:
+
+- A column of rows that each mix `raw` cells with controls, all with the same number of cells (the orchestrator's dock menu: two columns of entries, a `│` between them), is a **table** — one CSS grid, a `│` cell as a hairline, an upper-case caption as a heading.
+- A label that is a caption followed (or surrounded) by a run of `─` is a **section heading** with a drawn rule.
+- A menu entry prefixed `(•)`/`( )` or `[✓]`/`[ ]` draws a radio or check mark.
+- Blank `raw` rows stacked to push a hint bar down are a flexible gap.
+- Any other row containing `raw` cells is a **grid row**: the buffer's font at the cell pitch, so it still lines up, controls still live.
+
+Panels mounted into panes are also surfaces of the display list (`kind: "pane"`), so the themes that fold it draw them as cells; before, those panes were left empty in the web.
+
+`NATIVE_PANEL_THEMES` (Compact, macOS light and dark) turns it on; `fresh.nativePanels` in localStorage (`on`/`off`) overrides. Cosmos and Winamp keep the faithful fold.
 
 ## 2. The benchmark — what "VS Code-level polish" decomposes into
 
@@ -127,7 +153,7 @@ Work that is well-defined inside the current architecture. Effort: S (hours), M 
 - File drag-and-drop onto the window → open buffer. (S)
 
 **Rendering & visual polish**
-- ~~File browser (Open File / Save As / Switch Project) shipped as a slab of cells~~ **IMPLEMENTED:** it was the one chrome surface with no projection — the bridge sent `browserRect`/`browserCells` and the frontend drew a screenshot of the TUI (box-drawing frame, `☐` glyphs, space-padded columns, a one-cell scrollbar) inside an otherwise native page. Now `Editor::file_browser_view` projects the directory, the toggles, the nav shortcuts, the sortable columns and the visible entry window, each interactive element carrying **the cell span the renderer laid it out at**; the frontend renders a native card and routes clicks back to those spans, where the editor's existing hit-tests resolve them. `FileBrowserRenderer::render` takes a `draw` flag (layout and the list viewport are still computed under `suppress_chrome_cells`). Recording the spans also fixed a real hit-test bug in **both** frontends: the toggle/shortcut hit-tests used hardcoded 13/24/27/28-character offsets that were wrong for any localized label or a keybinding string of a different length.
+- ~~File browser (Open File / Save As / Switch Project) shipped as a slab of cells~~ **IMPLEMENTED:** it was the one chrome surface with no projection — the bridge sent `browserRect`/`browserCells` and the frontend drew a screenshot of the TUI (box-drawing frame, `☐` glyphs, space-padded columns, a one-cell scrollbar) inside an otherwise native page. Now `Editor::file_browser_view` projects the directory, the toggles, the nav shortcuts, the sortable columns and the visible entry window, each interactive element carrying **the cell span the renderer laid it out at**; the frontend renders a native card and sends clicks to those cells. The dialog is a description now (`shell::file_browser`): the spans are the rectangles of keyed nodes read back off the tree (`file_browser::rects`), each control answers its own press, and the list's window is the viewport's (`file_browser::window`). Recording the spans also fixed a real hit-test bug in **both** frontends: the toggle/shortcut hit-tests used hardcoded 13/24/27/28-character offsets that were wrong for any localized label or a keybinding string of a different length.
 - ~~Status bar projected from stale capture~~ **IMPLEMENTED:** `StatusBarChrome` was never cleared, so `status_view` kept projecting the previous frame's bar whenever the TUI hid it — the web drew a ghost status line under the Open File prompt row, and kept a full status bar after View → Toggle Status Bar. It is now reset on any frame that doesn't draw the bar (which also stops the click/hover hit-tests resolving segments that are no longer on screen).
 - Known remaining TUI-only surfaces (the web renders nothing for them): the **calibration wizard** (deprecated, `render.rs`) and the **quick-open mode-hints line** (skipped under `suppress_chrome_cells`, no projection). Neither leaks cells; both are projection gaps. (S each)
 - Keybinding-editor modal: footer hint row clips against the rounded bottom edge. (S)

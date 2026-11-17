@@ -60,11 +60,15 @@ pub fn relay_loop(conn: &mut impl RelayConnection) -> io::Result<RelayExitReason
     if let Err(e) = vt_input::enable_mouse_tracking(vt_input::MouseMode::CellMotion) {
         tracing::warn!("Failed to enable mouse tracking: {}", e);
     }
+    if let Err(e) = vt_input::enable_win32_input_mode() {
+        tracing::warn!("Failed to enable win32-input-mode: {}", e);
+    }
     // Spawn dedicated reader thread (same as direct mode)
     let reader = VtInputReader::spawn();
     let result = relay_loop_inner(conn, &reader);
 
     // Restore mouse tracking and console mode on exit
+    let _ = vt_input::disable_win32_input_mode();
     let _ = vt_input::disable_mouse_tracking();
     if let Err(e) = vt_input::restore_console_mode(old_console_mode) {
         tracing::warn!("Failed to restore console mode: {}", e);
@@ -82,6 +86,11 @@ fn relay_loop_inner(
     let mut control_buf = Vec::new();
     let mut control_byte = [0u8; 1];
     let mut last_size = crate::get_terminal_size().ok();
+    // Report this console's size before anything else: that is what tells the
+    // server a terminal is now in use here, and fits the session to it.
+    if let Some(size) = &last_size {
+        conn.send_resize(size.cols, size.rows)?;
+    }
 
     loop {
         // Check for data from server (non-blocking)

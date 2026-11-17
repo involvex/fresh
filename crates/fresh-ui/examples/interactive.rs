@@ -31,6 +31,7 @@ use crossterm::event::{
 use crossterm::style::{Color, Print, SetBackgroundColor, SetForegroundColor};
 use crossterm::{cursor, execute, queue, terminal};
 
+use fresh_ui::glyph::glyphs_in;
 use fresh_ui::Axis;
 use fresh_ui::{
     Draw, Input, KeyCode, KeyPress, Mods, MouseButton, Point, Rect, Scrim, Size, ThemeKey,
@@ -46,6 +47,8 @@ fn main() -> io::Result<()> {
     // Stands in for a host's own painter, drawn between the display list's two
     // halves. See `Terminal::banner`.
     let mut banner = true;
+    // The host owns the clock: see `Clicks`.
+    let mut clicks = Clicks::new();
     let redraw = |term: &mut Terminal, demo: &Demo, banner: bool| -> io::Result<()> {
         term.draw(demo.ui.spec(), demo.app.theme.name == "dark", banner)
     };
@@ -75,7 +78,7 @@ fn main() -> io::Result<()> {
                     }
                 }
                 CtEvent::Mouse(m) => {
-                    if let Some(input) = translate_mouse(m) {
+                    if let Some(input) = translate_mouse(m, &mut clicks) {
                         demo.input(input);
                     }
                 }
@@ -135,20 +138,53 @@ fn button(b: CtButton) -> MouseButton {
     }
 }
 
-fn translate_mouse(m: event::MouseEvent) -> Option<Input> {
+/// The host's click-run tracker.
+///
+/// **The library has no clock, deliberately.** Whether two presses are a
+/// double is a question about time and distance, and the answer belongs to
+/// whoever owns the input device and the user's preference for it — a real
+/// application reads a configured threshold, and its tests substitute the time
+/// source. So the host counts the run and reports it on `Input::press_n`; the
+/// library carries it to handlers as `Event::clicks` and onto the `Click` it
+/// synthesises from the press.
+///
+/// This is the smallest honest implementation of that contract: same button,
+/// same cell, inside the threshold.
+struct Clicks {
+    threshold: Duration,
+    last: Option<(std::time::Instant, Point, MouseButton)>,
+    count: u8,
+}
+
+impl Clicks {
+    fn new() -> Clicks {
+        Clicks {
+            threshold: Duration::from_millis(400),
+            last: None,
+            count: 0,
+        }
+    }
+
+    fn press(&mut self, pos: Point, button: MouseButton) -> u8 {
+        let now = std::time::Instant::now();
+        let consecutive = self.last.is_some_and(|(t, p, b)| {
+            now.duration_since(t) < self.threshold && p == pos && b == button
+        });
+        self.count = if consecutive { self.count + 1 } else { 1 };
+        self.last = Some((now, pos, button));
+        self.count
+    }
+}
+
+fn translate_mouse(m: event::MouseEvent, clicks: &mut Clicks) -> Option<Input> {
     let pos = Point::new(m.column as i32, m.row as i32);
     let mods = mods(m.modifiers);
     Some(match m.kind {
-        MouseEventKind::Down(b) => Input::Press {
-            pos,
-            button: button(b),
-            mods,
-        },
-        MouseEventKind::Up(b) => Input::Release {
-            pos,
-            button: button(b),
-            mods,
-        },
+        MouseEventKind::Down(b) => {
+            let b = button(b);
+            Input::press_n(pos, b, mods, clicks.press(pos, b))
+        }
+        MouseEventKind::Up(b) => Input::release(pos, button(b), mods),
         MouseEventKind::Moved | MouseEventKind::Drag(_) => Input::Move { pos, mods },
         MouseEventKind::ScrollDown => Input::Wheel {
             pos,
@@ -170,9 +206,12 @@ fn translate_mouse(m: event::MouseEvent) -> Option<Input> {
 // The backend: fold a display list into coloured cells
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq)]
+/// One cell. `sym` is the grapheme cluster painted into it — empty for the
+/// continuation cell after a wide glyph, which the terminal fills itself as
+/// it draws the glyph before it (see `fresh_ui::glyph`).
+#[derive(Clone, PartialEq)]
 struct Cell {
-    ch: char,
+    sym: String,
     fg: Color,
     bg: Color,
 }
@@ -180,7 +219,7 @@ struct Cell {
 impl Default for Cell {
     fn default() -> Self {
         Cell {
-            ch: ' ',
+            sym: " ".to_string(),
             fg: Color::Reset,
             bg: Color::Reset,
         }
@@ -227,7 +266,7 @@ impl Terminal {
         }
         let r = roles(dark);
         let ground = Cell {
-            ch: ' ',
+            sym: " ".to_string(),
             fg: c(r.text),
             bg: c(r.base),
         };
@@ -285,6 +324,19 @@ impl Terminal {
         let r = item.rect;
         let (fg, bg) = style(&item.theme, roles);
         match &item.draw {
+            // "There is more this way" — one glyph, centred on the cells the
+            // window reserved at that edge.
+            Draw::Overflow { axis, end, .. } => {
+                let g = match (axis, end) {
+                    (fresh_ui::Axis::Horizontal, fresh_ui::End::Before) => '<',
+                    (fresh_ui::Axis::Horizontal, fresh_ui::End::After) => '>',
+                    (fresh_ui::Axis::Vertical, fresh_ui::End::Before) => '^',
+                    (fresh_ui::Axis::Vertical, fresh_ui::End::After) => 'v',
+                };
+                self.fill(r, ' ', fg, bg, clip);
+                let x = r.x + (r.w.saturating_sub(1) / 2) as i32;
+                self.fill(Rect::new(x, r.y, 1, r.h), g, fg, bg, clip);
+            }
             Draw::Fill => {
                 if elevated(&item.theme) {
                     // A floating surface: it casts a shadow onto whatever is
@@ -300,11 +352,26 @@ impl Terminal {
                 };
                 self.fill(r, ch, fg, bg, clip);
             }
+            // A wash recolours what is under it and keeps the text; this
+            // backend has no ground to recolour, so it paints nothing.
+            Draw::Wash => {}
+            // A rule: the cluster, as many as fit the rect layout settled
+            // on. Nobody told the description how wide that would be.
+            Draw::Rule(g) => {
+                let w = fresh_ui::glyph::width(g).max(1) as i32;
+                for y in r.y..r.y + r.h as i32 {
+                    let mut x = r.x;
+                    while x + w <= r.right() {
+                        self.put_symbol(x, y, g, w as u16, (fg, bg), clip);
+                        x += w;
+                    }
+                }
+            }
             Draw::Scrim(Scrim::Opaque) => {
                 self.fill(frame, ' ', c(roles.text), c(roles.base), frame)
             }
             Draw::Scrim(Scrim::Dim) => self.dim(frame, roles),
-            Draw::Border => self.border(r, fg, bg, clip),
+            Draw::Border(bs) => self.border(r, fg, bg, clip, *bs),
             Draw::Lines(lines) => {
                 // Clipped to the item's own rect as well as its inherited one:
                 // an item declares how much room it has, and a run longer than
@@ -312,8 +379,11 @@ impl Terminal {
                 let clip = clip.intersect(r);
                 for (i, line) in lines.iter().enumerate() {
                     let y = r.y + i as i32;
-                    for (j, ch) in line.chars().enumerate() {
-                        self.put(r.x + j as i32, y, ch, fg, bg, clip);
+                    // By display width, not by char — the library's policy
+                    // (`fresh_ui::glyph`), so a wide glyph keeps the two
+                    // cells layout measured for it.
+                    for g in glyphs_in(line, r.x, clip.x, clip.right()) {
+                        self.put_symbol(g.x, y, g.text, g.width, (fg, bg), clip);
                     }
                 }
             }
@@ -321,10 +391,11 @@ impl Terminal {
                 offset,
                 content,
                 window,
+                ..
             } => {
-                let _ = window;
                 let track = r.h.max(1);
-                let (top, len) = Draw::scrollbar_thumb(*offset, *content, track);
+                let (top, len) =
+                    Draw::scrollbar_thumb(*offset, *content, u32::from(*window), track);
                 for i in 0..track {
                     let ch = if i >= top && i < top + len {
                         '█'
@@ -352,10 +423,26 @@ impl Terminal {
     }
 
     fn put(&mut self, x: i32, y: i32, ch: char, fg: Color, bg: Color, clip: Rect) {
+        let mut b = [0u8; 4];
+        self.put_symbol(x, y, ch.encode_utf8(&mut b), 1, (fg, bg), clip);
+    }
+
+    /// Paint one cluster at `(x, y)`, and blank the `w - 1` cells after it
+    /// that the glyph spills into, so nothing stale shows through them.
+    fn put_symbol(&mut self, x: i32, y: i32, sym: &str, w: u16, ink: (Color, Color), clip: Rect) {
+        let (fg, bg) = ink;
         if let Some(cell) = self.cell_mut(x, y, clip) {
-            cell.ch = ch;
+            cell.sym.clear();
+            cell.sym.push_str(sym);
             cell.fg = fg;
             cell.bg = bg;
+        }
+        for k in 1..w as i32 {
+            if let Some(cell) = self.cell_mut(x + k, y, clip) {
+                cell.sym.clear();
+                cell.fg = fg;
+                cell.bg = bg;
+            }
         }
     }
 
@@ -381,24 +468,27 @@ impl Terminal {
         }
     }
 
-    fn border(&mut self, r: Rect, fg: Color, bg: Color, clip: Rect) {
+    fn border(&mut self, r: Rect, fg: Color, bg: Color, clip: Rect, bs: fresh_ui::BorderStyle) {
         if r.w < 2 || r.h < 2 {
             return;
         }
         let (l, t) = (r.x, r.y);
         let (right, bottom) = (r.right() - 1, r.bottom() - 1);
+        // This demo used to round every corner unconditionally, which is a
+        // backend picking a look for a description that had not asked.
+        let (h, v, tl, tr, br, bl) = bs.glyphs();
         for x in l..=right {
-            self.put(x, t, '─', fg, bg, clip);
-            self.put(x, bottom, '─', fg, bg, clip);
+            self.put(x, t, h, fg, bg, clip);
+            self.put(x, bottom, h, fg, bg, clip);
         }
         for y in t..=bottom {
-            self.put(l, y, '│', fg, bg, clip);
-            self.put(right, y, '│', fg, bg, clip);
+            self.put(l, y, v, fg, bg, clip);
+            self.put(right, y, v, fg, bg, clip);
         }
-        self.put(l, t, '╭', fg, bg, clip);
-        self.put(right, t, '╮', fg, bg, clip);
-        self.put(l, bottom, '╰', fg, bg, clip);
-        self.put(right, bottom, '╯', fg, bg, clip);
+        self.put(l, t, tl, fg, bg, clip);
+        self.put(right, t, tr, fg, bg, clip);
+        self.put(l, bottom, bl, fg, bg, clip);
+        self.put(right, bottom, br, fg, bg, clip);
     }
 
     /// A soft shadow one cell to the right and below a floating surface: the
@@ -420,7 +510,8 @@ impl Terminal {
         if let Some(cell) = self.cell_mut(x, y, frame) {
             cell.fg = c(roles.shadow);
             cell.bg = c(roles.shadow_bg);
-            cell.ch = ' ';
+            cell.sym.clear();
+            cell.sym.push(' ');
         }
     }
 
@@ -434,7 +525,13 @@ impl Terminal {
         for y in 0..self.h {
             queue!(self.out, cursor::MoveTo(0, y))?;
             for x in 0..self.w {
-                let cell = self.cells[y as usize * self.w as usize + x as usize];
+                let cell = &self.cells[y as usize * self.w as usize + x as usize];
+                // A continuation cell: the wide glyph before it already moved
+                // the terminal's cursor past it, so printing anything here
+                // would push the rest of the row along.
+                if cell.sym.is_empty() {
+                    continue;
+                }
                 if cell.fg != fg {
                     fg = cell.fg;
                     queue!(self.out, SetForegroundColor(fg))?;
@@ -443,7 +540,7 @@ impl Terminal {
                     bg = cell.bg;
                     queue!(self.out, SetBackgroundColor(bg))?;
                 }
-                queue!(self.out, Print(cell.ch))?;
+                queue!(self.out, Print(&cell.sym))?;
             }
         }
         if let Some(cur) = spec.cursor.filter(|c| c.visible) {
@@ -590,6 +687,12 @@ fn style(theme: &ThemeKey, r: &Roles) -> (Color, Color) {
         }
         "button.disabled" => (r.faint, r.bar),
         "status" => (r.status_fg, r.status_bg),
+        // The transparent strip drawn over the list's first row, and the one
+        // part of it that absorbs a press.
+        "ribbon" => (r.title, r.hover),
+        "ribbon.button" => (r.focus_fg, r.focus_bg),
+        // The right-aligned id, pushed there by a flex gap with a floor.
+        "badge" => (r.faint, r.base),
         "menu" | "dropdown" | "palette" => (r.dim, r.elev),
         "modal" => (r.bright, r.modal),
         _ => (r.text, r.base),

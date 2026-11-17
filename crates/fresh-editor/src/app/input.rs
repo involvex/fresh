@@ -19,7 +19,7 @@
 use super::*;
 use crate::input::router;
 use anyhow::Result as AnyhowResult;
-use rust_i18n::t;
+use fresh_i18n::t;
 
 impl Editor {
     /// Dispatch a text-input mode's typed character to its plugin
@@ -78,10 +78,24 @@ impl Editor {
     /// fast typing/paste and the plugin re-arming `getNextKey`
     /// between iterations.
     fn try_resolve_next_key_callback(&mut self, key_event: &crossterm::event::KeyEvent) -> bool {
+        let payload = router::key_event_to_payload(key_event);
+        let chord = router::next_key_chord(&payload);
+        let claimed = self.deliver_next_key(payload);
+        if claimed {
+            // The key goes to the plugin, not through `handle_action`, so a
+            // macro being recorded would otherwise lose it, and replaying the
+            // handler would leave it waiting for a key that never comes.
+            self.record_macro_action(&Action::PluginNextKey(chord));
+        }
+        claimed
+    }
+
+    /// Hand `payload` to a plugin waiting on `editor.getNextKey()`, or buffer
+    /// it while the plugin holds key capture. Returns whether it was claimed.
+    pub(crate) fn deliver_next_key(&mut self, payload: fresh_core::api::KeyEventPayload) -> bool {
         use super::window::NextKeyClaim;
         // The queue/buffer state lives on the Window; the editor only
         // supplies the payload and performs the plugin resolution.
-        let payload = router::key_event_to_payload(key_event);
         match self.active_window_mut().claim_next_key(payload) {
             NextKeyClaim::Resolve(callback_id, payload) => {
                 let json = serde_json::to_string(&payload).unwrap_or_else(|_| "null".to_string());
@@ -120,14 +134,27 @@ impl Editor {
     pub fn handle_key_press(&mut self, press: fresh_input_parser::KeyPress) -> AnyhowResult<()> {
         // The decision is the router's ([`router::layout_reading`]); this
         // shell only supplies the keymap and the current context.
-        let layout = {
-            let context = self.get_key_context();
-            self.keybindings
-                .read()
-                .ok()
-                .and_then(|kb| router::layout_reading(&press, &kb, context))
-        };
+        let context = self.get_key_context();
+        let layout = self
+            .keybindings
+            .read()
+            .ok()
+            .and_then(|kb| router::layout_reading(&press, &kb, context.clone()));
         let (code, modifiers) = layout.unwrap_or((press.code, press.modifiers));
+        // An unbound Ctrl+J is Enter outside the terminal — see
+        // [`router::ctrl_j_reading`]. The modes it asks about are those the
+        // focused surface resolves keys against.
+        let modes = self.focused_modes();
+        let modes: Vec<&str> = modes.iter().map(String::as_str).collect();
+        let chord_pending = !self.active_window().chord_state.is_empty();
+        let (code, modifiers) = self
+            .keybindings
+            .read()
+            .ok()
+            .and_then(|kb| {
+                router::ctrl_j_reading(code, modifiers, &kb, &context, chord_pending, &modes)
+            })
+            .unwrap_or((code, modifiers));
         self.handle_key(code, modifiers)
     }
 
@@ -138,22 +165,60 @@ impl Editor {
         code: crossterm::event::KeyCode,
         modifiers: crossterm::event::KeyModifiers,
     ) -> AnyhowResult<()> {
+        // A key that arrives while a macro replay waits on a plugin step is
+        // held until the replay ends: run now, it would land between the
+        // macro's steps (and inside its undo group).
+        #[cfg(feature = "plugins")]
+        if self.macro_replay_parked() {
+            self.deferred_replay_input
+                .push_back(crate::app::macro_actions::DeferredInput::Key(
+                    code, modifiers,
+                ));
+            return Ok(());
+        }
+
+        // **Input is never routed over a tree older than the facts it routes
+        // over.** Every read below that asks the tree where the keyboard is
+        // — the PTY gate, the key context, the unfocused-popup guard — reads
+        // a tree laid out from the facts as they stand; and a key may change
+        // any of them, so the description is stale once it has been handled,
+        // and the next reader lays it out again.
+        self.mark_plugin_snapshot_dirty();
+        self.lay_out_shell_if_stale();
+        let r = self.handle_key_routed(code, modifiers);
+        self.shell_description_stale = true;
+        r
+    }
+
+    fn handle_key_routed(
+        &mut self,
+        code: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> AnyhowResult<()> {
         let _t_total = std::time::Instant::now();
 
         // Any keystroke may change routing-relevant UI state (open/close a
         // popup, move focus, toggle a mode), so advance the coarse UI
         // generation up front. Bumping on ENTRY (not exit) still lets the
         // chrome-tree reads *within* this keystroke share one rebuild — the
-        // memo caches under the new generation on first use, and a mid-
-        // keystroke surface change is caught by the memo's overlay-stack
-        // equality check, not by this bump.
-        self.bump_ui_gen();
 
         tracing::trace!(
             "Editor.handle_key: code={:?}, modifiers={:?}",
             code,
             modifiers
         );
+
+        // The keyboard is driving now, so pointer feedback stops: a hover
+        // band left under an idle pointer competes with the selection the
+        // keys are moving, and reads as a second one. The next pointer move
+        // re-establishes it (`fresh_ui::Ui::clear_hover`).
+        if let Some(mut ui) = self.shell_ui.take() {
+            let cleared = ui.clear_hover();
+            self.shell_ui = Some(ui);
+            if cleared {
+                self.apply_settled_shell_messages();
+            }
+        }
 
         // Create key event for dispatch methods
         let key_event = crossterm::event::KeyEvent::new(code, modifiers);
@@ -162,8 +227,9 @@ impl Editor {
         // (#2234, item 4): while the dock is mounted, record its host-side focus
         // plus the active window's key context for *every* key, before any
         // routing. If a repro shows `dock_focused=true` for keys the user aimed
-        // at the buffer, the dock is swallowing them (`chrome/dock.rs`'s
-        // `on_key`) — a
+        // at the buffer, the dock is swallowing them (its
+        // `view::shell::panel::keys_layer`, whose applier runs
+        // `dispatch_floating_widget_key`) — a
         // host-focus / plugin-`dockBlurred` desync; if `dock_focused=false`,
         // the keys reached the window and the issue is in key-context routing.
         if let Some(focused) = self.dock.as_ref().map(|d| d.focused) {
@@ -177,6 +243,8 @@ impl Editor {
             );
         }
 
+        self.end_dock_passed_key();
+
         // Event debug dialog intercepts ALL key events before any other processing.
         // This must be checked here (not just in main.rs/gui) so it works in
         // client/server mode where handle_key is called directly.
@@ -186,13 +254,11 @@ impl Editor {
             return Ok(());
         }
 
-        // Try terminal input dispatch first (handles terminal mode and re-entry).
-        // Note: `dispatch_terminal_input` short-circuits to None when a floating
-        // widget panel is mounted, so picker / form keys reach the panel below
-        // instead of being forwarded to the PTY child of the underlying terminal.
-        if self.dispatch_terminal_input(&key_event).is_some() {
-            return Ok(());
-        }
+        // The terminal's raw input is no pre-band stage: a live terminal's
+        // pane leaf holds the keyboard and claims its keys like any pane's,
+        // and the base dispatcher forwards them to the PTY in the
+        // `Terminal` context the leaf names (`chrome::base`). A key that a
+        // panel, a prompt or a popup holds never reaches it.
 
         // If a plugin is awaiting the next keypress (`editor.getNextKey()`),
         // hand this key to the front-most pending callback and consume it.
@@ -204,42 +270,49 @@ impl Editor {
             return Ok(());
         }
 
-        // Clear skip_ensure_visible flag so cursor becomes visible after key press
-        // (scroll actions will set it again if needed). Use the *effective*
+        // Release a scroll's hold so the cursor becomes visible after the key
+        // press (scroll actions will set it again if needed); a row hold the
+        // pointer left stays until the cursor moves (see
+        // `Viewport::release_hold_for_key`). Use the *effective*
         // active split so this clears the flag on a focused buffer-group
         // panel's own view state, not the group host's — without this, a
         // scroll action in the panel (mouse scrollbar click, plugin
         // scrollBufferToLine, etc.) sets `skip_ensure_visible` on the panel
         // and subsequent key presses never clear it, so cursor motion stops
         // scrolling the viewport.
-        let active_split = self.effective_active_split();
-        if let Some(view_state) = self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
-            .expect("active window must have a populated split layout")
-            .get_mut(&active_split)
-        {
-            view_state.viewport.clear_skip_ensure_visible();
-        }
-
-        // Chrome keyboard grabs — the pre-band's LAST stage, now only
-        // two components: the theme inspector's dismiss-and-continue
-        // observer (a keyboard PassAfter, not a claim) and the native
-        // context menus' navigation grab (a custom-dispatcher modal
-        // whose layer deliberately exposes no `KeyContext`; ruling at
-        // its site, #2587). Grabs as a CLASS outrank every layer rank
-        // by pipeline position — that is exactly why membership is
-        // restricted to whole-pipeline observers and custom-dispatch
-        // modals: any surface whose precedence is expressible as a
-        // rank rides the walk below instead (the dock and the
-        // floating modal moved there when their grabs were found
-        // inverting the ranks against an open prompt).
-        for c in super::chrome::components() {
-            if let Some(result) = c.on_key(self, code, modifiers) {
-                return result;
+        //
+        // A bare modifier press (kitty "report all keys" sends Shift, Ctrl,
+        // Alt and Super on their own) is not a keystroke the editor acts on:
+        // it only precedes the chord that is. Clearing the flag for it
+        // snapped a wheel-scrolled view back to the cursor the moment the
+        // user reached for Ctrl (issue #3324).
+        let is_bare_modifier = matches!(code, crossterm::event::KeyCode::Modifier(_));
+        if !is_bare_modifier {
+            let active_split = self.effective_active_split();
+            if let Some(view_state) = self
+                .active_window_mut()
+                .split_view_states_mut()
+                .get_mut(&active_split)
+            {
+                view_state
+                    .buffer_tab_state_mut()
+                    .viewport
+                    .release_hold_for_key();
             }
         }
+
+        // The pre-band's chrome keyboard grabs are gone. The stage existed
+        // for two shapes a `layer_rank` cannot express, and it outranked
+        // every rank by pipeline position — which is why membership was
+        // restricted by ruling rather than left open. Both members have since
+        // been said as something else: the context menus' navigation grab
+        // became a `Layer` answered by the walk below, and the theme
+        // inspector's dismiss-and-continue observer became
+        // `Dismiss { any_key }.passing_through()` on its own layer, which is
+        // what "a keyboard `PassAfter`" was a description of.
+        //
+        // A grab band with no members is a rank inversion waiting for the next
+        // surface that finds it convenient, so it goes with them.
 
         // Transient popups (Hover, Signature Help) are dismissed on any
         // key press — for both focused and unfocused popups: an unfocused
@@ -278,34 +351,51 @@ impl Editor {
             }
         }
 
-        // THE derived key walk: every registered overlay layer —
-        // capture-all modals, workspace trust, the prompt rungs, the
-        // popup rungs (including the unfocused popup-cancel/-focus
-        // interception), down to the editor base, whose handler is the
-        // pipeline tail (mode bindings, composite routing,
-        // chord/keybinding resolution — see `dispatch_base_key` in
-        // `chrome/base.rs`) — offered the key top-down in declared
-        // rank order. See `dispatch_layer_keyboard`.
-        let result = self.dispatch_layer_keyboard(&key_event);
-        // The base layer answers every key by contract (`Base::layers`
-        // pushes EDITOR_BASE unconditionally and `Base::on_layer_key`
-        // always returns `Some` — both commented as load-bearing at
-        // their sites, and pinned by `overlay_stack` unit tests). If
-        // that contract ever breaks anyway, an unhandled key is a far
-        // better failure mode on the main input path than a panic:
-        // degrade to Ignored in release, scream in debug.
-        debug_assert!(
-            result.is_some(),
-            "editor base layer must answer every key — a walk fell past Base \
-             (did Base::layers grow a gate, or Base::on_layer_key a None path?)"
-        );
-        match result {
-            Some(r) => {
-                r?;
+        // The migration shell is offered the key, and answers only for
+        // surfaces that have migrated their keyboard half — the context menus
+        // so far, whose open layer is modal and swallows everything it does
+        // not act on. Every other key falls through to the walk below.
+        // `dispatch` reports whether the tree claimed it rather than the
+        // caller inferring it from the messages: a modal swallow produces no
+        // message at all, and inferring claim from "said something" would let
+        // those keys straight through.
+        self.shell_key_event = Some(key_event);
+        // **The tree is the whole keyboard.** Every surface that can hold the
+        // keyboard is in it — the modals, the prompt, the menu, the popups, a
+        // panel, the explorer's header, and the active pane's content as the
+        // base's own focus holder — and the one that holds focus answers the
+        // key or hands it to the editor as a fact (`PaneKey`, `SidebarKey`,
+        // `PanelKey`, `PromptKey`), which is the only way into
+        // `chrome::base::dispatch_base_key`. There is no pipeline tail: a key
+        // the tree declines everywhere is nobody's. A key the tree has no
+        // vocabulary for (a media key, a bare modifier) is declined here for
+        // the same reason — nothing could have been bound to it.
+        match crate::view::shell::input::key(&fresh_input_parser::KeyPress::new(key_event)) {
+            Some(input) => {
+                let d = self.shell_dispatch(input);
+                tracing::debug!(
+                    target: "fresh::keys",
+                    ?code,
+                    ?modifiers,
+                    claimed = d.claimed,
+                    focus = ?self.shell_focus_key(),
+                    "key routed by the tree"
+                );
             }
-            None => {}
+            None => tracing::debug!(
+                target: "fresh::keys",
+                ?code,
+                ?modifiers,
+                "key the tree has no vocabulary for"
+            ),
         }
         Ok(())
+    }
+
+    /// The key of the element holding the tree's focus, for the trace.
+    fn shell_focus_key(&self) -> Option<fresh_ui::Key> {
+        let ui = self.shell_ui.as_ref()?;
+        ui.key_of(ui.focused()?)
     }
 
     /// Mode-binding stage of the pipeline: while the editor buffer has
@@ -322,31 +412,20 @@ impl Editor {
         code: crossterm::event::KeyCode,
         modifiers: crossterm::event::KeyModifiers,
     ) -> Option<AnyhowResult<()>> {
-        use crate::input::router::{ModeKeyDisposition, WidgetSelectionMove};
+        use crate::input::router::ModeKeyDisposition;
 
-        // effective_mode() returns buffer-local mode if present, else
-        // global mode, so virtual buffer modes aren't hijacked by global
-        // modes.
+        // effective_mode() returns the buffer-local mode if present, else
+        // the window's editor mode, else the editor-wide input mode, so
+        // virtual buffer modes aren't hijacked by either.
         let effective_mode = self.effective_mode().map(|s| s.to_owned());
         let allows_text_input = effective_mode
             .as_deref()
             .is_some_and(|m| self.mode_registry.allows_text_input(m));
-        // Only a text-input mode routes selection keys to a focused
-        // widget Text — don't pay for the panel lookup otherwise.
-        let focused_widget_panel = if allows_text_input {
-            let buffer_id = self.active_buffer();
-            self.focused_text_widget_panel_for_buffer(buffer_id)
-        } else {
-            None
-        };
         let view = router::ModeKeyView {
             allows_text_input,
             global_mode_read_only: self
-                .active_window()
-                .editor_mode
-                .as_deref()
+                .window_or_input_mode()
                 .map(|m| self.mode_registry.is_read_only(m)),
-            has_focused_text_widget: focused_widget_panel.is_some(),
             effective_mode,
         };
         let disposition = {
@@ -384,38 +463,6 @@ impl Editor {
                 Some(Ok(()))
             }
             ModeKeyDisposition::Forward(action) => Some(self.handle_action(action)),
-            ModeKeyDisposition::WidgetSelection(mv) => {
-                // Always consumed on a focused widget Text — a no-op move
-                // (already at a boundary) is still the correct shortcut
-                // behaviour.
-                if let Some(panel_id) = focused_widget_panel {
-                    let _ = match mv {
-                        WidgetSelectionMove::WordLeft => self
-                            .with_focused_text_editor(&panel_id, |e| e.move_word_left_selecting()),
-                        WidgetSelectionMove::WordRight => self
-                            .with_focused_text_editor(&panel_id, |e| e.move_word_right_selecting()),
-                        WidgetSelectionMove::Left => {
-                            self.with_focused_text_editor(&panel_id, |e| e.move_left_selecting())
-                        }
-                        WidgetSelectionMove::Right => {
-                            self.with_focused_text_editor(&panel_id, |e| e.move_right_selecting())
-                        }
-                        WidgetSelectionMove::Up => {
-                            self.with_focused_text_editor(&panel_id, |e| e.move_up_selecting())
-                        }
-                        WidgetSelectionMove::Down => {
-                            self.with_focused_text_editor(&panel_id, |e| e.move_down_selecting())
-                        }
-                        WidgetSelectionMove::Home => {
-                            self.with_focused_text_editor(&panel_id, |e| e.move_home_selecting())
-                        }
-                        WidgetSelectionMove::End => {
-                            self.with_focused_text_editor(&panel_id, |e| e.move_end_selecting())
-                        }
-                    };
-                }
-                Some(Ok(()))
-            }
             ModeKeyDisposition::Block => Some(Ok(())),
             ModeKeyDisposition::FallThrough => None,
         }
@@ -443,9 +490,16 @@ impl Editor {
         // Higher-priority modal contexts (Settings, Menu, Prompt) own the
         // keyboard regardless of whether a buffer popup happens to be
         // visible underneath. Skip the unfocused-popup interception so
-        // pressing Esc in a settings dialog still closes the dialog
-        // rather than reaching past it to dismiss a stale popup.
-        if crate::app::overlay::popup_blocked_by_higher_modal(&self.overlay_layers()) {
+        // pressing Esc in a settings dialog still closes the dialog rather
+        // than reaching past it to dismiss a stale popup.
+        //
+        // **Not `Ui::focus_confined`, though it looks like the same question.**
+        // A layer dismissed by this very keystroke goes on confining focus
+        // until the app stops declaring it, and this guard runs inside
+        // `dispatch_base_key` — reached precisely when a surface declined,
+        // including one that dismissed itself passing through. It needs
+        // post-mutation truth, which is what the re-derived stack gives it.
+        if self.shell_ui.as_ref().is_some_and(|ui| ui.keyboard_owned()) {
             return None;
         }
 
@@ -453,37 +507,12 @@ impl Editor {
         router::unfocused_popup_action(self.active_window().key_context.clone(), &kb, event)
     }
 
-    /// Resolve a key event against `KeyContext::Completion` when the topmost
-    /// visible popup is a completion popup. The gating and precedence
-    /// decision is [`router::completion_popup_action`]; this shell supplies
-    /// the topmost popup kind and the keymap.
-    pub(crate) fn resolve_completion_popup_action(
-        &self,
-        event: &crossterm::event::KeyEvent,
-    ) -> Option<crate::input::keybindings::Action> {
-        let topmost_kind = if self.global_popups.is_visible() {
-            self.global_popups.top().map(|p| p.kind)
-        } else if self.active_state().popups.is_visible() {
-            self.active_state().popups.top().map(|p| p.kind)
-        } else {
-            None
-        };
-        let kb = self.keybindings.read().unwrap();
-        router::completion_popup_action(topmost_kind, &kb, event)
-    }
-
-    /// Fire a `widget_event` at the plugin owning the dock, keyed to the
-    /// `sessions` widget. Used for dock-only gestures (Enter-activate,
-    /// the Alt+T/Alt+I/Alt+P filter toggles) that the dialog handles via
-    /// an editor mode the dock can't use — see `dispatch_floating_widget_key`.
-    fn fire_dock_widget_event(&self, panel_key: &crate::widgets::PanelKey, event_type: &str) {
-        self.fire_widget_event(
-            panel_key,
-            "sessions".to_string(),
-            event_type.to_string(),
-            serde_json::json!({}),
-        );
-    }
+    // **The completion resolver is the popup's own now.** It asked the keymap
+    // for the key as it arrived, from inside a walk the shell tree is offered
+    // the key *before* — the same shape that let a `menu`-section binding be
+    // swallowed before the keymap was ever consulted. The bindings are
+    // enumerated instead (`Editor::popup_keys`) and declared on the open
+    // popup's layer, where nothing is in front of them.
 
     /// Route a keystroke to the floating widget panel when one is
     /// mounted. Returns `true` if the key was consumed.
@@ -499,7 +528,6 @@ impl Editor {
         code: crossterm::event::KeyCode,
         modifiers: crossterm::event::KeyModifiers,
     ) -> bool {
-        use crate::input::router::WidgetKeyOutcome;
         let panel_key = match self.panel(slot) {
             Some(fwp) => fwp.panel_key.clone(),
             None => {
@@ -512,17 +540,95 @@ impl Editor {
                 return false;
             }
         };
+        let non_modal = matches!(
+            self.panel(slot).map(|f| f.placement),
+            Some(super::PanelPlacement::LeftDock)
+        ) || matches!(slot, super::PanelSlot::Sidebar(_));
+        self.dispatch_widget_panel_key(&panel_key, Some(slot), non_modal, code, modifiers)
+    }
+
+    /// Route a keystroke to the panel mounted into a pane's buffer. The
+    /// same router and the same widget handling as a slot's panel; what
+    /// its widgets decline is `FallThrough`, and the caller hands that on
+    /// to the buffer's own route.
+    /// A key on a focused control of the overlay prompt's toolbar. The
+    /// toolbar owns no channel — like a pane's panel, what its widgets
+    /// decline is the surface's own route (the prompt's).
+    pub(super) fn dispatch_prompt_toolbar_key(
+        &mut self,
+        code: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> bool {
+        let Some(pk) = self.prompt_toolbar_key() else {
+            return false;
+        };
+        // Esc on a dropdown whose list is up closes the list (restoring the
+        // selection it opened on); only a second Esc reaches the prompt and
+        // closes the overlay.
+        if code == crossterm::event::KeyCode::Esc && self.prompt_toolbar_list_open(&pk) {
+            self.handle_widget_command(
+                &pk,
+                fresh_core::api::WidgetAction::Key {
+                    key: crate::input::keybindings::KeySeq::one(
+                        crate::input::keybindings::Key::new(
+                            code,
+                            crossterm::event::KeyModifiers::NONE,
+                        ),
+                    )
+                    .to_string(),
+                },
+            );
+            return true;
+        }
+        self.dispatch_widget_panel_key(&pk, None, true, code, modifiers)
+    }
+
+    /// Whether the toolbar's focused control is a dropdown with its option
+    /// list open.
+    fn prompt_toolbar_list_open(&self, pk: &crate::widgets::PanelKey) -> bool {
+        let Some(focus) = self.widget_registry.focus_key(pk).filter(|f| !f.is_empty()) else {
+            return false;
+        };
+        matches!(
+            self.widget_registry
+                .instance_states(pk)
+                .and_then(|s| s.get(focus)),
+            Some(crate::widgets::WidgetInstanceState::Dropdown { open: true, .. })
+        )
+    }
+
+    pub(super) fn dispatch_pane_panel_key(
+        &mut self,
+        panel_key: &crate::widgets::PanelKey,
+        code: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> bool {
+        self.dispatch_widget_panel_key(panel_key, None, true, code, modifiers)
+    }
+
+    /// The one key path every described panel's widgets share. `slot` is
+    /// the panel's slot when it has one — the blur and cancel outcomes act
+    /// on it — and `None` for a pane's panel, which the router never asks
+    /// to blur or cancel.
+    fn dispatch_widget_panel_key(
+        &mut self,
+        panel_key: &crate::widgets::PanelKey,
+        slot: Option<super::PanelSlot>,
+        non_modal: bool,
+        code: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> bool {
+        use crate::input::router::WidgetKeyOutcome;
+        let panel_key = panel_key.clone();
         let view = router::WidgetPanelView {
-            is_left_dock: matches!(
-                self.panel(slot).map(|f| f.placement),
-                Some(super::PanelPlacement::LeftDock { .. })
-            ),
+            non_modal,
+            pane: slot.is_none(),
             focus_key: self
                 .widget_registry
                 .focus_key(&panel_key)
                 .map(str::to_string),
             focused_widget_is_text: self.panel_focused_widget_is_text(&panel_key),
-            editor_mode: self.active_window().editor_mode.clone(),
+            page: self.widget_registry.get(&panel_key).is_some_and(|p| p.page),
         };
         let outcome = {
             let kb = self.keybindings.read().unwrap();
@@ -536,23 +642,89 @@ impl Editor {
             modifiers = ?modifiers,
             focus_key = ?view.focus_key,
             ?outcome,
-            "dispatch_floating_widget_key: decision"
+            "dispatch_widget_panel_key: decision"
         );
+        // **1. The focused control.** It is offered every key exactly as
+        // typed — never one the router masked a modifier off (Ctrl+Enter is
+        // not Enter to a text area) — a printable character as text, and
+        // anything else as the key itself: Esc, which closes a control's own
+        // pop-up before it closes the panel, and a chord like Ctrl+C, which a
+        // read-only document copies with. `Consumed` ends the key here;
+        // `Pass` and `PassAfter` go on.
+        use crate::widgets::kinds::KeyDisposition;
+        let exact = crate::input::keybindings::KeySeq::one(crate::input::keybindings::Key::new(
+            code, modifiers,
+        ));
+        let offered = match &outcome {
+            WidgetKeyOutcome::TextChar(ch) => {
+                Some(self.handle_widget_text_char(&panel_key, &ch.to_string()))
+            }
+            WidgetKeyOutcome::SmartKey(k) if router::widget_key_is_exact(k, code, modifiers) => {
+                Some(self.widget_control_key(&panel_key, k))
+            }
+            _ => Some(self.widget_control_key(&panel_key, &exact)),
+        };
+        if offered == Some(KeyDisposition::Consumed) {
+            return true;
+        }
+        // **2. The panel's mode** — the plugin's commands, for a key the
+        // control left. (Its declared shortcuts never get here: the
+        // interior's capture leg took them ahead of the control.)
+        if let Some(keymap) = self.panel_keymap(&panel_key) {
+            use crate::view::shell::panel::Bound;
+            let ev = crossterm::event::KeyEvent::new(code, modifiers);
+            // A binding scoped to named controls (`"on:a,b"`) is the mode's
+            // only while one of them has focus; otherwise the key is unbound.
+            let focus_now = self
+                .widget_registry
+                .focus_key(&panel_key)
+                .map(str::to_string)
+                .unwrap_or_default();
+            let out_of_scope = self.keybindings.read().ok().is_some_and(|kb| {
+                kb.mode_binding_scope(&keymap.mode, &ev)
+                    .is_some_and(|w| !w.contains(&focus_now))
+            });
+            let bound = match out_of_scope {
+                true => Bound::None,
+                false => keymap.resolve(&ev),
+            };
+            match bound {
+                Bound::Run(action) => {
+                    self.active_window_mut().chord_state.clear();
+                    if let Err(e) = self.handle_action(action) {
+                        tracing::warn!("panel mode action failed: {e}");
+                    }
+                    return true;
+                }
+                Bound::Pending => {
+                    self.active_window_mut().chord_state.push((code, modifiers));
+                    return true;
+                }
+                Bound::None => self.active_window_mut().chord_state.clear(),
+            }
+        }
+        // **3. The panel's own defaults.** What the control already had its
+        // turn at is not offered to it again.
         match outcome {
-            WidgetKeyOutcome::DockEvent(event_type) => {
-                self.fire_dock_widget_event(&panel_key, event_type);
+            WidgetKeyOutcome::SmartKey(key)
+                if router::widget_key_is_exact(&key, code, modifiers) =>
+            {
+                self.widget_panel_default_key(&panel_key, &key);
                 true
             }
-            WidgetKeyOutcome::FocusWidget(key) => {
-                self.set_panel_focus_and_notify(&panel_key, key.to_string());
-                true
-            }
+            // The field declined the character and no binding wanted it.
+            WidgetKeyOutcome::TextChar(_) => true,
+            WidgetKeyOutcome::FallThrough => false,
             WidgetKeyOutcome::Blur => {
-                self.blur_floating_panel(slot);
+                if let Some(slot) = slot {
+                    self.blur_floating_panel(slot);
+                }
                 true
             }
             WidgetKeyOutcome::BlurUnconsumed => {
-                self.blur_floating_panel(slot);
+                if let Some(slot) = slot {
+                    self.blur_floating_panel_passing_key(slot);
+                }
                 false
             }
             WidgetKeyOutcome::CancelAndUnmount => {
@@ -569,24 +741,18 @@ impl Editor {
                     "cancel".to_string(),
                     serde_json::json!({}),
                 );
-                *self.panel_opt_mut(slot) = None;
+                if let Some(o) = slot.and_then(|s| self.panel_opt_mut(s)) {
+                    *o = None;
+                }
                 let _ = self.widget_registry.unmount(&panel_key);
                 true
             }
-            WidgetKeyOutcome::SmartKey(name) => {
+            WidgetKeyOutcome::SmartKey(key) => {
+                // The wire stays a string: `widgetKey(...)` is public API.
                 self.handle_widget_command(
                     &panel_key,
                     fresh_core::api::WidgetAction::Key {
-                        key: name.to_string(),
-                    },
-                );
-                true
-            }
-            WidgetKeyOutcome::TextChar(ch) => {
-                self.handle_widget_command(
-                    &panel_key,
-                    fresh_core::api::WidgetAction::TextInputChar {
-                        text: ch.to_string(),
+                        key: key.to_string(),
                     },
                 );
                 true
@@ -615,7 +781,6 @@ impl Editor {
                 true
             }
             WidgetKeyOutcome::Swallow => true,
-            WidgetKeyOutcome::FallThrough => false,
         }
     }
 }

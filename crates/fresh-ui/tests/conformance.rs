@@ -7,29 +7,30 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use fresh_ui::{
-    col, focusable, gesture, host_leaf, layer, layout_reader, text, viewport, BuildCx, Component,
-    ComponentExt, Constraints, Draw, Event, Focusable, Geom, GeomHandle, GestureKind, Hit,
-    HostLeaf, InitCx, Input, Intent, Key, KeyCode, KeyPress, LayoutCx, Modality, Mods, MouseButton,
-    Node, Point, PointerMode, Rect, RenderObject, Shortcut, Size, Sizing, Ui,
+    col, focusable, gesture, host_leaf, layer, layout_reader, text, viewport, Align, Anchor,
+    BuildCx, Component, ComponentExt, Constraints, Draw, Event, Focusable, Geom, GeomHandle,
+    GestureKind, Hit, HostLeaf, InitCx, Input, Intent, Key, KeyCode, KeyPress, LayoutCx,
+    LayoutInfo, Modality, Mods, MouseButton, Node, Place, Point, PointerMode, Rect, RenderObject,
+    Shortcut, Size, Sizing, Ui,
 };
 
 const FRAME: Size = Size { w: 20, h: 10 };
 
 fn press(ui: &mut Ui<()>, x: i32, y: i32) {
-    ui.dispatch(Input::Press {
-        pos: Point::new(x, y),
-        button: MouseButton::Left,
-        mods: Mods::NONE,
-    });
+    ui.dispatch(Input::press(
+        Point::new(x, y),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
 }
 
 fn click(ui: &mut Ui<()>, x: i32, y: i32) {
     press(ui, x, y);
-    ui.dispatch(Input::Release {
-        pos: Point::new(x, y),
-        button: MouseButton::Left,
-        mods: Mods::NONE,
-    });
+    ui.dispatch(Input::release(
+        Point::new(x, y),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
 }
 
 fn key(ui: &mut Ui<()>, code: KeyCode) {
@@ -283,6 +284,69 @@ fn a_handler_can_read_its_own_geometry() {
     assert_eq!(seen.get(), Rect::new(0, 0, 20, 1));
 }
 
+/// **A held window carries its unit with it.**
+///
+/// The snapshot a handle reads is the same window the tree laid out, so it is
+/// in the same unit: an item-scrolling viewport reports how many *items* are on
+/// screen, and the band beside it is what says so. Three-cell items in a
+/// nine-cell viewport are three of them, not nine — and a caller with only
+/// `rect()` and `scroll()` had no way to tell those two numbers apart.
+struct Windowed(Rc<Cell<(Option<Rect>, Option<fresh_ui::Band>)>>);
+
+#[derive(Default)]
+struct WindowedState {
+    geom: Option<GeomHandle>,
+}
+
+impl Component<()> for Windowed {
+    type State = WindowedState;
+
+    fn init(&self, cx: &mut InitCx<'_, ()>) -> WindowedState {
+        WindowedState {
+            geom: Some(cx.geometry()),
+        }
+    }
+
+    fn build(&self, s: &WindowedState, _cx: &mut BuildCx<'_, ()>) -> Node<()> {
+        let seen = self.0.clone();
+        let g = s.geom.clone().expect("constructed");
+        // The viewport is this component's own root, so the handle addresses
+        // it: geometry on a component answers with the render node it owns.
+        viewport(col().children((0..20).map(move |i| {
+            let seen = seen.clone();
+            let g = g.clone();
+            gesture(text(format!("card {i}")).h(Sizing::Cells(3))).on(
+                GestureKind::Press,
+                Rc::new(move |_e: &Event| {
+                    seen.set((g.window(), g.band()));
+                    None
+                }),
+            )
+        })))
+        .items(20)
+        .item_rows(3)
+    }
+}
+
+#[test]
+fn a_handle_reads_a_window_in_the_unit_its_offset_counts() {
+    let seen: Rc<Cell<(Option<Rect>, Option<fresh_ui::Band>)>> = Rc::default();
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(Windowed(seen.clone()).node(), Size::new(20, 9));
+    press(&mut ui, 1, 0);
+    let (window, band) = seen.get();
+    assert_eq!(
+        window.map(|w| w.h),
+        Some(3),
+        "nine cells of three-cell items is three items"
+    );
+    assert_eq!(
+        band,
+        Some(fresh_ui::Band::Cells(3)),
+        "and the band is what says the three is in items"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // D5 — a prop change after mount reaches the render object
 // ---------------------------------------------------------------------------
@@ -519,6 +583,442 @@ fn a_scroll_command_does_not_duplicate_the_layers() {
     assert_eq!(after, 1, "one layer, one scrim");
 }
 
+/// Cards of three different heights, named `card 0`..`card 5`, in a window
+/// four cells tall.
+fn cards(a: Rc<fresh_ui::behavior::anchor::Anchor>) -> Node<()> {
+    viewport(col().children((0..6).map(|i| {
+        col()
+            .key(Key::Pair("card".into(), i))
+            .children((0..=i % 3).map(move |r| text(format!("card {i}.{r}"))))
+    })))
+    .anchor_to(a)
+    .h(Sizing::Cells(4))
+}
+
+/// The rows the window is showing, top to bottom.
+fn shown(ui: &Ui<()>) -> Vec<String> {
+    ui.spec()
+        .visible()
+        .filter_map(|i| match &i.draw {
+            Draw::Lines(l) => l.first().map(|s| s.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// **Which card a window starts on is layout's answer.** The cards start
+/// at rows 0, 1, 3, 6, 7 and 9; a window scrolled to row 4 starts inside
+/// card 2 (rows 3–5), and one the wheel moved answers for where it went.
+#[test]
+fn a_paged_window_says_which_card_it_starts_on() {
+    use fresh_ui::behavior::anchor::Start;
+    let card = |i: u64| Key::Pair("card".into(), i);
+    let anchor = fresh_ui::behavior::anchor::Anchor::paged();
+    assert_eq!(anchor.start(), None, "not laid out");
+
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(cards(anchor.clone()), FRAME);
+    let at = |offset: i32, i: u64| {
+        Some(Start {
+            offset,
+            first: Some(card(i)),
+        })
+    };
+    assert_eq!(anchor.start(), at(0, 0));
+
+    anchor.scroll_to(fresh_ui::Point::new(0, 4));
+    ui.frame(cards(anchor.clone()), FRAME);
+    assert_eq!(anchor.start(), at(4, 2), "{:?}", shown(&ui));
+
+    ui.dispatch(Input::Wheel {
+        pos: fresh_ui::Point::new(0, 0),
+        delta: 3,
+        axis: fresh_ui::Axis::Vertical,
+        mods: Mods::NONE,
+    });
+    ui.frame(cards(anchor.clone()), FRAME);
+    assert_eq!(anchor.start(), at(7, 4), "{:?}", shown(&ui));
+
+    ui.frame(text("gone"), FRAME);
+    assert_eq!(anchor.start(), None, "a window that is gone starts nowhere");
+}
+
+/// **A page of cards is a window's height of content, not a count of
+/// cards.** The cards start at rows 0, 1, 3, 6, 7 and 9 in a window four
+/// rows tall; only layout knows which card a page lands on.
+#[test]
+fn a_page_of_cards_is_the_window_the_layout_measured() {
+    let card = |i: i32| Key::Pair("card".into(), i as u64);
+    let anchor = fresh_ui::behavior::anchor::Anchor::paged();
+    assert_eq!(anchor.page_key(&card(0), 1), None, "not laid out");
+
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(cards(anchor.clone()), FRAME);
+    // Four rows down from card 0's top is row 4, inside card 2 (rows 3–5).
+    assert_eq!(anchor.page_key(&card(0), 1), Some(card(2)));
+    // From card 2 (row 3): row 7, where card 4 starts.
+    assert_eq!(anchor.page_key(&card(2), 1), Some(card(4)));
+    // Back up from card 4 (row 7): row 3, card 2.
+    assert_eq!(anchor.page_key(&card(4), -1), Some(card(2)));
+    // Clamped at both ends.
+    assert_eq!(anchor.page_key(&card(5), 1), Some(card(5)));
+    assert_eq!(anchor.page_key(&card(1), -1), Some(card(0)));
+    // A key that is not a card of this window has no page.
+    assert_eq!(anchor.page_key(&card(99), 1), None);
+
+    // A window that was not asked to record its cards answers nothing.
+    let plain = fresh_ui::behavior::anchor::Anchor::new();
+    let mut other: Ui<()> = Ui::new();
+    other.frame(cards(plain.clone()), FRAME);
+    assert_eq!(plain.page_key(&card(0), 1), None);
+
+    // And a window that is gone has no page.
+    ui.frame(text("gone"), FRAME);
+    assert_eq!(anchor.page_key(&card(0), 1), None);
+}
+
+#[test]
+fn a_window_is_moved_to_a_band_it_measured_itself() {
+    // `reveal` takes a content row, which is only an item's position when
+    // every item is one cell tall. These are 1, 2 and 3 cells — so the
+    // caller names the card and the framework, which laid it out, finds it.
+    let anchor = fresh_ui::behavior::anchor::Anchor::new();
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(cards(anchor.clone()), FRAME);
+    assert_eq!(
+        shown(&ui),
+        vec!["card 0.0", "card 1.0", "card 1.1", "card 2.0"]
+    );
+
+    // The cards start at content rows 0, 1, 3, 6, 7 and 9. Card 4 is two
+    // cells tall at row 7, so the *shortest* move that holds all of it puts
+    // its last row at the window's bottom — the window starts at row 5.
+    anchor.reveal_key(Key::Pair("card".into(), 4));
+    ui.frame(cards(anchor.clone()), FRAME);
+    assert_eq!(
+        shown(&ui),
+        vec!["card 2.2", "card 3.0", "card 4.0", "card 4.1"],
+        "the window moved just far enough to hold card 4"
+    );
+
+    // Already inside: nothing moves.
+    anchor.reveal_key(Key::Pair("card".into(), 3));
+    ui.frame(cards(anchor.clone()), FRAME);
+    assert_eq!(
+        shown(&ui),
+        vec!["card 2.2", "card 3.0", "card 4.0", "card 4.1"],
+        "a band already in the window is left where it is"
+    );
+
+    // Backwards, to a band above the window.
+    anchor.reveal_key(Key::Pair("card".into(), 1));
+    ui.frame(cards(anchor.clone()), FRAME);
+    assert_eq!(
+        shown(&ui),
+        vec!["card 1.0", "card 1.1", "card 2.0", "card 2.1"],
+        "the window moved back to card 1's top"
+    );
+
+    // A key nothing carries leaves the window alone.
+    anchor.reveal_key(Key::Pair("card".into(), 99));
+    ui.frame(cards(anchor.clone()), FRAME);
+    assert_eq!(
+        shown(&ui),
+        vec!["card 1.0", "card 1.1", "card 2.0", "card 2.1"],
+        "an unknown key is not a scroll to the top"
+    );
+}
+
+#[test]
+fn a_band_taller_than_the_window_is_shown_from_its_top() {
+    // Otherwise the shortest move flushes its *bottom* edge with the
+    // window's, scrolling past the thing that was asked for.
+    let anchor = fresh_ui::behavior::anchor::Anchor::new();
+    let mut ui: Ui<()> = Ui::new();
+    let mk = |a: Rc<fresh_ui::behavior::anchor::Anchor>| -> Node<()> {
+        viewport(
+            col()
+                .child(text("before"))
+                .child(
+                    col()
+                        .key(Key::from("tall"))
+                        .children((0..6).map(|r| text(format!("tall {r}")))),
+                )
+                .child(text("after")),
+        )
+        .anchor_to(a)
+        .h(Sizing::Cells(3))
+    };
+    ui.frame(mk(anchor.clone()), FRAME);
+    anchor.reveal_key(Key::from("tall"));
+    ui.frame(mk(anchor.clone()), FRAME);
+    assert_eq!(shown(&ui), vec!["tall 0", "tall 1", "tall 2"]);
+}
+
+/// **A window's offset and its extent are counted in the same unit.** An
+/// index-scrolled window's offset is an item, so `reveal` has to compare it
+/// against how many *items* fit — which is the window's height in cells only
+/// when the items are one cell tall. Reading the height for both left a list
+/// of three-row cards where it was: item 11 sat "inside" a window that was
+/// fifteen cells but five items.
+#[test]
+fn an_item_window_of_tall_rows_reveals_by_item_not_by_cell() {
+    let anchor = fresh_ui::behavior::anchor::Anchor::new();
+    let mut ui: Ui<()> = Ui::new();
+    let mk = |a: Rc<fresh_ui::behavior::anchor::Anchor>| -> Node<()> {
+        viewport(layout_reader(move |info: LayoutInfo| {
+            let w = info.scroll_window.unwrap_or_default();
+            col().children((w.y..w.y + w.h as i32).map(|i| {
+                col()
+                    .h(Sizing::Cells(3))
+                    .children((0..3).map(move |r| text(format!("row {i}.{r}"))))
+            }))
+        }))
+        .items(12)
+        .item_rows(3)
+        .anchor_to(a)
+        .h(Sizing::Cells(9))
+    };
+    ui.frame(mk(anchor.clone()), FRAME);
+    assert_eq!(
+        shown(&ui).first().map(String::as_str),
+        Some("row 0.0"),
+        "the window starts on the first item"
+    );
+
+    // Three items fit in nine cells, so showing item 11 puts the window at 9.
+    anchor.reveal(11);
+    ui.frame(mk(anchor.clone()), FRAME);
+    assert_eq!(
+        shown(&ui),
+        vec![
+            "row 9.0", "row 9.1", "row 9.2", "row 10.0", "row 10.1", "row 10.2", "row 11.0",
+            "row 11.1", "row 11.2"
+        ],
+        "the window moved by items, not by cells"
+    );
+}
+
+/// **A modal layer owns the keys it declines, and the pointer can still pass.**
+///
+/// `Modality` used to be one knob for two channels, so a surface that wanted
+/// the keyboard had to take the pointer with it — or, as the editor's menu
+/// did, keep a whole input handler alive whose only remaining job was to
+/// return "consumed" for every key it had nothing to say about. `Keyboard`
+/// says the one thing without the other.
+#[test]
+fn a_keyboard_modal_layer_swallows_what_it_declines_and_lets_the_pointer_by() {
+    let pressed = Rc::new(Cell::new(0));
+    let p = pressed.clone();
+    let mk = || -> Node<()> {
+        let p = p.clone();
+        col()
+            .child(gesture(text("behind")).on(
+                GestureKind::Press,
+                Rc::new(move |_: &Event| {
+                    p.set(p.get() + 1);
+                    None
+                }),
+            ))
+            .child(
+                layer()
+                    .modality(Modality::Keyboard)
+                    // Anchored below the row behind it, the way a menu hangs
+                    // off its bar — so the pointer test is about modality
+                    // rather than about what the layer happens to cover.
+                    .anchor(Anchor::Point(0, 2))
+                    .child(focusable(text("menu")).autofocus()),
+            )
+    };
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(mk(), FRAME);
+
+    // Nothing in the chain acts on a printable key, and it stops all the same:
+    // the host behind this tree must not type it into the document.
+    assert!(
+        ui.dispatch(Input::Key(KeyPress {
+            code: KeyCode::Char('x'),
+            mods: Mods::NONE,
+        }))
+        .claimed,
+        "a modal layer owns the keys it declines"
+    );
+
+    // The pointer is untouched — the row behind still answers its own press,
+    // which is how clicking another menu label switches menus in one press.
+    click(&mut ui, 1, 0);
+    assert_eq!(pressed.get(), 1, "the pointer passes through");
+}
+
+/// **A layer that steps out of the way is out of the way.** A modal layer
+/// owns the keys it declines — but a `passing_through` dismissal is the layer
+/// saying "close me, and let the input reach what it was aimed at", so the
+/// modal claim must not put it back in front of the key it just left.
+///
+/// The editor's completion list is the shape: Enter means "close this and
+/// insert a newline", and the newline is the buffer's.
+#[test]
+fn a_pass_through_dismissal_beats_the_modal_claim() {
+    let dismiss_on_any = fresh_ui::Dismiss {
+        any_key: true,
+        ..fresh_ui::Dismiss::default()
+    };
+    let mk = move || -> Node<()> {
+        col().child(
+            layer()
+                .modality(Modality::Keyboard)
+                .dismiss(dismiss_on_any.passing_through())
+                .child(focusable(text("list")).autofocus()),
+        )
+    };
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(mk(), FRAME);
+    assert!(
+        !ui.dispatch(Input::Key(KeyPress {
+            code: KeyCode::Enter,
+            mods: Mods::NONE,
+        }))
+        .claimed,
+        "the layer dismissed itself and said the key goes on"
+    );
+
+    // Without `passing_through` the dismissal spends the key, as it always
+    // has: the layer *was* in the way, and getting rid of it is the gesture.
+    let mk2 = move || -> Node<()> {
+        col().child(
+            layer()
+                .modality(Modality::Keyboard)
+                .dismiss(dismiss_on_any)
+                .child(focusable(text("pane")).autofocus()),
+        )
+    };
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(mk2(), FRAME);
+    assert!(
+        ui.dispatch(Input::Key(KeyPress {
+            code: KeyCode::Enter,
+            mods: Mods::NONE,
+        }))
+        .claimed
+    );
+}
+
+/// **A layer that owns the keyboard confines focus traversal to itself**, and
+/// nothing inside it has to declare a scope for that to hold.
+///
+/// This is the same containment as the key claim, on the other mechanism, and
+/// leaving it out is worse than a stray highlight: `move_focus` returning true
+/// *claims the key*, so every directional key a modal declines was spent
+/// walking focus out of it. The editor found all three faces of that at once —
+/// Left, Right and Shift+Tab over a completion popup were swallowed instead of
+/// dismissing it, and Tab in a dialog left the dialog instead of reaching its
+/// next button.
+#[test]
+fn a_keyboard_modal_layer_keeps_focus_traversal_inside_itself() {
+    let mk = || -> Node<()> {
+        col()
+            // Two focusables behind the layer, so traversal has somewhere
+            // tempting to go in both directions.
+            .child(focusable(text("behind one")))
+            .child(focusable(text("behind two")))
+            .child(
+                layer()
+                    .modality(Modality::Keyboard)
+                    .dismiss(fresh_ui::Dismiss {
+                        any_key: true,
+                        ..fresh_ui::Dismiss::default()
+                    })
+                    .child(focusable(text("inside")).autofocus()),
+            )
+    };
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(mk(), FRAME);
+    let inside = ui.focused().expect("the layer autofocused");
+
+    for code in [
+        KeyCode::Tab,
+        KeyCode::BackTab,
+        KeyCode::Left,
+        KeyCode::Right,
+    ] {
+        ui.dispatch(Input::Key(KeyPress {
+            code,
+            mods: Mods::NONE,
+        }));
+        assert_eq!(
+            ui.focused(),
+            Some(inside),
+            "{code:?} moved focus out of the modal layer"
+        );
+    }
+}
+
+/// **Landing where you started is not a move**, so it does not claim the key.
+///
+/// Reading order wraps, so a scope holding one focusable answers every
+/// direction with that same element — and a "move" that reports true stops
+/// the key at `default_for_intent`, in front of the layer's own `Dismiss`.
+/// One focusable in one dismissing layer is the editor's completion popup,
+/// where it meant Left, Right and Shift+Tab did nothing at all instead of
+/// closing it.
+#[test]
+fn a_traversal_that_lands_where_it_started_does_not_claim_the_key() {
+    let mk = || -> Node<()> {
+        col().child(
+            layer()
+                .modality(Modality::Keyboard)
+                .dismiss(
+                    fresh_ui::Dismiss {
+                        any_key: true,
+                        ..fresh_ui::Dismiss::default()
+                    }
+                    .passing_through(),
+                )
+                .child(focusable(text("the only one")).autofocus()),
+        )
+    };
+    for code in [
+        KeyCode::Tab,
+        KeyCode::BackTab,
+        KeyCode::Left,
+        KeyCode::Right,
+    ] {
+        let mut ui: Ui<()> = Ui::new();
+        ui.frame(mk(), FRAME);
+        assert!(
+            !ui.dispatch(Input::Key(KeyPress {
+                code,
+                mods: Mods::NONE,
+            }))
+            .claimed,
+            "{code:?} was spent moving focus to where it already was"
+        );
+    }
+}
+
+/// The other half of the same rule: without modality an unclaimed key falls
+/// through, and the host behind the tree is told so.
+#[test]
+fn a_non_modal_layer_lets_a_key_it_declines_through() {
+    let mk = || -> Node<()> {
+        col().child(
+            layer()
+                .modality(Modality::None)
+                .child(focusable(text("menu")).autofocus()),
+        )
+    };
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(mk(), FRAME);
+    assert!(
+        !ui.dispatch(Input::Key(KeyPress {
+            code: KeyCode::Char('x'),
+            mods: Mods::NONE,
+        }))
+        .claimed,
+        "nothing claimed it, so the host may act on it"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // D10 — raw input is answered per element
 // ---------------------------------------------------------------------------
@@ -547,6 +1047,86 @@ fn a_leaf_inside_an_exclusive_layer_still_takes_raw_input() {
         "only the leaf inside the exclusive layer is live"
     );
     assert!(ui.raw_input());
+}
+
+/// **Raw input is the keyboard's.** A leaf takes it only while focus is on
+/// it or inside it, or nothing holds focus: a layer that holds the keyboard
+/// above a raw leaf — a popup over a terminal — takes the keys the leaf
+/// would have taken raw, whatever its modality.
+#[test]
+fn a_raw_leaf_takes_no_input_while_something_else_holds_the_keyboard() {
+    let grid = || {
+        host_leaf(|| {
+            Box::new(Grid {
+                cells: Cell::new(0),
+            })
+        })
+    };
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(
+        col().child(grid()).child(
+            layer()
+                .modality(Modality::Keyboard)
+                .child(focusable(text("popup")).autofocus()),
+        ),
+        FRAME,
+    );
+    assert!(ui.focused().is_some(), "the layer's field holds focus");
+    assert!(!ui.raw_input(), "so the leaf takes nothing raw");
+
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(col().child(focusable(grid()).autofocus()), FRAME);
+    assert!(ui.focused().is_some());
+    assert!(
+        ui.raw_input(),
+        "the leaf holds the keyboard and takes it raw"
+    );
+
+    // The leaf's keyboard is its holder's: a leaf wrapped in a focusable —
+    // under a keyed node above that, as a pane's context is — takes raw
+    // input while the wrapper holds focus, and none while a focusable beside
+    // it does.
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(
+        col()
+            .child(
+                fresh_ui::stack()
+                    .key("context")
+                    .child(focusable(grid()).autofocus()),
+            )
+            .child(focusable(text("field"))),
+        FRAME,
+    );
+    assert!(ui.raw_input(), "focus on the wrapper is focus on the leaf");
+    key(&mut ui, KeyCode::Tab);
+    assert!(
+        !ui.raw_input(),
+        "and the leaf takes nothing raw while the field beside it holds the keyboard"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A wash is a ground that keeps what it covers
+// ---------------------------------------------------------------------------
+
+/// A themed box paints a fill; the same box as a wash paints a wash, in the
+/// same place and before its own content, so a backend recolours the cells
+/// under it and keeps their text.
+#[test]
+fn a_washed_box_paints_a_wash_where_a_themed_box_paints_a_fill() {
+    let grounds = |root: Node<()>| -> Vec<(Draw, Rect)> {
+        let mut ui: Ui<()> = Ui::new();
+        ui.frame(root, FRAME)
+            .items
+            .iter()
+            .filter(|i| matches!(i.draw, Draw::Fill | Draw::Wash))
+            .map(|i| (i.draw.clone(), i.rect))
+            .collect()
+    };
+    let plain = grounds(col().child(col().theme("ground").child(text("over"))));
+    assert_eq!(plain, vec![(Draw::Fill, Rect::new(0, 0, 20, 1))]);
+    let washed = grounds(col().child(col().theme("ground").wash().child(text("over"))));
+    assert_eq!(washed, vec![(Draw::Wash, Rect::new(0, 0, 20, 1))]);
 }
 
 // ---------------------------------------------------------------------------
@@ -754,4 +1334,1068 @@ fn a_geometry_handle_does_not_read_a_recycled_slot() {
         Size::new(0, 0),
         "a handle to a disposed element reads nothing, not its slot's new occupant"
     );
+}
+
+/// **A thumb never claims less of the track than the window shows.**
+///
+/// The length is a ratio, and flooring it rounds the window *down*: 28 rows
+/// of 434 is 6.5% of a 28-cell track, which floors to one cell claiming 3.6%.
+/// A one-cell thumb is also the hardest thing on the bar to hit, so the row a
+/// user aims at lands on the track and page-jumps the viewport instead of
+/// grabbing — which is what a press one row below the top of a resting thumb
+/// did in the keybinding editor's 434-binding table.
+#[test]
+fn a_scrollbar_thumb_rounds_its_length_up() {
+    // The case above: two cells, not one.
+    assert_eq!(Draw::scrollbar_thumb(0, 434, 28, 28).1, 2);
+
+    // The rule, not the case: for any content longer than the track, the
+    // thumb is at least as long as the exact ratio would make it.
+    for track in [3u16, 7, 28, 40] {
+        for content in (track as u32 + 1)..600 {
+            let len = Draw::scrollbar_thumb(0, content, track as u32, track).1;
+            let exact = (track as f64) * (track as f64) / (content as f64);
+            assert!(
+                len as f64 >= exact,
+                "track {track}, content {content}: thumb {len} is shorter than the \
+                 window's own share of the track ({exact:.3})"
+            );
+            assert!(
+                (1..=track).contains(&len),
+                "track {track}, content {content}: thumb {len} is off the track"
+            );
+        }
+    }
+}
+
+/// **The window is an argument because it is not the track.**
+///
+/// A cell-scrolling viewport shows as many cells as its bar is tall, so the
+/// two numbers coincide and either one gives the ratio. An item-scrolling one
+/// does not: sixteen five-row cards in a twenty-two cell track show *four*,
+/// and reading the track as the window makes the ratio 22/16 — over one, so
+/// the thumb clamps to the whole bar. A thumb that fills its track says the
+/// list is entirely visible and has nowhere left to be dragged to, which is
+/// what every card list's bar said.
+#[test]
+fn a_scrollbar_thumb_measures_the_window_not_the_track() {
+    assert_eq!(Draw::scrollbar_thumb(0, 16, 4, 22), (0, 6));
+    // And the fully-scrolled thumb still sits flush against the bottom.
+    assert_eq!(Draw::scrollbar_thumb(12, 16, 4, 22), (16, 6));
+}
+
+/// Content that fits gives the whole track — there is nowhere to scroll, so
+/// there is no gap for the thumb to leave.
+#[test]
+fn a_scrollbar_thumb_fills_a_track_it_cannot_move_along() {
+    for content in 1..=28u32 {
+        assert_eq!(
+            Draw::scrollbar_thumb(0, content, 28, 28),
+            (0, 28),
+            "content {content} fits in 28 cells"
+        );
+    }
+}
+
+/// **What a reader builds this frame is what paints this frame.**
+///
+/// A `layout_reader`'s builder is a new closure over new state every
+/// description, and the framework invalidates it so the builder re-runs. But
+/// re-running the builder is only half of it: the subtree it produces has to
+/// reach the display list of *this* frame. It did not — the builder ran with
+/// the new state and the spec still carried the previous frame's text, so
+/// every surface built inside a reader painted one frame behind the state it
+/// was built from, and only caught up when some later, unrelated event
+/// happened to draw again.
+///
+/// In the editor that is the settings dialog: clicking a category moved the
+/// selection and rebuilt the description, and the screen kept showing the
+/// previous category until the pointer moved.
+#[test]
+fn a_layout_readers_rebuilt_subtree_paints_in_the_same_frame() {
+    fn painted(ui: &Ui<()>) -> Vec<String> {
+        ui.spec()
+            .items
+            .iter()
+            .filter_map(|i| match &i.draw {
+                Draw::Lines(l) => Some(l.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+    let tree = |label: &'static str| layout_reader(move |_| text(label));
+
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(tree("first"), FRAME);
+    assert_eq!(painted(&ui), vec!["first".to_string()]);
+
+    ui.frame(tree("second"), FRAME);
+    assert_eq!(
+        painted(&ui),
+        vec!["second".to_string()],
+        "the reader rebuilt with the new description, so the new subtree is \
+         what this frame paints — not what the last one did"
+    );
+
+    // The same, one layer in. A layer is laid out in its own pass, and that
+    // is where the editor's dialogs live.
+    // The subtree keeps the *same geometry* both times — the editor's dialog
+    // is a fixed-size box whose contents change — so nothing about the
+    // arrangement moves and only the text differs.
+    let layered = |label: &'static str| {
+        col().key(Key::Str("chrome".into())).child(
+            layer()
+                .within(Key::Str("chrome".into()))
+                .anchor(Anchor::Screen(Align::Center))
+                .place(Place::Over)
+                .child(layout_reader(move |_| {
+                    col()
+                        .w(Sizing::Cells(12))
+                        .h(Sizing::Cells(1))
+                        .key(Key::Str("box".into()))
+                        .child(text(label))
+                })),
+        )
+    };
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(layered("one"), FRAME);
+    assert_eq!(painted(&ui), vec!["one".to_string()]);
+
+    ui.frame(layered("two"), FRAME);
+    assert_eq!(
+        painted(&ui),
+        vec!["two".to_string()],
+        "a reader inside a layer paints this frame's build too"
+    );
+}
+
+/// **A press on the thumb picks it up; a press on the track jumps to it.**
+///
+/// Every press used to put the thumb's *top* under the pointer, so grabbing a
+/// thumb anywhere below its first row shifted it up by however far down it had
+/// been grabbed — the viewport moved without the pointer moving at all. That
+/// is the click-jumps-to-row bug, and it is why a press one row into a resting
+/// two-row thumb scrolled the keybinding editor's table.
+#[test]
+fn a_press_inside_the_thumb_grabs_it_rather_than_jumping() {
+    fn bar(ui: &mut Ui<()>) -> (Rect, i32) {
+        let v = ui.find_by_key(&Key::Str("v".into())).expect("the viewport");
+        (ui.rect_of(v), ui.scroll(v).0.y)
+    }
+    let tree = || {
+        // Thirty rows in a ten-row window puts four cells of thumb on a
+        // ten-cell track, so there is a thumb to grab in the first place.
+        viewport(col().children((0..30).map(|i| text(format!("row {i}")))))
+            .key(Key::Str("v".into()))
+            .scrollbar()
+            .h(Sizing::Cells(10))
+            .w(Sizing::Cells(10))
+    };
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(tree(), FRAME);
+    let (r, before) = bar(&mut ui);
+    assert_eq!(before, 0, "starts at the top");
+
+    // The bar is the viewport's last column; the resting thumb starts at its
+    // first row. Press one row into it and let go without moving.
+    let x = r.x + r.w as i32 - 1;
+    press(&mut ui, x, r.y + 1);
+    ui.dispatch(Input::release(
+        Point::new(x, r.y + 1),
+        MouseButton::Left,
+        Mods::NONE,
+    ));
+    ui.frame(tree(), FRAME);
+    assert_eq!(
+        bar(&mut ui).1,
+        before,
+        "a press inside the thumb with no movement moves nothing"
+    );
+
+    // A press on the bare track below the thumb still jumps.
+    press(&mut ui, x, r.y + 8);
+    ui.frame(tree(), FRAME);
+    assert!(
+        bar(&mut ui).1 > before,
+        "a press on the track below the thumb still jumps toward it"
+    );
+}
+
+/// **Confining focus and swallowing keys are two questions**, and
+/// `Modality::Focus` is the one variant that answers them differently.
+///
+/// A text prompt is the shape it exists for. While the prompt is up it is
+/// unambiguously where the keyboard is — the surface behind it must not get
+/// the key first, which is what confinement says — and yet a key the prompt
+/// itself does not act on is still the *editor's*: that is how a minibuffer's
+/// `Ctrl+P` reaches the command palette. `Modality::Keyboard` cannot say it,
+/// because swallowing is exactly what makes an open menu a dead end.
+///
+/// Without the split, a host with its own pipeline behind the tree had two
+/// bad options for such a surface: claim the keyboard and lose every binding
+/// it declines, or claim nothing and let whatever else is focusable take the
+/// key out from under it.
+#[test]
+fn a_focus_modal_layer_confines_traversal_without_swallowing() {
+    let seen = Rc::new(Cell::new(0));
+    let s = seen.clone();
+    let mk = move || -> Node<()> {
+        let s = s.clone();
+        col()
+            // Something else focusable and *asking for focus*, standing in
+            // for another surface that would otherwise take the keyboard.
+            .child(focusable(text("behind")).autofocus())
+            .child(
+                layer()
+                    .modality(Modality::Focus)
+                    .anchor(Anchor::Point(0, 2))
+                    .child(focusable(text("prompt")).autofocus().on_key({
+                        let s = s.clone();
+                        move |_: &Event| {
+                            s.set(s.get() + 1);
+                            None
+                        }
+                    })),
+            )
+    };
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(mk(), FRAME);
+
+    // Confinement: the layer's own chain is offered the key, not the
+    // focusable behind it that also asked for focus.
+    let d = ui.dispatch(Input::Key(KeyPress {
+        code: KeyCode::Char('x'),
+        mods: Mods::NONE,
+    }));
+    assert_eq!(
+        seen.get(),
+        1,
+        "the confined layer's chain saw the key first"
+    );
+
+    // And no swallow: the handler declined to stop, so the key is still the
+    // host's to resolve.
+    assert!(
+        !d.claimed,
+        "a Focus layer hands back what its chain did not act on"
+    );
+    assert!(
+        !ui.keyboard_owned(),
+        "and says so for the keys the tree cannot route at all"
+    );
+}
+
+/// **A surface can own the keyboard and still hand back what it declines**,
+/// and a host with its own pipeline behind the tree has to be able to ask
+/// each half separately: "may I intercept this key" is not "may I resolve
+/// it". `keyboard_owned` answers the second, `focus_confined` the first, and
+/// a `Modality::Focus` layer is precisely where the two disagree.
+///
+/// The editor's unfocused popups are the case. While a prompt is open they
+/// must not intercept a keystroke — the prompt owns the keyboard — but the
+/// prompt does not swallow, so what it declines is still the host's to
+/// resolve. Asking one question for both is what a ranked list of surfaces
+/// was doing.
+#[test]
+fn confining_focus_and_swallowing_keys_are_asked_separately() {
+    let ask = |m: Modality| -> (bool, bool) {
+        let mut ui: Ui<()> = Ui::new();
+        ui.frame(
+            col().child(
+                layer()
+                    .modality(m)
+                    .child(focusable(text("surface")).autofocus()),
+            ),
+            FRAME,
+        );
+        (ui.focus_confined(), ui.keyboard_owned())
+    };
+
+    assert_eq!(
+        ask(Modality::Focus),
+        (true, false),
+        "a Focus layer confines the keyboard and swallows nothing"
+    );
+    assert_eq!(
+        ask(Modality::Keyboard),
+        (true, true),
+        "a Keyboard layer does both"
+    );
+    assert_eq!(
+        ask(Modality::None),
+        (false, false),
+        "and an ordinary layer does neither"
+    );
+    assert_eq!(
+        ask(Modality::Pointer),
+        (false, false),
+        "nor does one that claims only the pointer"
+    );
+}
+
+/// **A dismissed layer goes on confining focus until the frame is rebuilt**,
+/// and that is a limit worth stating rather than a bug to fix. The library
+/// does not unilaterally remove a layer the application declared: dismissal
+/// reports itself (`on_dismiss`) and the *app* stops declaring the surface on
+/// its next frame. So between the dismissal and that frame, the element is
+/// still on the focused chain.
+///
+/// The consequence for a host with its own pipeline behind the tree: this
+/// question answers "was a surface confining focus when this frame was
+/// built", not "is one confining it right now". A host that must know the
+/// second — because a rung may mutate state and then decline the same
+/// keystroke — has to re-derive from its own live state, and that is exactly
+/// why `fresh-editor`'s `get_key_context` and its unfocused-popup guard read
+/// an app-side stack rather than asking here.
+#[test]
+fn a_dismissed_layer_still_confines_focus_until_the_next_frame() {
+    let mut ui: Ui<()> = Ui::new();
+    let mk = || -> Node<()> {
+        col().children([
+            focusable(text("behind")),
+            layer()
+                .modality(Modality::Focus)
+                .dismiss(fresh_ui::Dismiss::ESCAPE)
+                .child(focusable(text("prompt")).autofocus()),
+        ])
+    };
+    ui.frame(mk(), FRAME);
+    assert!(
+        ui.focus_confined(),
+        "the prompt confines focus while it is up"
+    );
+
+    ui.dispatch(Input::Key(KeyPress {
+        code: KeyCode::Esc,
+        mods: Mods::NONE,
+    }));
+    assert!(
+        ui.focus_confined(),
+        "and goes on doing so until the app stops declaring it"
+    );
+
+    // The app's next frame is what actually takes it away.
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(col().child(focusable(text("behind")).autofocus()), FRAME);
+    assert!(
+        !ui.focus_confined(),
+        "with the layer gone from the description, nothing confines focus"
+    );
+}
+
+/// The partner: a `Focus` layer still claims what its chain *does* act on.
+/// Declining is a node not stopping the flow, not the layer being absent.
+#[test]
+fn a_focus_modal_layer_still_claims_what_it_answers() {
+    let mk = || -> Node<()> {
+        col().child(layer().modality(Modality::Focus).child(
+            focusable(text("prompt")).autofocus().on_key(|e: &Event| {
+                e.stop();
+                None
+            }),
+        ))
+    };
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(mk(), FRAME);
+    assert!(
+        ui.dispatch(Input::Key(KeyPress {
+            code: KeyCode::Char('x'),
+            mods: Mods::NONE,
+        }))
+        .claimed,
+        "the node stopped the flow, so the key is spent"
+    );
+}
+
+/// **The pointer's mirror of `Modality::Keyboard`**, and the variant a
+/// surface needs when the tree owns its pointer while its *interior* owns its
+/// keyboard host-side.
+///
+/// The editor's plugin panel is the shape: the box swallows every press that
+/// lands outside it, and its keys go to the widget runtime through a layer of
+/// its own. Saying `Exclusive` for the pointer half took the keyboard too —
+/// focus moved into a layer with nothing focusable inside it, was dropped for
+/// want of anywhere to go, and the surface's real keyboard layer stopped
+/// being the one containment found. That is a plugin context menu that no
+/// longer closes on Escape, and it is what this variant prevents.
+#[test]
+fn a_pointer_modal_layer_takes_the_pointer_and_leaves_the_keyboard() {
+    let pressed = Rc::new(Cell::new(0));
+    let keyed = Rc::new(Cell::new(0));
+    let p = pressed.clone();
+    let k = keyed.clone();
+    let mk = move || -> Node<()> {
+        let (p, k) = (p.clone(), k.clone());
+        col()
+            .child(gesture(text("behind")).on(
+                GestureKind::Press,
+                Rc::new(move |_: &Event| {
+                    p.set(p.get() + 1);
+                    None
+                }),
+            ))
+            // The behind-the-scenes keyboard owner: a surface elsewhere in the
+            // frame that wants focus, standing in for the panel's own layer.
+            .child(focusable(text("elsewhere")).autofocus().on_key({
+                let k = k.clone();
+                move |_: &Event| {
+                    k.set(k.get() + 1);
+                    None
+                }
+            }))
+            // The claim: the whole frame, pointer only, nothing focusable in
+            // it — exactly the editor's modal slot.
+            .child(
+                layer()
+                    .modality(Modality::Pointer)
+                    .anchor(Anchor::Screen(Align::Start))
+                    .place(Place::Fill)
+                    .child(text("claim")),
+            )
+    };
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(mk(), FRAME);
+
+    // The pointer stops at the claim: the row behind it never sees the press.
+    click(&mut ui, 1, 0);
+    assert_eq!(pressed.get(), 0, "a pointer-modal layer takes the press");
+
+    // The keyboard is untouched: focus stayed where it asked to be, and the
+    // key reached it.
+    ui.dispatch(Input::Key(KeyPress {
+        code: KeyCode::Char('x'),
+        mods: Mods::NONE,
+    }));
+    assert_eq!(
+        keyed.get(),
+        1,
+        "focus never moved into the claim, so the key reached the real owner"
+    );
+    assert!(
+        !ui.keyboard_owned(),
+        "and the claim swallows nothing it never took"
+    );
+}
+
+/// **Flex contributes nothing but its floor to an intrinsic measure** (L15).
+///
+/// A box that is being *asked how big it wants to be* has no room to divide:
+/// the maximum it was handed is its parent's room, not an extent anyone has
+/// claimed. Dividing that among the flex children made every `Sizing::Auto`
+/// box holding a spacer as wide as the frame — which is why a menu dropdown
+/// and an anchored popup measured their own rows' text instead of saying
+/// `Auto`.
+///
+/// The row here is the shape that made the rule necessary: `label · spacer ·
+/// accelerator`, the spacer flexed, inside a box that hugs its content.
+#[test]
+fn flex_contributes_only_its_floor_to_an_intrinsic_measure() {
+    let hug = Key::Str("hug".into());
+    // A layer measures its child loosely — it is placed at a point and sized
+    // to what it holds, which is exactly the question the rule is about.
+    let mk = || {
+        col().child(
+            layer()
+                .anchor(Anchor::Point(0, 0))
+                .place(Place::Over)
+                .child(col().w(Sizing::Auto).key(hug.clone()).child(
+                    fresh_ui::row().w(Sizing::Auto).children([
+                        text("Open"),
+                        fresh_ui::row().w(Sizing::Flex(1)),
+                        text("^O"),
+                    ]),
+                )),
+        )
+    };
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(mk(), FRAME);
+    let w = ui.rect_of(ui.find_by_key(&hug).expect("the hugging box")).w;
+    assert_eq!(
+        w, 6,
+        "the box is as wide as its content — \"Open\" and \"^O\" — not as wide \
+         as the frame the flex spacer was offered"
+    );
+
+    // And where the extent *is* definite, flex still divides what is left:
+    // the same row inside a box of a stated width puts the accelerator against
+    // the right edge.
+    let fixed = Key::Str("fixed".into());
+    let acc = Key::Str("acc".into());
+    let mk = || {
+        col().w(Sizing::Cells(20)).key(fixed.clone()).child(
+            fresh_ui::row().w(Sizing::Flex(1)).children([
+                text("Open"),
+                fresh_ui::row().w(Sizing::Flex(1)),
+                text("^O").key(acc.clone()),
+            ]),
+        )
+    };
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(mk(), FRAME);
+    let r = ui.rect_of(ui.find_by_key(&acc).expect("the accelerator"));
+    assert_eq!(
+        r.x + r.w as i32,
+        20,
+        "a definite extent still has room for the spacer to divide"
+    );
+}
+#[test]
+fn nested_flex_under_a_definite_box_still_divides() {
+    use fresh_ui::{col, row, text, Key, Size, Sizing, Ui};
+    let inner = Key::Str("inner".into());
+    let mid = Key::Str("mid".into());
+    let mut ui: Ui<()> = Ui::new();
+    let (ik, mk2) = (inner.clone(), mid.clone());
+    ui.frame(
+        layout_reader(move |_i: LayoutInfo| {
+            col().w(Sizing::Cells(20)).h(Sizing::Cells(10)).children([
+                row().h(Sizing::Cells(1)).child(text("head")),
+                row().flex(1).children([
+                    col().w(Sizing::Cells(4)).child(text("cat")),
+                    col()
+                        .w(Sizing::Flex(1))
+                        .key(mk2.clone())
+                        .child(row().h(Sizing::Flex(1)).key(ik.clone()).child(text("x"))),
+                ]),
+            ])
+        }),
+        Size::new(40, 20),
+    );
+    let m = ui.rect_of(ui.find_by_key(&mid).expect("mid"));
+    let i = ui.rect_of(ui.find_by_key(&inner).expect("inner"));
+    assert_eq!((m.h, i.h), (9, 9), "mid={m:?} inner={i:?}");
+}
+
+/// **What a wrapped run inside a viewport does today, and what L5 still owes.**
+///
+/// The document view's shape: one wrapped run in a viewport, with the caret
+/// stated as a byte of the logical string. Two thirds of it already hold — the
+/// wrap makes the content taller than the window, and a byte inside the window
+/// lands on the row and column the wrap put it on — and this pins them so the
+/// remaining third is stated against something.
+///
+/// **What is missing is the follow**: a byte whose row is outside the window
+/// produces no caret and nothing scrolls to it, so a document view cannot put
+/// the caret back on screen by naming a byte. That is the viewport half of L5.
+#[test]
+fn a_wrapped_run_places_a_byte_caret_where_the_wrap_put_it() {
+    let key = Key::Str("doc".into());
+    // Three words of nine cells; at width 20 two fit per row, so the run is
+    // three rows tall in a window of two.
+    let doc = "alphaaaaa bravooooo charlieee deltaaaaa echoooooo foxtrotss";
+    let at = |w: u16, byte: usize| -> (Ui<()>, Option<Point>) {
+        let mut ui: Ui<()> = Ui::new();
+        ui.frame(
+            col().child(
+                viewport(text(doc).wrap().cursor_byte(byte))
+                    .key(key.clone())
+                    .h(Sizing::Cells(2)),
+            ),
+            Size::new(w, 6),
+        );
+        let caret = ui.spec().cursor.map(|c| c.pos);
+        (ui, caret)
+    };
+
+    // The wrap produces more rows than the window holds, so there is something
+    // for a scroll unit to count.
+    let (ui, first) = at(20, 0);
+    let (_, content) = ui.scroll(ui.find_by_key(&key).expect("the viewport"));
+    assert!(
+        content.h > 2,
+        "the wrapped run is taller than its window: {content:?}"
+    );
+    assert_eq!(first, Some(Point::new(0, 0)), "byte 0 is the first cell");
+
+    // A byte on the second wrapped row lands there, at its column within the
+    // row — the mapping is the wrap's, not the string's.
+    let second_row = doc.find("charlieee").expect("the third word");
+    assert_eq!(
+        at(20, second_row).1,
+        Some(Point::new(0, 1)),
+        "the first byte of the second wrapped row"
+    );
+    assert_eq!(
+        at(20, second_row + 4).1,
+        Some(Point::new(4, 1)),
+        "and four cells into it"
+    );
+
+    // The same byte at a width that fits everything on one row is on row 0 —
+    // the caret follows the wrap when the width changes.
+    assert_eq!(
+        at(60, second_row).1,
+        Some(Point::new(second_row as i32, 0)),
+        "one row at 60 columns, so the byte's column is its index"
+    );
+
+    // A byte whose row is past the window is not placed: a terminal has one
+    // cursor, and a row the clip does not show is not where the text is. Moving
+    // the window to it is `Anchor::reveal_byte`'s job, tested below.
+    let last = doc.find("foxtrotss").expect("the last word");
+    assert_eq!(
+        at(20, last).1,
+        None,
+        "today a caret outside the window is dropped rather than revealed"
+    );
+}
+
+/// **A caret named as a byte is revealed on the row the wrap put it on** (L5).
+///
+/// The follow the test above says is missing. A document view knows where its
+/// caret is as a byte of the string it handed over; which row that is belongs
+/// to the wrap, and changes with the width. `Anchor::reveal_byte` splits the
+/// question there — the caller names the byte, the framework moves the window
+/// — so a view can put its caret back on screen without re-shaping the text
+/// to work out where it went.
+#[test]
+fn a_byte_is_revealed_on_the_row_the_wrap_put_it_on() {
+    let anchor = fresh_ui::behavior::anchor::Anchor::new();
+    let run = Key::Str("run".into());
+    let port = Key::Str("port".into());
+    // Two nine-cell words per row at width 20: six words are three rows, in a
+    // window of one.
+    let doc = "alphaaaaa bravooooo charlieee deltaaaaa echoooooo foxtrotss";
+    let mk = |a: Rc<fresh_ui::behavior::anchor::Anchor>| -> Node<()> {
+        col().child(
+            viewport(text(doc).wrap().key(run.clone()))
+                .anchor_to(a)
+                .key(port.clone())
+                .h(Sizing::Cells(1)),
+        )
+    };
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(mk(anchor.clone()), Size::new(20, 6));
+    let scroll = |ui: &Ui<()>| ui.scroll(ui.find_by_key(&port).expect("the viewport")).0.y;
+    assert_eq!(scroll(&ui), 0, "the window starts at the top");
+
+    // A byte on the third wrapped row brings the window to it.
+    let third = doc.find("echoooooo").expect("the fifth word");
+    anchor.reveal_byte(run.clone(), third);
+    ui.frame(mk(anchor.clone()), Size::new(20, 6));
+    assert_eq!(scroll(&ui), 2, "the third row, in a window one row tall");
+
+    // Back to a byte on the first row, and the window comes back with it.
+    anchor.reveal_byte(run.clone(), 0);
+    ui.frame(mk(anchor.clone()), Size::new(20, 6));
+    assert_eq!(scroll(&ui), 0, "the first row again");
+
+    // The row is the wrap's, not the string's: at a width that fits everything
+    // on one row, the same byte needs no scroll at all.
+    let mut wide: Ui<()> = Ui::new();
+    let a2 = fresh_ui::behavior::anchor::Anchor::new();
+    let mk2 = |a: Rc<fresh_ui::behavior::anchor::Anchor>| -> Node<()> {
+        col().child(
+            viewport(text(doc).wrap().key(run.clone()))
+                .anchor_to(a)
+                .key(port.clone())
+                .h(Sizing::Cells(1)),
+        )
+    };
+    wide.frame(mk2(a2.clone()), Size::new(60, 6));
+    a2.reveal_byte(run.clone(), third);
+    wide.frame(mk2(a2.clone()), Size::new(60, 6));
+    assert_eq!(
+        wide.scroll(wide.find_by_key(&port).expect("the viewport"))
+            .0
+            .y,
+        0,
+        "one row at 60 columns, so the byte is already in the window"
+    );
+}
+
+/// **A selected byte range is washed across the rows the wrap put it on** (L5).
+///
+/// The other half of stating a text view's state in source coordinates. A
+/// selection is a fact about the string; which cells of which rows it covers is
+/// the wrap's answer and changes with the width, exactly as the caret's cell
+/// does. So the caller names the bytes and the rows come back from the same
+/// `Row::src` the caret is placed through — a selection and the caret walking
+/// out of its end cannot land on different rows.
+#[test]
+fn a_selected_byte_range_is_washed_across_the_rows_the_wrap_put_it_on() {
+    // Two nine-cell words per row at width 20.
+    let doc = "alphaaaaa bravooooo charlieee deltaaaaa echoooooo foxtrotss";
+    let washes = |w: u16, bytes: std::ops::Range<usize>| -> Vec<Rect> {
+        let mut ui: Ui<()> = Ui::new();
+        ui.frame(
+            col().child(text(doc).wrap().selection_bytes(bytes, "sel")),
+            Size::new(w, 6),
+        )
+        .items
+        .iter()
+        .filter(|i| i.draw == Draw::Wash)
+        .map(|i| i.rect)
+        .collect()
+    };
+
+    // Inside one row: the span is the cells those bytes occupy, and nothing
+    // else is washed.
+    let bravo = doc.find("bravooooo").expect("the second word");
+    assert_eq!(
+        washes(20, bravo..bravo + 5),
+        vec![Rect::new(10, 0, 5, 1)],
+        "five cells of the second word, on the first row"
+    );
+
+    // Across a wrap: one span per row, each cut to what that row shows. The
+    // space the break ate belongs to no row, so no span covers it.
+    let echo = doc.find("echoooooo").expect("the fifth word");
+    assert_eq!(
+        washes(20, bravo..echo + 4),
+        vec![
+            Rect::new(10, 0, 9, 1),
+            Rect::new(0, 1, 19, 1),
+            Rect::new(0, 2, 4, 1),
+        ],
+        "the tail of row 0, all of row 1, and four cells of row 2"
+    );
+
+    // The same bytes at a width that wraps differently are washed differently:
+    // the range is the caller's, the rows are the wrap's.
+    assert_eq!(
+        washes(60, bravo..echo + 4),
+        vec![Rect::new(bravo as i32, 0, (echo + 4 - bravo) as u16, 1)],
+        "one row at 60 columns, so one span"
+    );
+
+    // An empty range selects nothing, and so does a reversed one.
+    assert!(washes(20, bravo..bravo).is_empty());
+    assert!(washes(20, echo..bravo).is_empty());
+}
+
+/// **Two panels, one widget key, each its own rows.** A widget's key is
+/// unique only inside the panel that owns it; `text_rows` searches the frame
+/// and would answer for whichever panel comes first. `text_rows_in` is asked
+/// from a panel's own root, as `item_window_in` is, and each panel's run
+/// answers with the rows *its* width shaped.
+#[test]
+fn text_rows_are_read_from_the_subtree_that_owns_the_key() {
+    let run = Key::Str("prose".into());
+    let doc = "alpha beta gamma delta epsilon zeta";
+    let panel = |root: &str, w: u16| -> Node<()> {
+        col()
+            .key(Key::Str(root.into()))
+            .w(Sizing::Cells(w))
+            .child(text(doc).wrap().key(run.clone()))
+    };
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(
+        fresh_ui::row().children([panel("left", 12), panel("right", 40)]),
+        Size::new(60, 4),
+    );
+    let left = ui.find_by_key(&Key::Str("left".into())).expect("left");
+    let right = ui.find_by_key(&Key::Str("right".into())).expect("right");
+    let (_, l) = ui.text_rows_in(left, &run).expect("the left run");
+    let (_, r) = ui.text_rows_in(right, &run).expect("the right run");
+    assert!(
+        l.len() > r.len(),
+        "narrower wraps into more rows: {} vs {}",
+        l.len(),
+        r.len()
+    );
+    assert_eq!(r.len(), 1, "forty columns holds the whole line");
+    // And the frame-wide read is whichever comes first — the ambiguity the
+    // rooted form exists to remove.
+    let (_, first) = ui.text_rows(&run).expect("some run");
+    assert_eq!(first.len(), l.len());
+}
+
+/// **The wrap's rows are readable after layout, so "one rendered row down" is
+/// answerable without a second wrap** (L5).
+///
+/// The third piece, beside a byte caret and a byte press. Those answer at paint
+/// time and at press time; a surface whose `Up`/`Down` mean *rendered* rows
+/// asks from a key handler, which is at neither and has no width — which is why
+/// such a surface kept a shadow wrap of its own text just to have rows to
+/// count. `Ui::text_rows` hands back the wrap layout already did, at the width
+/// layout settled on, and `cell_of`/`byte_of` are the rest of the answer.
+#[test]
+fn the_rows_a_run_was_wrapped_into_are_readable_after_layout() {
+    use fresh_ui::render::prim::{byte_of, cell_of};
+    let run = Key::Str("run".into());
+    // Two nine-cell words per row at width 20; one row at 60.
+    let doc = "alphaaaaa bravooooo charlieee deltaaaaa echoooooo foxtrotss";
+    let rows_at = |w: u16| -> (Ui<()>, (String, Vec<fresh_ui::render::prim::Row>)) {
+        let mut ui: Ui<()> = Ui::new();
+        ui.frame(
+            col().child(text(doc).wrap().key(run.clone())),
+            Size::new(w, 6),
+        );
+        let rows = ui.text_rows(&run).expect("the run's rows");
+        (ui, rows)
+    };
+
+    let (_, (whole, rows)) = rows_at(20);
+    assert_eq!(rows.len(), 3, "three rows of two words at width 20");
+    assert_eq!(
+        whole, doc,
+        "the string the ranges index is the one that was shaped"
+    );
+    // `text[indent..] == whole[src]`, which is what makes the ranges usable.
+    for r in &rows {
+        assert_eq!(&r.text[r.indent..], &whole[r.src.clone()]);
+    }
+
+    // The question a key handler asks, answered from those rows alone: the
+    // byte one rendered row below this one, at the same column.
+    let down = |byte: usize| -> Option<usize> {
+        let (row, col) = cell_of(&rows, &whole, byte);
+        byte_of(&rows, &whole, row + 1, col as i32)
+    };
+    let bravo = doc.find("bravooooo").expect("the second word");
+    let delta = doc.find("deltaaaaa").expect("the fourth word");
+    assert_eq!(
+        down(bravo),
+        Some(delta),
+        "column 10 of row 0 is column 10 of row 1, which is the fourth word"
+    );
+    assert_eq!(down(doc.len() - 1), None, "nothing below the last row");
+
+    // The rows are the wrap's, so a different width is different rows — the
+    // reason a caller must not keep its own copy.
+    let (_, (_, wide)) = rows_at(60);
+    assert_eq!(wide.len(), 1, "one row at 60 columns");
+
+    // A key that names something which is not a text run answers nothing,
+    // rather than an empty wrap that would read as "no rows".
+    let mut ui: Ui<()> = Ui::new();
+    let boxed = Key::Str("boxed".into());
+    ui.frame(col().child(col().key(boxed.clone())), Size::new(20, 6));
+    assert!(ui.text_rows(&boxed).is_none());
+    assert!(ui.text_rows(&Key::Str("absent".into())).is_none());
+}
+
+// ── a window that scrolls across ────────────────────────────────────────────
+//
+// The axis is the window's, not the command's: `reveal_key` means "put this
+// inside", and which way that is has one right answer. These pin that, and the
+// affordance a horizontal window offers instead of a bar.
+
+/// Ten tabs of four cells in a window eight wide.
+fn strip(a: Rc<fresh_ui::behavior::anchor::Anchor>, keys: &[Key]) -> Node<()> {
+    let cells: Vec<Node<()>> = keys.iter().map(|k| text("abcd").key(k.clone())).collect();
+    viewport(fresh_ui::row().children(cells))
+        .scroll_axis(fresh_ui::Axis::Horizontal)
+        .scrollbar()
+        .anchor_to(a)
+        .w(Sizing::Cells(8))
+        .h(Sizing::Cells(1))
+}
+
+fn tab_keys(n: usize) -> Vec<Key> {
+    (0..n).map(|i| Key::Pair("tab".into(), i as u64)).collect()
+}
+
+/// **A horizontal window measures its content across, and reveals across.**
+///
+/// The content is forty cells of tabs in a window of eight. A vertical window
+/// would have clamped the row to its own width and had nothing to scroll; this
+/// one gives the row its natural width and keeps a window onto it. Revealing
+/// the last tab moves the window on `x` — with no axis named by the caller,
+/// because the window is what knows.
+#[test]
+fn a_horizontal_window_reveals_by_key_across() {
+    let keys = tab_keys(10);
+    let a = fresh_ui::behavior::anchor::Anchor::new();
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(strip(a.clone(), &keys), Size::new(20, 3));
+    let vp = ui.root().unwrap();
+    assert_eq!(ui.scroll(vp).0, Point::ZERO, "it starts at the first tab");
+
+    a.reveal_key(keys[9].clone());
+    ui.frame(strip(a.clone(), &keys), Size::new(20, 3));
+    let at = ui.scroll(vp).0;
+    assert!(at.x > 0, "the window moved across to the last tab: {at:?}");
+    assert_eq!(at.y, 0, "and not down");
+
+    // The shortest move, so the revealed tab is flush with the far edge. The
+    // content is 40 cells; the window is eight wide less the cell reserved at
+    // each end for a cap, so six; and the tenth tab ends the content.
+    assert_eq!(at.x, 40 - 6);
+
+    a.reveal_key(keys[0].clone());
+    ui.frame(strip(a.clone(), &keys), Size::new(20, 3));
+    assert_eq!(ui.scroll(vp).0.x, 0, "and back for the first");
+}
+
+/// **What it offers instead of a bar, and only where there is more.**
+///
+/// A one-row window has its content on the row a bar would need, so it caps
+/// the ends instead. A cap is drawn only on an edge with content behind it —
+/// so at the start there is only a `>` — and the cells are reserved whenever
+/// the content overflows, so the tabs do not shift by a column the moment the
+/// `<` appears.
+#[test]
+fn a_horizontal_window_caps_the_ends_that_have_more() {
+    let keys = tab_keys(10);
+    let a = fresh_ui::behavior::anchor::Anchor::new();
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(strip(a.clone(), &keys), Size::new(20, 3));
+
+    let caps = |ui: &Ui<()>| -> Vec<(i32, fresh_ui::End)> {
+        ui.spec()
+            .items
+            .iter()
+            .filter_map(|i| match i.draw {
+                Draw::Overflow { end, .. } => Some((i.rect.x, end)),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        caps(&ui),
+        vec![(7, fresh_ui::End::After)],
+        "at the start, only the far end has more"
+    );
+
+    a.reveal_key(keys[9].clone());
+    ui.frame(strip(a.clone(), &keys), Size::new(20, 3));
+    assert_eq!(
+        caps(&ui),
+        vec![(0, fresh_ui::End::Before)],
+        "at the end, only the near one"
+    );
+
+    // A window its content fits in offers nothing, and reserves nothing.
+    let few = tab_keys(1);
+    let b = fresh_ui::behavior::anchor::Anchor::new();
+    let mut ui2: Ui<()> = Ui::new();
+    ui2.frame(strip(b.clone(), &few), Size::new(20, 3));
+    assert!(caps(&ui2).is_empty(), "nothing overflows, so no caps");
+}
+
+/// **A press on a cap steps the window that way.**
+///
+/// The cap is the window's own affordance — it is drawn there *because* the
+/// window knows there is more behind that edge — so the move is the window's
+/// too, and the description says nothing about it.
+#[test]
+fn a_press_on_an_overflow_cap_steps_the_window() {
+    let keys = tab_keys(10);
+    let a = fresh_ui::behavior::anchor::Anchor::new();
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(strip(a.clone(), &keys), Size::new(20, 3));
+    let vp = ui.root().unwrap();
+
+    // The trailing cap is the window's last column.
+    press(&mut ui, 7, 0);
+    assert_eq!(
+        ui.scroll(vp).0.x,
+        6,
+        "one windowful across (8 less its caps)"
+    );
+
+    press(&mut ui, 0, 0);
+    assert_eq!(ui.scroll(vp).0.x, 0, "and the leading cap brings it back");
+
+    // The leading cell answers nothing while there is nothing behind it: the
+    // cap is not drawn there, so the press belongs to whatever is under it.
+    let before = ui.scroll(vp).0;
+    press(&mut ui, 0, 0);
+    assert_eq!(ui.scroll(vp).0, before);
+}
+
+/// **A cap is as wide as the window asked for, and the glyph sits in the
+/// middle of it.**
+///
+/// One cell says "there is more this way" perfectly well, and it is the
+/// default. But a cap is a button, and on a strip whose other buttons are
+/// padded labels — the tab strip's `+` is `" + "` — a one-cell arrow is the
+/// odd one out to the pointer as well as to the eye. So the window states the
+/// width, the measure reserves it at each end, and the backend centres the
+/// glyph in it.
+#[test]
+fn a_window_states_how_wide_its_caps_are() {
+    let keys = tab_keys(10);
+    let a = fresh_ui::behavior::anchor::Anchor::new();
+    let wide = |a: Rc<fresh_ui::behavior::anchor::Anchor>| {
+        viewport(
+            fresh_ui::row().children(
+                keys.iter()
+                    .map(|k| text("abcd").key(k.clone()))
+                    .collect::<Vec<_>>(),
+            ),
+        )
+        .scroll_axis(fresh_ui::Axis::Horizontal)
+        .scrollbar()
+        .scroll_cap_width(3)
+        .anchor_to(a)
+        .w(Sizing::Cells(12))
+        .h(Sizing::Cells(1))
+    };
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(wide(a.clone()), Size::new(20, 3));
+    let vp = ui.root().unwrap();
+
+    let cap = ui
+        .spec()
+        .items
+        .iter()
+        .find_map(|i| match i.draw {
+            Draw::Overflow { .. } => Some(i.rect),
+            _ => None,
+        })
+        .expect("the content overflows, so the far end is capped");
+    assert_eq!(cap.w, 3, "the cap is the width the window asked for");
+    assert_eq!(cap.x, 12 - 3, "at the far edge, not one cell of it");
+
+    // Six cells of window between the two three-cell caps, so the shortest
+    // move that puts the last tab flush with the near edge of the far cap is
+    // the content less six.
+    a.reveal_key(keys[9].clone());
+    ui.frame(wide(a.clone()), Size::new(20, 3));
+    assert_eq!(ui.scroll(vp).0.x, 40 - 6);
+}
+
+/// **Moving onto a cap asks for a frame, whichever way the pointer came.**
+///
+/// A cap draws itself from where the pointer is, not from an `Enter`: it is
+/// cells its window reserved, not an element, so sliding sideways out of the
+/// content and onto it crosses no boundary and fires nothing. Left there, the
+/// cap lit only when the pointer happened to cross some *other* node's edge on
+/// its way in — entering from above worked and entering from beside it did
+/// not. The window is marked instead, by asking the cap the same question its
+/// press asks, before and after the move.
+#[test]
+fn moving_onto_a_cap_asks_for_a_frame() {
+    let keys = tab_keys(10);
+    let a = fresh_ui::behavior::anchor::Anchor::new();
+    let mut ui: Ui<()> = Ui::new();
+    ui.frame(strip(a.clone(), &keys), Size::new(20, 3));
+
+    let lit = |ui: &Ui<()>| {
+        ui.spec()
+            .items
+            .iter()
+            .any(|i| matches!(i.draw, Draw::Overflow { hovered, .. } if hovered))
+    };
+    let moved = |ui: &mut Ui<()>, x: i32| {
+        ui.dispatch(Input::Move {
+            pos: Point::new(x, 0),
+            mods: Mods::NONE,
+        });
+        let asked = ui.needs_frame();
+        ui.tick();
+        asked
+    };
+
+    // Inside the tabs, one cell short of the trailing cap. Nothing is lit and
+    // nothing is owed.
+    assert!(!moved(&mut ui, 3), "a move within the content is quiet");
+    assert!(!lit(&ui));
+
+    // Sideways onto the cap: no element boundary is crossed, and it still
+    // lights.
+    assert!(moved(&mut ui, 7), "arriving on the cap owes a frame");
+    assert!(lit(&ui), "and the cap is lit");
+
+    // Staying on it owes nothing.
+    assert!(!moved(&mut ui, 7), "resting on the cap is quiet");
+    assert!(lit(&ui));
+
+    // And sideways off it puts it out.
+    assert!(moved(&mut ui, 3), "leaving it owes a frame too");
+    assert!(!lit(&ui), "and it goes dark");
 }

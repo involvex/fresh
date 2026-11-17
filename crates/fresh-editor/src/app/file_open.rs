@@ -6,7 +6,8 @@
 
 use crate::input::fuzzy::fuzzy_match;
 use crate::model::filesystem::{DirEntry, EntryType, FileSystem};
-use rust_i18n::t;
+use fresh_editor_core::model::host_path::{AsHostPath, HostPathBuf};
+use fresh_i18n::t;
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,6 +32,32 @@ pub enum SortMode {
     Size,
     Modified,
     Type,
+}
+
+/// One of the dialog's two checkboxes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Toggle {
+    ShowHidden,
+    DetectEncoding,
+}
+
+impl Toggle {
+    /// Stable name for the scene projection / frontend.
+    pub fn name(self) -> &'static str {
+        match self {
+            Toggle::ShowHidden => "showHidden",
+            Toggle::DetectEncoding => "detectEncoding",
+        }
+    }
+}
+
+/// One of the dialog's own controls, for the pointer's hover. The entry rows
+/// are not here: their hover is the list's own state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserPart {
+    Toggle(Toggle),
+    Shortcut(usize),
+    Column(SortMode),
 }
 
 /// Which section of the file browser is active
@@ -68,8 +95,13 @@ pub struct FileOpenState {
     raw_entries: Vec<DirEntry>,
 
     /// Directory entries with metadata (the currently displayed subset of
-    /// `raw_entries`, with the synthesized ".." prepended).
-    pub entries: Vec<FileOpenEntry>,
+    /// `raw_entries`, with the synthesized ".." prepended), in shared storage.
+    ///
+    /// The browser's list holds this handle and formats the entries its
+    /// window asks for, so a frame costs the window rather than the
+    /// directory. Edited copy-on-write (`Rc::make_mut`): a frame that holds
+    /// the listing keeps what it was drawn from.
+    pub entries: std::rc::Rc<Vec<FileOpenEntry>>,
 
     /// Whether directory is currently loading
     pub loading: bool,
@@ -83,17 +115,11 @@ pub struct FileOpenState {
     /// Sort direction (true = ascending)
     pub sort_ascending: bool,
 
-    /// Selected index in the current section (None = no selection)
-    pub selected_index: Option<usize>,
-
-    /// Scroll offset for file list
-    pub scroll_offset: usize,
-
-    /// Number of file rows visible in the viewport, as reported by the
-    /// renderer on the previous frame. Used by selection actions to clamp
-    /// `scroll_offset` to the actual viewport instead of a fixed default —
-    /// the renderer is the only place that knows the real viewport height.
-    pub last_visible_rows: usize,
+    /// The selected entry in the Files section, held by its path so it
+    /// stays on its file when the listing is re-sorted or refreshed.
+    /// Read and written through [`Self::selected_index`] and
+    /// [`Self::select_index`].
+    selection: crate::view::keyed_selection::KeyedSelection<PathBuf>,
 
     /// Which section is currently active
     pub active_section: FileOpenSection,
@@ -116,6 +142,10 @@ pub struct FileOpenState {
 
     /// Filesystem for checking path existence (used for drive letter detection on Windows)
     filesystem: Arc<dyn FileSystem + Send + Sync>,
+
+    /// The list's page: its layout records the window it was given here,
+    /// and PageUp/PageDown ask it for the entry a page away.
+    pub pager: std::rc::Rc<fresh_ui::behavior::Pager>,
 }
 
 impl FileOpenState {
@@ -132,14 +162,12 @@ impl FileOpenState {
         Self {
             current_dir: dir,
             raw_entries: Vec::new(),
-            entries: Vec::new(),
+            entries: Default::default(),
             loading: true,
             error: None,
             sort_mode: SortMode::Name,
             sort_ascending: true,
-            selected_index: None,
-            scroll_offset: 0,
-            last_visible_rows: 0,
+            selection: Default::default(),
             active_section: FileOpenSection::Files,
             filter: String::new(),
             shortcuts,
@@ -147,6 +175,7 @@ impl FileOpenState {
             show_hidden,
             detect_encoding: true,
             filesystem,
+            pager: fresh_ui::behavior::Pager::new(),
         }
     }
 
@@ -182,7 +211,7 @@ impl FileOpenState {
         if let Ok(home) = filesystem.home_dir() {
             shortcuts.push(NavigationShortcut {
                 label: "~".to_string(),
-                path: home,
+                path: (home).into_path_buf(),
                 description: t!("file_browser.home_dir").to_string(),
             });
         }
@@ -199,7 +228,7 @@ impl FileOpenState {
 
         // Documents directory - check existence via filesystem trait
         if let Some(docs) = dirs::document_dir() {
-            if filesystem.exists(&docs) {
+            if filesystem.exists(docs.as_host()) {
                 shortcuts.push(NavigationShortcut {
                     label: t!("file_browser.documents").to_string(),
                     path: docs,
@@ -210,7 +239,7 @@ impl FileOpenState {
 
         // Downloads directory - check existence via filesystem trait
         if let Some(downloads) = dirs::download_dir() {
-            if filesystem.exists(&downloads) {
+            if filesystem.exists(downloads.as_host()) {
                 shortcuts.push(NavigationShortcut {
                     label: t!("file_browser.downloads").to_string(),
                     path: downloads,
@@ -227,7 +256,7 @@ impl FileOpenState {
         {
             for letter in b'A'..=b'Z' {
                 let path = PathBuf::from(format!("{}:\\", letter as char));
-                if filesystem.exists(&path) {
+                if filesystem.exists(path.as_host()) {
                     shortcuts.push(NavigationShortcut {
                         label: format!("{}:", letter as char),
                         path,
@@ -266,8 +295,7 @@ impl FileOpenState {
         self.rebuild_entries();
         self.sort_entries();
         // No selection by default - user must type or navigate to select
-        self.selected_index = None;
-        self.scroll_offset = 0;
+        self.select_index(None);
     }
 
     /// Rebuild the displayed `entries` from `raw_entries`, prepending the
@@ -279,8 +307,11 @@ impl FileOpenState {
 
         // Add ".." entry for parent directory navigation (unless at root)
         if let Some(parent) = self.current_dir.parent() {
-            let parent_entry =
-                DirEntry::new(parent.to_path_buf(), "..".to_string(), EntryType::Directory);
+            let parent_entry = DirEntry::new(
+                HostPathBuf::from_path_buf(parent.to_path_buf()),
+                "..".to_string(),
+                EntryType::Directory,
+            );
             result.push(FileOpenEntry {
                 fs_entry: parent_entry,
                 matches_filter: true,
@@ -302,7 +333,7 @@ impl FileOpenState {
                 }),
         );
 
-        self.entries = result;
+        self.entries = std::rc::Rc::new(result);
         self.apply_filter_internal();
     }
 
@@ -328,7 +359,7 @@ impl FileOpenState {
     pub fn set_error(&mut self, error: String) {
         self.loading = false;
         self.error = Some(error);
-        self.entries.clear();
+        std::rc::Rc::make_mut(&mut self.entries).clear();
     }
 
     /// Check if a filename is hidden (starts with .)
@@ -348,7 +379,7 @@ impl FileOpenState {
 
         // When filter is non-empty, sort by match score (best matches first)
         if !filter.is_empty() {
-            self.entries.sort_by(|a, b| {
+            std::rc::Rc::make_mut(&mut self.entries).sort_by(|a, b| {
                 // ".." always stays at top
                 let a_is_parent = a.fs_entry.name == "..";
                 let b_is_parent = b.fs_entry.name == "..";
@@ -384,20 +415,19 @@ impl FileOpenState {
                 .iter()
                 .position(|e| e.matches_filter && e.fs_entry.name != "..");
             if let Some(idx) = first_match {
-                self.selected_index = Some(idx);
-                self.ensure_selected_visible();
+                self.select_index(Some(idx));
             } else {
-                self.selected_index = None;
+                self.select_index(None);
             }
         } else {
             // No filter: restore normal sort order and clear selection
             self.sort_entries();
-            self.selected_index = None;
+            self.select_index(None);
         }
     }
 
     fn apply_filter_internal(&mut self) {
-        for entry in &mut self.entries {
+        for entry in std::rc::Rc::make_mut(&mut self.entries).iter_mut() {
             if self.filter.is_empty() {
                 entry.matches_filter = true;
                 entry.match_score = 0;
@@ -414,7 +444,7 @@ impl FileOpenState {
         let sort_mode = self.sort_mode;
         let ascending = self.sort_ascending;
 
-        self.entries.sort_by(|a, b| {
+        std::rc::Rc::make_mut(&mut self.entries).sort_by(|a, b| {
             // ".." always stays at top
             let a_is_parent = a.fs_entry.name == "..";
             let b_is_parent = b.fs_entry.name == "..";
@@ -490,15 +520,28 @@ impl FileOpenState {
         self.sort_entries();
     }
 
-    /// Toggle hidden files visibility
-    pub fn toggle_hidden(&mut self) {
-        self.show_hidden = !self.show_hidden;
-        // Need to reload directory to apply this change
-    }
-
     /// Toggle encoding detection mode
     pub fn toggle_detect_encoding(&mut self) {
         self.detect_encoding = !self.detect_encoding;
+    }
+
+    /// Where the selected entry is in the listing: `None` when nothing is
+    /// selected or the selected file has left the listing.
+    pub fn selected_index(&self) -> Option<usize> {
+        let entries = &self.entries;
+        self.selection
+            .index(entries.len(), |i| entries[i].fs_entry.path.as_path())
+    }
+
+    /// Select the entry at `index` (`None`, or an index past the end,
+    /// clears the selection).
+    pub fn select_index(&mut self, index: Option<usize>) {
+        self.selection = match index.and_then(|i| self.entries.get(i).map(|e| (i, e))) {
+            Some((i, e)) => {
+                crate::view::keyed_selection::KeyedSelection::at(i, e.fs_entry.path.clone())
+            }
+            None => Default::default(),
+        };
     }
 
     /// Move selection up
@@ -510,15 +553,13 @@ impl FileOpenState {
                 }
             }
             FileOpenSection::Files => {
-                if let Some(idx) = self.selected_index {
+                if let Some(idx) = self.selected_index() {
                     if idx > 0 {
-                        self.selected_index = Some(idx - 1);
-                        self.ensure_selected_visible();
+                        self.select_index(Some(idx - 1));
                     }
                 } else if !self.entries.is_empty() {
                     // No selection, select last entry
-                    self.selected_index = Some(self.entries.len() - 1);
-                    self.ensure_selected_visible();
+                    self.select_index(Some(self.entries.len() - 1));
                 }
             }
         }
@@ -533,42 +574,42 @@ impl FileOpenState {
                 }
             }
             FileOpenSection::Files => {
-                if let Some(idx) = self.selected_index {
+                if let Some(idx) = self.selected_index() {
                     if idx + 1 < self.entries.len() {
-                        self.selected_index = Some(idx + 1);
-                        self.ensure_selected_visible();
+                        self.select_index(Some(idx + 1));
                     }
                 } else if !self.entries.is_empty() {
                     // No selection, select first entry
-                    self.selected_index = Some(0);
-                    self.ensure_selected_visible();
+                    self.select_index(Some(0));
                 }
             }
         }
     }
 
     /// Page up
-    pub fn page_up(&mut self, page_size: usize) {
-        if self.active_section == FileOpenSection::Files {
-            if let Some(idx) = self.selected_index {
-                self.selected_index = Some(idx.saturating_sub(page_size));
-                self.ensure_selected_visible();
-            } else if !self.entries.is_empty() {
-                self.selected_index = Some(0);
-            }
-        }
+    pub fn page_up(&mut self) {
+        self.page(-1);
     }
 
     /// Page down
-    pub fn page_down(&mut self, page_size: usize) {
-        if self.active_section == FileOpenSection::Files {
-            if let Some(idx) = self.selected_index {
-                self.selected_index =
-                    Some((idx + page_size).min(self.entries.len().saturating_sub(1)));
-                self.ensure_selected_visible();
-            } else if !self.entries.is_empty() {
-                self.selected_index = Some(self.entries.len().saturating_sub(1));
-            }
+    pub fn page_down(&mut self) {
+        self.page(1);
+    }
+
+    /// Move the selection `pages` pages, by the window the list was last
+    /// laid out with. With nothing selected, a page up lands on the first
+    /// entry and a page down on the last.
+    fn page(&mut self, pages: i32) {
+        if self.active_section != FileOpenSection::Files || self.entries.is_empty() {
+            return;
+        }
+        let to = match self.selected_index() {
+            Some(idx) => self.pager.target(idx, pages, self.entries.len()),
+            None if pages < 0 => Some(0),
+            None => Some(self.entries.len() - 1),
+        };
+        if let Some(to) = to {
+            self.select_index(Some(to));
         }
     }
 
@@ -578,8 +619,7 @@ impl FileOpenState {
             FileOpenSection::Navigation => self.selected_shortcut = 0,
             FileOpenSection::Files => {
                 if !self.entries.is_empty() {
-                    self.selected_index = Some(0);
-                    self.scroll_offset = 0;
+                    self.select_index(Some(0));
                 }
             }
         }
@@ -593,70 +633,16 @@ impl FileOpenState {
             }
             FileOpenSection::Files => {
                 if !self.entries.is_empty() {
-                    self.selected_index = Some(self.entries.len() - 1);
-                    self.ensure_selected_visible();
+                    self.select_index(Some(self.entries.len() - 1));
                 }
             }
         }
     }
 
-    /// Ensure selected item is visible in viewport, using the most recent
-    /// viewport height reported by the renderer. Called from input handlers,
-    /// where the actual viewport height isn't known directly.
-    fn ensure_selected_visible(&mut self) {
-        self.clamp_scroll_to_selection();
-    }
-
-    /// Reconcile `scroll_offset` with the actual viewport height. The
-    /// renderer calls this once per frame; selection actions call
-    /// `ensure_selected_visible` which uses the cached value.
-    pub fn update_scroll_for_visible_rows(&mut self, visible_rows: usize) {
-        self.last_visible_rows = visible_rows;
-        self.clamp_scroll_to_selection();
-    }
-
-    /// Clamp `scroll_offset` so the selection stays within the viewport
-    /// `[scroll_offset, scroll_offset + last_visible_rows)`, and so that we
-    /// never scroll past the last entry.
-    fn clamp_scroll_to_selection(&mut self) {
-        let visible_rows = self.last_visible_rows;
-        if visible_rows == 0 {
-            return;
-        }
-        if let Some(idx) = self.selected_index {
-            if idx < self.scroll_offset {
-                self.scroll_offset = idx;
-            } else if idx >= self.scroll_offset + visible_rows {
-                self.scroll_offset = idx + 1 - visible_rows;
-            }
-        }
-        let max_offset = self.entries.len().saturating_sub(visible_rows);
-        if self.scroll_offset > max_offset {
-            self.scroll_offset = max_offset;
-        }
-    }
-
-    /// Switch between navigation and files sections
-    pub fn switch_section(&mut self) {
-        self.active_section = match self.active_section {
-            FileOpenSection::Navigation => FileOpenSection::Files,
-            FileOpenSection::Files => FileOpenSection::Navigation,
-        };
-    }
-
     /// Get the currently selected entry (file or directory)
     pub fn selected_entry(&self) -> Option<&FileOpenEntry> {
         if self.active_section == FileOpenSection::Files {
-            self.selected_index.and_then(|idx| self.entries.get(idx))
-        } else {
-            None
-        }
-    }
-
-    /// Get the currently selected shortcut
-    pub fn selected_shortcut_entry(&self) -> Option<&NavigationShortcut> {
-        if self.active_section == FileOpenSection::Navigation {
-            self.shortcuts.get(self.selected_shortcut)
+            self.selected_index().and_then(|idx| self.entries.get(idx))
         } else {
             None
         }
@@ -670,9 +656,9 @@ impl FileOpenState {
                 .get(self.selected_shortcut)
                 .map(|s| s.path.clone()),
             FileOpenSection::Files => self
-                .selected_index
+                .selected_index()
                 .and_then(|idx| self.entries.get(idx))
-                .map(|e| e.fs_entry.path.clone()),
+                .map(|e| e.fs_entry.path.clone().into_path_buf()),
         }
     }
 
@@ -681,7 +667,7 @@ impl FileOpenState {
         match self.active_section {
             FileOpenSection::Navigation => true, // Shortcuts are always directories
             FileOpenSection::Files => self
-                .selected_index
+                .selected_index()
                 .and_then(|idx| self.entries.get(idx))
                 .map(|e| e.fs_entry.is_dir())
                 .unwrap_or(false),
@@ -689,15 +675,9 @@ impl FileOpenState {
     }
 
     /// Count matching entries
+    #[cfg(test)]
     pub fn matching_count(&self) -> usize {
         self.entries.iter().filter(|e| e.matches_filter).count()
-    }
-
-    /// Get visible entries (for rendering)
-    pub fn visible_entries(&self, max_rows: usize) -> &[FileOpenEntry] {
-        let start = self.scroll_offset;
-        let end = (start + max_rows).min(self.entries.len());
-        &self.entries[start..end]
     }
 }
 
@@ -757,7 +737,7 @@ mod tests {
 
     fn make_entry(name: &str, is_dir: bool) -> DirEntry {
         DirEntry::new(
-            PathBuf::from(format!("/test/{}", name)),
+            HostPathBuf::from_path_buf(PathBuf::from(format!("/test/{}", name))),
             name.to_string(),
             if is_dir {
                 EntryType::Directory
@@ -975,106 +955,48 @@ mod tests {
         ]);
 
         // Initially no selection
-        assert_eq!(state.selected_index, None);
+        assert_eq!(state.selected_index(), None);
 
         // First down selects first entry
         state.select_next();
-        assert_eq!(state.selected_index, Some(0));
+        assert_eq!(state.selected_index(), Some(0));
 
         state.select_next();
-        assert_eq!(state.selected_index, Some(1));
+        assert_eq!(state.selected_index(), Some(1));
 
         state.select_next();
-        assert_eq!(state.selected_index, Some(2));
+        assert_eq!(state.selected_index(), Some(2));
 
         state.select_next(); // Should stay at last
-        assert_eq!(state.selected_index, Some(2));
+        assert_eq!(state.selected_index(), Some(2));
 
         state.select_prev();
-        assert_eq!(state.selected_index, Some(1));
+        assert_eq!(state.selected_index(), Some(1));
 
         state.select_first();
-        assert_eq!(state.selected_index, Some(0));
+        assert_eq!(state.selected_index(), Some(0));
 
         state.select_last();
-        assert_eq!(state.selected_index, Some(2));
+        assert_eq!(state.selected_index(), Some(2));
     }
 
-    /// Regression test for #245: when the terminal is small enough that the
-    /// file list shows fewer than the previous hardcoded 15 rows, moving the
-    /// selection past the bottom of the viewport must scroll the list so the
-    /// selected entry stays visible.
+    /// Re-sorting moves the rows under the selection; the selection moves
+    /// with its file rather than staying on the row number.
     #[test]
-    fn test_scroll_follows_selection_in_small_viewport() {
+    fn a_resort_keeps_the_selected_file_selected() {
         let mut state = FileOpenState::new(PathBuf::from("/"), false, test_filesystem());
-        state.set_entries(
-            (0..10)
-                .map(|i| make_entry(&format!("f{i}"), false))
-                .collect(),
-        );
+        state.set_entries(vec![
+            make_entry("a.txt", false),
+            make_entry("b.txt", false),
+            make_entry("c.txt", false),
+        ]);
+        state.select_index(Some(0));
+        assert_eq!(state.selected_entry().unwrap().fs_entry.name, "a.txt");
 
-        // Renderer reports a 3-row viewport (very small terminal).
-        state.update_scroll_for_visible_rows(3);
-        assert_eq!(state.scroll_offset, 0);
-
-        // Walk down to index 4. Selection must remain inside [scroll_offset, scroll_offset + 3).
-        for _ in 0..5 {
-            state.select_next();
-        }
-        assert_eq!(state.selected_index, Some(4));
-        let idx = state.selected_index.unwrap();
-        assert!(
-            idx >= state.scroll_offset && idx < state.scroll_offset + 3,
-            "selected idx {idx} not in viewport [{}, {})",
-            state.scroll_offset,
-            state.scroll_offset + 3
-        );
-
-        // Jumping to the last entry must also keep it on screen.
-        state.select_last();
-        let idx = state.selected_index.unwrap();
-        assert_eq!(idx, 9);
-        assert!(
-            idx >= state.scroll_offset && idx < state.scroll_offset + 3,
-            "select_last left idx {idx} outside viewport [{}, {})",
-            state.scroll_offset,
-            state.scroll_offset + 3
-        );
-
-        // Moving back up shrinks the offset so we don't leave a blank tail.
-        state.select_first();
-        assert_eq!(state.selected_index, Some(0));
-        assert_eq!(state.scroll_offset, 0);
-    }
-
-    /// When the viewport shrinks (terminal resize), the next renderer pass
-    /// must re-clamp `scroll_offset` so the selection stays visible.
-    #[test]
-    fn test_scroll_reclamped_on_viewport_shrink() {
-        let mut state = FileOpenState::new(PathBuf::from("/"), false, test_filesystem());
-        state.set_entries(
-            (0..20)
-                .map(|i| make_entry(&format!("f{i}"), false))
-                .collect(),
-        );
-
-        state.update_scroll_for_visible_rows(15);
-        for _ in 0..15 {
-            state.select_next();
-        }
-        // Selection at idx 14 fits in a 15-row viewport with offset 0.
-        assert_eq!(state.selected_index, Some(14));
-        assert_eq!(state.scroll_offset, 0);
-
-        // Terminal shrinks to 4 rows; the next render reports the new height.
-        state.update_scroll_for_visible_rows(4);
-        let idx = state.selected_index.unwrap();
-        assert!(
-            idx >= state.scroll_offset && idx < state.scroll_offset + 4,
-            "selected idx {idx} not in shrunk viewport [{}, {})",
-            state.scroll_offset,
-            state.scroll_offset + 4
-        );
+        // Name again: descending, so a.txt moves to the bottom.
+        state.set_sort_mode(SortMode::Name);
+        assert_eq!(state.selected_index(), Some(2));
+        assert_eq!(state.selected_entry().unwrap().fs_entry.name, "a.txt");
     }
 
     #[test]

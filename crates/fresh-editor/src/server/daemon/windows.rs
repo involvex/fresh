@@ -27,23 +27,14 @@ pub fn daemonize() -> io::Result<()> {
 ///
 /// This is used when the client starts and no server is running.
 /// The server inherits the current working directory.
-/// `ssh_url`, when set, is forwarded as `--ssh-url <URL>` so the
-/// spawned daemon boots into an SSH authority instead of the default
-/// `Authority::local()` (see `EditorServerConfig.startup_authority`).
+/// Everything the daemon cannot rediscover for itself travels in
+/// [`DaemonSpawn`], which documents each flag and builds the argv.
 /// Returns the PID of the spawned server.
-pub fn spawn_server_detached(session_name: Option<&str>, ssh_url: Option<&str>) -> io::Result<u32> {
+pub fn spawn_server_detached(spawn: &super::DaemonSpawn<'_>) -> io::Result<u32> {
     let exe = std::env::current_exe()?;
 
     let mut cmd = std::process::Command::new(&exe);
-    cmd.arg("--server");
-
-    if let Some(name) = session_name {
-        cmd.arg("--session-name").arg(name);
-    }
-
-    if let Some(url) = ssh_url {
-        cmd.arg("--ssh-url").arg(url);
-    }
+    cmd.args(super::server_args(spawn));
 
     cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     cmd.stdin(std::process::Stdio::null());
@@ -57,7 +48,10 @@ pub fn spawn_server_detached(session_name: Option<&str>, ssh_url: Option<&str>) 
         .join("logs");
     std::fs::create_dir_all(&log_dir)?;
 
-    let log_file = log_dir.join(format!("server-{}.log", session_name.unwrap_or("default")));
+    let log_file = log_dir.join(format!(
+        "server-{}.log",
+        spawn.session_name.unwrap_or("default")
+    ));
     let stderr_file = std::fs::File::create(&log_file)?;
     cmd.stderr(std::process::Stdio::from(stderr_file));
 
@@ -65,6 +59,11 @@ pub fn spawn_server_detached(session_name: Option<&str>, ssh_url: Option<&str>) 
 
     let child = cmd.spawn()?;
     Ok(child.id())
+}
+
+/// Whether a daemon this process spawned has exited.
+pub fn spawned_daemon_exited(pid: u32) -> bool {
+    !is_process_running(pid)
 }
 
 /// Check if a process with the given PID is still running

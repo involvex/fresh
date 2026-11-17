@@ -41,6 +41,7 @@ fn launch_harness(
         key: "F7".to_string(),
         modifiers: vec![],
         keys: vec![],
+        chord: String::new(),
         action: "next_window".to_string(),
         args: std::collections::HashMap::new(),
         when: None,
@@ -90,7 +91,7 @@ fn switched_to_window_paints_explorer_chrome_on_first_frame() {
     {
         let mut h = launch_harness(&beta, &dir_context);
         h.editor_mut()
-            .restore_active_window_on_launch(false)
+            .restore_active_window_on_launch(fresh::app::workspace::ExplorerOnEntry::Enter)
             .unwrap();
         h.wait_until(|h| h.screen_to_string().contains("zz-tree-only-dir"))
             .unwrap();
@@ -124,7 +125,7 @@ fn switched_to_window_paints_explorer_chrome_on_first_frame() {
     // an Orchestrator-dock card or "Next Window" target is in.
     let mut h = launch_harness(&alpha, &dir_context);
     h.editor_mut()
-        .restore_active_window_on_launch(false)
+        .restore_active_window_on_launch(fresh::app::workspace::ExplorerOnEntry::Enter)
         .unwrap();
     h.wait_until(|h| h.screen_to_string().contains("alpha.txt"))
         .unwrap();

@@ -394,6 +394,13 @@ pub struct HardwareCursorRect {
 }
 
 impl RenderSnapshotExpect {
+    /// True when no field is set, so [`Self::check_against`] passes for
+    /// any snapshot. Compared through `Debug` so a field added later
+    /// counts without this needing an edit.
+    pub fn asserts_nothing(&self) -> bool {
+        format!("{self:?}") == format!("{:?}", Self::default())
+    }
+
     /// Returns `Some((field, expected, actual))` on the first
     /// mismatch.
     pub fn check_against(&self, actual: &RenderSnapshot) -> Option<(&'static str, String, String)> {
@@ -474,7 +481,7 @@ impl RenderSnapshotExpect {
         }
         if let Some((byte, delta)) = self.viewport_top_within_delta_of {
             let top = actual.viewport.top_byte;
-            let gap = if top > byte { top - byte } else { byte - top };
+            let gap = top.abs_diff(byte);
             if gap > delta {
                 return Some((
                     "viewport_top_within_delta_of",

@@ -7,9 +7,10 @@
 //! - Managing per-split view states (cursors, viewport)
 //! - Split size adjustment and maximize
 
-use rust_i18n::t;
+use fresh_editor_core::model::host_path::AsHostPath;
+use fresh_i18n::t;
 
-use crate::model::event::{BufferId, ContainerId, LeafId, SplitDirection, SplitId};
+use crate::model::event::{BufferId, LeafId, SplitId};
 use crate::view::folding::CollapsedFoldLineRange;
 use crate::view::split::{SplitViewState, TabTarget};
 
@@ -61,25 +62,15 @@ impl Editor {
         self.active_window_mut().promote_current_preview();
 
         let current_buffer_id = self.active_buffer();
-        let active_split = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split();
+        let active_split = self.active_window().split_manager().active_split();
 
         // Copy keyed states from source split so the new split inherits per-buffer state
         let source_keyed_states = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
+            .active_window()
+            .split_view_states()
             .get(&active_split)
             .map(|vs| {
-                vs.keyed_states
-                    .iter()
+                vs.buffer_states()
                     .filter(|(&buf_id, _)| buf_id != current_buffer_id)
                     .map(|(&buf_id, buf_state)| {
                         let folds = self
@@ -100,12 +91,10 @@ impl Editor {
                     )>>()
             });
 
-        let split_outcome = self.split_manager_mut().split_active_positioned(
-            direction,
-            current_buffer_id,
-            ratio,
-            before,
-        );
+        let split_outcome = self
+            .active_window_mut()
+            .split_manager_mut()
+            .split_active_positioned(direction, current_buffer_id, ratio, before);
         match split_outcome {
             Ok(new_split_id) => {
                 let mut view_state = SplitViewState::with_buffer(
@@ -113,19 +102,21 @@ impl Editor {
                     self.terminal_height,
                     current_buffer_id,
                 );
-                view_state.apply_config_defaults(crate::view::split::ViewConfigDefaults {
-                    line_numbers: self.config.editor.line_numbers,
-                    highlight_current_line: self.config.editor.highlight_current_line,
-                    line_wrap: self
-                        .active_window()
-                        .resolve_line_wrap_for_buffer(current_buffer_id),
-                    wrap_indent: self.config.editor.wrap_indent,
-                    wrap_column: self
-                        .active_window()
-                        .resolve_wrap_column_for_buffer(current_buffer_id),
-                    rulers: self.config.editor.rulers.clone(),
-                    scroll_offset: self.config.editor.scroll_offset,
-                });
+                view_state.buffer_tab_state_mut().apply_config_defaults(
+                    crate::view::split::ViewConfigDefaults {
+                        line_numbers: self.config.editor.line_numbers,
+                        highlight_current_line: self.config.editor.highlight_current_line,
+                        line_wrap: self
+                            .active_window()
+                            .resolve_line_wrap_for_buffer(current_buffer_id),
+                        wrap_indent: self.config.editor.wrap_indent,
+                        wrap_column: self
+                            .active_window()
+                            .resolve_wrap_column_for_buffer(current_buffer_id),
+                        rulers: self.config.editor.rulers.clone(),
+                        scroll_offset: self.config.editor.scroll_offset,
+                    },
+                );
 
                 // Copy keyed states from source split for OTHER buffers (not the active one).
                 // The active buffer gets a fresh cursor in the new split.
@@ -162,14 +153,12 @@ impl Editor {
                                 );
                             }
                         }
-                        view_state.keyed_states.insert(buf_id, buf_state);
+                        view_state.insert_buffer_state(buf_id, buf_state);
                     }
                 }
 
-                self.windows
-                    .get_mut(&self.active_window)
-                    .and_then(|w| w.split_view_states_mut())
-                    .expect("active window must have a populated split layout")
+                self.active_window_mut()
+                    .split_view_states_mut()
                     .insert(new_split_id, view_state);
                 let msg = match direction {
                     crate::model::event::SplitDirection::Horizontal => t!("split.horizontal"),
@@ -199,38 +188,25 @@ impl Editor {
         // migrated to an unrelated pane.
         self.active_window_mut().promote_current_preview();
 
-        let closing_split = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split();
+        let closing_split = self.active_window().split_manager().active_split();
 
         // Get the tabs from the split we're closing before we close it
         let closing_split_tabs = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
+            .active_window()
+            .split_view_states()
             .get(&closing_split)
             .map(|vs| vs.open_buffers.clone())
             .unwrap_or_default();
 
         match self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_manager_mut())
-            .expect("active window must have a populated split layout")
+            .active_window_mut()
+            .split_manager_mut()
             .close_split(closing_split)
         {
             Ok(_) => {
                 // Clean up the view state for the closed split
-                self.windows
-                    .get_mut(&self.active_window)
-                    .and_then(|w| w.split_view_states_mut())
-                    .expect("active window must have a populated split layout")
+                self.active_window_mut()
+                    .split_view_states_mut()
                     .remove(&closing_split);
 
                 // Drop the closed split from every terminal's scrollback set so
@@ -239,20 +215,12 @@ impl Editor {
                     .forget_split_terminal_modes(closing_split);
 
                 // Get the new active split after closing
-                let new_active_split = self
-                    .windows
-                    .get(&self.active_window)
-                    .and_then(|w| w.buffers.splits())
-                    .map(|(mgr, _)| mgr)
-                    .expect("active window must have a populated split layout")
-                    .active_split();
+                let new_active_split = self.active_window().split_manager().active_split();
 
                 // Transfer tabs from closed split to the new active split
                 if let Some(view_state) = self
-                    .windows
-                    .get_mut(&self.active_window)
-                    .and_then(|w| w.split_view_states_mut())
-                    .expect("active window must have a populated split layout")
+                    .active_window_mut()
+                    .split_view_states_mut()
                     .get_mut(&new_active_split)
                 {
                     for target in closing_split_tabs {
@@ -310,17 +278,9 @@ impl Editor {
             .unwrap_or(false);
 
         if next {
-            self.windows
-                .get_mut(&self.active_window)
-                .and_then(|w| w.split_manager_mut())
-                .expect("active window must have a populated split layout")
-                .next_split();
+            self.active_window_mut().split_manager_mut().next_split();
         } else {
-            self.windows
-                .get_mut(&self.active_window)
-                .and_then(|w| w.split_manager_mut())
-                .expect("active window must have a populated split layout")
-                .prev_split();
+            self.active_window_mut().split_manager_mut().prev_split();
         }
 
         if was_maximized {
@@ -328,57 +288,42 @@ impl Editor {
         }
 
         // Ensure the active tab is visible in the newly active split
-        let split_id = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split();
+        let split_id = self.active_window().split_manager().active_split();
         // Moving focus to a different split commits the preview — walking
         // away is commitment. Matches the rule applied in `focus_split`.
         self.active_window_mut()
             .promote_preview_if_not_in_split(split_id);
-        let buffer = self.active_buffer();
-        let tabs_width = self.active_window().split_tabs_width(split_id);
-        self.active_window_mut()
-            .ensure_active_tab_visible(split_id, buffer, tabs_width);
-
-        let buffer_id = self.active_buffer();
+        self.active_window().reveal_active_tab(split_id);
 
         // Bring terminal mode in line with the newly focused split: a
         // terminal resumes the live/scrollback mode it remembers, a
         // non-terminal clears terminal mode. Single restore authority.
         self.sync_terminal_mode_to_active_buffer();
 
-        // Emit buffer_activated hook for plugins
-        self.plugin_manager.read().unwrap().run_hook(
-            "buffer_activated",
-            crate::services::plugins::hooks::HookArgs::BufferActivated { buffer_id },
-        );
+        // Refresh the snapshot BEFORE the hook, for the reason
+        // `set_active_buffer` gives: the handler has to see the split that is
+        // active *now*. Focus moving between two splits on the SAME buffer
+        // never reaches `set_active_buffer` (it early-returns when the buffer
+        // does not change), so without this the plugin mirror still answers
+        // with the split focus just left. `markdown_compose` reads
+        // `getBufferInfo().view_mode` here to decide whether to restore
+        // compose, and a mirror one split behind told it "compose" as focus
+        // landed on a *source* pane — which it then composed: gutter hidden,
+        // wrap forced on, view mode flipped. Whether that happened at all came
+        // down to which thread won the race.
+        self.announce_focus();
     }
 
     /// Adjust the size of the active split
     pub fn adjust_split_size(&mut self, delta: f32) {
-        let active_split = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split();
+        let active_split = self.active_window().split_manager().active_split();
         if let Some(container) = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
+            .active_window()
+            .split_manager()
             .parent_container_of(active_split)
         {
-            self.windows
-                .get_mut(&self.active_window)
-                .and_then(|w| w.split_manager_mut())
-                .expect("active window must have a populated split layout")
+            self.active_window_mut()
+                .split_manager_mut()
                 .adjust_ratio(container, delta);
 
             let percent = (delta * 100.0) as i32;
@@ -391,10 +336,8 @@ impl Editor {
     /// Toggle maximize state for the active split
     pub fn toggle_maximize_split(&mut self) {
         match self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_manager_mut())
-            .expect("active window must have a populated split layout")
+            .active_window_mut()
+            .split_manager_mut()
             .toggle_maximize()
         {
             Ok(maximized) => {
@@ -410,32 +353,30 @@ impl Editor {
         }
     }
 
-    /// Get cached separator areas for testing
-    /// Returns (split_id, direction, x, y, length) tuples
-    pub fn get_separator_areas(&self) -> &[(ContainerId, SplitDirection, u16, u16, u16)] {
-        &self.active_layout().separator_areas
+    /// Where the dividers are, read off the tree that placed them: the
+    /// divider nodes' own rectangles (`view::shell::splits::separator_rects`),
+    /// as `(container, direction, x, y, length)`. The e2e drag tests assert
+    /// against this, so they are asserting against the tree.
+    pub fn get_separator_areas(
+        &self,
+    ) -> Vec<(
+        crate::model::event::ContainerId,
+        crate::model::event::SplitDirection,
+        u16,
+        u16,
+        u16,
+    )> {
+        self.separator_rects()
     }
 
-    /// Get cached tab layouts for testing
-    pub fn get_tab_layouts(
-        &self,
-    ) -> &std::collections::HashMap<LeafId, crate::view::ui::tabs::TabLayout> {
-        &self.active_layout().tab_layouts
-    }
-
-    /// Get cached split content areas for testing
-    /// Returns (split_id, buffer_id, content_rect, scrollbar_rect, thumb_start, thumb_end) tuples
-    pub fn get_split_areas(
-        &self,
-    ) -> &[(
-        LeafId,
-        BufferId,
-        ratatui::layout::Rect,
-        ratatui::layout::Rect,
-        usize,
-        usize,
-    )] {
-        &self.active_layout().split_areas
+    /// The panes the frame places, with the buffer each shows, in paint
+    /// order — for tests that address a pane.
+    ///
+    /// The rectangles this used to carry are the tree's
+    /// (`pane_content_rect`, `pane_vscroll_rect`), and so is the thumb now
+    /// (`bar_thumb`); what is left is which panes there are.
+    pub fn get_split_areas(&self) -> Vec<(LeafId, BufferId)> {
+        self.window_buffer_panes()
     }
 
     /// Get the ratio of a specific split (for testing).
@@ -443,56 +384,10 @@ impl Editor {
     /// Looks in the main split tree first, then falls back to splits
     /// that live inside stashed Grouped subtrees (buffer-group panels).
     pub fn get_split_ratio(&self, split_id: SplitId) -> Option<f32> {
-        self.windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
+        self.active_window()
+            .split_manager()
             .get_ratio(split_id)
             .or_else(|| self.grouped_split_ratio(crate::model::event::ContainerId(split_id)))
-    }
-
-    /// Get the active split ID (for testing)
-    pub fn get_active_split(&self) -> LeafId {
-        self.windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split()
-    }
-
-    /// Get the buffer ID for a split (for testing)
-    pub fn get_split_buffer(&self, split_id: SplitId) -> Option<BufferId> {
-        self.windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .get_buffer_id(split_id)
-    }
-
-    /// Get the open buffers (tabs) in a split (for testing)
-    pub fn get_split_tabs(&self, split_id: LeafId) -> Vec<BufferId> {
-        self.windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
-            .get(&split_id)
-            .map(|vs| vs.buffer_tab_ids_vec())
-            .unwrap_or_default()
-    }
-
-    /// Get the number of splits (for testing)
-    pub fn get_split_count(&self) -> usize {
-        self.windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .root()
-            .count_leaves()
     }
 
     /// Compute the drop zone for a tab drag at a given position (for testing)
@@ -605,7 +500,7 @@ impl Editor {
                     TabTarget::Group(_) => true,
                 };
                 if needs_switch {
-                    vs_mut.switch_buffer(next_buf);
+                    vs_mut.set_buffer_tab(next_buf);
                 }
             }
         }
@@ -639,22 +534,15 @@ impl Editor {
         // in its split (so a window resize never reached it). Refresh visible
         // terminal sizes so its PTY child sees the pane it now occupies —
         // mirrors `set_active_buffer` (issue #1795).
-        self.active_window_mut().resize_visible_terminals();
+        self.resize_visible_terminals();
 
         // Keep the newly active tab scrolled into view within its split,
         // matching `switch_split` and `set_active_buffer`.
-        let tabs_width = self.active_window().split_tabs_width(next_split);
-        self.active_window_mut()
-            .ensure_active_tab_visible(next_split, next_buf, tabs_width);
+        self.active_window().reveal_active_tab(next_split);
 
-        // Emit the buffer_activated hook for plugins, matching every other
-        // focus-changing command.
-        self.plugin_manager.read().unwrap().run_hook(
-            "buffer_activated",
-            crate::services::plugins::hooks::HookArgs::BufferActivated {
-                buffer_id: next_buf,
-            },
-        );
+        // Snapshot first, then the hook — see the note at the other
+        // split-focus site above.
+        self.announce_focus();
     }
 }
 
@@ -685,7 +573,7 @@ impl Editor {
         // would be a worse answer than the pane the caller asked for.
         let ratio = options.ratio.unwrap_or(0.5).clamp(0.05, 0.95);
 
-        let source_split_id = self.active_split_id();
+        let source_split_id = self.active_window().split_manager().active_split();
 
         let new_split_id = match self.split_pane_impl(direction, before, ratio) {
             Ok(id) => id,
@@ -710,7 +598,9 @@ impl Editor {
         }
 
         if options.keep_focus.unwrap_or(false) {
-            self.split_manager_mut().set_active_split(source_split_id);
+            self.active_window_mut()
+                .split_manager_mut()
+                .set_active_split(source_split_id);
         }
 
         // Geometry has to be computed after the layout settles, which
@@ -721,7 +611,7 @@ impl Editor {
             .get(&self.active_window)
             .and_then(|w| w.buffers.splits())
             .and_then(|(_, vs)| vs.get(&new_split_id))
-            .map(|vs| vs.active_buffer)
+            .map(|vs| vs.buffer_tab())
             .unwrap_or(self.active_buffer());
 
         // Refresh before answering: the caller awaiting this response is
@@ -741,46 +631,40 @@ impl Editor {
         });
     }
 
-    /// The active pane's id.
-    pub(crate) fn active_split_id(&self) -> crate::model::event::LeafId {
-        self.windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr.active_split())
-            .expect("active window must have a populated split layout")
-    }
-
-    /// Where a pane currently sits on screen, in editor-area cells.
-    /// `None` once the leaf is gone (closed, or collapsed by its last tab).
+    /// Where a pane currently sits on screen, as the last layout placed it.
+    /// `None` once the leaf is gone (closed, or collapsed by its last tab) or
+    /// hidden behind a maximized sibling.
+    ///
+    /// Read off the window's retained pane rects, which the layout funnel
+    /// refreshes before any caller of this runs (`split_pane_impl` ends in
+    /// `relayout`).
     pub(crate) fn split_rect(
         &self,
         leaf: crate::model::event::LeafId,
     ) -> Option<ratatui::layout::Rect> {
-        let area = self
-            .windows
-            .get(&self.active_window)
-            .map(|w| w.editor_content_area())?;
         self.windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .and_then(|(mgr, _)| {
-                mgr.get_visible_buffers(area)
-                    .into_iter()
-                    .find(|(id, _, _)| *id == leaf)
-                    .map(|(_, _, rect)| rect)
-            })
+            .get(&self.active_window)?
+            .visible_panes()
+            .into_iter()
+            .find(|(id, _, _)| *id == leaf)
+            .map(|(_, _, rect)| rect)
     }
 
     /// Resolve a caller-supplied path against the window's root, so a script
     /// can say `"README.md"` and mean the obvious thing.
+    ///
+    /// Asked of the window's own filesystem: "absolute" and "join" both mean
+    /// something different on a remote host than on the client, so a script
+    /// saying `"README.md"` against an SSH workspace used to get the client's
+    /// separator pushed into the middle of a POSIX path.
     #[cfg(feature = "plugins")]
     fn resolve_workspace_path(&self, path: &str) -> std::path::PathBuf {
-        let p = std::path::Path::new(path);
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            self.active_window().root.join(p)
-        }
+        let window = self.active_window();
+        window
+            .authority()
+            .filesystem
+            .resolve_typed_path(window.root.as_host(), path)
+            .into_path_buf()
     }
 }
 
@@ -842,10 +726,8 @@ impl Editor {
 
         for source in sources {
             if let Some(vs) = self
-                .windows
-                .get_mut(&self.active_window)
-                .and_then(|w| w.split_view_states_mut())
-                .expect("active window must have a populated split layout")
+                .active_window_mut()
+                .split_view_states_mut()
                 .get_mut(&source)
             {
                 vs.remove_buffer(buffer_id);
@@ -926,7 +808,7 @@ impl Editor {
                 underline: true,
                 ..Default::default()
             };
-            self.handle_add_overlay(buffer_id, namespace.clone(), range, options);
+            self.handle_add_overlay(buffer_id, namespace.clone(), range, options, false);
         }
     }
 
@@ -995,13 +877,15 @@ impl Editor {
             .and_then(|label| self.split_by_label(label))
             .filter(|leaf| *leaf != source_split);
 
+        // The window's filesystem resolves it, as in
+        // `resolve_workspace_path` above.
         let path = {
-            let p = std::path::Path::new(&target.path);
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                self.active_window().root.join(p)
-            }
+            let window = self.active_window();
+            window
+                .authority()
+                .filesystem
+                .resolve_typed_path(window.root.as_host(), &target.path)
+                .into_path_buf()
         };
         let line = target.target;
 
@@ -1044,14 +928,16 @@ impl Editor {
                 .get(&self.active_window)
                 .and_then(|w| w.buffers.splits())
                 .and_then(|(_, vs)| vs.get(&leaf))
-                .map(|vs| vs.active_buffer);
+                .and_then(|vs| vs.shown_buffer());
             if let Some(buffer_id) = opened {
                 self.handle_move_buffer_to_split(buffer_id, leaf.0);
             }
         }
 
         // Focus follows the jump — the user asked to go there.
-        self.split_manager_mut().set_active_split(leaf);
+        self.active_window_mut()
+            .split_manager_mut()
+            .set_active_split(leaf);
     }
 
     /// The leaf a label names, when it still exists.
@@ -1061,11 +947,14 @@ impl Editor {
             .windows
             .get(&self.active_window)
             .and_then(|w| w.buffers.splits())?;
+        // Which leaves show, not where: a labeled leaf hidden behind a
+        // maximized sibling is not a destination.
+        let visible = mgr.visible_leaves();
         mgr.labels()
             .iter()
             .find(|(_, l)| l.as_str() == label)
             .map(|(id, _)| crate::model::event::LeafId(*id))
-            .filter(|leaf| self.split_rect(*leaf).is_some())
+            .filter(|leaf| visible.iter().any(|(id, _)| id == leaf))
     }
 
     /// The pane to open a target in when no label named one: the nearest
@@ -1078,14 +967,13 @@ impl Editor {
     /// the destination is where a reader would look for it and does not depend
     /// on where focus happened to be.
     #[cfg(feature = "plugins")]
-    fn pane_beside(
+    pub(super) fn pane_beside(
         &self,
         this_one: crate::model::event::LeafId,
     ) -> Option<crate::model::event::LeafId> {
         let window = self.windows.get(&self.active_window)?;
-        let area = window.editor_content_area();
-        let (mgr, _) = window.buffers.splits()?;
-        let panes = mgr.get_visible_buffers(area);
+        // The panes as the last layout placed them, in the tree's order.
+        let panes = window.visible_panes();
         let here = panes.iter().find(|(id, _, _)| *id == this_one)?.2;
 
         let usable: Vec<_> = panes
@@ -1103,5 +991,30 @@ impl Editor {
                     .max_by_key(|(_, _, rect)| (rect.x as u32, rect.y as u32))
             })
             .map(|(id, _, _)| *id)
+    }
+}
+
+impl crate::app::window::Window {
+    /// Get the active split ID (for testing)
+    pub fn get_active_split(&self) -> LeafId {
+        self.split_manager().active_split()
+    }
+
+    /// Get the buffer ID for a split (for testing)
+    pub fn get_split_buffer(&self, split_id: SplitId) -> Option<BufferId> {
+        self.split_manager().get_buffer_id(split_id)
+    }
+
+    /// Get the open buffers (tabs) in a split (for testing)
+    pub fn get_split_tabs(&self, split_id: LeafId) -> Vec<BufferId> {
+        self.split_view_states()
+            .get(&split_id)
+            .map(|vs| vs.buffer_tab_ids_vec())
+            .unwrap_or_default()
+    }
+
+    /// Get the number of splits (for testing)
+    pub fn get_split_count(&self) -> usize {
+        self.split_manager().root().count_leaves()
     }
 }

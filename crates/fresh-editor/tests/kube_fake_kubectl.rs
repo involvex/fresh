@@ -11,8 +11,9 @@
 //! The "pod workspace" is a real local temp dir, so the agent's absolute paths
 //! resolve without any chroot.
 
+use fresh_editor_core::model::host_path::AsHostPath;
 use std::path::PathBuf;
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 
 use fresh::model::filesystem::FileSystem;
 use fresh::services::authority::{connect_kube_authority, RemoteAgentSpec};
@@ -20,23 +21,19 @@ use fresh::services::env_provider::EnvProvider;
 use fresh::services::remote::{KubeConnection, KubeTarget, RemoteFileSystem};
 use fresh::services::workspace_trust::WorkspaceTrust;
 
-static PATH_INIT: Once = Once::new();
-
-/// Prepend the fake-kubectl fixtures dir to PATH exactly once, so
-/// `Command::new("kubectl")` resolves to the shim. `Once` keeps the
-/// process-global env mutation from racing across parallel tests in this
-/// binary.
-fn ensure_fake_kubectl_on_path() {
-    PATH_INIT.call_once(|| {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-kube");
-        assert!(
-            dir.join("kubectl").exists(),
-            "fake kubectl shim missing at {}",
-            dir.display()
-        );
-        let old = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{old}", dir.display()));
-    });
+/// Put the fake-kubectl fixtures dir in front of PATH until the returned
+/// pin drops, so `Command::new("kubectl")` resolves to the shim. PATH is
+/// process-global and every test file runs in the one `all_tests` binary,
+/// so this goes through the same pin as every other shim instead of a
+/// permanent prepend.
+fn fake_kubectl_on_path() -> crate::common::global_state::PathPin {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-kube");
+    assert!(
+        dir.join("kubectl").exists(),
+        "fake kubectl shim missing at {}",
+        dir.display()
+    );
+    crate::common::global_state::pin_path_with_dir_first(&dir)
 }
 
 fn python3_available() -> bool {
@@ -66,7 +63,7 @@ fn target(workspace: &std::path::Path) -> KubeTarget {
 
 #[test]
 fn kube_connection_round_trips_a_file_through_fake_kubectl() {
-    ensure_fake_kubectl_on_path();
+    let _path = fake_kubectl_on_path();
     if !python3_available() {
         eprintln!("skipping: python3 not found on PATH");
         return;
@@ -88,16 +85,16 @@ fn kube_connection_round_trips_a_file_through_fake_kubectl() {
     // AgentChannel → filesystem protocol.
     let fs = RemoteFileSystem::new(connection.channel(), "k8s:test/fake-pod".to_string());
     let file = ws.join("hello.txt");
-    fs.write_file(&file, b"cloud workspace")
+    fs.write_file(file.as_host(), b"cloud workspace")
         .expect("write_file over the agent channel");
     assert_eq!(
-        fs.read_file(&file)
+        fs.read_file(file.as_host())
             .expect("read_file over the agent channel"),
         b"cloud workspace"
     );
     // The bytes really landed on the local "pod" filesystem.
     assert_eq!(std::fs::read(&file).unwrap(), b"cloud workspace");
-    assert!(fs.exists(&file));
+    assert!(fs.exists(file.as_host()));
 
     drop(connection);
 }
@@ -114,7 +111,7 @@ fn kube_connection_round_trips_a_file_through_fake_kubectl() {
 /// keepalive owns no runtime); GREEN once the keepalive owns a dedicated one.
 #[test]
 fn agent_channel_survives_dropping_the_attach_runtime() {
-    ensure_fake_kubectl_on_path();
+    let _path = fake_kubectl_on_path();
     if !python3_available() {
         eprintln!("skipping: python3 not found on PATH");
         return;
@@ -139,7 +136,7 @@ fn agent_channel_survives_dropping_the_attach_runtime() {
     // Channel is live right after connect.
     authority
         .filesystem
-        .write_file(&f, b"alive")
+        .write_file(f.as_host(), b"alive")
         .expect("write before the simulated restart");
 
     // Simulate the editor restart: drop the editor's runtime while KEEPING the
@@ -151,7 +148,7 @@ fn agent_channel_survives_dropping_the_attach_runtime() {
     // either return Err (channel closed) or panic (`block_on` on a dropped
     // runtime). Catch both so the failure is a clean, descriptive RED.
     let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        authority.filesystem.read_file(&f)
+        authority.filesystem.read_file(f.as_host())
     }));
     match read {
         Ok(Ok(bytes)) => assert_eq!(bytes, b"alive"),
@@ -168,7 +165,7 @@ fn agent_channel_survives_dropping_the_attach_runtime() {
 
 #[test]
 fn attach_spec_payload_parses_and_connects_through_fake_kubectl() {
-    ensure_fake_kubectl_on_path();
+    let _path = fake_kubectl_on_path();
     if !python3_available() {
         eprintln!("skipping: python3 not found on PATH");
         return;
@@ -210,13 +207,13 @@ fn attach_spec_payload_parses_and_connects_through_fake_kubectl() {
 
     // The connected authority's filesystem works end to end.
     let f = ws.join("spec.txt");
-    authority.filesystem.write_file(&f, b"via-spec").unwrap();
-    assert_eq!(authority.filesystem.read_file(&f).unwrap(), b"via-spec");
+    authority.filesystem.write_file(f.as_host(), b"via-spec").unwrap();
+    assert_eq!(authority.filesystem.read_file(f.as_host()).unwrap(), b"via-spec");
 }
 
 #[test]
 fn kube_authority_spawns_one_shot_and_lsp_through_fake_kubectl() {
-    ensure_fake_kubectl_on_path();
+    let _path = fake_kubectl_on_path();
     if !python3_available() {
         eprintln!("skipping: python3 not found on PATH");
         return;
@@ -247,8 +244,8 @@ fn kube_authority_spawns_one_shot_and_lsp_through_fake_kubectl() {
 
     // Filesystem (agent channel).
     let f = ws.join("a.txt");
-    authority.filesystem.write_file(&f, b"hi").unwrap();
-    assert_eq!(authority.filesystem.read_file(&f).unwrap(), b"hi");
+    authority.filesystem.write_file(f.as_host(), b"hi").unwrap();
+    assert_eq!(authority.filesystem.read_file(f.as_host()).unwrap(), b"hi");
 
     // One-shot process spawn routes through the agent's `exec` (i.e. runs in
     // the "pod"). Use `sh -c` so it's robust across systems.
@@ -327,4 +324,54 @@ fn kube_authority_spawns_one_shot_and_lsp_through_fake_kubectl() {
     assert_eq!(echoed, "pong\n");
 
     rt.block_on(child.kill()).ok();
+}
+
+/// A machine opened only to be read (`openMachine` with no window behind it)
+/// gets `TrustLevel::Blocked`: it can read the disk and run nothing.
+#[test]
+fn a_blocked_authority_reads_the_machine_but_runs_nothing_on_it() {
+    let _path = fake_kubectl_on_path();
+    if !python3_available() {
+        eprintln!("skipping: python3 not found on PATH");
+        return;
+    }
+
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let ws = workspace.path().to_path_buf();
+    std::fs::write(ws.join("transcript.jsonl"), b"{\"cwd\":\"/srv\"}\n").expect("seed a transcript");
+
+    let rt = multi_thread_rt();
+    let (authority, _keepalive) = rt
+        .block_on(connect_kube_authority(
+            target(&ws),
+            vec![],
+            // What `start_remote_connect(.., for_machine = true)` passes.
+            Arc::new(WorkspaceTrust::new(
+                None,
+                fresh::services::workspace_trust::TrustLevel::Blocked,
+            )),
+            Arc::new(EnvProvider::inactive()),
+            None,
+        ))
+        .expect("connect over fake kubectl");
+
+    assert_eq!(
+        authority
+            .filesystem
+            .read_file(ws.join("transcript.jsonl").as_host())
+            .expect("a blocked authority still reads files"),
+        b"{\"cwd\":\"/srv\"}\n"
+    );
+
+    // The refusal is the trust gate, not a missing binary: `true` exists.
+    let spawned = rt.block_on(authority.process_spawner.spawn(
+        "true".to_string(),
+        Vec::new(),
+        None,
+    ));
+    assert!(
+        spawned.is_err(),
+        "a machine opened only to be read must refuse to run commands, got {:?}",
+        spawned.map(|o| o.exit_code)
+    );
 }

@@ -11,7 +11,7 @@
 //!    activate event on Enter and silently overwrote the field.
 //!
 //! Each test sets up a workspace with two predictable subdirs
-//! (`alpha_dir/` and `alpha_two/`). The Project Path is driven via
+//! (`alpha_dir/` and `alpha_two/`). The Folder field is driven via
 //! an absolute path (`<workspace>/al`) so the plugin's
 //! `fetchPathCompletions` reads the workspace directly — its
 //! `parent = "."` branch for un-slashed inputs would resolve
@@ -22,7 +22,7 @@
 use crate::common::harness::{copy_plugin, copy_plugin_lib, EditorTestHarness};
 use crossterm::event::{KeyCode, KeyModifiers};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Build a workspace with two `alpha*` subdirs and the orchestrator
 /// plugin installed. Returns (tempdir guard, canonicalized
@@ -82,67 +82,98 @@ fn wait_for_new_session_command(harness: &mut EditorTestHarness) {
         .unwrap();
 }
 
+/// The form's frame title. The dialog is `┌ New Workspace ──…`; the
+/// palette row that opens it reads `Orchestrator: New Workspace`, so the
+/// frame's corner is what tells the two apart.
+const FORM_TITLE: &str = "┌ New Workspace";
+
+/// Open the form and put focus in its Folder field — the path field these
+/// completion tests drive. (The form itself opens on the prompt, or on the
+/// agent when the agent takes none; the Folder field is a few Tab stops
+/// on.)
 fn open_new_session_form(harness: &mut EditorTestHarness) {
-    harness
-        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
-        .unwrap();
-    harness.wait_for_prompt().unwrap();
-    harness.type_text("Orchestrator: New Workspace").unwrap();
-    harness
-        .wait_until(|h| h.screen_to_string().contains("Orchestrator: New Workspace"))
-        .unwrap();
+    open_new_session_form_unfocused(harness);
+    // The fold's open state is remembered across opens, so a test that ran
+    // earlier can leave it open; start every test from the default.
+    set_details(harness, false);
+    focus_stop(harness, "Folder:");
+}
+
+/// Open or close the `Details` fold, whichever state it was left in.
+fn set_details(harness: &mut EditorTestHarness, open: bool) {
+    if harness.screen_to_string().contains("Hide details") == open {
+        return;
+    }
+    focus_stop(harness, "Details");
     harness
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
     harness
-        .wait_until(|h| {
-            h.screen_to_string()
-                .contains("ORCHESTRATOR :: New Workspace")
-        })
+        .wait_until(|h| h.screen_to_string().contains("Hide details") == open)
         .unwrap();
 }
 
-/// Read the bracketed text inside the Project Path field from the
-/// rendered screen. The field renders as `│ [<value>...] │` on the
-/// row after the `Project Path` label. Returns the trimmed value.
+/// Open the form with `terminal` picked (a first launch has no agent), focus
+/// on the agent selector.
+fn open_new_session_form_unfocused(harness: &mut EditorTestHarness) {
+    crate::common::launch_form::open_new_workspace_form(harness);
+}
+
+/// Tab until the focused control's line contains `needle`.
+fn focus_stop(harness: &mut EditorTestHarness, needle: &str) {
+    let mut guard = 0;
+    while !harness
+        .screen_to_string()
+        .lines()
+        .any(|l| l.contains('▸') && l.contains(needle))
+    {
+        harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+        harness.tick_and_render().unwrap();
+        guard += 1;
+        assert!(
+            guard < 30,
+            "Tab never reached the {needle:?} stop. Screen:\n{}",
+            harness.screen_to_string(),
+        );
+    }
+}
+
+/// Read the bracketed text inside the Folder field from the rendered
+/// screen. The field renders as `Folder: [<value>...]`, the value cell on
+/// the label's own row. Returns the trimmed value.
 fn project_path_field_value(screen: &str) -> String {
-    let lines: Vec<&str> = screen.lines().collect();
-    let label_row = lines
-        .iter()
-        .position(|l| l.contains("Project Path"))
-        .expect("Project Path label must appear on screen");
-    for next in lines.iter().skip(label_row + 1).take(3) {
-        if let Some(open) = next.find('[') {
-            if let Some(close_rel) = next[open + 1..].find(']') {
-                return next[open + 1..open + 1 + close_rel].trim().to_string();
-            }
+    let line = screen
+        .lines()
+        .find(|l| l.contains("Folder:"))
+        .expect("Folder label must appear on screen");
+    if let Some(open) = line.find('[') {
+        if let Some(close_rel) = line[open + 1..].find(']') {
+            return line[open + 1..open + 1 + close_rel].trim().to_string();
         }
     }
     panic!(
-        "Could not find [...] field after Project Path label.\nScreen:\n{}",
+        "Could not find [...] field on the Folder row.\nScreen:\n{}",
         screen
     );
 }
 
-/// True when the rendered screen contains a dim `┄┄┄...┄┄┄`
-/// separator row — the host-rendered popup's replacement for
-/// the input field's normal `╰─...─╯` bottom border. Its
-/// presence is the load-bearing visual cue that input + popup
-/// are part of one unified box: above the separator is the
-/// active input, below it (and inside the labeled section's
-/// side borders) are the candidate rows.
-fn screen_has_completion_dim_separator(screen: &str) -> bool {
+/// True when the rendered screen shows a completion list box: a `┌─...─┐`
+/// top row with nothing but rule in it. A field outside a labeled section
+/// drops its candidates in a bordered box of their own, the way a dropdown's
+/// option list is drawn; a dialog's own top border carries its title, so it
+/// never matches.
+pub(crate) fn screen_has_completion_box(screen: &str) -> bool {
     screen.lines().any(|l| {
-        if let Some(start) = l.find('┄') {
-            let rest = &l[start..];
-            let run: String = rest.chars().take_while(|c| *c == '┄').collect();
-            return run.chars().count() >= 8;
-        }
-        false
+        let Some(start) = l.find('┌') else {
+            return false;
+        };
+        let rest = &l[start + '┌'.len_utf8()..];
+        let run = rest.chars().take_while(|c| *c == '─').count();
+        run >= 8 && rest.chars().nth(run) == Some('┐')
     })
 }
 
-/// Type `<workspace>/al` into the focused Project Path field and
+/// Type `<workspace>/al` into the focused Folder field and
 /// wait for the completion dropdown to surface both `alpha_dir/`
 /// and `alpha_two/` candidates. Returns the typed prefix so the
 /// caller can compare against the field value.
@@ -161,13 +192,12 @@ fn type_alpha_prefix_and_wait(
     prefix
 }
 
-/// The host-rendered popup integrates with the wrapping
-/// labeled-section chrome: the input field's normal bottom
-/// border becomes a dim `┄┄┄...┄┄┄` separator (cueing that the
-/// box has extended downward), and the side borders continue
-/// past the input through the candidate rows.
+/// The host-rendered popup of a field outside a labeled section is a
+/// bordered box under the field, drawn like a dropdown's option list — not
+/// the section-joined list with its dim `┄` separator, which has no section
+/// border here to join.
 #[test]
-fn completion_popup_renders_with_dim_separator() {
+fn completion_popup_renders_as_a_box_under_its_field() {
     let (_temp, workspace) = set_up_workspace();
     let mut harness = EditorTestHarness::with_working_dir(160, 50, workspace.clone()).unwrap();
     harness.tick_and_render().unwrap();
@@ -178,9 +208,13 @@ fn completion_popup_renders_with_dim_separator() {
 
     let screen = harness.screen_to_string();
     assert!(
-        screen_has_completion_dim_separator(&screen),
-        "completion popup must render with a dim `┄┄┄...┄┄┄` separator \
-         between input and candidates. Screen:\n{}",
+        screen_has_completion_box(&screen),
+        "completion popup must render as a bordered `┌─...─┐` box. Screen:\n{}",
+        screen,
+    );
+    assert!(
+        !screen.contains('┄'),
+        "no section separator without a section. Screen:\n{}",
         screen,
     );
 }
@@ -216,7 +250,7 @@ fn tab_advances_focus_without_accepting_completion() {
          Screen:\n{}",
         harness.screen_to_string(),
     );
-    // Focus left the Project Path field: exactly one `▸` marker is on
+    // Focus left the Folder field: exactly one `▸` marker is on
     // screen, and it's no longer on the path line.
     let screen = harness.screen_to_string();
     assert_eq!(
@@ -231,7 +265,7 @@ fn tab_advances_focus_without_accepting_completion() {
         .expect("project path line present");
     assert!(
         !path_line.contains('▸'),
-        "Tab moved focus off Project Path, so its `▸` marker is gone. Line: {:?}",
+        "Tab moved focus off Folder field, so its `▸` marker is gone. Line: {:?}",
         path_line,
     );
 }
@@ -261,7 +295,7 @@ fn down_then_tab_accepts_completion() {
         .wait_until(|h| project_path_field_value(&h.screen_to_string()) == expected)
         .unwrap();
 
-    // Tab-accept keeps focus on the Project Path field (it didn't
+    // Tab-accept keeps focus on the Folder field (it didn't
     // advance): the `▸` marker is still on the path line.
     let screen = harness.screen_to_string();
     let path_line = screen
@@ -270,7 +304,7 @@ fn down_then_tab_accepts_completion() {
         .expect("project path line present");
     assert!(
         path_line.contains('▸'),
-        "Tab-accept should leave focus on the Project Path field. Line: {:?}\nScreen:\n{}",
+        "Tab-accept should leave focus on the Folder field. Line: {:?}\nScreen:\n{}",
         path_line,
         screen,
     );
@@ -339,7 +373,7 @@ fn enter_keeps_typed_text_when_completion_open() {
     );
 }
 
-/// Type the `<workspace>/alpha_` prefix into Project Path and
+/// Type the `<workspace>/alpha_` prefix into Folder field and
 /// wait until the popup has surfaced at least the first
 /// candidate (`alpha_00/`). With 10 candidates the popup spans
 /// `total - visible = 5` extra rows that the user must scroll
@@ -464,14 +498,13 @@ fn completion_popup_renders_scrollbar_when_overflowing() {
 }
 
 /// The selected candidate's row paints with `popup_selection_bg`
-/// across the candidate text + trailing pad + scrollbar column,
-/// but the popup's `│` side borders must stay outside the
-/// highlight — the right `│` in particular must keep the
-/// popup's base bg (`theme.suggestion_bg`), not the selection
-/// blue. Regression guard for a bug where the row-level
-/// selection style propagated onto the wrapping `│ ... │` entry
-/// and the per-border fg-only inline overlay could not paint
-/// the bg back, so the right border sat on selection blue.
+/// across the candidate text, trailing pad and scrollbar column, but
+/// the popup's `│` side borders must stay outside the highlight — the
+/// right `│` in particular keeps the list box's own ground
+/// (`popup_bg`, the ground a dropdown's option list takes), not the
+/// selection blue. Regression guard for a bug where the row-level
+/// selection style propagated onto the border and it sat on selection
+/// blue.
 #[test]
 fn selection_highlight_does_not_overlap_right_border() {
     let (_temp, workspace, _names) = set_up_workspace_many_alphas();
@@ -493,37 +526,26 @@ fn selection_highlight_does_not_overlap_right_border() {
     // `alpha_00/` is the first candidate, now selected after the `↓`
     // stepped into the dropdown (the host keeps `selectedIndex` at 0
     // when first entering the list).
-    let (_text_col, row) = harness
+    let (text_col, row) = harness
         .find_text_on_screen("alpha_00/")
         .expect("`alpha_00/` should be visible as the first candidate row");
 
-    // Scan the selected row right-to-left for the popup's
-    // right `│` border. The dialog that wraps the form draws
-    // its own `│` one column further out, so the rightmost
-    // `│` is the dialog's border — the popup's right border
-    // is the next `│` inward, identified as the rightmost `│`
-    // whose left neighbor is NOT also `│` (the dialog border
-    // would have the popup's `│` immediately to its left).
+    // The popup's right `│` is the first one to the right of the selected
+    // candidate's text: the list box is exactly as wide as its field, so
+    // that is its wall, whatever frames the dialog further out.
     let width = harness.buffer().area.width;
-    let mut right_border_col: Option<u16> = None;
-    for x in (1..width).rev() {
-        if harness.get_cell(x, row).as_deref() == Some("│")
-            && harness.get_cell(x - 1, row).as_deref() != Some("│")
-        {
-            right_border_col = Some(x);
-            break;
-        }
-    }
-    let right_border_col = right_border_col.unwrap_or_else(|| {
-        panic!(
-            "popup right `│` border should be visible on the selected candidate row.\nScreen:\n{}",
-            harness.screen_to_string(),
-        )
-    });
+    let right_border_col = (text_col..width)
+        .find(|&x| harness.get_cell(x, row).as_deref() == Some("│"))
+        .unwrap_or_else(|| {
+            panic!(
+                "popup right `│` border should be visible on the selected candidate row.\nScreen:\n{}",
+                harness.screen_to_string(),
+            )
+        });
 
-    let (popup_selection_bg, suggestion_bg) = {
+    let (popup_selection_bg, popup_bg) = {
         let theme = harness.editor().theme();
-        (theme.popup_selection_bg, theme.suggestion_bg)
+        (theme.popup_selection_bg, theme.popup_bg)
     };
     let border_style = harness
         .get_cell_style(right_border_col, row)
@@ -541,10 +563,10 @@ fn selection_highlight_does_not_overlap_right_border() {
     );
     assert_eq!(
         border_style.bg,
-        Some(suggestion_bg),
+        Some(popup_bg),
         "right `│` border on the selected candidate row should paint on the \
-         popup's base background (`suggestion_bg` = {:?}), not {:?}.\nScreen:\n{}",
-        suggestion_bg,
+         list box's own ground (`popup_bg` = {:?}), not {:?}.\nScreen:\n{}",
+        popup_bg,
         border_style.bg,
         harness.screen_to_string(),
     );
@@ -663,7 +685,7 @@ fn enter_advance_after_popup_dismiss_moves_plugin_focus_mirror() {
     let typed = type_alpha_prefix_and_wait(&mut harness, &workspace);
 
     // Popup is open. Enter #1 dismisses it (stays on the
-    // Project Path text input).
+    // Folder field text input).
     harness
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
@@ -686,9 +708,9 @@ fn enter_advance_after_popup_dismiss_moves_plugin_focus_mirror() {
     harness.tick_and_render().unwrap();
 
     // Now type a marker character. If the plugin's focus
-    // mirror correctly advanced past Project Path, this char
+    // mirror correctly advanced past Folder field, this char
     // lands somewhere else (Workspace Name's input replaces the
-    // placeholder, etc.) and the Project Path value stays at
+    // placeholder, etc.) and the Folder field value stays at
     // `typed`. If the plugin's mirror is stuck on
     // project_path, the marker extends it.
     harness.type_text("Z").unwrap();
@@ -697,8 +719,8 @@ fn enter_advance_after_popup_dismiss_moves_plugin_focus_mirror() {
     assert_eq!(
         project_path_field_value(&harness.screen_to_string()),
         typed,
-        "after Enter-Enter, focus must have advanced past the Project Path \
-         text input; a subsequent keystroke must not extend the Project Path \
+        "after Enter-Enter, focus must have advanced past the Folder field \
+         text input; a subsequent keystroke must not extend the Folder field \
          value. Screen:\n{}",
         harness.screen_to_string(),
     );
@@ -731,9 +753,8 @@ fn completion_popup_scrolls_with_mouse_wheel() {
     // Locate a row owned by the popup so the wheel lands on its
     // hit-test target. `alpha_00/` is the top candidate row when
     // the popup just opened; find its on-screen row and scroll
-    // there. Column is irrelevant for the host's wheel routing
-    // (it only checks `last_inner_rect` containment), but pick
-    // a column inside the panel for realism.
+    // there. The wheel is the popup's own viewport's, so the
+    // column only has to be inside the panel.
     let (col, row) = harness
         .find_text_on_screen("alpha_00/")
         .expect("`alpha_00/` should be visible before scrolling");
@@ -761,7 +782,7 @@ fn completion_popup_scrolls_with_mouse_wheel() {
 
 /// A terminal bracketed paste (`Event::Paste`, the single-event path
 /// a real terminal emits for clipboard paste — distinct from typed
-/// keys and from `Ctrl+V`) must land in the focused Project Path
+/// keys and from `Ctrl+V`) must land in the focused Folder field
 /// field, NOT in the buffer obscured by the modal.
 ///
 /// Regression for the reported bug: with the New-Session dialog open,
@@ -769,7 +790,7 @@ fn completion_popup_scrolls_with_mouse_wheel() {
 /// buffer instead of the focused dialog field. Bracketed paste arrives
 /// as one `Event::Paste` that never passes through the floating-panel
 /// key dispatcher, so it fell straight through to the buffer paste
-/// path. Without the fix the Project Path field stays unchanged (the
+/// path. Without the fix the Folder field stays unchanged (the
 /// text went to the buffer) and this assertion fails.
 #[test]
 fn bracketed_paste_routes_to_focused_dialog_field() {
@@ -780,7 +801,7 @@ fn bracketed_paste_routes_to_focused_dialog_field() {
 
     open_new_session_form(&mut harness);
 
-    // The Project Path text field is focused on open. Paste a marker
+    // The Folder field text field is focused on open. Paste a marker
     // through the real bracketed-paste event path.
     harness.send_paste("PASTEDMARKER").unwrap();
     harness
@@ -789,7 +810,7 @@ fn bracketed_paste_routes_to_focused_dialog_field() {
 
     assert!(
         project_path_field_value(&harness.screen_to_string()).contains("PASTEDMARKER"),
-        "bracketed paste should land in the focused Project Path field. Screen:\n{}",
+        "bracketed paste should land in the focused Folder field. Screen:\n{}",
         harness.screen_to_string(),
     );
 
@@ -798,10 +819,7 @@ fn bracketed_paste_routes_to_focused_dialog_field() {
     // the now-revealed buffer.
     harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
     harness
-        .wait_until(|h| {
-            !h.screen_to_string()
-                .contains("ORCHESTRATOR :: New Workspace")
-        })
+        .wait_until(|h| !h.screen_to_string().contains(FORM_TITLE))
         .unwrap();
     assert!(
         !harness.screen_to_string().contains("PASTEDMARKER"),
@@ -815,10 +833,10 @@ fn bracketed_paste_routes_to_focused_dialog_field() {
 /// — neither inserted into any field nor leaked into the obscured
 /// buffer.
 ///
-/// The form's tab cycle always starts with the "Run in:" backend
-/// tabs (`[local, ssh, kubernetes, devcontainer, project_path, …]`)
-/// and opens with `project_path` focused, so a single Shift+Tab walks
-/// focus back onto the `devcontainer` backend tab — a non-text Button,
+/// The form's tab cycle runs the mode switch, the agent, the prompt, then
+/// `Project`, `Machine` and the fields; this test puts focus in the
+/// Folder field, so a single Shift+Tab walks focus back onto the
+/// `Machine` dropdown — a non-text widget,
 /// regardless of git / worktree state. Pasting there must be
 /// swallowed. Without the fix the paste falls through to the buffer;
 /// revealing the buffer after Esc shows the marker and this fails.
@@ -831,8 +849,8 @@ fn bracketed_paste_ignored_when_non_text_widget_focused() {
 
     open_new_session_form(&mut harness);
 
-    // Walk focus off the Project Path text field onto a backend tab
-    // (a non-text Button) — the tabbable immediately before it.
+    // Walk focus off the Folder field text field onto the Machine
+    // dropdown (a non-text widget) — the tabbable immediately before it.
     harness
         .send_key(KeyCode::BackTab, KeyModifiers::NONE)
         .unwrap();
@@ -852,10 +870,7 @@ fn bracketed_paste_ignored_when_non_text_widget_focused() {
     // the hidden buffer; revealing it after Esc surfaces the marker.
     harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
     harness
-        .wait_until(|h| {
-            !h.screen_to_string()
-                .contains("ORCHESTRATOR :: New Workspace")
-        })
+        .wait_until(|h| !h.screen_to_string().contains(FORM_TITLE))
         .unwrap();
     assert!(
         !harness.screen_to_string().contains("IGNORED_PASTE"),
@@ -887,7 +902,7 @@ fn ctrl_v_pastes_into_focused_dialog_field() {
 
     open_new_session_form(&mut harness);
 
-    // The Project Path text field is focused on open.
+    // The Folder field text field is focused on open.
     harness
         .send_key(KeyCode::Char('v'), KeyModifiers::CONTROL)
         .unwrap();
@@ -898,10 +913,7 @@ fn ctrl_v_pastes_into_focused_dialog_field() {
     // And it must not have leaked into the buffer underneath.
     harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
     harness
-        .wait_until(|h| {
-            !h.screen_to_string()
-                .contains("ORCHESTRATOR :: New Workspace")
-        })
+        .wait_until(|h| !h.screen_to_string().contains(FORM_TITLE))
         .unwrap();
     assert!(
         !harness.screen_to_string().contains("CTRLV_MARKER"),
@@ -970,41 +982,43 @@ fn focused_line(screen: &str) -> String {
 
 /// Open the form on a non-git workspace (so the worktree toggle and
 /// Branch field are absent — a predictable, minimal field set).
-fn open_form_on(workspace: &PathBuf) -> EditorTestHarness {
-    let mut harness = EditorTestHarness::with_working_dir(160, 50, workspace.clone()).unwrap();
+fn open_form_on(workspace: &Path) -> EditorTestHarness {
+    let mut harness =
+        EditorTestHarness::with_working_dir(160, 50, workspace.to_path_buf()).unwrap();
     harness.tick_and_render().unwrap();
     wait_for_new_session_command(&mut harness);
     open_new_session_form(&mut harness);
     harness
 }
 
-/// Tab moves linearly between *fields* — one stop per radio group, not
-/// one per option. Walking a full cycle lands the marker on the active
-/// "Run in:" tab exactly once and the active "Agent:" preset exactly
-/// once (never on an inactive option), and reaches `[ Create & Visit ]`.
+/// Tab moves linearly between *fields* — one stop per selector, not one
+/// per option. Walking a full cycle lands the marker on the "Machine:"
+/// dropdown exactly once and the "Agent:" selector exactly once (the
+/// options inside each are ←/→'s, never Tab stops), and reaches
+/// `[ Create & Visit ]`.
 #[test]
 fn tab_is_linear_one_stop_per_radio_group() {
     let (_temp, workspace) = set_up_workspace();
     let mut harness = open_form_on(&workspace);
 
-    // Advance to the single "Run in:" stop — the anchor for one cycle.
-    // (The form opens focused on Project Path, so the "Run in:" tab is a
+    // Advance to the single "Machine:" stop — the anchor for one cycle.
+    // (The form opens focused on Folder field, so the "Machine:" stop is a
     // few stops away.)
     let mut guard = 0;
-    while !focused_line(&harness.screen_to_string()).contains("Run in:") {
+    while !focused_line(&harness.screen_to_string()).contains("▸ Machine:") {
         harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
         harness.tick_and_render().unwrap();
         guard += 1;
         assert!(
             guard < 20,
-            "Tab never reached the 'Run in:' stop. Screen:\n{}",
+            "Tab never reached the 'Machine:' stop. Screen:\n{}",
             harness.screen_to_string(),
         );
     }
 
     // Walk exactly one full cycle: collect the focused line at each stop
-    // starting from the "Run in:" anchor, tabbing until the marker lands
-    // back on a "Run in:" line. Counting over a fixed number of presses
+    // starting from the "Machine:" anchor, tabbing until the marker lands
+    // back on a "Machine:" line. Counting over a fixed number of presses
     // would over-count once the press count exceeds the cycle length;
     // bounding on "back to the anchor" makes the assertions independent
     // of how many fields the active backend has.
@@ -1013,13 +1027,13 @@ fn tab_is_linear_one_stop_per_radio_group() {
         harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
         harness.tick_and_render().unwrap();
         let line = focused_line(&harness.screen_to_string());
-        if line.contains("Run in:") {
+        if line.contains("▸ Machine:") {
             break; // back to the anchor — one full cycle walked
         }
         cycle_lines.push(line);
         assert!(
             cycle_lines.len() < 20,
-            "focus cycle never returned to the 'Run in:' anchor. Screen:\n{}",
+            "focus cycle never returned to the 'Machine:' anchor. Screen:\n{}",
             harness.screen_to_string(),
         );
     }
@@ -1029,18 +1043,15 @@ fn tab_is_linear_one_stop_per_radio_group() {
     let mut saw_create = false;
     let mut saw_inactive_option = false;
     for line in &cycle_lines {
-        if line.contains("Run in:") {
+        if line.contains("▸ Machine:") {
             run_in_stops += 1;
-            // The marker must precede the *active* backend (Local), not
-            // an inactive option.
-            if line.contains("▸ [ SSH ]")
-                || line.contains("▸ [ Kubernetes ]")
-                || line.contains("▸ [ Devcontainer ]")
-            {
+            // The dropdown is one stop, and the marker sits on the row — with
+            // Local still the value, since Tab never changes it.
+            if !line.contains("[Local") {
                 saw_inactive_option = true;
             }
         }
-        if line.contains("Agent:") {
+        if line.contains("▸ Agent:") {
             agent_stops += 1;
             if line.contains("▸ [ claude")
                 || line.contains("▸ [ aider")
@@ -1049,71 +1060,65 @@ fn tab_is_linear_one_stop_per_radio_group() {
                 saw_inactive_option = true;
             }
         }
-        if line.contains("Create Workspace") {
+        if line.contains("[ Launch ]") {
             saw_create = true;
         }
     }
 
     assert!(
         !saw_inactive_option,
-        "Tab must never land on an inactive radio option (←/→ changes the option). \
+        "Tab must never land on an inactive option (←/→ changes the option). \
          Screen:\n{}",
         harness.screen_to_string(),
     );
     assert_eq!(
         run_in_stops, 1,
-        "the 'Run in:' group is a single Tab stop per cycle (got {run_in_stops})",
+        "the 'Machine:' control is a single Tab stop per cycle (got {run_in_stops})",
     );
     assert_eq!(
         agent_stops, 1,
         "the 'Agent:' group is a single Tab stop per cycle (got {agent_stops})",
     );
-    assert!(saw_create, "Tab must reach the [ Create Workspace ] button");
+    assert!(saw_create, "Tab must reach the [ Launch ] button");
 }
 
-/// ←/→ changes the option *within* the "Run in:" selector (and swaps
-/// the body), while Tab leaves the option alone. This is the split the
-/// help line documents: Tab between fields, ←/→ within a group.
+/// ←/→ changes the option *within* the "Machine:" dropdown, while Tab
+/// leaves the option alone. This is the split the help line documents: Tab
+/// between fields, ←/→ within a group.
 #[test]
 fn arrows_switch_run_in_selector_option() {
     let (_temp, workspace) = set_up_workspace();
     let mut harness = open_form_on(&workspace);
 
-    // Shift+Tab from the initial Project Path focus wraps to the active
-    // "Run in:" tab (the first stop in the cycle).
-    harness
-        .send_key(KeyCode::BackTab, KeyModifiers::NONE)
-        .unwrap();
-    harness.tick_and_render().unwrap();
-    assert!(
-        focused_line(&harness.screen_to_string()).contains("Run in:"),
-        "Shift+Tab should land focus on the Run in selector. Screen:\n{}",
-        harness.screen_to_string(),
-    );
+    focus_stop(&mut harness, "▸ Machine:");
 
-    // → moves to the next option (SSH) and the body swaps to SSH fields.
+    // → moves to the next option: with no saved machines that is the
+    // devcontainer. Folder field stays — it is the one path field in every
+    // mode.
     harness
         .send_key(KeyCode::Right, KeyModifiers::NONE)
         .unwrap();
     harness
-        .wait_until(|h| h.screen_to_string().contains("Host  ("))
-        .unwrap();
-    assert!(
-        focused_line(&harness.screen_to_string()).contains("▸ [ SSH ]"),
-        "→ should move the focus marker onto the SSH option. Screen:\n{}",
-        harness.screen_to_string(),
-    );
+        .wait_until(|h| focused_line(&h.screen_to_string()).contains("Devcontainer"))
+        .unwrap_or_else(|_| {
+            panic!(
+                "→ should pick Devcontainer. Screen:\n{}",
+                harness.screen_to_string()
+            )
+        });
+    harness.assert_screen_contains("Folder:");
 
-    // ← moves back to Local and restores the local body (Project Path).
+    // ← moves back to Local.
     harness.send_key(KeyCode::Left, KeyModifiers::NONE).unwrap();
     harness
-        .wait_until(|h| h.screen_to_string().contains("Project Path"))
+        .wait_until(|h| focused_line(&h.screen_to_string()).contains("[Local"))
         .unwrap();
     assert!(
-        focused_line(&harness.screen_to_string()).contains("▸ [ Local ]"),
-        "← should move the focus marker back onto the Local option. Screen:\n{}",
+        focused_line(&harness.screen_to_string()).contains("[Local"),
+        "← should pick Local again. Screen:\n{}",
         harness.screen_to_string(),
     );
+    harness.assert_screen_contains("Folder:");
 }
 
 /// Esc is scoped: the first Esc closes an open completion dropdown
@@ -1132,7 +1137,7 @@ fn esc_closes_dropdown_first_then_cancels_dialog() {
         .unwrap();
     let screen = harness.screen_to_string();
     assert!(
-        screen.contains("ORCHESTRATOR :: New Workspace"),
+        screen.contains(FORM_TITLE),
         "first Esc must NOT cancel the dialog. Screen:\n{}",
         screen,
     );
@@ -1146,16 +1151,13 @@ fn esc_closes_dropdown_first_then_cancels_dialog() {
     // Second Esc: dialog cancels.
     harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
     harness
-        .wait_until(|h| {
-            !h.screen_to_string()
-                .contains("ORCHESTRATOR :: New Workspace")
-        })
+        .wait_until(|h| !h.screen_to_string().contains(FORM_TITLE))
         .unwrap();
 }
 
 /// Ctrl+Enter submits the form from anywhere — here from a text field,
 /// where a bare Enter would only advance focus. The form leaves its
-/// editable state (the "Run in:" selector row disappears as the dialog
+/// editable state (the "Machine:" control disappears as the dialog
 /// switches to the connecting/creating view or closes outright).
 #[test]
 #[cfg_attr(target_os = "windows", ignore)]
@@ -1177,25 +1179,94 @@ fn ctrl_enter_submits_from_a_text_field() {
     let (_temp, workspace) = set_up_workspace();
     let mut harness = open_form_on(&workspace);
 
-    // Focus is on the Project Path text field. A bare Enter here would
-    // advance focus (and keep the editable "Run in:" row). Ctrl+Enter
-    // must instead submit — the editable selector row goes away.
+    // Focus is on the Folder field text field. A bare Enter here would
+    // advance focus (and keep the editable "Machine" control). Ctrl+Enter
+    // must instead submit — the editable control goes away.
     assert!(
-        harness.screen_to_string().contains("←/→ switch type"),
-        "precondition: the editable Run-in selector is showing",
+        harness.screen_to_string().contains("Machine:"),
+        "precondition: the editable Machine control is showing",
     );
     harness
         .send_key(KeyCode::Enter, KeyModifiers::CONTROL)
         .unwrap();
     harness
-        .wait_until(|h| !h.screen_to_string().contains("←/→ switch type"))
+        .wait_until(|h| !h.screen_to_string().contains("Machine:"))
+        .unwrap();
+}
+
+/// A first launch has no agent chosen: the selector reads `Choose an
+/// agent…` with a note that Launch waits for one. Picking an agent clears
+/// the note, and Launch then goes.
+#[test]
+fn a_first_launch_asks_for_an_agent_before_it_launches() {
+    use portable_pty::{native_pty_system, PtySize};
+    let pty_ok = native_pty_system()
+        .openpty(PtySize {
+            rows: 1,
+            cols: 1,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .is_ok();
+    if !pty_ok {
+        eprintln!("Skipping first-launch agent test: PTY not available");
+        return;
+    }
+
+    let (_temp, workspace) = set_up_workspace();
+    // A data home of its own, so no earlier launch has remembered an agent.
+    let data_home = tempfile::TempDir::new().unwrap();
+    let dir_context = fresh::config_io::DirectoryContext::for_testing(data_home.path());
+    let mut harness = EditorTestHarness::create(
+        160,
+        50,
+        crate::common::harness::HarnessOptions::new()
+            .with_working_dir(workspace)
+            .with_shared_dir_context(dir_context),
+    )
+    .unwrap();
+    harness.tick_and_render().unwrap();
+    wait_for_new_session_command(&mut harness);
+
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.wait_for_prompt().unwrap();
+    harness.type_text("Orchestrator: New Workspace").unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Orchestrator: New Workspace"))
+        .unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains(FORM_TITLE))
+        .unwrap();
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("Agent: [Choose an agent…"),
+        "a first launch has no agent chosen. Screen:\n{screen}",
+    );
+    assert!(
+        screen.contains("Choose which agent to run — Launch waits for it."),
+        "the form says Launch waits for an agent. Screen:\n{screen}",
+    );
+
+    crate::common::launch_form::choose_terminal_agent(&mut harness);
+    harness.assert_screen_not_contains("Launch waits for it");
+
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::CONTROL)
+        .unwrap();
+    harness
+        .wait_until(|h| !h.screen_to_string().contains(FORM_TITLE))
         .unwrap();
 }
 
 /// Advance Tab focus until the single "Agent:" preset stop is reached.
 fn focus_agent_preset_stop(harness: &mut EditorTestHarness) {
     let mut guard = 0;
-    while !focused_line(&harness.screen_to_string()).contains("Agent:") {
+    while !focused_line(&harness.screen_to_string()).contains("▸ Agent:") {
         harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
         harness.tick_and_render().unwrap();
         guard += 1;
@@ -1205,29 +1276,6 @@ fn focus_agent_preset_stop(harness: &mut EditorTestHarness) {
             harness.screen_to_string(),
         );
     }
-}
-
-/// Tab to the collapsed "Advanced…" fold header and activate it, so the
-/// folded controls (worktree, branch fields, and the "Teach Fresh CLI"
-/// toggle) render. The header glyph flips `▶` → `▼` when expanded.
-fn expand_advanced(harness: &mut EditorTestHarness) {
-    let mut guard = 0;
-    while !focused_line(&harness.screen_to_string()).contains("Advanced") {
-        harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
-        harness.tick_and_render().unwrap();
-        guard += 1;
-        assert!(
-            guard < 20,
-            "Tab never reached the 'Advanced…' fold. Screen:\n{}",
-            harness.screen_to_string(),
-        );
-    }
-    harness
-        .send_key(KeyCode::Enter, KeyModifiers::NONE)
-        .unwrap();
-    harness
-        .wait_until(|h| h.screen_to_string().contains("▼ Advanced"))
-        .unwrap();
 }
 
 /// The launcher prioritises the coding-CLI presets — a bare `terminal`,
@@ -1315,26 +1363,14 @@ fn agent_dropdown_opens_as_floating_popover() {
          at once); before={closed_before}, open={open_count}. Screen:\n{open_screen}",
     );
 
-    // Web-scene parity: the projection the web frontend renders from (the
-    // `/state` route → `widgets_view`) must report the dropdown as OPEN, so
-    // the web floats its own native option pop-over from the same state.
-    {
-        let surfaces = harness.editor().widgets_view();
-        let modal = surfaces
-            .iter()
-            .find(|s| s.kind == "floatingModal")
-            .expect("the New-Workspace form must appear as a floatingModal in the web scene");
-        let inst = modal
-            .instances
-            .get("agent_dropdown")
-            .expect("the web scene must carry the agent_dropdown instance state");
-        assert_eq!(
-            inst.dropdown_open,
-            Some(true),
-            "the web scene must report the agent dropdown as open (so the web \
-             frontend renders the floating option list)",
-        );
-    }
+    // **Web-scene parity, removed with the web's plugin-panel path.** This
+    // asserted that `widgets_view` reported `agent_dropdown` as open, so the
+    // web frontend could float its own native option list from the same state.
+    // That projection is deleted deliberately (see the plan's "the web's
+    // plugin panels, and what bringing them back takes"); the TUI assertion
+    // above still covers the behaviour this test is named for. Restore this
+    // block when the web renders plugin panels from the display list, and note
+    // what it wanted: open/closed, and the committed selection index.
 
     // Esc closes the pop-over, back to the single-value trigger.
     harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
@@ -1367,36 +1403,15 @@ fn agent_dropdown_opens_as_floating_popover() {
         "clicking the `claude` option must select it as the Agent value. Screen:\n{after_click}",
     );
 
-    // Web-scene parity again: after the click the projection must show the
-    // pop-over closed and the newly-selected index committed — the same
-    // state the web `/state` route would report so selection round-trips.
-    {
-        let surfaces = harness.editor().widgets_view();
-        let modal = surfaces
-            .iter()
-            .find(|s| s.kind == "floatingModal")
-            .expect("form surface in web scene after selection");
-        let inst = modal
-            .instances
-            .get("agent_dropdown")
-            .expect("agent_dropdown instance in web scene after selection");
-        assert_eq!(
-            inst.dropdown_open,
-            Some(false),
-            "picking an option must close the pop-over in the web scene too",
-        );
-        // `claude` is index 1 in the prioritised preset order (terminal, claude,
-        // codex, …), so a successful click committed that selection.
-        assert_eq!(
-            inst.selected_index,
-            Some(1),
-            "the clicked `claude` option must be the committed selection in the web scene",
-        );
-    }
+    // **Web-scene parity, removed with the web's plugin-panel path** — the
+    // partner of the block above. It asserted the pop-over closed *and* that
+    // `selected_index` committed to 1 (`claude`, index 1 in the prioritised
+    // preset order), so selection round-tripped through the projection. The
+    // two screen assertions above cover the same behaviour for the TUI.
 }
 
 /// Clicking the *closed* `Agent: [<value> ▼]` trigger opens the option
-/// pop-over. The trigger is not focused when the form opens (Project Path
+/// pop-over. The trigger is not focused when the form opens (Folder field
 /// is), so the click must BOTH move focus to the dropdown AND toggle its
 /// list open. Regression: the TUI floating-panel click path only focused
 /// the dropdown and fired the event to the plugin — it never called
@@ -1506,19 +1521,21 @@ fn agent_dropdown_popover_anchored_under_trigger() {
     );
 }
 
-/// Picking a coding agent surfaces its per-agent controls — an "Auto
-/// mode" checkbox and a "Start prompt" box — which are hidden for the
-/// bare `terminal` default. Stepping ←/→ off `terminal` onto the first
-/// agent (claude) reveals both.
+/// The prompt box is always on screen, so nothing moves when the agent
+/// changes; for the bare `terminal` default it is read-only and says the
+/// agent takes no prompt. Picking a coding agent enables it and surfaces
+/// the agent's "Auto mode" checkbox. Stepping ←/→ off `terminal` onto the
+/// first agent (claude) does both.
 #[test]
-fn selecting_an_agent_reveals_auto_mode_and_start_prompt() {
+fn selecting_an_agent_reveals_auto_mode_and_enables_prompt() {
     let (_temp, workspace) = set_up_workspace();
     let mut harness = open_form_on(&workspace);
 
-    // The bare-terminal default carries no agent options.
+    // The bare-terminal default carries no agent options, and its prompt
+    // box says so.
     let screen = harness.screen_to_string();
     assert!(
-        !screen.contains("Auto mode") && !screen.contains("Start prompt"),
+        !screen.contains("Auto mode") && screen.contains("This agent takes no prompt"),
         "the terminal preset must not show agent-only controls. Screen:\n{screen}",
     );
 
@@ -1540,15 +1557,17 @@ fn selecting_an_agent_reveals_auto_mode_and_start_prompt() {
         );
     }
     assert!(
-        harness.screen_to_string().contains("Start prompt"),
-        "an agent that takes a launch prompt must show the Start prompt box. Screen:\n{}",
+        harness
+            .screen_to_string()
+            .contains("Describe the task for the agent"),
+        "an agent that takes a launch prompt must enable the prompt box. Screen:\n{}",
         harness.screen_to_string(),
     );
 }
 
 /// The agent controls adapt to the selected agent: opencode has no
-/// launch bypass-approvals flag (it's config-driven), so it shows the
-/// Start prompt box but *not* the Auto mode checkbox.
+/// launch bypass-approvals flag (it's config-driven), so it enables the
+/// prompt box but shows *no* Auto mode checkbox.
 #[test]
 fn opencode_shows_start_prompt_without_auto_mode() {
     let (_temp, workspace) = set_up_workspace();
@@ -1575,8 +1594,8 @@ fn opencode_shows_start_prompt_without_auto_mode() {
 
     let screen = harness.screen_to_string();
     assert!(
-        screen.contains("Start prompt"),
-        "opencode takes a launch prompt, so the Start prompt box must show. Screen:\n{screen}",
+        screen.contains("Describe the task for the agent"),
+        "opencode takes a launch prompt, so the prompt box must be enabled. Screen:\n{screen}",
     );
     assert!(
         !screen.contains("Auto mode"),
@@ -1584,39 +1603,24 @@ fn opencode_shows_start_prompt_without_auto_mode() {
     );
 }
 
-/// The "Teach agent the Fresh CLI" toggle lives under the "Advanced…" fold
-/// (enabled by default, but folded away so it doesn't clutter the common
-/// case). It's an agent-only control: even with Advanced expanded it stays
-/// hidden for the bare `terminal` preset (nothing to teach), and appears once
-/// a supporting agent (claude) is selected.
+/// The "Teach Fresh CLI" toggle is an agent-only control: it is
+/// disclosed by the *value* of the agent selector — hidden for the bare
+/// `terminal` preset (nothing to teach), shown once a supporting agent
+/// (claude) is selected — with no fold to open first.
 #[test]
 fn teach_fresh_cli_toggle_shown_for_agent_hidden_for_terminal() {
     let (_temp, workspace) = set_up_workspace();
     let mut harness = open_form_on(&workspace);
 
-    // Collapsed Advanced: the toggle is folded away regardless of agent.
+    // The bare-terminal default: a terminal has no system prompt to inject
+    // into, so there is nothing to teach.
     assert!(
-        !harness
-            .screen_to_string()
-            .contains("Teach agent the Fresh CLI"),
-        "the Teach Fresh CLI toggle must be hidden while Advanced is collapsed. Screen:\n{}",
+        !harness.screen_to_string().contains("Teach Fresh CLI"),
+        "the terminal preset must not show the Teach Fresh CLI toggle. Screen:\n{}",
         harness.screen_to_string(),
     );
 
-    // Expand Advanced. With the bare-terminal default still active, the toggle
-    // stays hidden — a terminal has no system prompt to inject into.
-    expand_advanced(&mut harness);
-    assert!(
-        !harness
-            .screen_to_string()
-            .contains("Teach agent the Fresh CLI"),
-        "the terminal preset must not show the Teach Fresh CLI toggle even under \
-         an expanded Advanced fold. Screen:\n{}",
-        harness.screen_to_string(),
-    );
-
-    // Select the first agent (claude) via the dropdown; the toggle now renders
-    // under the (still-expanded) Advanced fold.
+    // Select the first agent (claude) via the dropdown; the toggle appears.
     focus_agent_preset_stop(&mut harness);
     let mut guard = 0;
     while !focused_line(&harness.screen_to_string()).contains("claude") {
@@ -1632,18 +1636,108 @@ fn teach_fresh_cli_toggle_shown_for_agent_hidden_for_terminal() {
         );
     }
     assert!(
-        harness
-            .screen_to_string()
-            .contains("Teach agent the Fresh CLI"),
-        "selecting a supporting agent must reveal the Teach Fresh CLI toggle under \
-         the expanded Advanced fold. Screen:\n{}",
+        harness.screen_to_string().contains("Teach Fresh CLI"),
+        "selecting a supporting agent must reveal the Teach Fresh CLI toggle. \
+         Screen:\n{}",
         harness.screen_to_string(),
     );
 }
 
+/// True when the focus marker sits on the row of the field labelled
+/// `title` — a field's label and its value cell share one row.
+fn field_focused(screen: &str, title: &str) -> bool {
+    focused_line(screen).contains(title)
+}
+
+/// Type `text` one settled keystroke at a time. `type_text` pushes the
+/// whole string through without draining the panel's async work in
+/// between, and a field in this form can then lose a leading character —
+/// a separate bug this test doesn't want to trip over.
+fn type_settled(harness: &mut EditorTestHarness, text: &str) {
+    for ch in text.chars() {
+        harness
+            .send_key(KeyCode::Char(ch), KeyModifiers::NONE)
+            .unwrap();
+    }
+}
+
+/// A value longer than the field can show must still be navigable to its
+/// start: the field paints a window over the value that follows the
+/// caret, so Home (or a walk of Left) brings the head back on screen and
+/// what you then type lands where you can see it.
+///
+/// It didn't. The field was pinned to the value's *tail* — `…` then the
+/// last N chars — and a caret in the hidden head was clamped to the first
+/// visible char, so Home moved the caret but nothing on screen moved with
+/// it: the beginning of a long workspace name, path or agent command
+/// could not be seen or visually edited at all.
+#[test]
+fn long_value_can_be_navigated_back_to_its_start() {
+    let (_temp, workspace) = set_up_workspace();
+    // A narrow screen keeps the form's fields narrow, so a modest value
+    // already outgrows them.
+    let mut harness = EditorTestHarness::with_working_dir(100, 40, workspace.clone()).unwrap();
+    harness.tick_and_render().unwrap();
+    wait_for_new_session_command(&mut harness);
+    open_new_session_form(&mut harness);
+
+    // Walk to the Workspace field (a plain text field — the Folder field
+    // opens a completion popup as it fills, which is a different test's
+    // subject). It lives in the Details fold, so open that first.
+    set_details(&mut harness, true);
+    let mut guard = 0;
+    while !field_focused(&harness.screen_to_string(), "Workspace:") {
+        harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+        harness.tick_and_render().unwrap();
+        guard += 1;
+        assert!(
+            guard < 20,
+            "Tab never reached the Workspace field. Screen:\n{}",
+            harness.screen_to_string(),
+        );
+    }
+
+    // Clear the suggested name (End, then backspace it away) and type a
+    // value wider than the field.
+    harness.send_key(KeyCode::End, KeyModifiers::NONE).unwrap();
+    for _ in 0..40 {
+        harness
+            .send_key(KeyCode::Backspace, KeyModifiers::NONE)
+            .unwrap();
+    }
+    type_settled(&mut harness, &format!("QQQ{}ZZZ", "-abcdefghij".repeat(5)));
+    harness
+        .wait_until(|h| h.screen_to_string().contains("ZZZ"))
+        .unwrap();
+
+    // Typing keeps the caret end in view, so the head is off screen.
+    harness.assert_screen_not_contains("QQQ");
+
+    // Home brings the window home with the caret.
+    harness.send_key(KeyCode::Home, KeyModifiers::NONE).unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("QQQ"))
+        .unwrap();
+
+    // And the caret is really where the screen says it is: what we type
+    // now lands at the value's start, in view.
+    type_settled(&mut harness, "YY");
+    harness
+        .wait_until(|h| h.screen_to_string().contains("YYQQQ"))
+        .unwrap();
+
+    // Walking back to the tail brings the window with it, too.
+    harness.send_key(KeyCode::End, KeyModifiers::NONE).unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("ZZZ"))
+        .unwrap();
+    harness.assert_screen_not_contains("YYQQQ");
+}
+
 /// "Run Agent…" and "New Workspace" are one dialog, distinguished only by
-/// where its "Launch in" switch starts — and flipping that switch reshapes the
-/// form in place rather than opening a different one.
+/// its mode switch (`( ) New workspace  ( ) Here · <name>`) — and flipping
+/// that switch reshapes the form in place rather than opening a different
+/// one.
 ///
 /// This is the structural guard on the unification: two dialogs with two submit
 /// paths is what let the current-workspace path silently drop the agent-resume
@@ -1652,111 +1746,97 @@ fn teach_fresh_cli_toggle_shown_for_agent_hidden_for_terminal() {
 /// Driven from the New-Workspace entry point (the reliable one — confirming a
 /// quick-open entry re-computes the suggestion list and indexes it by row while
 /// plugin commands are still registering, so opening by palette twice in one
-/// test is racy). That the *Run Agent* entry point opens this same form
-/// pre-switched is asserted through the frame title, which follows the switch.
+/// test is racy). The frame title follows the switch.
 #[test]
 fn run_agent_and_new_workspace_are_one_dialog() {
     let (_temp, workspace) = set_up_workspace();
     let mut harness = open_form_on(&workspace);
 
     // Opened as "New Workspace": the workspace-creation fields are all here.
-    harness.assert_screen_contains("Launch in:");
     harness.assert_screen_contains("New workspace");
-    harness.assert_screen_contains("Project Path");
-    harness.assert_screen_contains("Workspace Name");
-    harness.assert_screen_contains("Advanced");
-    harness.assert_screen_contains("Run in:");
+    harness.assert_screen_contains("Here ·");
+    harness.assert_screen_contains("Folder:");
+    harness.assert_screen_contains("Project:");
+    harness.assert_screen_contains("Machine:");
     harness.assert_screen_contains("Agent:");
 
-    // Flip "Launch in" to the current workspace. The form opens focused on
-    // Project Path, so Shift+Tab twice reaches the switch (via the backend
-    // tab group, which is a single stop).
-    harness
-        .send_key(KeyCode::BackTab, KeyModifiers::NONE)
-        .unwrap();
-    harness.tick_and_render().unwrap();
-    harness
-        .send_key(KeyCode::BackTab, KeyModifiers::NONE)
-        .unwrap();
-    harness.tick_and_render().unwrap();
-    assert!(
-        focused_line(&harness.screen_to_string()).contains("Launch in:"),
-        "Shift+Tab should reach the Launch-in switch. Screen:\n{}",
-        harness.screen_to_string(),
-    );
-    harness.send_key(KeyCode::Left, KeyModifiers::NONE).unwrap();
+    // Walk back to the switch and flip it to Here.
+    flip_to_here(&mut harness);
 
-    // Everything workspace-shaped is gone — this is exactly what the separate
-    // Run-Agent dialog used to show — and the frame now says so.
-    harness
-        .wait_until(|h| h.screen_to_string().contains("ORCHESTRATOR :: Run Agent"))
-        .unwrap();
-    harness.assert_screen_contains("Current workspace");
-    harness.assert_screen_not_contains("Project Path");
-    harness.assert_screen_not_contains("Workspace Name");
-    harness.assert_screen_not_contains("Advanced");
-    harness.assert_screen_not_contains("Run in:");
+    // Everything workspace-shaped is gone and the frame says so.
+    harness.assert_screen_not_contains("Folder:");
+    harness.assert_screen_not_contains("Project:");
+    harness.assert_screen_not_contains("Machine:");
     // The agent selector is shared by both shapes, so it stays.
     harness.assert_screen_contains("Agent:");
 
     // Focus stayed on the switch, so flipping back is one key — the form
     // must not fling focus elsewhere when its shape changes under the user.
     assert!(
-        focused_line(&harness.screen_to_string()).contains("Launch in:"),
+        focused_line(&harness.screen_to_string()).contains("Here ·"),
         "flipping the switch must leave focus on it. Screen:\n{}",
         harness.screen_to_string(),
     );
 
     // And back again: same dialog, more of it.
+    harness.send_key(KeyCode::Left, KeyModifiers::NONE).unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Folder:"))
+        .unwrap();
+    harness.assert_screen_contains(FORM_TITLE);
+    harness.assert_screen_contains("Machine:");
+}
+
+/// Shift+Tab back to the mode switch and flip it to Here; waits for the
+/// `Run Agent` frame.
+fn flip_to_here(harness: &mut EditorTestHarness) {
+    let mut guard = 0;
+    while !focused_line(&harness.screen_to_string()).contains("New workspace") {
+        harness
+            .send_key(KeyCode::BackTab, KeyModifiers::NONE)
+            .unwrap();
+        harness.tick_and_render().unwrap();
+        guard += 1;
+        assert!(
+            guard < 30,
+            "Shift+Tab never reached the mode switch. Screen:\n{}",
+            harness.screen_to_string(),
+        );
+    }
     harness
         .send_key(KeyCode::Right, KeyModifiers::NONE)
         .unwrap();
     harness
-        .wait_until(|h| h.screen_to_string().contains("Project Path"))
+        .wait_until(|h| h.screen_to_string().contains("┌ Run Agent"))
         .unwrap();
-    harness.assert_screen_contains("ORCHESTRATOR :: New Workspace");
-    harness.assert_screen_contains("Run in:");
 }
 
 /// The agent list ends in "custom…", whose whole purpose is to let the user
-/// type an arbitrary command — so the Agent Command field has to be present,
-/// and focusable, in the current-workspace shape too.
+/// type an arbitrary command — so picking it has to reveal the Agent Command
+/// field, focused, in the current-workspace shape too.
 ///
-/// It wasn't. On a local *new workspace* that field lives under the Advanced
-/// fold, and both the fold and the inline fallback were gated on "creating",
-/// so running in the current workspace rendered no command box at all. Picking
-/// "custom…" then left the form claiming an agent the user had no way to name,
-/// and — because the preset hands focus to a `cmd` field that wasn't in the
-/// focus cycle — dropped focus back to the top of the form, where the next
-/// arrow key silently flipped "Launch in" to "New workspace".
+/// It once didn't: the field lived under a workspace-shaped fold that the
+/// current-workspace shape did not render at all, so "custom…" left the form
+/// claiming an agent the user had no way to name, and — because the preset
+/// hands focus to a `cmd` field that wasn't in the focus cycle — dropped focus
+/// back to the top of the form, where the next arrow key silently flipped
+/// the mode switch to "New workspace".
 #[test]
 fn custom_agent_is_typable_when_running_in_the_current_workspace() {
     let (_temp, workspace) = set_up_workspace();
     let mut harness = open_form_on(&workspace);
 
-    // Flip "Launch in" to the current workspace (as `Run Agent…` opens it).
-    harness
-        .send_key(KeyCode::BackTab, KeyModifiers::NONE)
-        .unwrap();
-    harness.tick_and_render().unwrap();
-    harness
-        .send_key(KeyCode::BackTab, KeyModifiers::NONE)
-        .unwrap();
-    harness.tick_and_render().unwrap();
-    harness.send_key(KeyCode::Left, KeyModifiers::NONE).unwrap();
-    harness
-        .wait_until(|h| h.screen_to_string().contains("ORCHESTRATOR :: Run Agent"))
-        .unwrap();
+    // Flip the switch to Here (the Run Agent shape).
+    flip_to_here(&mut harness);
 
-    // The command box is here even though the workspace-shaped Advanced fold
-    // that normally holds it is not.
-    harness.assert_screen_contains("Agent Command");
-    harness.assert_screen_not_contains("Advanced");
+    // The command box is disclosed by the selector: a preset fills it, so it
+    // only shows for "custom…".
+    harness.assert_screen_not_contains("Agent Command");
 
     // Walk to the agent selector and step left, which wraps the list around to
     // "custom…" — the shortest route, and the one that used to strand focus.
     let mut guard = 0;
-    while !focused_line(&harness.screen_to_string()).contains("Agent:") {
+    while !focused_line(&harness.screen_to_string()).contains("▸ Agent:") {
         harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
         harness.tick_and_render().unwrap();
         guard += 1;
@@ -1768,15 +1848,18 @@ fn custom_agent_is_typable_when_running_in_the_current_workspace() {
     }
     harness.send_key(KeyCode::Left, KeyModifiers::NONE).unwrap();
     harness
-        .wait_until(|h| h.screen_to_string().contains("custom"))
+        .wait_until(|h| {
+            let s = h.screen_to_string();
+            s.contains("custom") && s.contains("Agent Command")
+        })
         .unwrap();
 
     // Focus followed the preset onto the command field, so the user can just
-    // type — and, critically, is not sitting on the "Launch in" switch.
+    // type — and, critically, is not sitting on the mode switch.
     let focused = focused_line(&harness.screen_to_string());
     assert!(
-        !focused.contains("Launch in:"),
-        "picking 'custom…' must not drop focus onto the Launch-in switch — the \
+        !focused.contains("New workspace"),
+        "picking 'custom…' must not drop focus onto the mode switch — the \
          next arrow key would change the workspace target. Screen:\n{}",
         harness.screen_to_string(),
     );
@@ -1790,4 +1873,378 @@ fn custom_agent_is_typable_when_running_in_the_current_workspace() {
     harness
         .wait_until(|h| h.screen_to_string().contains("zzcustomcmd"))
         .unwrap();
+}
+
+/// Write `config` as the `~/.ssh/config` of the editor's resolved home.
+fn plant_ssh_config(data_home: &tempfile::TempDir, config: &str) {
+    let ssh = data_home.path().join("home").join(".ssh");
+    fs::create_dir_all(&ssh).unwrap();
+    fs::write(ssh.join("config"), config).unwrap();
+}
+
+/// Save an ssh machine before the editor starts (see the shared helper).
+fn plant_saved_ssh_machine(data_home: &tempfile::TempDir, id: &str, name: &str, target: &str) {
+    crate::common::launch_form::plant_saved_ssh_machine(
+        &data_home.path().join("data"),
+        id,
+        name,
+        target,
+    );
+}
+
+/// Open the New Workspace form on an editor whose resolved home holds
+/// `config` as its `~/.ssh/config`.
+fn form_with_planted_ssh_config(
+    workspace: PathBuf,
+    data_home: &tempfile::TempDir,
+    config: &str,
+) -> EditorTestHarness {
+    plant_ssh_config(data_home, config);
+    let dir_context = fresh::config_io::DirectoryContext::for_testing(data_home.path());
+    let mut harness = EditorTestHarness::create(
+        160,
+        50,
+        crate::common::harness::HarnessOptions::new()
+            .with_working_dir(workspace)
+            .with_shared_dir_context(dir_context),
+    )
+    .unwrap();
+    harness.tick_and_render().unwrap();
+    wait_for_new_session_command(&mut harness);
+    open_new_session_form(&mut harness);
+    harness
+}
+
+/// Step onto the first saved machine in the Machine control: → walks off
+/// Local onto it (saved machines come straight after Local).
+fn step_to_first_saved_machine(harness: &mut EditorTestHarness) {
+    focus_stop(harness, "▸ Machine:");
+    harness
+        .send_key(KeyCode::Right, KeyModifiers::NONE)
+        .unwrap();
+    harness.tick_and_render().unwrap();
+}
+
+/// **A `~` path is a path.** Nothing in the plugin runs through a shell — the
+/// completion list calls `readDir` and the git probe execs directly — so a
+/// typed `~/…` used to reach both as a literal tilde. `readDir("~")` finds
+/// nothing and `git -C ~/repo` fails, which the form reads as "not a git
+/// path" and renders as a disabled worktree toggle on a repository that
+/// plainly is one.
+///
+/// This asserts the completion half, because it is synchronous and caused
+/// *only* by expansion: the entry can reach the popup by no other route.
+/// Three async assertions on the worktree toggle were tried first and two of
+/// them passed against the bug — `!contains("non-git")` holds before the
+/// probe has run at all, and the "New branch name" row renders whenever
+/// `projectPathIsGit !== false`, which includes the broken path, where the
+/// probe leaves it undefined rather than false.
+///
+/// The directory is planted under the editor's *resolved* home, so the `~`
+/// under test is the one the editor would expand.
+#[test]
+fn a_tilde_path_expands_for_the_completion_list() {
+    let (_temp, workspace) = set_up_workspace();
+    let data_home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(data_home.path().join("home").join("tildedir")).unwrap();
+
+    let mut harness = form_with_planted_ssh_config(workspace, &data_home, "");
+
+    // The form opens focused on Folder field, so this goes straight in.
+    for ch in "~/tilded".chars() {
+        harness
+            .send_key(KeyCode::Char(ch), KeyModifiers::NONE)
+            .unwrap();
+    }
+
+    harness
+        .wait_until(|h| h.screen_to_string().contains("tildedir"))
+        .unwrap_or_else(|_| {
+            panic!(
+                "`~/` must list the editor's own home: the planted directory can \
+                 reach the completion popup by no other route. Screen:\n{}",
+                harness.screen_to_string()
+            )
+        });
+}
+
+/// **A `~/.ssh/config` host is not a machine until it is added.** The
+/// Machines dialog is the one place a machine becomes usable; every picker
+/// lists only saved ones, so a host shows up the same way everywhere or not
+/// at all. The form's Machine control goes from Local straight to the
+/// devcontainer, and the `+ Add machine…` button under it is the way in.
+#[test]
+fn a_config_host_is_not_offered_until_it_is_added() {
+    let (_temp, workspace) = set_up_workspace();
+    let data_home = tempfile::tempdir().unwrap();
+    let mut harness = form_with_planted_ssh_config(
+        workspace,
+        &data_home,
+        "Host plantedbox\n  HostName 10.0.0.9\n  User deploy\n",
+    );
+
+    harness.assert_screen_contains("+ Add machine…");
+    focus_stop(&mut harness, "▸ Machine:");
+    harness
+        .send_key(KeyCode::Right, KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .wait_until(|h| focused_line(&h.screen_to_string()).contains("Devcontainer"))
+        .unwrap_or_else(|_| {
+            panic!(
+                "the option after Local is the devcontainer, not the config host. Screen:\n{}",
+                harness.screen_to_string()
+            )
+        });
+    harness.assert_screen_not_contains("plantedbox");
+}
+
+/// **A saved machine is an option.** Planted the way `Add Machine` saves one.
+#[test]
+fn a_saved_machine_is_offered_with_what_it_resolves_to() {
+    let (_temp, workspace) = set_up_workspace();
+    let data_home = tempfile::tempdir().unwrap();
+    plant_saved_ssh_machine(&data_home, "m-planted", "plantedbox", "deploy@10.0.0.9");
+    let mut harness = form_with_planted_ssh_config(workspace, &data_home, "");
+
+    step_to_first_saved_machine(&mut harness);
+    harness
+        .wait_until(|h| focused_line(&h.screen_to_string()).contains("plantedbox"))
+        .unwrap_or_else(|_| {
+            panic!(
+                "the saved machine should be an option. Screen:\n{}",
+                harness.screen_to_string()
+            )
+        });
+    harness.assert_screen_contains("deploy@10.0.0.9");
+}
+
+/// **Typing a repository path must arm the worktree toggle.** The form opens
+/// on a non-git workspace, so the group starts as the dim `[ ] Create a git
+/// worktree` with "disabled — non-git" under it. Typing a real repository's
+/// path has to replace that with the live toggle and the Checkout branch
+/// field it reveals — the probe's answer is what the row is *for*.
+///
+/// Asserted on the note rather than the toggle glyph: the dim placeholder and
+/// the live toggle both render `[ ]` while unchecked, so only the note tells
+/// the two states apart.
+#[test]
+fn typing_a_repository_path_arms_the_worktree_toggle() {
+    let (_temp, workspace) = set_up_workspace();
+    let repo = workspace.join("alpha_dir");
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "t@example.com"],
+        vec!["config", "user.name", "t"],
+        vec!["commit", "-q", "--allow-empty", "-m", "seed"],
+    ] {
+        let out = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {:?} failed: {:?}", args, out);
+    }
+
+    let mut harness = open_form_on(&workspace);
+    harness
+        .wait_until(|h| h.screen_to_string().contains("plain folder"))
+        .expect("the form opens on a non-git workspace, so the plan starts as a plain folder");
+
+    // The form opens focused on Folder field.
+    harness.type_text(repo.to_str().unwrap()).unwrap();
+    // Leave the field: the path-completion popup it opened covers the plan
+    // line under it, and Tab closes it without accepting a suggestion.
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+
+    harness
+        .wait_until(|h| {
+            let s = h.screen_to_string();
+            !s.contains("plain folder") && s.contains("new worktree")
+        })
+        .unwrap_or_else(|_| {
+            panic!(
+                "a typed git repository path must turn the plan into a new \
+                 worktree. Screen:\n{}",
+                harness.screen_to_string()
+            )
+        });
+}
+
+/// **And the same for a `~` path**, which is the shape the disabled toggle
+/// was actually reported on: `git -C ~/repo` with a literal tilde fails, the
+/// form reads that as "not a git path", and a repository that plainly is one
+/// gets the dim row.
+///
+/// The sibling completion test could only assert the popup, because the two
+/// obvious worktree assertions are vacuous on their own — `!contains(
+/// "non-git")` holds before the probe has run at all. Waiting for the
+/// disabled row *first* is what makes this one bite: the group is established
+/// as disabled, and only the probe's answer can clear it.
+#[test]
+fn a_tilde_repository_path_arms_the_worktree_toggle() {
+    let (_temp, workspace) = set_up_workspace();
+    let data_home = tempfile::tempdir().unwrap();
+    let repo = data_home.path().join("home").join("tildedir");
+    fs::create_dir_all(&repo).unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "t@example.com"],
+        vec!["config", "user.name", "t"],
+        vec!["commit", "-q", "--allow-empty", "-m", "seed"],
+    ] {
+        let out = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {:?} failed: {:?}", args, out);
+    }
+
+    let mut harness = form_with_planted_ssh_config(workspace, &data_home, "");
+    harness
+        .wait_until(|h| h.screen_to_string().contains("plain folder"))
+        .expect("the form opens on a non-git workspace, so the plan starts as a plain folder");
+
+    harness.type_text("~/tildedir").unwrap();
+    // Leave the field: the path-completion popup it opened covers the plan
+    // line under it, and Tab closes it without accepting a suggestion.
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+
+    harness
+        .wait_until(|h| {
+            let s = h.screen_to_string();
+            !s.contains("plain folder") && s.contains("new worktree")
+        })
+        .unwrap_or_else(|_| {
+            panic!(
+                "`~/tildedir` is a repository, so the plan must be a new worktree. \
+                 Screen:\n{}",
+                harness.screen_to_string()
+            )
+        });
+}
+
+/// **A remote workspace gets the same worktree offer a local one does.** The
+/// repository is simply on the other side of a connection; before the remote
+/// group existed, picking an ssh machine dropped the worktree controls
+/// entirely and the only way to branch on a remote checkout was to ssh in and
+/// do it by hand.
+#[test]
+fn the_ssh_form_offers_a_worktree_too() {
+    let (_temp, workspace) = set_up_workspace();
+    let data_home = tempfile::tempdir().unwrap();
+    plant_saved_ssh_machine(&data_home, "m-planted", "plantedbox", "deploy@10.0.0.9");
+    let mut harness = form_with_planted_ssh_config(workspace, &data_home, "");
+
+    step_to_first_saved_machine(&mut harness);
+    // The worktree choice lives in the Details fold.
+    set_details(&mut harness, true);
+    harness
+        .wait_until(|h| h.screen_to_string().contains("New worktree"))
+        .unwrap_or_else(|_| {
+            panic!(
+                "an ssh machine should offer the worktree group. Screen:\n{}",
+                harness.screen_to_string()
+            )
+        });
+}
+
+/// **"Could not ask" is not "the answer is no".** A host that cannot be
+/// reached and a path that is not a repository are different problems with
+/// different fixes, and calling the first one "not a git repository" sends the
+/// user to inspect a path that may be perfectly fine.
+///
+/// `ssh` passes the remote command's exit status through, so the probe used to
+/// read the two apart with a regex over ssh's prose. It swallows the remote's
+/// own failures instead, which leaves a non-zero status meaning only one
+/// thing. The host here is `.invalid`, a name reserved never to resolve, so
+/// the failure is the transport's however the runner is configured — and if
+/// `ssh` is absent altogether, that is a transport failure too.
+#[test]
+fn an_unreachable_host_is_not_reported_as_a_missing_repository() {
+    let (_temp, workspace) = set_up_workspace();
+    let data_home = tempfile::tempdir().unwrap();
+    plant_saved_ssh_machine(&data_home, "m-dead", "deadbox", "deploy@nowhere.invalid");
+    let mut harness = form_with_planted_ssh_config(workspace, &data_home, "");
+
+    step_to_first_saved_machine(&mut harness);
+    // The remote path field, which is what the probe needs before it has
+    // anything to ask about.
+    focus_stop(&mut harness, "Folder:");
+    harness.type_text("/srv/repo").unwrap();
+
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Host unreachable"))
+        .unwrap_or_else(|_| {
+            panic!(
+                "an unresolvable host must read as unreachable. Screen:\n{}",
+                harness.screen_to_string()
+            )
+        });
+    let screen = harness.screen_to_string();
+    assert!(
+        !screen.contains("Not a git repository"),
+        "a host that never answered must not be reported as having no \
+         repository. Screen:\n{screen}",
+    );
+}
+
+/// **A machine added from a `~/.ssh/config` host reaches ssh as the alias.**
+///
+/// `Add as machine` saves the alias as the target, which is an implicit
+/// promise that the user's entry for it keeps working. It once did not: the
+/// form resolved the alias itself to `user@hostname:port` and handed ssh *that*,
+/// and a resolved destination matches no `Host` block — so every directive
+/// beyond the three this plugin's own parser reads (`HostName`, `User`,
+/// `Port`) silently stopped applying. `IdentityFile` was the one that hurt:
+/// a host picked from the list connected with the wrong key and failed
+/// `Permission denied (publickey)`, with nothing on screen to say which half
+/// of the config was live.
+///
+/// The shim makes the difference observable without a network: it answers the
+/// probe for `aliasbox` and refuses `deploy@10.0.0.9`. The remote branch name
+/// can only reach the screen through an ssh call that was given the alias.
+///
+/// Linux-only, like every other shim-driven test here
+/// (`orchestrator_pending_ssh.rs` and the `dormant_ssh` reproducers all carry
+/// the same gate): the fixture is a `#!/bin/sh` script standing in for `ssh`
+/// on `$PATH`, which Windows cannot execute — so the probe never answers and
+/// the wait for the remote branch name runs until the harness kills it. The
+/// rest of this file is path-completion coverage that does run on Windows,
+/// hence the gate on the function rather than the module.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_config_alias_is_handed_to_ssh_as_the_alias() {
+    let (_temp, workspace) = set_up_workspace();
+    let data_home = tempfile::tempdir().unwrap();
+    let _ssh = crate::common::dormant_ssh::alias_only_ssh_on_path();
+    plant_saved_ssh_machine(&data_home, "m-alias", "aliasbox", "aliasbox");
+
+    let mut harness = form_with_planted_ssh_config(
+        workspace,
+        &data_home,
+        "Host aliasbox\n  HostName 10.0.0.9\n  User deploy\n  Port 2222\n\
+         \n  IdentityFile /keys/aliasbox\n",
+    );
+    step_to_first_saved_machine(&mut harness);
+
+    // The remote probe only runs once there is a path to ask about.
+    focus_stop(&mut harness, "Folder:");
+    for ch in "/srv/aliasrepo".chars() {
+        harness
+            .send_key(KeyCode::Char(ch), KeyModifiers::NONE)
+            .unwrap();
+    }
+
+    harness
+        .wait_until(|h| h.screen_to_string().contains("remote-main-branch"))
+        .unwrap_or_else(|_| {
+            panic!(
+                "the branch the host reported must reach the form, which it can \
+                 only do through an ssh call given the alias `aliasbox` rather \
+                 than the resolved `deploy@10.0.0.9`. Screen:\n{}",
+                harness.screen_to_string()
+            )
+        });
 }

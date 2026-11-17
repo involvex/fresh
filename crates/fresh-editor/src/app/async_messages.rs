@@ -15,12 +15,12 @@ use crate::services::async_bridge::{
 use crate::services::lsp::diagnostics::AnchoredDiagnostic;
 use crate::state::{SemanticTokenSpan, SemanticTokenStore};
 use crate::view::file_tree::{FileTreeView, NodeId};
+use fresh_i18n::t;
 use lsp_types::{
     Diagnostic, FoldingRange, InlayHint, SemanticToken, SemanticTokensEdit,
     SemanticTokensFullDeltaResult, SemanticTokensLegend, SemanticTokensRangeResult,
     SemanticTokensResult,
 };
-use rust_i18n::t;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -182,6 +182,31 @@ impl Editor {
             if !lsp.has_server_named(&server_name) {
                 tracing::debug!(
                     "Dropping diagnostics from stopped server '{}' for {}",
+                    server_name,
+                    uri
+                );
+                return;
+            }
+
+            // Drop diagnostics from a server whose copy of the document we know
+            // has diverged from the buffer: it computed them from text the user
+            // never wrote, and the version they carry cannot expose that,
+            // because the server is answering for every change it did receive.
+            // A full-text resync is already pending, so a correct set follows
+            // shortly (#3038).
+            let desynced = uri
+                .parse::<lsp_types::Uri>()
+                .ok()
+                .map(|u| PathBuf::from(u.path().as_str()))
+                .is_some_and(|path| {
+                    lsp.all_handles()
+                        .iter()
+                        .any(|sh| sh.name == server_name && sh.handle.needs_full_resync(&path))
+                });
+            if desynced {
+                tracing::debug!(
+                    "Dropping diagnostics from '{}' for {}: its copy of the \
+                     document is stale, awaiting resync",
                     server_name,
                     uri
                 );
@@ -726,6 +751,7 @@ impl Editor {
                             result_id: decoded.result_id,
                             data: decoded.raw_data,
                             tokens: decoded.spans,
+                            stale: false,
                         });
                     }
                 }
@@ -746,6 +772,12 @@ impl Editor {
                 match result {
                     Err(_) => {
                         // Error already logged by the generic LSP response handler.
+                        // The server may not know our `previousResultId` (e.g. it
+                        // restarted); forget it so the next request is a plain
+                        // `full` instead of repeating the failing delta forever.
+                        if let Some(store) = state.semantic_tokens.as_mut() {
+                            store.result_id = None;
+                        }
                     }
                     Ok(tokens_opt) => {
                         let existing_store = state.semantic_tokens.as_ref();
@@ -837,6 +869,7 @@ impl Editor {
                             result_id: decoded.result_id,
                             data: decoded.raw_data,
                             tokens: spans,
+                            stale: false,
                         });
                     }
                 }
@@ -959,6 +992,8 @@ impl Editor {
             "LSP ({}) semantic-tokens refresh requested, re-pulling semantic tokens",
             language
         );
+        // Same server, so its `resultId`s stay valid: keep delta requests.
+        self.invalidate_semantic_tokens_for_language(&language, false);
         self.request_semantic_tokens_for_language(&language);
     }
 
@@ -997,6 +1032,14 @@ impl Editor {
         // Only re-issue requests on a net-new capability; an unregister or a
         // no-op registration should not trigger a fresh round of requests.
         if changed && register {
+            // A newly registered semantic-tokens provider may be a different
+            // server than the one whose tokens (and `resultId`) we hold.
+            if registrations
+                .iter()
+                .any(|(method, _)| method.starts_with("textDocument/semanticTokens"))
+            {
+                self.invalidate_semantic_tokens_for_language(&language, true);
+            }
             self.request_semantic_tokens_for_language(&language);
             self.request_folding_ranges_for_language(&language);
             self.request_inlay_hints_for_language(&language);
@@ -1160,9 +1203,25 @@ impl Editor {
         // that language so the server can start providing diagnostics, etc.
         // without waiting for the next user edit.
         if status == LspServerStatus::Running {
-            let was_already_running = old_status
-                .as_ref()
-                .is_some_and(|s| matches!(s, LspServerStatus::Running));
+            // `Unresponsive` counts as already-running: the server never
+            // stopped, it just went quiet, so recovering from it must not
+            // re-`didOpen` every buffer.
+            let was_already_running = old_status.as_ref().is_some_and(|s| {
+                matches!(s, LspServerStatus::Running | LspServerStatus::Unresponsive)
+            });
+
+            // A server that is answering again must not have its old
+            // expiries explaining results it now produces correctly
+            // (issue #2197). Matched on the server as well as the language,
+            // because a universal server records its expiries under the
+            // label `"universal"` rather than under any language.
+            let recovered_language = language.clone();
+            let recovered_server = server_name_ref.clone();
+            self.active_window_mut()
+                .lsp_request_timeouts
+                .retain(|(lang, _), record| {
+                    lang != &recovered_language && record.server_name != recovered_server
+                });
             if !was_already_running {
                 let scope = self
                     .lsp()
@@ -1191,9 +1250,22 @@ impl Editor {
 
         // Handle server crash - trigger auto-restart
         if status == LspServerStatus::Error {
+            // `Unresponsive` is a live server that stopped answering, and it
+            // is the state most likely to *precede* a death — wedged, then
+            // OOM-killed or its stdout reader errors. Leaving it out would
+            // cost that server its auto-restart and leave its diagnostics on
+            // screen, which is exactly what used to happen when the same
+            // sequence passed through `Running`.
             let was_running = old_status
                 .as_ref()
-                .map(|s| matches!(s, LspServerStatus::Running | LspServerStatus::Initializing))
+                .map(|s| {
+                    matches!(
+                        s,
+                        LspServerStatus::Running
+                            | LspServerStatus::Initializing
+                            | LspServerStatus::Unresponsive
+                    )
+                })
                 .unwrap_or(false);
 
             if was_running {
@@ -1218,6 +1290,18 @@ impl Editor {
         // (and the status popup keeps showing "Indexing …") even
         // though the process is gone — that's the "popup still says
         // indexing after external kill" user report.
+        // The popup is a snapshot, so a server going quiet (or answering
+        // again) has to re-render it: otherwise an open popup keeps saying
+        // `(ready)` while the status bar reads `LSP (stuck)`, or keeps
+        // saying `(not responding)` after the server recovered.
+        if matches!(
+            status,
+            LspServerStatus::Unresponsive | LspServerStatus::Running
+        ) && old_status != Some(status)
+        {
+            self.refresh_lsp_status_popup_if_open();
+        }
+
         if matches!(status, LspServerStatus::Error | LspServerStatus::Shutdown) {
             let any_running_for_lang =
                 self.active_window()
@@ -1243,6 +1327,7 @@ impl Editor {
             LspServerStatus::Starting => "starting",
             LspServerStatus::Initializing => "initializing",
             LspServerStatus::Running => "running",
+            LspServerStatus::Unresponsive => "unresponsive",
             LspServerStatus::Error => "error",
             LspServerStatus::Shutdown => "shutdown",
         };
@@ -1251,6 +1336,7 @@ impl Editor {
                 LspServerStatus::Starting => "starting",
                 LspServerStatus::Initializing => "initializing",
                 LspServerStatus::Running => "running",
+                LspServerStatus::Unresponsive => "unresponsive",
                 LspServerStatus::Error => "error",
                 LspServerStatus::Shutdown => "shutdown",
             })
@@ -1266,21 +1352,37 @@ impl Editor {
         );
     }
 
-    /// Handle custom LSP notification
-    #[allow(dead_code)] // Prepared for future use when AsyncMessage::LspCustomNotification is added
+    /// Handle a server -> client LSP notification the editor does not handle
+    /// itself (e.g. clangd's `textDocument/clangd.fileStatus`) by forwarding
+    /// it to plugins subscribed with `editor.on("lsp/custom_notification", ..)`.
     pub(super) fn handle_custom_notification(
         &mut self,
         language: String,
+        server_name: String,
         method: String,
         params: Option<Value>,
     ) {
-        tracing::debug!("Custom LSP notification {} from {}", method, language);
-        let payload = serde_json::json!({
-            "language": language,
-            "method": method,
-            "params": params,
-        });
-        self.emit_event("lsp/custom_notification", payload);
+        tracing::debug!(
+            "Custom LSP notification {} from {} ({})",
+            method,
+            language,
+            server_name
+        );
+        let plugin_manager = self.plugin_manager.read().unwrap();
+        // Chatty servers can send these often; skip the plugin-thread
+        // round trip when nothing is listening.
+        if !plugin_manager.has_subscribers("lsp/custom_notification") {
+            return;
+        }
+        plugin_manager.run_hook(
+            "lsp/custom_notification",
+            crate::services::plugins::hooks::HookArgs::LspCustomNotification {
+                language,
+                server_name,
+                method,
+                params,
+            },
+        );
     }
 
     /// Handle LSP server request (server -> client)
@@ -1480,6 +1582,14 @@ impl Editor {
         };
         win.install_initialized_file_explorer(view, defaults);
         if is_active {
+            self.sync_quick_open_file_visibility();
+        }
+        // "Ready" replaces "initializing" and nothing more specific: a focus
+        // or a reveal that spoke since keeps its word.
+        let still_initializing = self
+            .get_status_message()
+            .is_none_or(|m| *m == t!("explorer.initializing"));
+        if is_active && still_initializing {
             self.set_status_message(t!("status.file_explorer_ready").to_string());
         }
     }
@@ -1557,6 +1667,8 @@ impl Editor {
         if commands.is_empty() {
             return false;
         }
+        // Visual or not, a command can change what plugins read back.
+        self.mark_plugin_snapshot_dirty();
 
         // Classify each command as visual (needs re-render) or not.
         // `HookCompleted` is a pure ack. `SetStatusBarValue` is treated as
@@ -1574,34 +1686,7 @@ impl Editor {
         // debounce tick — e.g. live_diff's 75ms `editor.delay()` recompute
         // repainted the screen twice per keystroke with no change. Invisible
         // on a fast terminal, but real lag over a serial console (#2100).
-        use fresh_core::api::PluginCommand as Pc;
-        let has_visual_commands = commands.iter().any(|c| match c {
-            Pc::HookCompleted { .. }
-            | Pc::Delay { .. }
-            | Pc::SpawnProcess { .. }
-            | Pc::SpawnBackgroundProcess { .. }
-            | Pc::KillBackgroundProcess { .. }
-            | Pc::SpawnProcessWait { .. }
-            | Pc::HttpFetch { .. }
-            | Pc::WatchPath { .. }
-            | Pc::UnwatchPath { .. }
-            | Pc::SetGlobalState { .. }
-            | Pc::SetWindowState { .. }
-            | Pc::SetViewState { .. }
-            // Arming or cancelling a timer paints nothing; what the handler
-            // eventually draws arrives as its own command and is counted then.
-            | Pc::SetPluginTimer { .. }
-            | Pc::ClearPluginTimer { .. } => false,
-            Pc::SetStatusBarValue {
-                buffer_id,
-                key,
-                value,
-            } => {
-                self.current_status_bar_value(fresh_core::BufferId(*buffer_id as usize), key)
-                    != Some(value.as_str())
-            }
-            _ => true,
-        });
+        let has_visual_commands = commands.iter().any(|c| self.plugin_command_is_visual(c));
 
         for command in &commands {
             match command {
@@ -1664,6 +1749,41 @@ impl Editor {
         has_visual_commands
     }
 
+    /// Whether dispatching `command` can change the screen (see
+    /// `process_plugin_commands`). A batch does when one of its commands does.
+    #[cfg(feature = "plugins")]
+    fn plugin_command_is_visual(&self, command: &fresh_core::api::PluginCommand) -> bool {
+        use fresh_core::api::PluginCommand as Pc;
+        match command {
+            Pc::Batch { commands } => commands.iter().any(|c| self.plugin_command_is_visual(c)),
+            Pc::HookCompleted { .. }
+            | Pc::Delay { .. }
+            | Pc::SpawnProcess { .. }
+            | Pc::SpawnBackgroundProcess { .. }
+            | Pc::KillBackgroundProcess { .. }
+            | Pc::SpawnProcessWait { .. }
+            | Pc::HttpFetch { .. }
+            | Pc::WatchPath { .. }
+            | Pc::UnwatchPath { .. }
+            | Pc::SetGlobalState { .. }
+            | Pc::SetWindowState { .. }
+            | Pc::SetViewState { .. }
+            // Arming or cancelling a timer paints nothing; what the handler
+            // eventually draws arrives as its own command and is counted then.
+            | Pc::SetPluginTimer { .. }
+            | Pc::ClearPluginTimer { .. } => false,
+            Pc::SetStatusBarValue {
+                buffer_id,
+                key,
+                value,
+            } => {
+                self.current_status_bar_value(fresh_core::BufferId(*buffer_id as usize), key)
+                    != Some(value.as_str())
+            }
+            _ => true,
+        }
+    }
+
     /// Process pending plugin action completions
     #[cfg(feature = "plugins")]
     pub(super) fn process_pending_plugin_actions(&mut self) {
@@ -1719,6 +1839,50 @@ impl Editor {
     #[doc(hidden)]
     pub fn pending_plugin_actions_is_empty(&self) -> bool {
         true
+    }
+
+    /// Wait until the plugin runtime is at rest, servicing its command
+    /// channel throughout. Returns whether that servicing processed
+    /// anything.
+    ///
+    /// Not the same as `pending_plugin_actions` being empty: that only
+    /// means the handler was *called*, which for an `async` handler is its
+    /// first `await`. The rest runs a host round-trip at a time, and
+    /// between an answer going out and the next command coming back the
+    /// command channel is quiet for reasons unrelated to being finished.
+    ///
+    /// Test-harness helper. The editor's own loop pumps this pipeline every
+    /// frame and has nowhere to be in between.
+    #[cfg(feature = "plugins")]
+    #[doc(hidden)]
+    pub fn sync_plugin_runtime(&mut self) -> bool {
+        use fresh_plugin_runtime::thread::oneshot::TryRecvError;
+
+        let Some(rx) = self.plugin_manager.read().unwrap().sync_runtime() else {
+            return false;
+        };
+        let mut had_messages = false;
+        loop {
+            match rx.try_recv() {
+                Ok(()) => break,
+                Err(TryRecvError::Empty) => {
+                    // Keep answering: the plugin thread may be parked on a
+                    // host round-trip queued ahead of the sync request.
+                    had_messages |= self.process_async_messages();
+                    std::thread::yield_now();
+                }
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        // Pick up the commands those continuations queued.
+        had_messages | self.process_async_messages()
+    }
+
+    /// Stub for builds without plugin support.
+    #[cfg(not(feature = "plugins"))]
+    #[doc(hidden)]
+    pub fn sync_plugin_runtime(&mut self) -> bool {
+        false
     }
 
     /// Process pending LSP server restarts (with exponential backoff)
@@ -1810,6 +1974,25 @@ impl Editor {
                     }
                 }
             }
+        }
+    }
+
+    /// Mark the semantic tokens of every open buffer of `language` as stale
+    /// (see `Window::invalidate_semantic_tokens`), so the next scheduled
+    /// request is sent even for buffers that have not been edited.
+    pub(super) fn invalidate_semantic_tokens_for_language(
+        &mut self,
+        language: &str,
+        forget_result_id: bool,
+    ) {
+        let buffer_ids: Vec<_> = self
+            .buffers_for_language(language)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        for buffer_id in buffer_ids {
+            self.active_window_mut()
+                .invalidate_semantic_tokens(buffer_id, forget_result_id);
         }
     }
 
@@ -2006,5 +2189,42 @@ mod tests {
         let updated = apply_semantic_token_edits(base, &[edit]).expect("edit should apply");
         assert_eq!(updated.len(), 10);
         assert_eq!(&updated[5..10], &[0, 5, 1, 2, 0]);
+    }
+
+    /// A batch repaints when one of its commands would: a hook that only
+    /// re-publishes what is already shown must not start a render loop.
+    #[cfg(feature = "plugins")]
+    #[test]
+    fn a_batch_is_visual_when_one_of_its_commands_is() {
+        use fresh_core::api::PluginCommand as Pc;
+        let temp = tempfile::tempdir().unwrap();
+        let editor = crate::app::Editor::for_test(
+            crate::config::Config::default(),
+            80,
+            24,
+            None,
+            crate::config_io::DirectoryContext::for_testing(temp.path()),
+            crate::view::color_support::ColorCapability::TrueColor,
+            std::sync::Arc::new(crate::model::filesystem::StdFileSystem),
+            None,
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let ack = || Pc::HookCompleted {
+            hook_name: "render_start".into(),
+        };
+        let decoration = || Pc::ClearNamespace {
+            buffer_id: fresh_core::BufferId(1),
+            namespace: fresh_core::overlay::OverlayNamespace::new(),
+        };
+        assert!(!editor.plugin_command_is_visual(&Pc::Batch {
+            commands: vec![ack(), ack()],
+        }));
+        assert!(editor.plugin_command_is_visual(&Pc::Batch {
+            commands: vec![ack(), decoration()],
+        }));
     }
 }

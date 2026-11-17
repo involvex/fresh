@@ -226,6 +226,10 @@ impl<M> Index<ElementId> for Arena<M> {
 /// through leaves the last committed content intact; three separate rules
 /// depend on it — the error policy, deferred disposal, and unwinding a failed
 /// constructor.
+// `Desc` holds the displaced description by value so an abort puts it back
+// without a copy; the buffer lives for one transaction, and boxing it would
+// add an allocation to every mutation of a reconcile.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Undo<M> {
     Created(ElementId),
     Root(Option<ElementId>),
@@ -243,9 +247,13 @@ pub(crate) struct Txn<M> {
 }
 
 impl<M> Txn<M> {
-    fn new() -> Self {
+    /// Start a transaction on a recycled journal. `undo` is expected empty;
+    /// what it carries is capacity, so the reconcile does not rebuild it entry
+    /// by entry the way the previous one did.
+    fn with_journal(undo: Vec<Undo<M>>) -> Self {
+        debug_assert!(undo.is_empty(), "a recycled journal must be empty");
         Txn {
-            undo: Vec::new(),
+            undo,
             detached: Vec::new(),
         }
     }
@@ -258,11 +266,24 @@ impl<M> Txn<M> {
 impl<M: 'static> Ui<M> {
     pub(crate) fn begin_txn(&mut self) {
         debug_assert!(self.txn.is_none(), "reconcile transactions do not nest");
-        self.txn = Some(Txn::new());
+        let journal = std::mem::take(&mut self.spare_undo);
+        self.txn = Some(Txn::with_journal(journal));
+    }
+
+    /// Empty a finished journal and keep its allocation for the next
+    /// transaction. The entries are dropped here exactly as they were when the
+    /// whole vector was dropped; only the buffer survives.
+    fn recycle_journal(&mut self, mut undo: Vec<Undo<M>>) {
+        undo.clear();
+        if undo.capacity() > self.spare_undo.capacity() {
+            self.spare_undo = undo;
+        }
     }
 
     pub(crate) fn commit_txn(&mut self) {
-        let txn = self.txn.take().expect("commit without an open transaction");
+        let mut txn = self.txn.take().expect("commit without an open transaction");
+        let journal = std::mem::take(&mut txn.undo);
+        self.recycle_journal(journal);
         for c in txn.detached {
             self.mark_disposed(c);
             self.pending_dispose.push(c);
@@ -270,8 +291,9 @@ impl<M: 'static> Ui<M> {
     }
 
     pub(crate) fn abort_txn(&mut self) {
-        let txn = self.txn.take().expect("abort without an open transaction");
-        for u in txn.undo.into_iter().rev() {
+        let mut txn = self.txn.take().expect("abort without an open transaction");
+        let mut journal = std::mem::take(&mut txn.undo);
+        for u in journal.drain(..).rev() {
             match u {
                 Undo::Created(id) => {
                     if let Some(el) = self.arena.release(id) {
@@ -303,6 +325,7 @@ impl<M: 'static> Ui<M> {
             }
         }
         // Detached elements were never marked, so they are already intact.
+        self.recycle_journal(journal);
         self.sched.borrow_mut().clear_building();
     }
 
@@ -520,6 +543,34 @@ impl<M: 'static> Ui<M> {
                 return;
             }
         }
+        // **The props memo**, asked before the description is swapped in,
+        // because it compares the old props against the new. A component that
+        // answers `true` has said its build is a pure function of props that
+        // did not change, so the build below is skipped and with it the whole
+        // child reconciliation — nothing is unmounted, so state, focus and
+        // scroll are untouched.
+        //
+        // Only when the desc carries no children of its own: a component can
+        // be handed children through its description, and those are not part
+        // of the props it compared. Skipping with children present would drop
+        // a change the component never got to see.
+        //
+        // The default is `false`, so this is inert until a component opts in.
+        // What it exists for: `Node::shared`'s reference identity asks the
+        // caller to hold an `Rc<Node>` across frames, which a host deriving
+        // its description from a store cannot do — there is no `Rc` to keep.
+        let memo_skip = {
+            let el = &self.arena[id];
+            matches!(el.ty, ElemType::Component(_))
+                && resolve(&new).children.is_empty()
+                && match (
+                    crate::desc::component_of(&new),
+                    crate::desc::component_of(&el.desc),
+                ) {
+                    (Some(next), Some(prev)) => next.props_eq(prev.as_ref()),
+                    _ => false,
+                }
+        };
         let moved = crate::desc::layout_relevant_changed(&self.arena[id].desc, &new);
         self.set_desc(id, new);
         if let Some(a) = self.arena[id].desc.anchor.clone() {
@@ -538,7 +589,14 @@ impl<M: 'static> Ui<M> {
         self.renderer
             .update(id, self.arena[id].ty, self.arena[id].name);
         self.refresh_provided(id);
-        self.rebuild(id);
+        // A memo skips only the *build*. If this element is separately dirty —
+        // its own state changed, or an ambient it read did — the flush reaches
+        // it through the dirty set and rebuilds it there, which is the whole
+        // reason the two paths are distinct.
+        match memo_skip {
+            true => self.set_needs_build(id, false),
+            false => self.rebuild(id),
+        }
     }
 
     /// A `Provide` element whose value changed swaps it in place — descendants
@@ -549,10 +607,18 @@ impl<M: 'static> Ui<M> {
         };
         let value = p.value.clone();
         let key = p.key;
+        let p_same = p.same.clone();
         let Some(node) = self.arena[id].provides.clone() else {
             return;
         };
-        if Rc::ptr_eq(&node.value.borrow(), &value) {
+        let unchanged = {
+            let held = node.value.borrow();
+            Rc::ptr_eq(&held, &value)
+                || p_same
+                    .as_ref()
+                    .is_some_and(|same| same(held.as_ref(), value.as_ref()))
+        };
+        if unchanged {
             return;
         }
         *node.value.borrow_mut() = value;
@@ -732,6 +798,14 @@ impl<M: 'static> Ui<M> {
         if self.captured == Some(id) {
             self.captured = None;
         }
+        // A drag outlives its captor (see `hit::Drag`), but nothing it holds
+        // may name an element that is gone. One that goes away mid-drag is
+        // simply no longer under the pointer; it is not told, having nothing
+        // left to tell.
+        if let Some(d) = self.drag.as_mut() {
+            d.under.retain(|&e| e != id);
+            d.lifted_from.retain(|&e| e != id);
+        }
         if self.focus == Some(id) {
             // Nothing is told it lost focus: the element is already gone, and
             // `apply_autofocus` decides where focus goes next.
@@ -739,12 +813,13 @@ impl<M: 'static> Ui<M> {
         }
         if self.focus_restore == Some(id) {
             self.focus_restore = None;
+            self.focus_restore_scope = None;
         }
         self.hover.retain(|h| *h != id);
-        if let Some((targets, _)) = &mut self.press {
+        if let Some((targets, _, _)) = &mut self.press {
             targets.retain(|t| *t != id);
         }
-        if self.press.as_ref().is_some_and(|(t, _)| t.is_empty()) {
+        if self.press.as_ref().is_some_and(|(t, _, _)| t.is_empty()) {
             self.press = None;
         }
         self.geom_store.borrow_mut().entries.remove(&id);
@@ -794,6 +869,9 @@ impl<M: 'static> Ui<M> {
                 self.focus_roots.retain(|x| *x != f);
             }
             self.anchored.retain(|a| *a != id);
+            if let Some(a) = &el.desc.anchor {
+                a.unbind(id);
+            }
             self.renderer.dispose(id, el.ty, el.name);
             self.forget_element(id);
         }
@@ -814,6 +892,7 @@ impl<M: 'static> Ui<M> {
             return;
         };
         let clips = obj.clips();
+        let clip_inset = obj.clip_inset();
         let out_of_flow = obj.out_of_flow();
         let reads_window = obj.reads_window();
         let raw_input = obj.takes_raw_input();
@@ -826,12 +905,18 @@ impl<M: 'static> Ui<M> {
             children: Vec::new(),
             w: crate::desc::Sizing::Auto,
             h: crate::desc::Sizing::Auto,
+            min_w: 0,
+            min_h: 0,
+            priority: 0,
+            pointer: None,
             clips,
+            clip_inset,
             out_of_flow,
             reads_window,
             raw_input,
             scrollbar,
             theme: None,
+            classes: None,
             key: None,
             data: RenderData::fresh(),
         });
@@ -854,6 +939,7 @@ impl<M: 'static> Ui<M> {
             .desc
             .sync_render(Some(obj.as_mut()));
         let clips = obj.clips();
+        let clip_inset = obj.clip_inset();
         let out_of_flow = obj.out_of_flow();
         let reads_window = obj.reads_window();
         let raw_input = obj.takes_raw_input();
@@ -862,6 +948,7 @@ impl<M: 'static> Ui<M> {
         if let Some(n) = self.render.get_mut(r) {
             n.obj = Some(obj);
             n.clips = clips;
+            n.clip_inset = clip_inset;
             n.out_of_flow = out_of_flow;
             n.reads_window = reads_window;
             n.raw_input = raw_input;

@@ -1,3 +1,4 @@
+use fresh_core::BufferId;
 use std::ops::Range;
 
 /// Pre-calculated line information for an event
@@ -27,9 +28,26 @@ pub struct SearchState {
     pub wrap_search: bool,
     /// Optional search range (for search in selection)
     pub search_range: Option<Range<usize>>,
-    /// True if the match count was capped at MAX_MATCHES
-    #[allow(dead_code)]
+    /// True if the search stopped at MAX_MATCHES with more to find
     pub capped: bool,
+    /// The query as it was searched for, with the flags of that search:
+    /// re-highlighting after an edit matches with it, not with whatever
+    /// the flags are now.
+    pub search_query: crate::model::buffer::SearchQuery,
+    /// The buffer the match set was collected from, and that buffer's
+    /// version at the time.
+    ///
+    /// `matches` is a snapshot of byte offsets, so it only means anything in
+    /// that buffer, unedited. Navigation searches again instead of using it
+    /// once either has changed.
+    pub collected_from: (BufferId, u64),
+    /// True while the search namespace holds one overlay per match, so the
+    /// overlays track edits and are the live match set.
+    ///
+    /// Small files only; `clear_search_overlays` turns it off. While it
+    /// holds, an empty overlay set means the edits removed every match, not
+    /// that the overlays are missing.
+    pub overlays_track_matches: bool,
 }
 
 impl SearchState {
@@ -56,6 +74,13 @@ pub struct InteractiveReplaceState {
     pub has_wrapped: bool,
     /// Number of replacements made so far
     pub replacements_made: usize,
-    /// Compiled regex for regex-mode replace (None when regex mode is off)
-    pub regex: Option<regex::bytes::Regex>,
+    /// The query the matches are found with.
+    pub query: crate::model::buffer::SearchQuery,
+    /// Whether the replacement is a template (`$1`, `\n`) expanded per
+    /// match: regex mode only. Plain-text replacement is literal.
+    pub expand_replacement: bool,
+    /// The selection the replace is confined to, as Find in Selection
+    /// confines a search (None: the whole buffer). Its end moves with the
+    /// replacements made inside it.
+    pub scope: Option<std::ops::Range<usize>>,
 }

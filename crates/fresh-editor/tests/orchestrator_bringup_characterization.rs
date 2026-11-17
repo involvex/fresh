@@ -18,8 +18,6 @@
 //!
 //! Plugins are disabled so the tests exercise only the Rust core path.
 
-mod common;
-
 use fresh::config::Config;
 use fresh::config_io::DirectoryContext;
 use fresh::model::filesystem::StdFileSystem;
@@ -90,6 +88,26 @@ impl Scenario {
         .unwrap();
     }
 
+    /// Like [`Self::place_workspace`], stamped as last focused at `at` — the
+    /// stamp `open_last_workspace` reopens the newest of.
+    fn place_focused_workspace(&self, root: &Path, label: &str, at: u64) {
+        let ws_dir = self.data_dir().join("workspaces");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let mut ws = fresh::workspace::Workspace::new(canonical.clone());
+        ws.label = Some(label.to_string());
+        ws.last_focused_at = Some(at);
+        let filename = format!(
+            "{}.json",
+            fresh::workspace::encode_path_for_filename(&canonical)
+        );
+        std::fs::write(
+            ws_dir.join(filename),
+            serde_json::to_vec_pretty(&ws).unwrap(),
+        )
+        .unwrap();
+    }
+
     /// Seed an id-keyed **co-tenant** workspace file
     /// (`<encoded-root>.<stable_id>.json`) — the way a workspace extracted
     /// into its own window over the same project persists. Several may share
@@ -137,6 +155,7 @@ impl Scenario {
                 window: true,
                 label: Some(label.to_string()),
                 command: None,
+                adopt_window: None,
             },
         );
         let filename = format!(
@@ -152,13 +171,31 @@ impl Scenario {
 
     /// Construct the editor exactly as a `fresh <project>` launch would
     /// (read persistence, discover sessions, pick the foreground window,
-    /// build the windows map).
+    /// build the windows map), then list the workspaces the way the
+    /// Orchestrator dock does — which reads the rest of the registry.
     fn bring_up(&self) -> fresh::app::Editor {
         self.bring_up_in(&self.project_canon)
     }
 
     /// Like [`Self::bring_up`] but launches with an explicit cwd.
     fn bring_up_in(&self, cwd: &Path) -> fresh::app::Editor {
+        let mut editor = self.boot_in(cwd);
+        editor.ensure_all_workspaces_loaded();
+        editor
+    }
+
+    /// The editor as construction leaves it, before anything has listed the
+    /// workspaces.
+    fn boot_in(&self, cwd: &Path) -> fresh::app::Editor {
+        self.boot_with(cwd, false)
+    }
+
+    /// [`Self::boot_in`] as a bare `fresh` with Auto Attach on boots.
+    fn boot_orchestrator_in(&self, cwd: &Path) -> fresh::app::Editor {
+        self.boot_with(cwd, true)
+    }
+
+    fn boot_with(&self, cwd: &Path, orchestrator_mode: bool) -> fresh::app::Editor {
         let dir_context = DirectoryContext::for_testing(self.data_root.path());
         let filesystem: Arc<dyn fresh::model::filesystem::FileSystem + Send + Sync> =
             Arc::new(StdFileSystem);
@@ -178,6 +215,7 @@ impl Scenario {
             None,
             false,
             false,
+            orchestrator_mode,
         )
         .unwrap()
     }
@@ -410,6 +448,7 @@ fn restore_previous_session_false_still_picks_window_but_skips_workspace() {
         None,
         false,
         false,
+        false,
     )
     .unwrap();
 
@@ -455,4 +494,102 @@ fn discovery_surfaces_co_tenant_workspaces_sharing_a_root() {
             .collect(),
         "co-tenant windows must keep their own stable ids"
     );
+}
+
+/// Boot reads only the launch directory's workspaces; the rest of the
+/// registry stays on disk until something lists it, and is then added
+/// without disturbing the windows already built.
+#[test]
+fn boot_reads_only_the_launch_dirs_workspaces_until_they_are_listed() {
+    let s = Scenario::new();
+    s.place_workspace(&s.project_canon, "project");
+    s.place_workspace(&s.other_canon, "other");
+
+    let mut editor = s.boot_in(&s.project_canon);
+    assert_eq!(
+        window_roots(&editor),
+        vec![s.project_canon.clone()],
+        "boot builds only the launch directory's window"
+    );
+
+    let active = editor.active_window_id();
+    editor.ensure_all_workspaces_loaded();
+    let mut expected = vec![s.project_canon.clone(), s.other_canon.clone()];
+    expected.sort();
+    assert_eq!(
+        window_roots(&editor),
+        expected,
+        "listing the workspaces reads the rest of the registry"
+    );
+    assert_eq!(
+        editor.active_window_id(),
+        active,
+        "loading the registry does not switch windows"
+    );
+
+    // Idempotent: a second listing adds nothing.
+    editor.ensure_all_workspaces_loaded();
+    assert_eq!(window_roots(&editor), expected);
+}
+
+/// Orchestrator mode opens the launch directory's workspace, like any other
+/// launch, even when another one was used more recently; and boot reads only
+/// that directory's, so a bare `fresh` does not get slower with every
+/// workspace saved. The rest are added when something lists them.
+#[test]
+fn orchestrator_boot_opens_the_launch_dir_workspace() {
+    let s = Scenario::new();
+    s.place_focused_workspace(&s.project_canon, "project", 100);
+    s.place_focused_workspace(&s.worktree_canon, "worktree", 200);
+    s.place_focused_workspace(&s.other_canon, "other", 300);
+
+    let mut editor = s.boot_orchestrator_in(&s.project_canon);
+    assert_eq!(
+        window_roots(&editor),
+        vec![s.project_canon.clone()],
+        "boot builds the launch directory's workspace, nothing else"
+    );
+    let active = editor.active_window_id();
+    assert_eq!(
+        editor.session(active).map(|w| w.root.clone()),
+        Some(s.project_canon.clone()),
+        "a bare `fresh` opens the directory it was typed in"
+    );
+
+    editor.ensure_all_workspaces_loaded();
+    let mut all = vec![
+        s.project_canon.clone(),
+        s.worktree_canon.clone(),
+        s.other_canon.clone(),
+    ];
+    all.sort();
+    assert_eq!(
+        window_roots(&editor),
+        all,
+        "listing the workspaces adds the rest"
+    );
+    assert_eq!(
+        editor.active_window_id(),
+        active,
+        "loading the registry does not switch windows"
+    );
+}
+
+/// `open_last_workspace` sends a bare `fresh` to the workspace focused most
+/// recently, wherever it is. With none stamped there is nowhere to go, and
+/// the launch stays in the current directory.
+#[test]
+fn the_last_used_workspace_is_the_most_recently_focused() {
+    let s = Scenario::new();
+    let dir_context = DirectoryContext::for_testing(s.data_root.path());
+    let last_used = || fresh::app::Editor::last_used_workspace_root(&dir_context);
+    assert_eq!(last_used(), None, "a first run has none");
+
+    s.place_workspace(&s.project_canon, "project");
+    assert_eq!(last_used(), None, "a workspace never stamped was not used last");
+
+    s.place_focused_workspace(&s.project_canon, "project", 100);
+    s.place_focused_workspace(&s.other_canon, "other", 300);
+    s.place_focused_workspace(&s.worktree_canon, "worktree", 200);
+    assert_eq!(last_used(), Some(s.other_canon.clone()));
 }

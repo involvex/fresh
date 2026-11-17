@@ -7,6 +7,7 @@
 //! never leak to callers outside `split_rendering`.
 
 use crate::view::overlay::{Overlay, OverlayFace};
+use crate::view::theme::ThemeStyle;
 use crate::view::theme::{Theme, TokenColorExt};
 use fresh_core::api::ViewTokenStyle;
 use ratatui::style::{Color, Modifier, Style};
@@ -32,8 +33,8 @@ pub(super) struct CharStyleContext<'a> {
     pub highlight_bg_theme_key: Option<&'static str>,
     /// Pre-resolved semantic token color for this byte position.
     pub semantic_token_color: Option<Color>,
-    /// Overlays currently active at `byte_pos`, already in priority-ascending
-    /// order ("last write wins"). Empty when `byte_pos` is `None`.
+    /// Overlays active at the source byte or inherited from adjacent text,
+    /// in ascending priority order.
     pub active_overlays: &'a [&'a Overlay],
     pub primary_cursor_position: usize,
     pub is_active: bool,
@@ -59,6 +60,36 @@ pub(super) struct CharStyleOutput {
     pub region: &'static str,
 }
 
+/// The text attributes of a key that keeps them in `Theme::key_modifiers`
+/// (`editor.fg`, `editor.bg`, `editor.current_line_bg`): per-cell keys, read
+/// with a check that skips the key lookup entirely for the common theme that
+/// gives none of those keys attributes.
+fn ground_attrs(theme: &Theme, key: &'static str) -> Modifier {
+    if theme.key_modifiers.is_empty() {
+        Modifier::empty()
+    } else {
+        theme.resolve_modifier_key(key)
+    }
+}
+
+/// Whether an overlay paints a background of its own (not `Reset`).
+fn overlay_has_own_bg(overlay: &Overlay, theme: &Theme) -> bool {
+    let bg = match &overlay.face {
+        OverlayFace::Background { color } => Some(*color),
+        OverlayFace::Style { style } => style.bg,
+        OverlayFace::ThemedStyle {
+            fallback_style,
+            bg_theme,
+            ..
+        } => bg_theme
+            .as_deref()
+            .and_then(|key| theme.resolve_theme_key(key))
+            .or(fallback_style.bg),
+        OverlayFace::Underline { .. } | OverlayFace::Foreground { .. } => None,
+    };
+    bg.is_some_and(|c| c != Color::Reset)
+}
+
 /// Compute the style for a character by layering:
 /// token -> ANSI -> syntax -> semantic -> overlays -> selection -> cursor.
 /// Also tracks which theme keys produced the final fg/bg colors.
@@ -77,7 +108,9 @@ pub(super) fn compute_char_style(ctx: &CharStyleContext) -> CharStyleOutput {
         if let Some(ref fg) = ts.fg {
             s = s.fg(fg.to_ratatui(ctx.theme));
         } else {
-            s = s.fg(ctx.theme.editor_fg);
+            s = s
+                .fg(ctx.theme.editor_fg)
+                .add_modifier(ground_attrs(ctx.theme, "editor.fg"));
             fg_theme_key = Some("editor.fg");
         }
         if let Some(ref bg) = ts.bg {
@@ -103,7 +136,9 @@ pub(super) fn compute_char_style(ctx: &CharStyleContext) -> CharStyleOutput {
         if let Some(fg) = ctx.ansi_style.fg {
             s = s.fg(fg);
         } else {
-            s = s.fg(ctx.theme.editor_fg);
+            s = s
+                .fg(ctx.theme.editor_fg)
+                .add_modifier(ground_attrs(ctx.theme, "editor.fg"));
             fg_theme_key = Some("editor.fg");
         }
         if let Some(bg) = ctx.ansi_style.bg {
@@ -120,7 +155,9 @@ pub(super) fn compute_char_style(ctx: &CharStyleContext) -> CharStyleOutput {
     } else {
         // Default color from theme
         fg_theme_key = Some("editor.fg");
-        Style::default().fg(ctx.theme.editor_fg)
+        Style::default()
+            .fg(ctx.theme.editor_fg)
+            .add_modifier(ground_attrs(ctx.theme, "editor.fg"))
     };
 
     // If we have ANSI style but also syntax highlighting, syntax takes precedence for color
@@ -152,6 +189,7 @@ pub(super) fn compute_char_style(ctx: &CharStyleContext) -> CharStyleOutput {
         style = style.bg(bg);
         if let Some(key) = ctx.highlight_bg_theme_key {
             bg_theme_key = Some(key);
+            style = style.add_modifier(ctx.theme.resolve_modifier_key(key));
         }
     }
 
@@ -164,6 +202,12 @@ pub(super) fn compute_char_style(ctx: &CharStyleContext) -> CharStyleOutput {
         }
     }
 
+    // Styled cells without a source byte are inline virtual text (inlay hints
+    // and plugin annotations). They borrow an adjacent source cell's overlays
+    // so background bands stay continuous, but ordinary overlay ink belongs to
+    // the source text. Legibility fallbacks are handled separately below.
+    let is_styled_inline_cell = ctx.byte_pos.is_none() && ctx.token_style.is_some();
+
     // Apply overlay styles — last overlay wins for each attribute
     for overlay in ctx.active_overlays {
         match &overlay.face {
@@ -171,9 +215,13 @@ pub(super) fn compute_char_style(ctx: &CharStyleContext) -> CharStyleOutput {
                 color,
                 style: _underline_style,
             } => {
+                if is_styled_inline_cell {
+                    continue;
+                }
                 style = style.add_modifier(Modifier::UNDERLINED).fg(*color);
                 if let Some(key) = overlay.theme_key {
                     fg_theme_key = Some(key);
+                    style = style.add_modifier(ctx.theme.resolve_modifier_key(key));
                 }
             }
             OverlayFace::Background { color } => {
@@ -183,23 +231,38 @@ pub(super) fn compute_char_style(ctx: &CharStyleContext) -> CharStyleOutput {
                     // Pick up any SGR modifier the theme associates with
                     // this bg slot (e.g. terminal-adaptive themes ship
                     // `Reversed` for `ui.semantic_highlight_bg`).
-                    let m = ctx.theme.modifier_for_bg_key(key);
+                    let m = ctx.theme.resolve_modifier_key(key);
                     if !m.is_empty() {
                         style = style.add_modifier(m);
                     }
                 }
             }
             OverlayFace::Foreground { color } => {
+                if is_styled_inline_cell {
+                    continue;
+                }
                 style = style.fg(*color);
                 if let Some(key) = overlay.theme_key {
                     fg_theme_key = Some(key);
+                    style = style.add_modifier(ctx.theme.resolve_modifier_key(key));
                 }
             }
             OverlayFace::Style {
                 style: overlay_style,
             } => {
+                if is_styled_inline_cell {
+                    if let Some(bg) = overlay_style.bg {
+                        style = style.bg(bg);
+                        if let Some(key) = overlay.theme_key {
+                            bg_theme_key = Some(key);
+                            style = style.add_modifier(ctx.theme.resolve_modifier_key(key));
+                        }
+                    }
+                    continue;
+                }
                 style = style.patch(*overlay_style);
                 if let Some(key) = overlay.theme_key {
+                    style = style.add_modifier(ctx.theme.resolve_modifier_key(key));
                     if overlay_style.bg.is_some() {
                         bg_theme_key = Some(key);
                     }
@@ -216,26 +279,50 @@ pub(super) fn compute_char_style(ctx: &CharStyleContext) -> CharStyleOutput {
                 fg_on_low_contrast,
             } => {
                 let mut themed_style = *fallback_style;
+                // An injected cell — a spliced inlay hint or plugin
+                // annotation — takes the band's *ground* and not its ink: the
+                // band's own foreground and attributes belong to the source
+                // character it actually covers. The two legibility rules
+                // below are not ordinary ink, so they still reach such a
+                // cell; losing them is what left a hint unreadable on an
+                // occurrence highlight. Sharing one path with ordinary cells
+                // is what keeps that from coming apart again.
+                if is_styled_inline_cell {
+                    themed_style.fg = None;
+                    themed_style.add_modifier = Modifier::empty();
+                    themed_style.sub_modifier = Modifier::empty();
+                }
                 // Resolve bg first so the collision check below sees it.
                 if let Some(bg_key) = bg_theme {
                     if let Some(color) = ctx.theme.resolve_theme_key(bg_key) {
                         themed_style = themed_style.bg(color);
                     }
-                    let m = ctx.theme.modifier_for_bg_key(bg_key);
+                    let m = ctx.theme.resolve_modifier_key(bg_key);
                     if !m.is_empty() {
                         themed_style = themed_style.add_modifier(m);
                     }
                 }
+                let collides = {
+                    let new_bg = themed_style.bg.or(style.bg);
+                    matches!((style.fg, new_bg), (Some(f), Some(b)) if f == b)
+                };
+                // A collision foreground is a legibility fallback, so an
+                // injected cell keeps it. The band's literal colour stands in
+                // when no `fg_theme` key resolves below.
+                if *fg_on_collision_only && collides {
+                    themed_style.fg = fallback_style.fg;
+                }
                 if let Some(fg_key) = fg_theme {
                     if let Some(color) = ctx.theme.resolve_theme_key(fg_key) {
                         let apply = if *fg_on_collision_only {
-                            let new_bg = themed_style.bg.or(style.bg);
-                            matches!((style.fg, new_bg), (Some(f), Some(b)) if f == b)
+                            collides
                         } else {
-                            true
+                            !is_styled_inline_cell
                         };
                         if apply {
-                            themed_style = themed_style.fg(color);
+                            themed_style = themed_style
+                                .fg(color)
+                                .add_modifier(ctx.theme.resolve_modifier_key(fg_key));
                         }
                     }
                 }
@@ -258,18 +345,38 @@ pub(super) fn compute_char_style(ctx: &CharStyleContext) -> CharStyleOutput {
 
     // Apply current line background highlight (before selection, so selection overrides it)
     if ctx.is_cursor_line_highlighted && !ctx.is_selected && style.bg.is_none() {
-        style = style.bg(ctx.current_line_bg);
+        style = style
+            .bg(ctx.current_line_bg)
+            .add_modifier(ground_attrs(ctx.theme, "editor.current_line_bg"));
     }
 
     // Apply selection highlighting (preserve fg/syntax colors, only change bg).
     // Themes may also opt into SGR text attributes here (e.g. `Reversed`)
     // so a native-palette theme can swap fg/bg via the terminal instead
     // of relying on a fixed bg color — see `Theme::selection_modifier`.
-    if ctx.is_selected {
-        style = style.bg(ctx.theme.selection_bg);
-        if !ctx.theme.selection_modifier.is_empty() {
-            style = style.add_modifier(ctx.theme.selection_modifier);
-        }
+    //
+    // An overlay marked `above_selection` (the current search match, which
+    // Find Next also selects) keeps its own look instead, when it has a
+    // background of its own. One without (a theme whose selection is only
+    // reverse video lends the current match its `Reset` selection
+    // background) is drawn like the selection, selected or not, so it still
+    // stands out.
+    let (above_with_bg, above_without_bg) = ctx
+        .active_overlays
+        .iter()
+        .filter(|o| o.above_selection)
+        .fold((false, false), |(with, without), o| {
+            if overlay_has_own_bg(o, ctx.theme) {
+                (true, without)
+            } else {
+                (with, true)
+            }
+        });
+    if (ctx.is_selected && !above_with_bg) || above_without_bg {
+        // `selection_modifier` is `editor.selection_bg`'s attributes.
+        style = style
+            .bg(ctx.theme.selection_bg)
+            .add_modifier(ctx.theme.selection_modifier);
         bg_theme_key = Some("editor.selection_bg");
         region = "Selection";
     }
@@ -288,10 +395,19 @@ pub(super) fn compute_char_style(ctx: &CharStyleContext) -> CharStyleOutput {
             region = "Cursor";
         }
     } else if ctx.is_cursor {
-        style = style.fg(ctx.theme.editor_fg).bg(ctx.theme.inactive_cursor);
+        style = style
+            .theme_fg(ctx.theme, "editor.fg")
+            .theme_bg(ctx.theme, "editor.inactive_cursor");
         fg_theme_key = Some("editor.fg");
         bg_theme_key = Some("editor.inactive_cursor");
         region = "Inactive Cursor";
+    }
+
+    // A cell left on the pane's own ground is drawn with `editor.bg`. The
+    // ground itself is painted with colors only, so its attributes go on
+    // exactly these cells, as every other key's go on the cells drawn with it.
+    if bg_theme_key == Some("editor.bg") && style.bg.is_none() {
+        style = style.add_modifier(ground_attrs(ctx.theme, "editor.bg"));
     }
 
     CharStyleOutput {
@@ -331,10 +447,18 @@ mod tests {
     }
 
     fn run(theme: &Theme, overlay: &Overlay, existing_fg: Option<Color>) -> CharStyleOutput {
-        let overlays: Vec<&Overlay> = vec![overlay];
+        run_on_cell(theme, overlay, existing_fg, None)
+    }
+
+    fn run_on_cell(
+        theme: &Theme,
+        overlay: &Overlay,
+        existing_fg: Option<Color>,
+        token_style: Option<&ViewTokenStyle>,
+    ) -> CharStyleOutput {
         compute_char_style(&CharStyleContext {
-            byte_pos: Some(0),
-            token_style: None,
+            byte_pos: token_style.is_none().then_some(0),
+            token_style,
             ansi_style: Style::default(),
             is_cursor: false,
             is_selected: false,
@@ -344,7 +468,7 @@ mod tests {
             highlight_bg: None,
             highlight_bg_theme_key: None,
             semantic_token_color: None,
-            active_overlays: &overlays,
+            active_overlays: &[overlay],
             primary_cursor_position: 0,
             is_active: true,
             skip_primary_cursor_reverse: true,
@@ -360,6 +484,78 @@ mod tests {
             "editor.diff_add_bg",
             true,
         )
+    }
+
+    #[test]
+    fn diagnostic_overlay_takes_its_keys_attributes() {
+        // Issue #3494: a theme can draw diagnostics as an underline by
+        // giving the diagnostic background key `["underlined"]`.
+        let theme = Theme::from_json(
+            r#"{
+                "name": "underlined-diagnostics",
+                "extends": "builtin://dark",
+                "diagnostic": {
+                    "error_bg": { "color": "Default", "modifier": ["underlined"] }
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut ml = MarkerList::new();
+        ml.set_buffer_size(100);
+        // The face and key `diagnostic_to_overlay` gives an error.
+        let error = Overlay::new(
+            &mut ml,
+            0..10,
+            OverlayFace::Background {
+                color: theme.diagnostic_error_bg,
+            },
+        )
+        .with_theme_key("diagnostic.error_bg");
+        let out = run(&theme, &error, Some(theme.syntax_keyword));
+        assert!(out.style.add_modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(out.style.fg, Some(theme.syntax_keyword));
+
+        // The stock theme gives the key no attributes.
+        let dark = Theme::load_builtin(crate::view::theme::THEME_DARK).unwrap();
+        let out = run(&dark, &error, Some(dark.syntax_keyword));
+        assert!(!out.style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn foreground_overlay_and_default_text_take_their_keys_attributes() {
+        let mut theme = Theme::load_builtin(crate::view::theme::THEME_DARK).unwrap();
+        theme.set_modifier_key("editor.bracket_match_fg", Modifier::BOLD);
+        theme.set_modifier_key("editor.fg", Modifier::ITALIC);
+        let mut ml = MarkerList::new();
+        ml.set_buffer_size(100);
+        let bracket = Overlay::new(
+            &mut ml,
+            0..10,
+            OverlayFace::Foreground {
+                color: theme.bracket_match_fg,
+            },
+        )
+        .with_theme_key("editor.bracket_match_fg");
+        let out = run(&theme, &bracket, None);
+        assert!(out.style.add_modifier.contains(Modifier::BOLD));
+        // Plain text (no syntax color) is drawn with `editor.fg`.
+        assert!(out.style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn themed_overlay_takes_both_keys_attributes() {
+        let mut theme = Theme::load_builtin(crate::view::theme::THEME_DARK).unwrap();
+        theme.set_modifier_key("search.match_fg", Modifier::BOLD);
+        theme.set_modifier_key("search.match_bg", Modifier::UNDERLINED);
+        let mut ml = MarkerList::new();
+        ml.set_buffer_size(100);
+        let o = themed_overlay(&mut ml, "search.match_fg", "search.match_bg", false);
+        let out = run(&theme, &o, Some(theme.syntax_keyword));
+        assert!(out
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD | Modifier::UNDERLINED));
+        assert_eq!(out.style.fg, Some(theme.search_match_fg));
     }
 
     #[test]
@@ -390,6 +586,93 @@ mod tests {
         assert!(out.style.add_modifier.contains(Modifier::ITALIC));
     }
 
+    fn run_selected(theme: &Theme, overlay: &Overlay) -> CharStyleOutput {
+        let overlays: Vec<&Overlay> = vec![overlay];
+        compute_char_style(&CharStyleContext {
+            byte_pos: Some(0),
+            token_style: None,
+            ansi_style: Style::default(),
+            is_cursor: false,
+            is_selected: true,
+            theme,
+            highlight_color: None,
+            highlight_theme_key: None,
+            highlight_bg: None,
+            highlight_bg_theme_key: None,
+            semantic_token_color: None,
+            active_overlays: &overlays,
+            primary_cursor_position: 0,
+            is_active: true,
+            skip_primary_cursor_reverse: true,
+            is_cursor_line_highlighted: false,
+            current_line_bg: theme.current_line_bg,
+        })
+    }
+
+    #[test]
+    fn selection_paints_over_ordinary_overlay() {
+        let theme = Theme::load_builtin(crate::view::theme::THEME_DARK).unwrap();
+        let mut ml = MarkerList::new();
+        ml.set_buffer_size(100);
+        let o = Overlay::new(
+            &mut ml,
+            0..10,
+            OverlayFace::Style {
+                style: Style::default().bg(Color::Rgb(1, 2, 3)),
+            },
+        );
+
+        let out = run_selected(&theme, &o);
+
+        assert_eq!(out.style.bg, Some(theme.selection_bg));
+        assert_eq!(out.bg_theme_key, Some("editor.selection_bg"));
+    }
+
+    #[test]
+    fn above_selection_overlay_keeps_its_bg_on_selected_text() {
+        let theme = Theme::load_builtin(crate::view::theme::THEME_DARK).unwrap();
+        let mut ml = MarkerList::new();
+        ml.set_buffer_size(100);
+        let o = Overlay::new(
+            &mut ml,
+            0..10,
+            OverlayFace::Style {
+                style: Style::default().bg(Color::Rgb(1, 2, 3)),
+            },
+        )
+        .with_above_selection();
+
+        let out = run_selected(&theme, &o);
+
+        assert_eq!(out.style.bg, Some(Color::Rgb(1, 2, 3)));
+    }
+
+    /// An above-selection overlay with no background of its own (the current
+    /// match in a theme whose selection is only reverse video) is drawn like
+    /// the selection, even on a cell that is not selected.
+    #[test]
+    fn above_selection_overlay_without_bg_is_drawn_like_the_selection() {
+        let mut theme = Theme::load_builtin(crate::view::theme::THEME_DARK).unwrap();
+        theme.selection_bg = Color::Reset;
+        theme.selection_modifier = Modifier::REVERSED;
+        let mut ml = MarkerList::new();
+        ml.set_buffer_size(100);
+        let o = Overlay::new(
+            &mut ml,
+            0..10,
+            OverlayFace::Style {
+                style: Style::default().bg(Color::Reset),
+            },
+        )
+        .with_above_selection();
+
+        let unselected = run(&theme, &o, None);
+        assert!(unselected.style.add_modifier.contains(Modifier::REVERSED));
+
+        let selected = run_selected(&theme, &o);
+        assert!(selected.style.add_modifier.contains(Modifier::REVERSED));
+    }
+
     #[test]
     fn collision_only_preserves_non_matching_fg() {
         // Red keyword on Green diff-add bg: no collision → keep Red.
@@ -407,15 +690,24 @@ mod tests {
     #[test]
     fn collision_only_applies_on_same_colour() {
         // Green string on Green diff-add bg: collision → Black.
+        use crate::view::theme::TokenColorExt;
+
         let theme = Theme::load_builtin(THEME_TERMINAL).unwrap();
         let mut ml = MarkerList::new();
         ml.set_buffer_size(100);
         let o = diff_add(&mut ml);
+        let hint_style = ViewTokenStyle {
+            fg: fresh_core::api::TokenColor::from_ratatui(Color::Green),
+            ..ViewTokenStyle::default()
+        };
 
-        let out = run(&theme, &o, Some(Color::Green));
-
-        assert_eq!(out.style.bg, Some(Color::Green));
-        assert_eq!(out.style.fg, Some(Color::Black));
+        for out in [
+            run(&theme, &o, Some(Color::Green)),
+            run_on_cell(&theme, &o, None, Some(&hint_style)),
+        ] {
+            assert_eq!(out.style.bg, Some(Color::Green));
+            assert_eq!(out.style.fg, Some(Color::Black));
+        }
     }
 
     #[test]
@@ -432,6 +724,28 @@ mod tests {
 
         assert_eq!(out.style.bg, Some(Color::Yellow));
         assert_eq!(out.style.fg, Some(Color::Black));
+    }
+
+    #[test]
+    fn styled_inline_cell_takes_themed_bg_but_keeps_its_fg() {
+        // Search matches paint ordinary source text with both search colors,
+        // but an inline hint only borrows the match's background. Its own
+        // foreground must survive instead of becoming sticky search ink.
+        use crate::view::theme::TokenColorExt;
+
+        let theme = Theme::load_builtin(THEME_TERMINAL).unwrap();
+        let mut ml = MarkerList::new();
+        ml.set_buffer_size(100);
+        let o = themed_overlay(&mut ml, "search.match_fg", "search.match_bg", false);
+        let hint_style = ViewTokenStyle {
+            fg: fresh_core::api::TokenColor::from_ratatui(Color::Blue),
+            ..ViewTokenStyle::default()
+        };
+
+        let out = run_on_cell(&theme, &o, None, Some(&hint_style));
+
+        assert_eq!(out.style.bg, Some(Color::Yellow));
+        assert_eq!(out.style.fg, Some(Color::Blue));
     }
 
     fn occurrence_overlay(marker_list: &mut MarkerList) -> Overlay {
@@ -474,17 +788,26 @@ mod tests {
             "fixture no longer collides (contrast {before:.2}) — pick a colour that does"
         );
 
-        let out = run(&theme, &o, Some(comment));
-        assert_eq!(out.style.bg, Some(theme.semantic_highlight_bg));
-        let painted = painted_rgb(out.style.fg.unwrap(), ColorCapability::TrueColor).unwrap();
-        let after = contrast_ratio(painted, hl);
-        assert!(
-            after >= 3.0,
-            "fg {:?} over highlight {:?} is still only {after:.2}:1",
-            out.style.fg,
-            hl
-        );
-        assert_ne!(out.style.fg, Some(comment), "the colliding fg must move");
+        use crate::view::theme::TokenColorExt;
+        let hint_style = ViewTokenStyle {
+            fg: fresh_core::api::TokenColor::from_ratatui(comment),
+            ..ViewTokenStyle::default()
+        };
+        for out in [
+            run(&theme, &o, Some(comment)),
+            run_on_cell(&theme, &o, None, Some(&hint_style)),
+        ] {
+            assert_eq!(out.style.bg, Some(theme.semantic_highlight_bg));
+            let painted = painted_rgb(out.style.fg.unwrap(), ColorCapability::TrueColor).unwrap();
+            let after = contrast_ratio(painted, hl);
+            assert!(
+                after >= 3.0,
+                "fg {:?} over highlight {:?} is still only {after:.2}:1",
+                out.style.fg,
+                hl
+            );
+            assert_ne!(out.style.fg, Some(comment), "the colliding fg must move");
+        }
     }
 
     #[test]

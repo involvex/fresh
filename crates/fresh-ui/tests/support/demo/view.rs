@@ -19,7 +19,7 @@ use fresh_ui::schedule::BuildCx;
 use fresh_ui::widgets::{divider, Button, Dropdown, List, RadioGroup, TextField};
 use fresh_ui::{Component, ComponentExt};
 
-use super::model::{App, Filter, Menu, Msg, Task, Theme, COMMANDS};
+use super::model::{App, Filter, Menu, Msg, Task, Theme, COMMANDS, PROJECTS};
 
 /// The theme reaches the status bar and the rows without appearing in a single
 /// intermediate signature.
@@ -37,6 +37,63 @@ pub fn view(app: &App) -> Node<Msg> {
         // wherever focus happens to be — that is what makes them global.
         .action(Intent::Custom("menu.file"), |_| Msg::Menu(Some(Menu::File)))
         .action(Intent::Custom("menu.go"), |_| Msg::Menu(Some(Menu::Go)))
+        .action(Intent::Custom("project.next"), |_| Msg::NextProject)
+}
+
+/// A scratch note, per project, owned by the element and not by the model.
+///
+/// **The point of the whole arrangement.** Its value is `Persisted` under the
+/// enclosing scope, so switching projects discards this element — the subtree
+/// above it is keyed by project — and switching back restores what this
+/// project had. Nothing in `App` knows the note exists.
+///
+/// A per-project visit counter, and the reason it counts rather than saying
+/// something fixed.
+///
+/// A note seeded per project reads the same whether it was *restored* or
+/// merely re-seeded, so it proves nothing. A count cannot be faked: this
+/// element is constructed once per visit — the subtree above it is keyed by
+/// project, so switching away destroys it — and the number it shows is
+/// therefore the number of times this project has been visited, which is only
+/// possible if the previous visit's value came back.
+///
+/// Alt-P a few times and watch the two counts advance independently. Without
+/// the scope, or without a `Store` installed on the `Ui`, both would sit at 1
+/// forever.
+struct Scratch;
+
+#[derive(Default)]
+struct ScratchState {
+    visits: Option<Rc<fresh_ui::behavior::Persisted<u32>>>,
+    scope: String,
+}
+
+impl Component<Msg> for Scratch {
+    type State = ScratchState;
+
+    fn init(&self, cx: &mut fresh_ui::InitCx<'_, Msg>) -> ScratchState {
+        // Read in `init`, which is where `Persisted` needs it — and is safe
+        // precisely because `scope()` keys the subtree, so this element never
+        // outlives the scope it read.
+        let scope = cx
+            .read(&fresh_ui::behavior::PERSISTENCE_SCOPE)
+            .map(|s| (*s).clone())
+            .unwrap_or_else(|| "<unscoped>".into());
+        let visits = cx.register(fresh_ui::behavior::Persisted::new(&scope, "visits", 0u32));
+        // One construction is one visit. `set` writes through, so the store is
+        // current immediately rather than at teardown — which matters because
+        // disposal is deferred past the *next* document's construction.
+        visits.set(visits.get() + 1);
+        ScratchState {
+            visits: Some(visits),
+            scope,
+        }
+    }
+
+    fn build(&self, s: &ScratchState, _cx: &mut BuildCx<'_, Msg>) -> Node<Msg> {
+        let n = s.visits.as_ref().map(|v| v.get()).unwrap_or(0);
+        text(format!(" {} · visit {n}", s.scope)).theme("statusbar")
+    }
 }
 
 fn app_body(app: &App) -> Node<Msg> {
@@ -47,12 +104,27 @@ fn app_body(app: &App) -> Node<Msg> {
             .theme("app")
             .children([
                 menu_bar(app),
-                row().flex(1).children([
-                    sidebar(app).w(Sizing::Cells(app.sidebar)),
-                    grip(),
-                    body(app).flex(1),
-                    preview(app),
-                ]),
+                // **The document boundary.** `scope` keys this subtree by the
+                // project *and* provides the persistence scope, which have to
+                // travel together: a scope that changed value under a
+                // surviving element would be an ambient change, and
+                // `Persisted` reads its scope in `init()`. Switching projects
+                // therefore replaces everything below — and the scratch note
+                // comes back, because its value is anchored to the scope
+                // rather than to a position in the tree.
+                fresh_ui::ambient::scope(
+                    PROJECTS[app.project],
+                    col().flex(1).children([
+                        row().flex(1).children([
+                            sidebar(app).w(Sizing::Cells(app.sidebar)),
+                            grip(),
+                            body(app).flex(1),
+                            preview(app),
+                        ]),
+                        Scratch.node().h(Sizing::Cells(1)),
+                    ]),
+                )
+                .flex(1),
                 StatusBar {
                     count: app.tasks.len(),
                     status: app.status.clone(),
@@ -114,7 +186,37 @@ fn sidebar(app: &App) -> Node<Msg> {
                 })
             })
             .node(),
+        overflow_panel(app),
     ])
+}
+
+/// A bordered panel whose content cannot fit, so a bound has something to do.
+///
+/// Ten cells inside the frame; eleven cells of promises. A nine-cell name, a
+/// gap that will not close below one cell, and a one-cell slot. An
+/// over-wide child is normally clamped to what remains and never escapes — but
+/// `min_w` is a floor layout keeps *even when keeping it puts the slot outside
+/// the parent*, and outside the parent is the column the border is drawn on.
+///
+/// **"Toggle clipping"** in the palette (Ctrl-P) turns the bound off and on.
+/// With it on — the default, because `border()` implies it — the wall survives
+/// and the slot is simply not drawn: `│clip-test │`. With it off, the slot is
+/// placed on the wall's column and paints over it: `│clip-test M`.
+fn overflow_panel(app: &App) -> Node<Msg> {
+    col()
+        .border()
+        .clip(app.clip)
+        .theme("sidebar")
+        .h(Sizing::Cells(3))
+        // A width of its own, not the sidebar's: ten cells inside the frame,
+        // for eleven cells of promises. Dragging the grip then moves the panel
+        // without changing what it is demonstrating.
+        .w(Sizing::Cells(12))
+        .child(row().h(Sizing::Cells(1)).children([
+            text("clip-test").w(Sizing::Cells(9)),
+            row().flex(1).min_w(1),
+            text("M").w(Sizing::Cells(1)).theme("sidebar.title"),
+        ]))
 }
 
 /// A one-cell column that resizes the sidebar. Pressing it captures the
@@ -140,11 +242,64 @@ fn grip() -> Node<Msg> {
 // -- the task list -----------------------------------------------------------
 
 fn body(app: &App) -> Node<Msg> {
-    col().children([
-        new_task_row(app).h(Sizing::Cells(1)),
-        divider(0).h(Sizing::Cells(0)),
-        task_list(app).flex(1),
+    // The list, with a ribbon drawn *over* its first row rather than above it.
+    // See `ribbon`.
+    stack().children([
+        col().children([
+            new_task_row(app).h(Sizing::Cells(1)),
+            divider(0).h(Sizing::Cells(0)),
+            task_list(app).flex(1),
+        ]),
+        // The overlay column spans the whole body — a stack child stretches —
+        // so it, and the spacer that positions the strip, have to say they are
+        // not pointer targets. A container that draws nothing still hits by
+        // default, and without this the column swallows every click on the
+        // list below it.
+        col()
+            .pointer_mode(fresh_ui::desc::PointerMode::Transparent)
+            .children([
+                // One row down: past the entry field, onto the list's own
+                // first row. (The divider between them is zero-height.)
+                row()
+                    .h(Sizing::Cells(1))
+                    .pointer_mode(fresh_ui::desc::PointerMode::Transparent),
+                ribbon(app).h(Sizing::Cells(1)),
+            ]),
     ])
+}
+
+/// A one-row strip drawn on top of the list's first row.
+///
+/// **The point of it is what it does *not* absorb.** The strip spans the whole
+/// width, but only its button is a pointer target: everything else is
+/// `PointerMode::Transparent`, so a press on the strip's text reaches the task
+/// row underneath and selects it. Without a pointer mode on ordinary
+/// containers this could not be written — a container that draws nothing still
+/// hits, so the strip would swallow the whole first row.
+///
+/// It is the shape a title bar drawn on a panel's border takes, or a pinned
+/// header over a list.
+fn ribbon(app: &App) -> Node<Msg> {
+    // The run count the host reported for the last row press, shown here
+    // because the row's own `toggled #N` status would overwrite it.
+    let last = match app.last_click {
+        Some((i, n)) => format!("row {i} ×{n}"),
+        None => "—".into(),
+    };
+    let label = format!(" ribbon: click the text, it falls through · last press: {last} ");
+    row()
+        // The strip itself, and the spacer inside it, let presses through.
+        .pointer_mode(fresh_ui::desc::PointerMode::Transparent)
+        .children([
+            text(label)
+                .theme("ribbon")
+                .pointer_mode(fresh_ui::desc::PointerMode::Transparent),
+            row()
+                .flex(1)
+                .pointer_mode(fresh_ui::desc::PointerMode::Transparent),
+            // …and this one does not.
+            gesture(text(" [clear filter] ").theme("ribbon.button")).on_click(|_| Msg::RibbonClear),
+        ])
 }
 
 fn new_task_row(app: &App) -> Node<Msg> {
@@ -188,14 +343,32 @@ fn task_list(app: &App) -> Node<Msg> {
 fn task_row(task: &Task, i: usize, accent: &'static str) -> Node<Msg> {
     let mark = if task.done { "[x]" } else { "[ ]" };
     let id = task.id;
-    // No Click handler here: the enclosing List activates a row on click and
-    // on Enter alike, and this row's list is wired with on_activate(Toggle), so
-    // a click toggles it once. The row keeps only what the List does not do —
-    // the secondary-click context menu.
-    let _ = id;
-    gesture(row().children([text(format!("{accent}{mark} ")), text(task.title.clone())])).on(
+    // No Click handler for *activation* here: the enclosing List activates a
+    // row on click and on Enter alike, and this row's list is wired with
+    // on_activate(Toggle), so a click toggles it once. The row keeps only what
+    // the List does not do — the secondary-click context menu, and the run
+    // count below.
+    gesture(row().children([
+        text(format!("{accent}{mark} ")),
+        text(task.title.clone()),
+        // **A gap that refuses to close.** `flex(1)` alone gives the badge its
+        // right edge, and `min_w(3)` keeps three cells between the title and
+        // the badge once the column is too narrow for both — the title
+        // truncates instead of the gap silently vanishing. Drag the sidebar
+        // grip right to squeeze this and watch the gap hold.
+        row().flex(1).min_w(3),
+        text(format!("#{id}")).theme("badge"),
+    ]))
+    .on(
         GestureKind::SecondaryClick,
         Rc::new(move |e: &Event| Some(Msg::OpenContext(i, e.pos))),
+    )
+    // How many presses in a run this was, straight off the event. The library
+    // has no clock: the host counts the run and reports it, and a `Click`
+    // carries the count of the press it completes.
+    .on(
+        GestureKind::Click,
+        Rc::new(move |e: &Event| Some(Msg::Clicked(i, e.clicks))),
     )
 }
 
@@ -375,6 +548,12 @@ pub fn shortcuts() -> Vec<fresh_ui::focus::Shortcut> {
     s.push(fresh_ui::focus::Shortcut::new(
         KeyPress::with(KeyCode::Char('g'), Mods::ALT),
         Intent::Custom("menu.go"),
+    ));
+    // Alt-P switches documents. Everything below the scope is replaced, and
+    // the scratch note comes back with the project it belongs to.
+    s.push(fresh_ui::focus::Shortcut::new(
+        KeyPress::with(KeyCode::Char('p'), Mods::ALT),
+        Intent::Custom("project.next"),
     ));
     s
 }

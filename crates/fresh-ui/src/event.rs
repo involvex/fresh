@@ -18,6 +18,8 @@ use crate::render::geom::Point;
 pub enum Flow {
     #[default]
     Continue,
+    /// The handler claimed the event: propagation ends, the tree resolves
+    /// nothing further, and a host behind the tree does not act on it.
     Stop,
 }
 
@@ -68,6 +70,7 @@ pub enum KeyCode {
     BackTab,
     Backspace,
     Delete,
+    Insert,
     Up,
     Down,
     Left,
@@ -77,6 +80,15 @@ pub enum KeyCode {
     PageUp,
     PageDown,
     F(u8),
+    /// The dedicated context-menu key (`Menu`, sometimes "Application"), and
+    /// the reason it is here rather than in a host's private vocabulary:
+    /// **containment applies to keys the tree cannot name.** A surface that
+    /// owns the keyboard swallows anything the host declines to translate, so
+    /// a key with no variant here is not "left on the old path" while a focus
+    /// layer is up — it is eaten. The editor's dock lost its context menu to
+    /// exactly that: `F2` had a variant and fell through to the host's router,
+    /// `Menu` did not and died silently.
+    Menu,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -116,6 +128,16 @@ pub enum GestureKind {
     Key,
     FocusGained,
     FocusLost,
+    /// A drag ([`Event::start_drag`]) brought the pointer onto this node.
+    /// Fired on the node itself, not propagated, like `Enter` — and on every
+    /// node the pointer comes onto, as `Enter` is, not only drop targets: it
+    /// is the drag's hover, which the capture keeps from `Enter`.
+    DragEnter,
+    /// A drag took the pointer off this node, or ended elsewhere.
+    DragLeave,
+    /// A drag was released over this node. Listening for it is what makes a
+    /// node a **drop target**; see [`Event::start_drag`].
+    Drop,
 }
 
 /// Where in the walk this delivery is.
@@ -134,6 +156,21 @@ pub enum Input {
         pos: Point,
         button: MouseButton,
         mods: Mods,
+        /// Which press in a run this is: `1` for a single, `2` for the second
+        /// of a double, `3` for a triple, and so on.
+        ///
+        /// **Reported by the host, not derived here.** A double is a fact about
+        /// *time* — two presses close enough together, near enough to each
+        /// other — and the library has no clock and should not grow one. Hosts
+        /// already have this: a terminal front end has its own configurable
+        /// threshold, and its tests have a substitutable time source that a
+        /// clock in here would defeat. So the host says how many, and the
+        /// library carries it to the handler on [`Event::clicks`] and onto the
+        /// `Click` it synthesises.
+        ///
+        /// [`Input::press`] sets it to 1, which is what a host that does not
+        /// track runs should send.
+        clicks: u8,
     },
     Release {
         pos: Point,
@@ -153,6 +190,33 @@ pub enum Input {
         mods: Mods,
     },
     Key(KeyPress),
+}
+
+impl Input {
+    /// A single press — `clicks: 1`.
+    pub fn press(pos: Point, button: MouseButton, mods: Mods) -> Input {
+        Input::Press {
+            pos,
+            button,
+            mods,
+            clicks: 1,
+        }
+    }
+
+    /// A press that is the `clicks`-th of a run.
+    pub fn press_n(pos: Point, button: MouseButton, mods: Mods, clicks: u8) -> Input {
+        Input::Press {
+            pos,
+            button,
+            mods,
+            clicks,
+        }
+    }
+
+    /// A release.
+    pub fn release(pos: Point, button: MouseButton, mods: Mods) -> Input {
+        Input::Release { pos, button, mods }
+    }
 }
 
 /// Which way a wheel turns, and which way an offset moves.
@@ -184,7 +248,8 @@ pub(crate) struct Ctl {
     pub flow: Cell<Flow>,
     pub default_prevented: Cell<bool>,
     pub capture_request: Cell<Option<ElementId>>,
-    pub release_request: Cell<bool>,
+    /// The capture is a drag: see [`Event::start_drag`].
+    pub drag_request: Cell<bool>,
     pub focus_request: Cell<Option<(ElementId, SelectionOnFocus)>>,
 }
 
@@ -215,7 +280,45 @@ pub struct Event {
     pub delta: i32,
     /// Which axis `delta` moves along. `Vertical` for everything else.
     pub axis: Axis,
+    /// The byte of the text under the pointer, in the *logical* string of the
+    /// text run this event's target is — `None` when the target is not text.
+    ///
+    /// **The library is the only thing that can answer this.** The caller
+    /// supplied the string; the library decided which of it is visible and
+    /// where each grapheme landed. Reporting only a column asks the caller to
+    /// redo that decision — which it can only do by laying the text out a
+    /// second time, and which is wrong outright if it assumes one byte per
+    /// cell. Both of those exist in this workspace's editor today, the second
+    /// as a live defect on any non-ASCII label or value.
+    ///
+    /// Wrapped text answers as well. A row is not a slice of the logical
+    /// string — the break ate a space, a hanging indent added some — so each
+    /// row says which bytes it *is*, and the press resolves against the row it
+    /// landed on rather than against a count of the rows above it. Whitespace
+    /// a break dropped belongs to no row, so a press past the end of a wrapped
+    /// row reports the byte just past the text that row shows, which is the
+    /// caret position at the row's end.
+    ///
+    /// This is the same mapping, read backwards, that places
+    /// [`TextProps::cursor`](crate::desc::TextProps::cursor) from a byte —
+    /// deliberately, so a press and the caret it moves cannot disagree about
+    /// where the wrap broke.
+    pub text_byte: Option<usize>,
+    /// The pointer came here by capture: an element took it on a press
+    /// (`capture_pointer`) and this move or release was routed to that
+    /// element rather than by what is under the pointer. A listener that
+    /// treats a move as a drag reads this, so a bare motion across it is
+    /// not one — a fact returned for every hover would ask for a frame per
+    /// pointer sample.
+    pub captured: bool,
     pub key: Option<KeyPress>,
+    /// Which press in a run produced this, as the host reported it: `1` for a
+    /// single, `2` for a double, `3` for a triple. `1` for everything that is
+    /// not a press or a click.
+    ///
+    /// A `Click` carries the count of the press it completes, so a listener can
+    /// tell a double-click from a single without tracking presses itself.
+    pub clicks: u8,
     /// On a focus event, what the acquisition asked the target to do with its
     /// selection.
     pub selection: SelectionOnFocus,
@@ -237,11 +340,14 @@ impl Event {
             kind,
             pos: Point::ZERO,
             local: Point::ZERO,
+            text_byte: None,
+            captured: false,
             button: MouseButton::Left,
             mods: Mods::NONE,
             delta: 0,
             axis: Axis::Vertical,
             key: None,
+            clicks: 1,
             selection: SelectionOnFocus::None,
             target: at,
             current: at,
@@ -272,17 +378,28 @@ impl Event {
         self.ctl.capture_request.set(Some(self.current));
     }
 
-    pub fn release_pointer(&self) {
-        self.ctl.release_request.set(true);
+    /// Capture the pointer for a **drag and drop**: everything
+    /// [`capture_pointer`](Self::capture_pointer) does, and while the press is
+    /// held the tree also watches what is *under* the pointer, which a
+    /// capture otherwise hides: every node the pointer comes onto hears
+    /// `DragEnter`, and `DragLeave` when it goes off — the drag's hover. The
+    /// release is offered as `Drop` to the drop target under the pointer, the
+    /// innermost node on the topmost path that listens for
+    /// [`GestureKind::Drop`], before this element hears its own `Release`;
+    /// then the pointer's hover is resynced to what is under it.
+    ///
+    /// What is being dragged is not the tree's to carry. The handler that
+    /// starts the drag says so in the message it returns, and the owner of
+    /// that state reads it back when a target reports the drop — the same
+    /// rule every other gesture's state follows.
+    pub fn start_drag(&self) {
+        self.capture_pointer();
+        self.ctl.drag_request.set(true);
     }
 
     /// Ask for focus to move to this element.
     pub fn request_focus(&self, sel: SelectionOnFocus) {
         self.ctl.focus_request.set(Some((self.current, sel)));
-    }
-
-    pub fn is_key(&self, code: KeyCode, mods: Mods) -> bool {
-        matches!(self.key, Some(k) if k.code == code && k.mods == mods)
     }
 }
 

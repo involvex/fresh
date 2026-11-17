@@ -12,6 +12,7 @@
 // Transport: one WebSocket — the server pushes region-diff frames whenever
 // the scene changes (no client polling), and all input rides the same socket.
 // --------------------------------------------------------------------------
+/** let scene: Scene | Null */
 let scene = null;
 // ---- typography metrics: measured, not constant (docs §3.3) ----------------
 // The cell size is derived from a canvas measureText of the SAME monospace
@@ -38,7 +39,7 @@ const FONT_STACK = rootCss.getPropertyValue("--font-family").trim()
 const BASE_FONT = parseFloat(rootCss.getPropertyValue("--font-size-base")) || 13;  // CSS px at zoom 1.0
 const CELL_AIR = 1.0477;          // cell width / glyph advance (see above)
 let zoom = 1;
-try{ const z=parseFloat(localStorage.getItem("fresh.zoom")); if(z>=0.5&&z<=3) zoom=z; }catch(_){}
+try{ const z=parseFloat(localStorage.getItem("fresh.zoom")??""); if(z>=0.5&&z<=3) zoom=z; }catch(_){}
 // Web-theme density multiplier (see js/15-theme.js). A pure view scale layered
 // UNDER the user's own zoom: the Compact theme renders the whole grid a notch
 // smaller for more code on screen, Cosmos/macOS keep it at 1.0. Declared here
@@ -49,14 +50,14 @@ let FONT = BASE_FONT, CW = 8.2, CH = 18;   // refined by measureMetrics()
 const measureCtx = document.createElement("canvas").getContext("2d");
 function measureMetrics(){
   FONT = Math.round(BASE_FONT*zoom*webThemeScale*100)/100;
-  measureCtx.font = FONT+"px "+FONT_STACK;
+  measureCtx.font = `${FONT}px ${FONT_STACK}`;
   const adv = measureCtx.measureText("M0".repeat(60)).width/120;  // per-cell advance
   CW = adv>0 ? Math.round(adv*CELL_AIR*100)/100 : 8.2*zoom;       // canvas-less fallback
   CH = Math.round(FONT*(18/13)*100)/100;
   // Publish the zoomed size back to CSS: chrome sizes itself in em off
   // --font-size, so the native UI scales with the buffer instead of staying
   // pinned at the unzoomed base.
-  document.documentElement.style.setProperty("--font-size", FONT+"px");
+  document.documentElement.style.setProperty("--font-size", `${FONT}px`);
   // Font/cell alignment: the SVG buffer pins every glyph to a CW-pitch column,
   // but native chrome text flows at the font's *natural* advance (~CW/CELL_AIR),
   // so N characters of chrome were narrower than the N cells the TUI budgeted
@@ -64,7 +65,11 @@ function measureMetrics(){
   // hold their own text. Add exactly the missing tracking (CW − advance) as
   // letter-spacing so one chrome glyph advances one cell, matching the grid.
   const advNat = adv>0 ? adv : CW/CELL_AIR;
-  document.documentElement.style.setProperty("--cell-tracking", (Math.round((CW-advNat)*1000)/1000)+"px");
+  document.documentElement.style.setProperty("--cell-tracking", `${Math.round((CW-advNat)*1000)/1000}px`);
+  // The cell box, for CSS that lays text out on the grid (a native panel's
+  // grid rows, 46-native.css).
+  document.documentElement.style.setProperty("--cell-w", `${CW}px`);
+  document.documentElement.style.setProperty("--cell-h", `${CH}px`);
 }
 measureMetrics();
 
@@ -79,43 +84,55 @@ measureMetrics();
 // getComputedStyle, so each access reflects the current (possibly overridden) var.
 const shellN=k=>parseFloat(rootCss.getPropertyValue(k))||0;
 const SHELL={ get pad(){return shellN("--shell-pad");}, get top(){return shellN("--bezel-top");},
-  get bot(){return shellN("--bezel-bot");}, get side(){return shellN("--bezel-side");},
-  get gap(){return shellN("--dock-gap");} };
+  get bot(){return shellN("--bezel-bot");}, get side(){return shellN("--bezel-side");} };
 let APPX=0, APPY=0;
-function syncAppOrigin(){ const r=document.getElementById("app").getBoundingClientRect(); APPX=r.left; APPY=r.top; }
-const appH=()=>document.getElementById("app").clientHeight;
+function syncAppOrigin(){ const r=byId("app").getBoundingClientRect(); APPX=r.left; APPY=r.top; }
+const appH=()=>byId("app").clientHeight;
 // Pixel width of a full-height LEFT dock (0 when the dock is hidden/absent):
-// the bezel's screen starts to its right, so the sidebar floats free of it.
+// the columns of the grid the dock's own surface covers.
 function dockWidthPx(){
-  if(!scene||!scene.regions) return 0;
-  for(const s of (scene.regions.widgets||[]))
-    if(s.kind==="dock"&&s.rect&&s.rect.x===0&&s.rect.w<(scene.w||0)) return px(s.rect.w,CW);
-  return 0;
+  const sc=scene;
+  if(!sc) return 0;
+  return px(treeDockCells(sc.regions),CW);
 }
-// Wrap the bezel around the grid minus the dock columns. Runs after every
-// render/frame (dock width and grid size are server-driven) and on window
-// resize; on mobile (or before the first scene) the bezel is hidden.
+// Wrap the bezel around the WHOLE grid. Runs after every render/frame (the
+// grid size is server-driven) and on window resize; on mobile (or before the
+// first scene) the bezel is hidden.
+//
+// It used to start the bezel to the right of the dock, so the dock could float
+// beside the device as its own card — which worked while the dock was native
+// DOM the frontend was free to inset (a card narrower than its cell rect, a
+// gap where the bezel's left rail lands). The dock is the display list's now:
+// its items sit at the exact cells the tree laid them out at, because that is
+// what makes a click on one of them mean the same thing the terminal's click
+// means. So the dock cannot be inset, and a bezel whose left rail claimed the
+// same pixels simply had the dock painted over it — rail, legend and all. The
+// grid is one rectangle; the device wraps it, dock included.
 function layoutShell(){
   syncAppOrigin();
   const dev=document.getElementById("device");
   if(!dev) return;
   // The bezel is a shell-theme decoration (COSMOS hardware / Winamp skin
   // window); the macOS / compact web themes run full-bleed, so the device is
-  // hidden and the menubar clip (which carves out the dock↔bezel gap) is
-  // neutralised for them.
-  if(isMobile()||!scene||!shellTheme()){
+  // hidden and the menubar clip (which the shell themes use while the dock
+  // moves) is neutralised for them.
+  const sc=scene;
+  if(isMobile()||!sc||!shellTheme()){
     dev.classList.remove("on");
     document.documentElement.style.setProperty("--clip-left","0px");
     return;
   }
   dev.classList.add("on");
-  const dw=dockWidthPx();
-  // Clip full-grid-width chrome rows (menubar) to the screen — see the CSS.
-  document.documentElement.style.setProperty("--clip-left", dw+"px");
-  dev.style.left=(APPX+dw-SHELL.side)+"px";
-  dev.style.top=(APPY-SHELL.top)+"px";
-  dev.style.width=(px(scene.w||0,CW)-dw+2*SHELL.side)+"px";
-  dev.style.height=(px(scene.h||0,CH)+SHELL.top+SHELL.bot)+"px";
+  // The menubar row spans the full grid width; the dock covers its left half,
+  // in the terminal by painting over it and here by an opaque ground on the
+  // dock's surface. The clip keeps the strip from showing through while the
+  // dock slides in and out (the FLIP in 30-render.js moves the chrome, not the
+  // dock's own items) — see the CSS.
+  document.documentElement.style.setProperty("--clip-left", `${dockWidthPx()}px`);
+  dev.style.left=`${APPX-SHELL.side}px`;
+  dev.style.top=`${APPY-SHELL.top}px`;
+  dev.style.width=`${px(sc.w,CW)+2*SHELL.side}px`;
+  dev.style.height=`${px(sc.h,CH)+SHELL.top+SHELL.bot}px`;
 }
 
 function setZoom(z){
@@ -147,15 +164,44 @@ function setPaletteCentered(on){
 // Browser zoom or a monitor move changes devicePixelRatio without any event;
 // the matchMedia re-arm pattern fires once per change — re-measure (rounding
 // of the advance can shift with rasterization) and re-fit the grid.
-(function armDpr(){
-  matchMedia(`(resolution: ${devicePixelRatio}dppx)`)
-    .addEventListener("change",()=>{ measureMetrics(); if(scene) render(); resize(); armDpr(); },{once:true});
-})();
+function armDpr(){
+  listen(matchMedia(`(resolution: ${devicePixelRatio}dppx)`),
+    "change",()=>{ measureMetrics(); if(scene) render(); resize(); armDpr(); },{once:true});
+}
+armDpr();
 
-const esc = s => String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+/** const esc: <T>(T) => String */
+const esc = s => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+  .replace(/"/g,"&quot;").replace(/'/g,"&#39;");
+/** const px: (Number, Number) => Number */
 const px = (cells, sz) => (cells*sz);
-function place(el, r){ el.style.left=px(r.x,CW)+"px"; el.style.top=px(r.y,CH)+"px"; el.style.width=px(r.w,CW)+"px"; el.style.height=px(r.h,CH)+"px"; }
+// A box placed at a cell rectangle that the page lays out itself, whose
+// content natively takes less height than the cells the terminal measured:
+// let it hug that content, kept centred on the rectangle it was given. Runs
+// after layout; `max` keeps the cell height as the cap (the content scrolls
+// past it).
+/** function hugHeight(El) => Undefined */
+function hugHeight(el){
+  requestAnimationFrame(()=>{
+    const h0=parseFloat(el.style.height), top0=parseFloat(el.style.top);
+    if(!(h0>0)) return;
+    el.style.height="auto"; el.style.maxHeight=`${h0}px`;
+    const h=el.offsetHeight;
+    if(h<h0-1) el.style.top=`${top0+(h0-h)/2}px`;
+  });
+}
+/** function place(El, Rect) => Undefined */
+function place(el, r){ el.style.left=`${px(r.x,CW)}px`; el.style.top=`${px(r.y,CH)}px`; el.style.width=`${px(r.w,CW)}px`; el.style.height=`${px(r.h,CH)}px`; }
+// An element the page shell (shell.html) always has.
+/** function byId(String) => El */
+function byId(id){
+  const el=document.getElementById(id);
+  if(!el) throw new Error(`#${id} is missing from shell.html`);
+  return el;
+}
+/** function div(String) => El */
 function div(cls){ const d=document.createElement("div"); d.className=cls; return d; }
 // cell coordinate to forward to the editor for a click on a chrome rect
+/** const rectCell: (Rect) => {col: Number, row: Number} */
 const rectCell = r => ({ col: r.x + Math.floor(r.w/2), row: r.y });
 

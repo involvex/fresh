@@ -22,6 +22,7 @@ type GitFile = { rel: string; abs: string };
 const finder = new Finder<GitFile>(editor, {
   id: "git-find-file",
   format: (file) => ({
+    id: file.rel,
     label: file.rel,
     location: { file: file.abs, line: 1, column: 1 },
   }),
@@ -39,12 +40,13 @@ async function loadGitFiles(): Promise<GitFile[]> {
     return [];
   }
 
-  const result = await editor.spawnProcess(
+  const result = await editor.runOnTarget(
     "git",
-    ["ls-files", "--full-name"],
+    // `-z`: names as they are, unquoted, whatever characters they hold.
+    ["ls-files", "-z", "--full-name"],
     repo.root,
   );
-  if (result.exit_code !== 0) {
+  if (result.code !== 0) {
     editor.debug(`Failed to load git files: ${result.stderr}`);
     return [];
   }
@@ -52,8 +54,7 @@ async function loadGitFiles(): Promise<GitFile[]> {
   // `ls-files --full-name` yields repo-relative paths. Keep them for display
   // and join to the repo root for opening.
   return result.stdout
-    .split("\n")
-    .map((line) => line.trim())
+    .split("\0")
     .filter((line) => line !== "")
     .map((rel) => ({ rel, abs: toAbsInRepo(editor, repo, rel) }));
 }

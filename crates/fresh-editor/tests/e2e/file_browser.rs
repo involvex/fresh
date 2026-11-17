@@ -501,6 +501,85 @@ fn test_file_browser_dot_reveals_hidden() {
     );
 }
 
+/// Test Enter on a partial dotfile name opens the highlighted entry
+#[test]
+fn test_file_browser_enter_completes_partial_dotted_name() {
+    let temp_dir = TempDir::new().unwrap();
+    let project_root = temp_dir.path().to_path_buf();
+
+    fs::write(project_root.join("visible.txt"), "visible").unwrap();
+    let config_dir = project_root.join(".config");
+    fs::create_dir(&config_dir).unwrap();
+    fs::write(config_dir.join("nested.txt"), "nested").unwrap();
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        80,
+        24,
+        Default::default(),
+        project_root.clone(),
+    )
+    .unwrap();
+
+    harness
+        .send_key(KeyCode::Char('o'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("visible.txt"))
+        .expect("Visible file should appear");
+
+    harness.type_text(".conf").unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains(".config/"))
+        .expect("Typing '.conf' should reveal .config/");
+
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("nested.txt"))
+        .expect("Enter should navigate into .config/");
+}
+
+/// Test Enter creates a new file whose name is a prefix of an existing file
+#[test]
+fn test_file_browser_enter_creates_file_named_as_prefix_of_existing_file() {
+    let temp_dir = TempDir::new().unwrap();
+    let project_root = temp_dir.path().to_path_buf();
+
+    fs::write(project_root.join("visible.txt"), "visible").unwrap();
+    fs::write(project_root.join(".env.example"), "example").unwrap();
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        80,
+        24,
+        Default::default(),
+        project_root.clone(),
+    )
+    .unwrap();
+
+    harness
+        .send_key(KeyCode::Char('o'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("visible.txt"))
+        .expect("Visible file should appear");
+
+    harness.type_text(".env").unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains(".env.example"))
+        .expect("Typing '.env' should reveal .env.example");
+
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .wait_until(|h| {
+            let screen = h.screen_to_string();
+            screen.contains(".env") && !screen.contains(".env.example")
+        })
+        .expect("Enter should create .env as a new file");
+}
+
 /// Test backspace goes to parent directory when filter is empty
 #[test]
 fn test_file_browser_backspace_parent() {
@@ -1324,4 +1403,63 @@ fn test_file_open_shortcuts_load_async_issue_903() {
          Screen:\n{}",
         screen
     );
+}
+
+/// **PageDown moves by the rows the list shows.** It moved a fixed ten
+/// rows, whatever the dialog's height gave the list; the list records the
+/// window its layout placed, and a page is that.
+#[test]
+fn test_file_browser_page_down_moves_by_the_window() {
+    let temp_dir = TempDir::new().unwrap();
+    let project_root = temp_dir.path().to_path_buf();
+    for i in 0..60 {
+        fs::write(project_root.join(format!("file_{i:02}.txt")), "x").unwrap();
+    }
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        100,
+        45,
+        Default::default(),
+        project_root.clone(),
+    )
+    .unwrap();
+    harness
+        .send_key(KeyCode::Char('o'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("file_00.txt"))
+        .expect("Files should be listed");
+    let selected = |h: &EditorTestHarness| {
+        h.editor()
+            .active_window()
+            .file_open_state
+            .as_ref()
+            .and_then(|s| s.selected_index())
+    };
+    // Down past the first window, so every row on screen is a file.
+    for _ in 0..25 {
+        harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    }
+    harness.render().unwrap();
+    let from = selected(&harness).expect("a selection");
+    let screen = harness.screen_to_string();
+    let rows = screen
+        .lines()
+        .filter(|l| l.contains("file_") && l.contains(".txt") && l.contains('│'))
+        .count();
+    assert!(rows > 10, "the list shows more than ten rows:\n{screen}");
+
+    harness
+        .send_key(KeyCode::PageDown, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    assert_eq!(
+        selected(&harness),
+        Some(from + rows),
+        "a page is the {rows} rows on screen:\n{screen}"
+    );
+    harness
+        .send_key(KeyCode::PageUp, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+    assert_eq!(selected(&harness), Some(from));
 }

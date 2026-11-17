@@ -64,6 +64,14 @@ pub fn fold_signature(folds: &[std::ops::Range<usize>]) -> u64 {
     h.finish() | 1
 }
 
+/// One line's decorations: its soft breaks, its conceals (the byte range and
+/// what replaces it), and its inline hints.
+type LineDecorations<'a> = (
+    Vec<SoftBreakRender>,
+    Vec<(std::ops::Range<usize>, Option<&'a str>)>,
+    Vec<crate::view::ui::split_rendering::transforms::InlineHint>,
+);
+
 /// Plugin decorations that move row boundaries, snapshotted for one build.
 ///
 /// Owned data rather than a borrow of the managers, because the build holds
@@ -95,6 +103,11 @@ pub struct IndexDecorations {
     /// closure over a side list, which left the snapshot incomplete and the
     /// virtual half undiffable.
     pub virtual_lines: Vec<usize>,
+    /// The anchors in `virtual_lines` of lines drawn *above* their line (a
+    /// table row's `├─┼─┤`), sorted. The rest are drawn below it (a list
+    /// item's spacer), and the index orders a line's rows the way they are
+    /// drawn: rows above, the text, rows below.
+    pub virtual_lines_above: Vec<usize>,
 }
 
 impl IndexDecorations {
@@ -113,6 +126,13 @@ impl IndexDecorations {
         (hi - lo) as u32
     }
 
+    /// Virtual lines anchored in `start..end` that are drawn above their line.
+    pub fn virtual_rows_above_in(&self, start: usize, end: usize) -> u32 {
+        let lo = self.virtual_lines_above.partition_point(|p| *p < start);
+        let hi = self.virtual_lines_above.partition_point(|p| *p < end);
+        (hi - lo) as u32
+    }
+
     /// Move every stored position the way the buffer's markers moved for this
     /// edit, so the snapshot stays in current buffer coordinates.
     ///
@@ -123,14 +143,19 @@ impl IndexDecorations {
     ///
     /// * **Deletion** collapses the removed span onto its start — a position
     ///   inside it clamps to `start`, one after it moves back by `removed`.
-    /// * **Insertion** is *right gravity*: a position sitting exactly at the
-    ///   insertion point is pushed forward. Every decoration anchor in the
-    ///   editor is right-gravity, because that is all `MarkerList::create`
-    ///   makes. (It used to take a `left_affinity` flag that never reached
-    ///   the tree, and call sites labelled their markers by that flag rather
-    ///   than by what the tree did — which is how this was written backwards
-    ///   in the first place. The flag is gone; `create_left_gravity` is the
-    ///   real thing.)
+    /// * **Insertion** is *right gravity* by default: a position sitting
+    ///   exactly at the insertion point is pushed forward. That is what
+    ///   `MarkerList::create` does, and what every decoration anchor here is,
+    ///   with one exception: an inline hint carries its own
+    ///   [`MarkerGravity`](crate::view::virtual_text::MarkerGravity), because
+    ///   inlay hints ask for left-gravity markers so an edit at a hint's
+    ///   anchor cannot drag the hint off its line (issue #722). A left-gravity
+    ///   anchor stays where it is when text is inserted exactly at it. (This
+    ///   rule used to take a `left_affinity` flag that never reached the tree,
+    ///   and call sites labelled their markers by that flag rather than by
+    ///   what the tree did — which is how this was written backwards in the
+    ///   first place. The flag is gone; `create_left_gravity` is the real
+    ///   thing, and gravity now travels with the decoration.)
     ///
     /// Getting the insertion rule backwards is not a boundary nicety: typing
     /// one character immediately before a conceal left the snapshot's copy of
@@ -170,8 +195,22 @@ impl IndexDecorations {
         for p in &mut self.virtual_lines {
             *p = shift(*p);
         }
+        for p in &mut self.virtual_lines_above {
+            *p = shift(*p);
+        }
         for h in &mut self.inline_hints {
-            h.anchor = shift(h.anchor);
+            // A left-gravity hint anchored exactly at the insertion point
+            // stays put, matching what the marker tree does to the live
+            // anchor; everything else follows the default right-gravity
+            // rule above.
+            h.anchor = if h.gravity == crate::view::virtual_text::MarkerGravity::Left
+                && removed == 0
+                && h.anchor == start
+            {
+                h.anchor
+            } else {
+                shift(h.anchor)
+            };
         }
         for (r, _) in &mut self.conceals {
             let s = shift(r.start);
@@ -226,6 +265,15 @@ impl IndexDecorations {
             |a, b| a == b,
             &mut |p: &usize| ranges.push(*p..*p + 1),
         );
+        // A line moving from below its anchor to above it keeps its anchor,
+        // so the side is diffed on its own.
+        diff_sorted(
+            &self.virtual_lines_above,
+            &new.virtual_lines_above,
+            |p| *p,
+            |a, b| a == b,
+            &mut |p: &usize| ranges.push(*p..*p + 1),
+        );
         // Folds are part of the geometry key, so two snapshots under one
         // geometry normally agree and this arm finds nothing. It is not a
         // backstop against a `fold_signature` collision — folds are not in
@@ -272,15 +320,7 @@ impl IndexDecorations {
     /// The decorations touching `line_start..line_end`, as the transforms want
     /// them. Conceals are kept whenever they *overlap* the line rather than
     /// start inside it: one spanning a line break still hides part of this line.
-    fn for_line(
-        &self,
-        line_start: usize,
-        line_end: usize,
-    ) -> (
-        Vec<SoftBreakRender>,
-        Vec<(std::ops::Range<usize>, Option<&str>)>,
-        Vec<crate::view::ui::split_rendering::transforms::InlineHint>,
-    ) {
+    fn for_line(&self, line_start: usize, line_end: usize) -> LineDecorations<'_> {
         let breaks = self
             .soft_breaks
             .iter()
@@ -366,6 +406,9 @@ pub struct LineWrap {
     pub resumable: Vec<bool>,
     /// Plugin virtual lines anchored in this logical line.
     pub virtual_rows: u32,
+    /// How many of `virtual_rows` are drawn above the line's text; the rest
+    /// are drawn below it. Rows are ordered as drawn.
+    pub virtual_above: u32,
     /// Every byte of this line is inside a collapsed fold, so it draws nothing
     /// and occupies no visual row.
     pub hidden: bool,
@@ -378,6 +421,7 @@ impl Default for LineWrap {
             carries: vec![RowCarry::default()],
             resumable: vec![true],
             virtual_rows: 0,
+            virtual_above: 0,
             hidden: false,
         }
     }
@@ -524,12 +568,18 @@ pub struct WrapIndex {
 /// `decoration_repairs` counts diffs that found real work; a version bump
 /// whose snapshot turned out identical is free and is not counted, so the
 /// number means "batches that changed something", not "batches seen".
+///
+/// `repair_bytes_read` counts the source bytes text-edit repairs tokenised.
+/// A repair that reads from its resume row to the line's end pays for the
+/// whole tail, which on a long line is the O(line) cost the windowed read
+/// exists to avoid; one that resyncs inside its windows pays for a few rows.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct WrapIndexStats {
     pub rebuilds: u64,
     pub lines_built: u64,
     pub decoration_repairs: u64,
     pub lines_repaired: u64,
+    pub repair_bytes_read: u64,
 }
 
 impl WrapIndexStats {
@@ -539,6 +589,7 @@ impl WrapIndexStats {
             lines_built: self.lines_built + other.lines_built,
             decoration_repairs: self.decoration_repairs + other.decoration_repairs,
             lines_repaired: self.lines_repaired + other.lines_repaired,
+            repair_bytes_read: self.repair_bytes_read + other.repair_bytes_read,
         }
     }
 }
@@ -607,6 +658,11 @@ impl WrapIndex {
         let mut lines = Vec::with_capacity(line_count);
         for line in 0..line_count {
             let vrows = line_virtual_rows(buffer, line, decorations);
+            if let Some(flat) = try_build_line_flat(buffer, line, geometry.rule, vrows, decorations)
+            {
+                lines.push(flat);
+                continue;
+            }
             lines.push(build_line(
                 buffer,
                 line,
@@ -707,10 +763,6 @@ impl WrapIndex {
         self.rows.total().max(1)
     }
 
-    pub fn rows_in_line(&self, line: usize) -> u32 {
-        self.lines.get(line).map_or(1, |l| l.total_rows())
-    }
-
     /// Absolute row index of `line`'s first row.
     /// One line's canonical wrap structure, for the render path's
     /// cursor-line expansion.
@@ -735,7 +787,7 @@ impl WrapIndex {
             .row_starts
             .partition_point(|&s| s <= rel)
             .saturating_sub(1);
-        self.rows.prefix(line) + lw.virtual_rows + row_in_line as u32
+        self.rows.prefix(line) + lw.virtual_above + row_in_line as u32
     }
 
     /// Address of absolute visual row `row`. O(log lines).
@@ -757,7 +809,7 @@ impl WrapIndex {
         let lw = &self.lines[line];
         let line_start = buffer.line_start_offset(line).unwrap_or(0);
         let row_in_line = row.saturating_sub(base);
-        if row_in_line < lw.virtual_rows {
+        if row_in_line < lw.virtual_above {
             return RowAddr {
                 row,
                 byte: line_start,
@@ -767,13 +819,25 @@ impl WrapIndex {
                 is_virtual: true,
             };
         }
-        let idx = ((row_in_line - lw.virtual_rows) as usize).min(lw.row_starts.len() - 1);
+        let idx = (row_in_line - lw.virtual_above) as usize;
+        if idx >= lw.row_starts.len() {
+            // One of the rows drawn below the line's text.
+            let last = lw.row_starts.len() - 1;
+            return RowAddr {
+                row,
+                byte: line_start + lw.row_starts[last] as usize,
+                line,
+                row_in_line: row_in_line as usize,
+                carry: RowCarry::default(),
+                is_virtual: true,
+            };
+        }
         RowAddr {
             row,
             byte: line_start + lw.row_starts[idx] as usize,
             line,
             // Drawn-row offset, not `idx`: the virtual rows above are drawn too.
-            row_in_line: idx + lw.virtual_rows as usize,
+            row_in_line: row_in_line as usize,
             carry: lw.carries[idx],
             is_virtual: false,
         }
@@ -798,11 +862,11 @@ impl WrapIndex {
         // but `resumable` is indexed by wrap row. A non-virtual address is
         // always at or past the virtual block, so the subtraction is safe; the
         // walk-back distance is the same in both spaces.
-        let mut idx = addr.row_in_line.saturating_sub(lw.virtual_rows as usize);
+        let mut idx = addr.row_in_line.saturating_sub(lw.virtual_above as usize);
         while idx > 0 && !lw.resumable[idx] {
             idx -= 1;
         }
-        let skip = (addr.row_in_line.saturating_sub(lw.virtual_rows as usize) - idx) as u32;
+        let skip = (addr.row_in_line.saturating_sub(lw.virtual_above as usize) - idx) as u32;
         (row - skip, skip)
     }
 
@@ -974,25 +1038,6 @@ impl WrapIndex {
         let resume_rel = self.lines[line].row_starts[resume_idx];
         let resume_carry = self.lines[line].carries[resume_idx];
         let resume_byte = line_start + resume_rel as usize;
-        // Decoration-aware, and read from the resume row rather than the line's
-        // start: repair is meant to cost rows, not the line.
-        let stream = line_token_stream(
-            buffer,
-            line,
-            line_ending,
-            &self.decorations,
-            Some(resume_byte),
-        );
-
-        // The *new* stream may open this row with injected content the resume
-        // cannot reconstruct (an edit can move a hint or a soft break onto a row
-        // that previously started with plain source), or the resume byte may no
-        // longer address anything while the line still has content.
-        let tail = tokens_from(&stream, resume_byte);
-        if !resume_is_safe(&stream, resume_byte) || (tail.is_empty() && !stream.is_empty()) {
-            self.rebuild_one(buffer, line, rule, line_ending);
-            return;
-        }
 
         // Resync also requires the tail to be pure shifted source: past the last
         // decoration in the line. Beyond such a point the overlay reattaches to
@@ -1000,6 +1045,52 @@ impl WrapIndex {
         // continuation". With decorations applied by later passes rather than
         // here, that floor is just the edit's end.
         let resync_floor = rel_end_old;
+
+        // Read from the resume row rather than the line's start, and only as
+        // far as the layout takes to resync: repair is meant to cost rows, not
+        // the line. A decorated line is read whole, since its decorations
+        // reach across any cut; a plain one in windows that grow until the
+        // rows realign, which is usually well before the line ends.
+        let edit_end = (edit.start + edit.inserted).max(resume_byte);
+        let window_chars =
+            edit_end - resume_byte + REPAIR_WINDOW_ROWS * rule.available_width().max(1);
+        let mut reader =
+            TailReader::new(buffer, line, &self.decorations, resume_byte, window_chars);
+        let stream = match &mut reader {
+            Some(reader) => LineStream::verbatim(reader.next_chunk(
+                buffer,
+                line_ending,
+                &self.decorations.folds,
+            )),
+            None => {
+                let line_end = buffer
+                    .line_start_offset(line + 1)
+                    .unwrap_or_else(|| buffer.len())
+                    .min(buffer.len());
+                self.stats.repair_bytes_read += line_end.saturating_sub(resume_byte) as u64;
+                line_token_stream(
+                    buffer,
+                    line,
+                    line_ending,
+                    &self.decorations,
+                    Some(resume_byte),
+                )
+            }
+        };
+
+        // The *new* stream may not be resumable at this byte at all — it can
+        // open the row with injected content the carry cannot reconstruct, or
+        // reach into it with a conceal's replacement — and the resume byte may
+        // no longer address anything while the line still has content. Either
+        // way the line is laid out from its start instead.
+        let Some(mut tail) = stream.resume_at(resume_byte) else {
+            self.rebuild_one(buffer, line, rule, line_ending);
+            return;
+        };
+        if tail.is_empty() && !stream.is_empty() {
+            self.rebuild_one(buffer, line, rule, line_ending);
+            return;
+        }
 
         let mut machine = WrapMachine::resume(rule, resume_carry);
         let mut new_starts: Vec<u32> = Vec::new();
@@ -1009,25 +1100,36 @@ impl WrapIndex {
         let mut prev_rel = resume_rel;
         let mut resync_at: Option<usize> = None;
 
-        for token in tail {
-            machine.feed(token);
-            if let Some(hit) = absorb_rows(
-                &machine,
-                line_start,
-                resume_rel,
-                &mut sealed,
-                &mut prev_rel,
-                &mut new_starts,
-                &mut new_carries,
-                &mut new_resumable,
-                &self.lines[line],
-                resume_idx,
-                resync_floor,
-                delta,
-            ) {
-                resync_at = Some(hit);
-                break;
+        'read: loop {
+            for token in tail {
+                machine.feed(token);
+                if let Some(hit) = absorb_rows(
+                    &machine,
+                    line_start,
+                    resume_rel,
+                    &mut sealed,
+                    &mut prev_rel,
+                    &mut new_starts,
+                    &mut new_carries,
+                    &mut new_resumable,
+                    &self.lines[line],
+                    resume_idx,
+                    resync_floor,
+                    delta,
+                ) {
+                    resync_at = Some(hit);
+                    break 'read;
+                }
             }
+            match reader.as_mut().filter(|r| !r.is_done()) {
+                Some(reader) => {
+                    tail = reader.next_chunk(buffer, line_ending, &self.decorations.folds);
+                }
+                None => break,
+            }
+        }
+        if let Some(reader) = &reader {
+            self.stats.repair_bytes_read += reader.bytes_read() as u64;
         }
         if resync_at.is_none() {
             let finished = machine.finish();
@@ -1095,6 +1197,7 @@ impl WrapIndex {
         lw.carries = carries;
         lw.resumable = resumable;
         lw.virtual_rows = vrows;
+        lw.virtual_above = self.decorations.virtual_rows_above_in(line_start, line_end);
         lw.hidden = hidden;
         let new_total = lw.total_rows();
         self.rows.set(line, old_total, new_total);
@@ -1116,6 +1219,16 @@ impl WrapIndex {
         self.stats.lines_repaired += 1;
     }
 }
+
+/// Rows past the edit a repair's first window reaches.
+///
+/// An edit that leaves every break where it was resyncs on the next row; one
+/// that moves a word across a break shifts the rows after it until both
+/// layouts happen to break at the same word, which on prose takes a few
+/// dozen. Later windows double, so this only sets where the doubling starts —
+/// and `build_base_tokens` never reads fewer than 1024 characters, so on a
+/// pane narrower than about 128 columns the first window is that floor.
+const REPAIR_WINDOW_ROWS: usize = 8;
 
 /// A buffer mutation, as the damage contract sees it.
 #[derive(Debug, Clone, Copy)]
@@ -1168,15 +1281,21 @@ fn line_token_stream(
     line_ending: LineEnding,
     decorations: &IndexDecorations,
     from_byte: Option<usize>,
-) -> Vec<ViewTokenWire> {
+) -> LineStream {
     use crate::view::ui::split_rendering::transforms::{
         apply_conceal_ranges, apply_soft_breaks, splice_inline_virtual_text,
     };
 
-    let mut tokens =
-        build_line_tokens_from(buffer, line, line_ending, &decorations.folds, from_byte);
+    let mut tokens = build_line_tokens_from(
+        buffer,
+        line,
+        line_ending,
+        &decorations.folds,
+        from_byte,
+        None,
+    );
     if decorations.is_empty() {
-        return tokens;
+        return LineStream::verbatim(tokens);
     }
     let line_start = buffer.line_start_offset(line).unwrap_or(0);
     let line_end = buffer
@@ -1193,7 +1312,147 @@ fn line_token_stream(
     if !hints.is_empty() {
         tokens = splice_inline_virtual_text(tokens, &hints);
     }
-    tokens
+    // Only the conceal pass substitutes text for source bytes: soft breaks and
+    // inline hints inject tokens with no anchor at all, and both split source
+    // text without disturbing the bytes it stands for.
+    LineStream::new(tokens, &conceals)
+}
+
+/// A plain line's tail, read in windows that grow until the caller has
+/// enough of it.
+///
+/// A repair stops reading at the row where the new layout lands back on the
+/// old one, which is usually a few rows past the edit and sometimes a few
+/// dozen; reading the line's whole tail to get there made every keystroke on
+/// a long soft-wrapped line O(line) again (issue #3631).
+///
+/// Each window's tokens are the full tail's, in order: text merges across the
+/// reader's pieces, so a window cut short differs from a full read only in
+/// its last token, which may be a word cut in two. A cut word wraps
+/// differently from the whole one, so that token is held back and the next
+/// window starts at its first byte. Fed one after another, the windows are
+/// exactly the stream a single read would have produced.
+///
+/// A window holding nothing but its cut token — a line with no spaces in it
+/// (minified JSON, base64, CJK prose) is a single token from end to end —
+/// gives up on windows and reads the rest in one go. Doubling instead would
+/// read such a token about three times over to find its end; this reads it
+/// once, as the whole-tail read did.
+///
+/// Decorated lines are not read this way: soft breaks, conceals and hints
+/// reach across a cut, and a conceal half inside a window would substitute
+/// differently from the whole one. Nor are lines a fold starts inside of:
+/// the tokenizer applies a fold only at the boundaries of what it reads, so
+/// a window restarting inside one would skip bytes the full read draws.
+/// Folds start at line starts once resolved, so this is the transient state
+/// a line join leaves behind.
+struct TailReader {
+    line: usize,
+    line_end: usize,
+    next: usize,
+    chars: usize,
+    done: bool,
+    bytes_read: usize,
+}
+
+impl TailReader {
+    /// `None` when `line` carries decorations, or a fold starts inside it.
+    fn new(
+        buffer: &mut Buffer,
+        line: usize,
+        decorations: &IndexDecorations,
+        from_byte: usize,
+        chars: usize,
+    ) -> Option<Self> {
+        let line_start = buffer.line_start_offset(line).unwrap_or(0);
+        let line_end = buffer
+            .line_start_offset(line + 1)
+            .unwrap_or_else(|| buffer.len())
+            .min(buffer.len());
+        if !decorations.is_empty() {
+            let (breaks, conceals, hints) = decorations.for_line(line_start, line_end);
+            if !breaks.is_empty() || !conceals.is_empty() || !hints.is_empty() {
+                return None;
+            }
+            if decorations
+                .folds
+                .iter()
+                .any(|f| f.start > line_start && f.start < line_end)
+            {
+                return None;
+            }
+        }
+        Some(Self {
+            line,
+            line_end,
+            next: from_byte,
+            chars: chars.max(1),
+            done: false,
+            bytes_read: 0,
+        })
+    }
+
+    fn is_done(&self) -> bool {
+        self.done
+    }
+
+    /// Source bytes tokenised so far, re-reads included.
+    fn bytes_read(&self) -> usize {
+        self.bytes_read
+    }
+
+    /// The next window, continuing exactly where the previous one stopped.
+    fn next_chunk(
+        &mut self,
+        buffer: &mut Buffer,
+        line_ending: LineEnding,
+        folds: &[std::ops::Range<usize>],
+    ) -> Vec<ViewTokenWire> {
+        loop {
+            // Characters never outnumber bytes, so a tail this short cannot be
+            // cut: read it unbounded and finish.
+            let complete = self.line_end.saturating_sub(self.next) <= self.chars;
+            let budget = (!complete).then_some(self.chars);
+            let mut tokens = build_line_tokens_from(
+                buffer,
+                self.line,
+                line_ending,
+                folds,
+                Some(self.next),
+                budget,
+            );
+            if complete {
+                self.bytes_read += self.line_end.saturating_sub(self.next);
+                self.done = true;
+                return tokens;
+            }
+            let read_to = tokens
+                .last()
+                .and_then(token_source_end)
+                .unwrap_or(self.next);
+            self.bytes_read += read_to.saturating_sub(self.next);
+            self.chars = self.chars.saturating_mul(2);
+            let held_back = tokens.pop().and_then(|t| t.source_offset);
+            match held_back {
+                Some(at) if at > self.next && !tokens.is_empty() => {
+                    self.next = at;
+                    return tokens;
+                }
+                // One token wider than the whole window: its end is unknown
+                // until it is read whole, so read everything left.
+                _ => self.chars = usize::MAX,
+            }
+        }
+    }
+}
+
+/// The byte just past what `token` stands for in the source.
+fn token_source_end(token: &ViewTokenWire) -> Option<usize> {
+    let start = token.source_offset?;
+    Some(match &token.kind {
+        ViewTokenWireKind::Text(text) => start + text.len(),
+        _ => start + 1,
+    })
 }
 
 /// Wrap one logical line from scratch.
@@ -1217,10 +1476,65 @@ pub(crate) fn line_drawn_row_starts(
     decorations: &IndexDecorations,
 ) -> Vec<u32> {
     let line_start = buffer.line_start_offset(line).unwrap_or(0);
-    let tokens = line_token_stream(buffer, line, line_ending, decorations, None);
+    let tokens = line_token_stream(buffer, line, line_ending, decorations, None).into_tokens();
     let out = WrapMachine::run(tokens, rule);
     let (row_starts, _, _) = rows_to_starts(&out, line_start, 0);
     row_starts
+}
+
+/// One-row shortcut for wrap-off lines, bypassing tokenisation entirely.
+///
+/// With soft wrap off the rule is a `Chop` safety bound, so a line shorter
+/// than that bound cannot break and occupies exactly one row. Deriving that
+/// row from the line's byte range is the same answer the machine reaches,
+/// so this is a shortcut rather than a second opinion — the count-only
+/// mirrors this module warns about were a *reimplementation* of wrapping,
+/// which is what made them drift.
+///
+/// Returns `None` for anything the reasoning does not cover, so the full
+/// pipeline stays the default. `flat_matches_full_pipeline` holds the two
+/// against each other across the shapes that reach it.
+fn try_build_line_flat(
+    buffer: &mut Buffer,
+    line: usize,
+    rule: WrapRule,
+    virtual_rows: u32,
+    decorations: &IndexDecorations,
+) -> Option<LineWrap> {
+    let WrapRule::Chop { chars } = rule else {
+        return None;
+    };
+    // Decorations splice, conceal and break the token stream; all of that
+    // is row structure this shortcut cannot see.
+    if !decorations.is_empty() {
+        return None;
+    }
+    let line_start = buffer.line_start_offset(line)?;
+    let line_end = buffer
+        .line_start_offset(line + 1)
+        .unwrap_or_else(|| buffer.len())
+        .min(buffer.len());
+    let span = line_end.saturating_sub(line_start);
+    // A char is at least one byte, so a byte count under the bound puts the
+    // character count under it too — conservative in the safe direction.
+    if span >= chars {
+        return None;
+    }
+    // A line with no source bytes of its own produces a row the pipeline
+    // marks unresumable, having no source token to resume at. Rather than
+    // reproduce that reasoning, decline anything short enough to be one:
+    // two bytes covers an empty line under either line ending.
+    if span <= 2 {
+        return None;
+    }
+    Some(LineWrap {
+        row_starts: vec![0],
+        carries: vec![RowCarry::default()],
+        resumable: vec![true],
+        virtual_rows,
+        virtual_above: decorations.virtual_rows_above_in(line_start, line_end),
+        hidden: false,
+    })
 }
 
 fn build_line(
@@ -1232,7 +1546,7 @@ fn build_line(
     decorations: &IndexDecorations,
 ) -> LineWrap {
     let line_start = buffer.line_start_offset(line).unwrap_or(0);
-    let tokens = line_token_stream(buffer, line, line_ending, decorations, None);
+    let tokens = line_token_stream(buffer, line, line_ending, decorations, None).into_tokens();
     let out = WrapMachine::run(tokens, rule);
     let (row_starts, carries, resumable) = rows_to_starts(&out, line_start, 0);
     let line_end = buffer
@@ -1244,6 +1558,7 @@ fn build_line(
         carries,
         resumable,
         virtual_rows,
+        virtual_above: decorations.virtual_rows_above_in(line_start, line_end),
         hidden: decorations.line_is_hidden(line_start, line_end),
     }
 }
@@ -1305,68 +1620,181 @@ fn row_is_resumable(row: &RowInfo, tokens: &[ViewTokenWire]) -> bool {
     tokens.get(idx).and_then(|t| t.source_offset) == Some(source_byte)
 }
 
-/// Is `byte` a valid resume point in this token stream?
+/// What a token's `source_offset` claims about its text.
 ///
-/// Only when the first source token at or after `byte` is not preceded by
-/// injected tokens. Decorations move with the text on an edit, so a hint or a
-/// soft break can land on a row that previously started with plain source; the
-/// row's stored flag describes the *old* stream, and this checks the new one.
-fn resume_is_safe(tokens: &[ViewTokenWire], byte: usize) -> bool {
-    let mut prev_injected = false;
-    for token in tokens {
-        let Some(offset) = token.source_offset else {
-            prev_injected = true;
-            continue;
-        };
-        if offset >= byte {
-            return !prev_injected;
-        }
-        let end = offset
-            + match &token.kind {
-                ViewTokenWireKind::Text(s) => s.len(),
-                _ => 1,
-            };
-        if end > byte {
-            return !prev_injected;
-        }
-        prev_injected = false;
-    }
-    true
+/// [`ViewTokenWire`] records *where* a token is anchored and says nothing about
+/// whether its text is the bytes found there, yet a decorated stream carries
+/// both kinds: plain source text *is* the buffer's bytes, while a conceal's
+/// replacement is anchored at the range it hides and draws glyphs that are not
+/// those bytes at all (a whole `---` renders as one `─`). Resuming a layout
+/// part-way through a token means cutting its text at a source byte, which is
+/// meaningful only for the first kind — on the second the cut landed inside a
+/// multi-byte glyph and panicked the editor on a keystroke. Carrying the
+/// distinction in the type is what makes the meaningless cut unwritable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceExtent {
+    /// Injected by a decoration or by wrapping: no source bytes at all.
+    Injected,
+    /// The token's text *is* the buffer's bytes from its `source_offset`, so a
+    /// source byte inside it addresses the same character in both.
+    Verbatim,
+    /// The token stands in for source bytes up to `end`, and its text is not
+    /// those bytes. All or nothing: there is no "rest of it" to resume from.
+    Substituted { end: usize },
 }
 
-/// Sub-stream beginning at absolute `byte`, splitting a `Text` token if needed.
+/// One token of a [`LineStream`], with what its anchor means.
+#[derive(Debug, Clone)]
+struct StreamToken {
+    token: ViewTokenWire,
+    extent: SourceExtent,
+}
+
+/// One logical line's token stream, addressable by source byte.
 ///
-/// Strictly source-addressed: injected tokens before the first source token at
-/// or after `byte` are not included. Rows that open with injected content are
-/// marked non-resumable and never reach this function.
-fn tokens_from(tokens: &[ViewTokenWire], byte: usize) -> Vec<ViewTokenWire> {
-    let mut out = Vec::new();
-    let mut started = false;
-    for token in tokens {
-        if started {
-            out.push(token.clone());
-            continue;
+/// Built once, where the decoration transforms run and the conceal ranges that
+/// substituted text are still in hand — nothing downstream can recover that
+/// from the tokens alone.
+#[derive(Debug)]
+struct LineStream {
+    tokens: Vec<StreamToken>,
+}
+
+impl LineStream {
+    /// Classify `tokens` against the `conceals` that were applied to them.
+    ///
+    /// Conceals are sorted by start and may overlap, so containment is decided
+    /// against a running maximum of their ends: any range that starts at or
+    /// before a token and ends after it contains it. Erring towards
+    /// `Substituted` only costs a line rebuild; erring the other way would
+    /// hand the resume a token it must not cut, which is the bug.
+    fn new(
+        tokens: Vec<ViewTokenWire>,
+        conceals: &[(std::ops::Range<usize>, Option<&str>)],
+    ) -> Self {
+        let mut max_end: Vec<usize> = Vec::with_capacity(conceals.len());
+        let mut running = 0usize;
+        for (r, _) in conceals {
+            running = running.max(r.end);
+            max_end.push(running);
         }
-        let Some(offset) = token.source_offset else {
-            continue;
-        };
-        if offset >= byte {
-            started = true;
-            out.push(token.clone());
-            continue;
-        }
-        if let ViewTokenWireKind::Text(s) = &token.kind {
-            if offset + s.len() > byte {
-                started = true;
-                out.push(ViewTokenWire {
-                    source_offset: Some(byte),
-                    kind: ViewTokenWireKind::Text(s[byte - offset..].to_string()),
-                    style: token.style.clone(),
-                });
+        let extent_of = |offset: usize| -> SourceExtent {
+            let i = conceals.partition_point(|(r, _)| r.start <= offset);
+            match i.checked_sub(1) {
+                Some(i) if max_end[i] > offset => SourceExtent::Substituted { end: max_end[i] },
+                _ => SourceExtent::Verbatim,
             }
+        };
+        Self {
+            tokens: tokens
+                .into_iter()
+                .map(|token| {
+                    let extent = match token.source_offset {
+                        None => SourceExtent::Injected,
+                        Some(offset) => extent_of(offset),
+                    };
+                    StreamToken { token, extent }
+                })
+                .collect(),
         }
     }
-    out
+
+    /// A stream nothing has substituted into: every anchored token is source.
+    fn verbatim(tokens: Vec<ViewTokenWire>) -> Self {
+        Self::new(tokens, &[])
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+
+    /// The tokens themselves, for a layout that starts at the line's own start
+    /// and so never addresses the stream by byte.
+    fn into_tokens(self) -> Vec<ViewTokenWire> {
+        self.tokens.into_iter().map(|t| t.token).collect()
+    }
+
+    /// The sub-stream to resume layout from at absolute source `byte`, or
+    /// `None` when this stream cannot be resumed there and the line has to be
+    /// laid out from its start instead.
+    ///
+    /// Strictly source-addressed: injected tokens before the first source token
+    /// at or after `byte` are not included, and a row that opens with injected
+    /// content the carry cannot reconstruct — a hint, a soft break's prefix —
+    /// is not resumable at all. Decorations move with the text on an edit, so
+    /// such content can land on a row that previously started with plain
+    /// source; the row's stored flag describes the *old* stream and this checks
+    /// the new one.
+    ///
+    /// `byte` inside a [`SourceExtent::Substituted`] token is the case that
+    /// used to panic: a conceal reaching across a line start (a compose-mode
+    /// paragraph join does exactly that) leaves the line's stream opening with
+    /// a replacement anchored on the line above, and the line's own first byte
+    /// falls inside it.
+    fn resume_at(&self, byte: usize) -> Option<Vec<ViewTokenWire>> {
+        let mut out: Vec<ViewTokenWire> = Vec::new();
+        let mut prev_injected = false;
+        for st in &self.tokens {
+            if !out.is_empty() {
+                out.push(st.token.clone());
+                continue;
+            }
+            // No source bytes at all: a wrap break, a hanging indent, an
+            // inline hint. A row opening with one cannot be resumed into.
+            let (Some(offset), SourceExtent::Verbatim | SourceExtent::Substituted { .. }) =
+                (st.token.source_offset, st.extent)
+            else {
+                prev_injected = true;
+                continue;
+            };
+            let substituted_until = match st.extent {
+                SourceExtent::Substituted { end } => Some(end),
+                _ => None,
+            };
+            if offset >= byte {
+                if prev_injected {
+                    return None;
+                }
+                out.push(st.token.clone());
+                continue;
+            }
+            match substituted_until {
+                // Ends before the resume point: already laid out, skip it.
+                Some(end) if end <= byte => prev_injected = false,
+                // `byte` is inside the bytes this token stands in for. Its
+                // glyphs are not those bytes, so no suffix of it is the tail.
+                Some(_) => return None,
+                None => {
+                    let ViewTokenWireKind::Text(text) = &st.token.kind else {
+                        // Every other kind is one source byte wide, and
+                        // `offset < byte` puts it wholly behind the resume.
+                        prev_injected = false;
+                        continue;
+                    };
+                    let cut = byte - offset;
+                    if cut >= text.len() {
+                        prev_injected = false;
+                        continue;
+                    }
+                    // The boundary check is about `byte`, not about this
+                    // token: a row start is recorded at a character boundary,
+                    // but it comes from the *old* layout and is shifted
+                    // arithmetically, so this is the one place that can prove
+                    // it still addresses a character. Verbatim text mirrors the
+                    // buffer, so its boundaries are the buffer's.
+                    if prev_injected || !text.is_char_boundary(cut) {
+                        return None;
+                    }
+                    out.push(ViewTokenWire {
+                        source_offset: Some(byte),
+                        kind: ViewTokenWireKind::Text(text[cut..].to_string()),
+                        style: st.token.style.clone(),
+                    });
+                }
+            }
+        }
+        Some(out)
+    }
 }
 
 /// Seal rows the machine has completed; return the old row index resynced to.
@@ -1396,17 +1824,23 @@ fn absorb_rows(
                 None => *prev_rel,
             }
         };
+        let resumable = *sealed == 1 || row_is_resumable(&row, machine.tokens_so_far());
         new_starts.push(rel);
         new_carries.push(row.carry);
-        new_resumable.push(if *sealed == 1 {
-            true
-        } else {
-            row_is_resumable(&row, machine.tokens_so_far())
-        });
+        new_resumable.push(resumable);
         *prev_rel = rel;
-        if new_starts.len() > 1 {
+        // Resync claims that from here on the old layout is the new one shifted
+        // by `delta`, which holds only if "this byte, this carry" *identifies*
+        // the row — that is, if the row is a resume point on both sides. A row
+        // opening with injected content is not: its start is the first source
+        // byte it happens to contain, while its columns begin with a
+        // decoration's spill-over (a conceal replacement wider than the row's
+        // remaining width leaves its tail at the head of the next row). Two such
+        // rows can share a start byte and a carry and still run out of width at
+        // different bytes, which spliced a tail that was three bytes off.
+        if new_starts.len() > 1 && resumable {
             for k in (resume_idx + 1)..old.row_starts.len() {
-                if old.row_starts[k] < resync_floor {
+                if old.row_starts[k] < resync_floor || !old.resumable[k] {
                     continue;
                 }
                 if (old.row_starts[k] as i64 + delta) == rel as i64 && old.carries[k] == row.carry {
@@ -1454,6 +1888,55 @@ fn absorb_finished(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The index keeps its own copy of the decoration anchors and shifts them
+    /// itself, so it has to model each anchor the way the marker tree does.
+    /// Inlay hints ask for left-gravity markers (issue #722); if the snapshot
+    /// kept assuming right gravity, an insertion at a hint's anchor would move
+    /// the index's copy onto the next line while the renderer drew it on this
+    /// one — the same wrong-until-the-server-answers window the fix closed,
+    /// just moved from the renderer into the coordinate service.
+    #[test]
+    fn inline_hint_anchors_shift_by_their_own_gravity() {
+        use crate::view::ui::split_rendering::transforms::InlineHint;
+        use crate::view::virtual_text::{MarkerGravity, VirtualTextPosition};
+
+        let hint = |anchor: usize, gravity: MarkerGravity| InlineHint {
+            anchor,
+            text: ": Duration".to_string(),
+            position: VirtualTextPosition::BeforeChar,
+            pad_to_column: None,
+            style: None,
+            gravity,
+        };
+
+        let mut decorations = IndexDecorations {
+            inline_hints: vec![hint(5, MarkerGravity::Left), hint(5, MarkerGravity::Right)],
+            ..Default::default()
+        };
+
+        // One byte inserted at exactly byte 5 — the anchor of both hints.
+        decorations.shift_for_edit(5, 0, 1);
+
+        assert_eq!(
+            decorations.inline_hints[0].anchor, 5,
+            "a left-gravity hint stays put, as its marker does",
+        );
+        assert_eq!(
+            decorations.inline_hints[1].anchor, 6,
+            "a right-gravity hint is pushed along, as its marker is",
+        );
+
+        // A deletion covering the anchor collapses both onto its start,
+        // gravity being an insertion-time rule only.
+        let mut decorations = IndexDecorations {
+            inline_hints: vec![hint(7, MarkerGravity::Left), hint(7, MarkerGravity::Right)],
+            ..Default::default()
+        };
+        decorations.shift_for_edit(5, 4, 0);
+        assert_eq!(decorations.inline_hints[0].anchor, 5);
+        assert_eq!(decorations.inline_hints[1].anchor, 5);
+    }
     use crate::model::filesystem::StdFileSystem;
     use crate::state::EditorState;
     use std::sync::Arc;
@@ -1756,6 +2239,291 @@ mod tests {
         );
     }
 
+    /// A conceal whose range spans a line break must not corrupt the line
+    /// below it.
+    ///
+    /// Repair resumes a line from a row start — for the first row, the line's
+    /// own start byte. That byte can sit *inside* a conceal range, because a
+    /// conceal is free to span the newline (markdown_compose joins a wrapped
+    /// paragraph's source lines exactly that way). The stream for such a line
+    /// opens with the conceal's replacement text, anchored at the range's
+    /// start, which is on the line above.
+    ///
+    /// The resume then tried to take "the rest" of that token by subtracting
+    /// source bytes — `text[byte - source_offset..]` — but a replacement's
+    /// glyphs are not the bytes it hides, and the cut landed inside the `─`,
+    /// panicking the editor on a keystroke.
+    #[test]
+    fn an_edit_below_a_conceal_that_spans_a_line_break_does_not_panic() {
+        use crate::model::cursor::Cursors;
+        use crate::model::event::Event;
+        use fresh_core::overlay::OverlayNamespace;
+
+        let text = "aaaa\nbbbb\n";
+        let mut state = EditorState::new(
+            80,
+            24,
+            crate::config::LARGE_FILE_THRESHOLD_BYTES as usize,
+            test_fs(),
+        );
+        let mut cursors = Cursors::new();
+        let cursor_id = cursors.primary_id();
+        state.apply(
+            &mut cursors,
+            &Event::Insert {
+                position: 0,
+                text: text.to_string().into(),
+                cursor_id,
+            },
+        );
+
+        // `aaa[a\nb]bbb`: the range covers the newline, so the second line's
+        // stream opens with the replacement anchored two bytes before it.
+        let ns = OverlayNamespace::from_string("test".to_string());
+        state
+            .conceals
+            .add(&mut state.marker_list, ns, 3..7, Some("─".to_string()));
+
+        let geom = geometry(20);
+        build_index(&mut state, geom);
+
+        // Type on the concealed line — the keystroke that crashed.
+        state.apply(
+            &mut cursors,
+            &Event::Insert {
+                position: 8,
+                text: "x".to_string().into(),
+                cursor_id,
+            },
+        );
+        build_index(&mut state, geom);
+
+        let maintained = state
+            .wrap_indices
+            .get(&geom)
+            .map(|i| (structure(i), i.total_rows()))
+            .expect("index present");
+        let fresh = fresh_index(&mut state, geom);
+        assert_eq!(
+            maintained.0,
+            structure(&fresh),
+            "maintained index disagrees with a fresh build"
+        );
+        assert_eq!(maintained.1, fresh.total_rows());
+    }
+
+    /// A row that opens with a decoration's spill-over is not a resync point.
+    ///
+    /// Repair rewraps forward from the damaged row and stops as soon as a new
+    /// row boundary lands on an old one — same start byte once shifted by the
+    /// edit's delta, same carry — then splices the old tail. That claim rests
+    /// on the pair *identifying* the row, which holds only for a row a layout
+    /// can be resumed at: one that opens with the source token at its own start
+    /// byte.
+    ///
+    /// A conceal replacement wider than the width left on its row leaves its
+    /// tail at the head of the next row, and that row's recorded start is the
+    /// first source byte it *contains*, several columns in. Two such rows can
+    /// share a start byte and a carry while running out of width at different
+    /// bytes — so the spliced tail was three bytes off, and every row start
+    /// after it in the line was wrong.
+    #[test]
+    fn a_row_opening_with_a_decoration_spill_is_not_a_resync_point() {
+        use crate::model::cursor::Cursors;
+        use crate::model::event::Event;
+        use fresh_core::overlay::OverlayNamespace;
+
+        let text = format!(
+            "{}\n{}\n{}\n",
+            "a".repeat(60),
+            "b".repeat(60),
+            "c".repeat(60)
+        );
+        let mut state = EditorState::new(
+            80,
+            24,
+            crate::config::LARGE_FILE_THRESHOLD_BYTES as usize,
+            test_fs(),
+        );
+        let mut cursors = Cursors::new();
+        let cursor_id = cursors.primary_id();
+        state.apply(
+            &mut cursors,
+            &Event::Insert {
+                position: 0,
+                text: text.clone().into(),
+                cursor_id,
+            },
+        );
+
+        // Two conceals on the third line, each hiding source bytes behind a
+        // four-column rule. The second one's replacement is what spills.
+        let ns = OverlayNamespace::from_string("test".to_string());
+        for range in [126..133, 148..152] {
+            state.conceals.add(
+                &mut state.marker_list,
+                ns.clone(),
+                range,
+                Some("────".to_string()),
+            );
+        }
+
+        let geom = geometry(20);
+        build_index(&mut state, geom);
+
+        // Type at the second conceal's start: it rides forward with the text,
+        // and the row after it now opens with the tail of its replacement.
+        state.apply(
+            &mut cursors,
+            &Event::Insert {
+                position: 148,
+                text: "xxx".to_string().into(),
+                cursor_id,
+            },
+        );
+        build_index(&mut state, geom);
+
+        let maintained = state
+            .wrap_indices
+            .get(&geom)
+            .map(|i| (structure(i), i.total_rows()))
+            .expect("index present");
+        let fresh = fresh_index(&mut state, geom);
+        assert_eq!(
+            maintained.0,
+            structure(&fresh),
+            "the spliced tail must be what a fresh build lays out"
+        );
+        assert_eq!(maintained.1, fresh.total_rows());
+    }
+
+    /// The same spec as `a_maintained_index_answers_like_a_fresh_build`, swept
+    /// over generated conceal sets and edit sequences instead of hand-picked
+    /// ones.
+    ///
+    /// Conceals are where maintenance is hardest: their replacements are not
+    /// the bytes they hide, they can span a line break, they can overlap, and
+    /// they ride the edit like any other marker. Both bugs this net was written
+    /// for were invisible to the hand-written cases — one panicked the editor
+    /// on a keystroke (a resume cutting a replacement at a source byte), the
+    /// other spliced a tail three bytes off (a resync onto a row that opens
+    /// with a replacement's spill-over).
+    ///
+    /// Deterministic: the generator is a fixed-seed LCG, so a failure names the
+    /// seed and reproduces exactly.
+    #[test]
+    fn a_maintained_index_answers_like_a_fresh_build_under_conceals() {
+        use crate::model::cursor::Cursors;
+        use crate::model::event::Event;
+        use fresh_core::overlay::OverlayNamespace;
+
+        const WIDTH: usize = 20;
+        const LINE: usize = 60;
+
+        fn rand(state: &mut u64) -> usize {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (*state >> 33) as usize
+        }
+
+        let text = format!(
+            "{}\n{}\n{}\n",
+            "a".repeat(LINE),
+            "b".repeat(LINE),
+            "c".repeat(LINE)
+        );
+
+        for seed in 0..500u64 {
+            let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(12345);
+            let mut state = EditorState::new(
+                80,
+                24,
+                crate::config::LARGE_FILE_THRESHOLD_BYTES as usize,
+                test_fs(),
+            );
+            let mut cursors = Cursors::new();
+            let cursor_id = cursors.primary_id();
+            state.apply(
+                &mut cursors,
+                &Event::Insert {
+                    position: 0,
+                    text: text.clone().into(),
+                    cursor_id,
+                },
+            );
+
+            // Multi-byte replacements on purpose: a byte-indexed cut into one
+            // is what panicked, and a single-byte glyph would have hidden it.
+            let ns = OverlayNamespace::from_string("test".to_string());
+            let mut conceals = Vec::new();
+            for _ in 0..(1 + rand(&mut rng) % 4) {
+                let start = rand(&mut rng) % (text.len() - 8);
+                let end = start + 1 + rand(&mut rng) % 8;
+                let replacement = match rand(&mut rng) % 3 {
+                    0 => None,
+                    n => Some("─".repeat(n * (1 + rand(&mut rng) % 3))),
+                };
+                conceals.push((start..end, replacement.clone()));
+                state
+                    .conceals
+                    .add(&mut state.marker_list, ns.clone(), start..end, replacement);
+            }
+
+            let geom = geometry(WIDTH);
+            build_index(&mut state, geom);
+
+            let mut edits = Vec::new();
+            for _ in 0..4 {
+                let len = state.buffer.len();
+                let position = rand(&mut rng) % len;
+                if rand(&mut rng).is_multiple_of(2) {
+                    let inserted = "x".repeat(1 + rand(&mut rng) % 4);
+                    edits.push((position, 0, inserted.clone()));
+                    state.apply(
+                        &mut cursors,
+                        &Event::Insert {
+                            position,
+                            text: inserted.into(),
+                            cursor_id,
+                        },
+                    );
+                } else {
+                    let removed = (1 + rand(&mut rng) % 5).min(len - position);
+                    let whole = state.buffer.to_string().expect("buffer is utf-8");
+                    let deleted_text = whole[position..position + removed].to_string();
+                    edits.push((position, removed, String::new()));
+                    state.apply(
+                        &mut cursors,
+                        &Event::Delete {
+                            range: position..position + removed,
+                            deleted_text: deleted_text.into(),
+                            cursor_id,
+                        },
+                    );
+                }
+
+                build_index(&mut state, geom);
+                let maintained = state
+                    .wrap_indices
+                    .get(&geom)
+                    .map(|i| (structure(i), i.total_rows()))
+                    .expect("index present");
+                let fresh = fresh_index(&mut state, geom);
+                assert_eq!(
+                    maintained.0,
+                    structure(&fresh),
+                    "seed {seed}: conceals {conceals:?}, edits {edits:?}"
+                );
+                assert_eq!(
+                    maintained.1,
+                    fresh.total_rows(),
+                    "seed {seed}: conceals {conceals:?}, edits {edits:?}"
+                );
+            }
+        }
+    }
+
     /// **The spec, in one sentence: an index that has been maintained across
     /// edits must answer exactly as an index built from scratch right now.**
     ///
@@ -1837,7 +2605,7 @@ mod tests {
                 &mut cursors,
                 &Event::Insert {
                     position: 0,
-                    text: text.clone(),
+                    text: text.clone().into(),
                     cursor_id,
                 },
             );
@@ -1860,7 +2628,7 @@ mod tests {
                     &mut cursors,
                     &Event::Insert {
                         position,
-                        text: "x".repeat(len),
+                        text: "x".repeat(len).into(),
                         cursor_id,
                     },
                 ),
@@ -1871,7 +2639,7 @@ mod tests {
                         &mut cursors,
                         &Event::Delete {
                             range: start..start + len,
-                            deleted_text,
+                            deleted_text: deleted_text.into(),
                             cursor_id,
                         },
                     )
@@ -1952,7 +2720,10 @@ mod tests {
     /// indistinguishable from one built from scratch.
     #[test]
     fn repair_equals_rebuild() {
-        let cases: &[(&str, &[(usize, usize, &str)])] = &[
+        // A line of text, and the edits (position, removed, inserted) made
+        // to it.
+        type Case<'a> = (&'a str, &'a [(usize, usize, &'a str)]);
+        let cases: &[Case] = &[
             (
                 "alpha beta gamma delta epsilon",
                 &[(0, 0, "x"), (10, 0, "yy"), (5, 3, "")],
@@ -2006,6 +2777,135 @@ mod tests {
         let fresh = built(&mut buffer, 20);
         assert_eq!(structure(&index), structure(&fresh));
         assert_eq!(index.total_rows(), fresh.total_rows());
+    }
+
+    /// A repair inside a long line that starts from a window around the edit
+    /// lands where a full rebuild would, wherever in the line the edit is and
+    /// whatever it does to the rows around it — including when the window runs
+    /// out before the layout resyncs and the repair falls back to the tail. The
+    /// line mixes words longer than a row (split by grapheme) with ordinary
+    /// ones and wide characters, so edits inside and next to a split word are
+    /// both covered.
+    #[test]
+    fn repair_inside_a_long_line_equals_rebuild() {
+        let word = |i: usize| match i % 7 {
+            0 => "x".repeat(37),
+            3 => "\u{4e2d}\u{6587}".to_string(),
+            _ => format!("w{i}"),
+        };
+        let text = (0..600).map(word).collect::<Vec<_>>().join(" ");
+        let long_insert = "y".repeat(90);
+        for width in [13usize, 20, 41] {
+            let mut mirror = text.clone();
+            let mut buffer = Buffer::from_bytes(text.as_bytes().to_vec(), test_fs());
+            let mut index = built(&mut buffer, width);
+            let len = mirror.len();
+            let edits: &[(usize, usize, &str)] = &[
+                (len / 2, 0, "Z"),
+                (len / 3, 4, ""),
+                (len / 4, 0, " "),
+                (len / 5, 1, "a much longer insertion that spans rows"),
+                (len / 7, 0, &long_insert),
+                (10, 0, "Q"),
+            ];
+            for &(at, removed, insert) in edits {
+                // Land on character boundaries of the current text.
+                let mut start = at.min(mirror.len());
+                while !mirror.is_char_boundary(start) {
+                    start -= 1;
+                }
+                let mut end = (start + removed).min(mirror.len());
+                while !mirror.is_char_boundary(end) {
+                    end += 1;
+                }
+                mirror.replace_range(start..end, insert);
+                edit(&mut buffer, &mut index, start, end - start, insert);
+                let fresh = built(&mut buffer, width);
+                assert_eq!(
+                    structure(&index),
+                    structure(&fresh),
+                    "repair diverged at width {width} after edit ({start}, {}, {insert:?})",
+                    end - start
+                );
+            }
+        }
+    }
+
+    /// Typing into the middle of a long line of prose must not read the rest
+    /// of the line: the layout resyncs within a few dozen rows of the edit, so
+    /// the tail past that is spliced without being tokenised (issue #3631).
+    ///
+    /// Not every edit resyncs — a long insertion can shift the rows after it
+    /// out of phase for hundreds of rows — so this covers the edits typing
+    /// makes, and the rebuild comparison above covers the rest.
+    #[test]
+    fn typing_mid_line_reads_only_a_window() {
+        // Words of varied length, as prose has. A line of identical words wraps
+        // periodically, and an insertion that shifts it out of phase never
+        // lands on an old row boundary again — every repair of such a line
+        // reads its tail, window or not.
+        let words = [
+            "the", "quick", "brown", "fox", "jumps", "over", "a", "lazy", "dog,",
+        ];
+        let mut seed = 7u32;
+        let text = (0..20_000)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                words[(seed >> 16) as usize % words.len()]
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut buffer = Buffer::from_bytes(text.as_bytes().to_vec(), test_fs());
+        let mut index = built(&mut buffer, 80);
+        let len = buffer.len();
+        let edits: &[(usize, usize, &str)] = &[
+            (len / 2, 0, "Z"),
+            (len / 2, 1, ""),
+            (len / 3, 0, " "),
+            (len / 4, 3, ""),
+            (len / 5, 0, "xy"),
+            (len / 6, 0, "quick "),
+        ];
+        for &(start, removed, insert) in edits {
+            let before = index.stats().repair_bytes_read;
+            edit(&mut buffer, &mut index, start, removed, insert);
+            let fresh = built(&mut buffer, 80);
+            assert_eq!(structure(&index), structure(&fresh));
+            // The tail from any of these edits is several thousand bytes; the
+            // rows to resync in are a few dozen of 80 columns.
+            let read = index.stats().repair_bytes_read - before;
+            let tail = (buffer.len() - start) as u64;
+            assert!(
+                read * 4 < tail,
+                "edit ({start}, {removed}, {insert:?}) read {read} of a {tail}-byte tail"
+            );
+        }
+    }
+
+    /// A line with no spaces is one token from end to end, so no window can
+    /// hold a whole token of it. The repair has to notice and read the rest
+    /// once — doubling windows to find the token's end read it about three
+    /// times over, which made such lines slower than the whole-tail read.
+    #[test]
+    fn a_line_without_spaces_is_read_once() {
+        let text = (0..8000)
+            .map(|i| format!("\"k{i}\":{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut buffer = Buffer::from_bytes(text.as_bytes().to_vec(), test_fs());
+        let mut index = built(&mut buffer, 80);
+        let start = buffer.len() / 2;
+        let before = index.stats().repair_bytes_read;
+        edit(&mut buffer, &mut index, start, 0, "q");
+        let read = index.stats().repair_bytes_read - before;
+        let fresh = built(&mut buffer, 80);
+        assert_eq!(structure(&index), structure(&fresh));
+        let resume_row_ahead = 80 * 4;
+        let tail = (buffer.len() - start + resume_row_ahead) as u64;
+        assert!(
+            read < tail * 3 / 2,
+            "read {read} bytes for a {tail}-byte tail"
+        );
     }
 
     /// Editing at the *start* of a huge line resyncs: the boundaries after the
@@ -2159,6 +3059,52 @@ mod tests {
         assert!(set.get(&geometry(10)).is_none(), "oldest evicted");
     }
 
+    /// The margin is the user's `scroll_offset` with wrap off too — skipping it
+    /// here skips it everywhere, leaving the cursor on the window's last row.
+    #[test]
+    fn ensure_visible_in_rows_keeps_the_margin_with_wrap_off() {
+        use crate::view::viewport::Viewport;
+
+        // Wrap off is `Chop`, so row 9 is line 9.
+        let text = (0..100)
+            .map(|i| format!("line_{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut buffer = Buffer::from_bytes(text.as_bytes().to_vec(), test_fs());
+        let mut index = WrapIndex::default();
+        let geometry = WrapIndexGeometry {
+            fold_signature: 0,
+            rule: WrapRule::Chop { chars: 1000 },
+            view_mode: CacheViewMode::Source,
+        };
+        index.ensure_built(
+            &mut buffer,
+            geometry,
+            inputs(0),
+            LineEnding::LF,
+            &IndexDecorations::default(),
+        );
+
+        let height = 10usize;
+        let mut viewport = Viewport::new(20, height as u16);
+        viewport.line_wrap_enabled = false;
+        viewport.set_scroll_offset(3);
+        viewport.set_top_byte(0);
+        viewport.set_top_view_line_offset(0);
+
+        // On the last row: three rows inside the margin, so the view scrolls by 3.
+        let cursor_byte = buffer.line_start_offset(height - 1).unwrap();
+        viewport.ensure_visible_in_rows(&index, &buffer, cursor_byte, None);
+
+        let top_line = buffer.get_line_number(viewport.top_byte());
+        assert_eq!(
+            top_line, 3,
+            "wrap-off placement must keep `scroll_offset` rows below the cursor: \
+             expected top line 3, got {top_line}"
+        );
+        assert_eq!(viewport.top_view_line_offset(), 0);
+    }
+
     /// Row-space `ensure_visible` matches the Python model's rule exactly
     /// (`tests/wrap_model/wrap_model/viewport.py::Viewport.ensure_visible`):
     /// scroll the minimum that puts the cursor's row inside the margin, clamped
@@ -2253,6 +3199,43 @@ mod tests {
         assert_eq!(top_row(&viewport), 0);
     }
 
+    /// The same-buffer scroll sync's "show the end" is decided in row space:
+    /// the last full page, the row the wheel stops at, with no rows built.
+    #[test]
+    fn scroll_to_end_in_rows_lands_on_the_last_full_page() {
+        use crate::view::viewport::Viewport;
+
+        let text = long_line(300);
+        let mut buffer = Buffer::from_bytes(text.as_bytes().to_vec(), test_fs());
+        let index = built(&mut buffer, 20);
+        let total = index.total_rows() as usize;
+
+        let mut viewport = Viewport::new(20, 10);
+        viewport.line_wrap_enabled = true;
+        let height = viewport.visible_line_count();
+        let top_row = |vp: &Viewport| {
+            let line = buffer.get_line_number(vp.top_byte());
+            index.line_first_row(line) as usize + vp.top_view_line_offset()
+        };
+
+        assert!(viewport.scroll_to_end_in_rows(&index, &buffer));
+        assert_eq!(top_row(&viewport), total.saturating_sub(height));
+        assert!(
+            !viewport.scroll_to_end_in_rows(&index, &buffer),
+            "already at the end: nothing moves"
+        );
+
+        // Where a wheel scroll to the bottom lands, exactly.
+        let mut wheel = Viewport::new(20, 10);
+        wheel.line_wrap_enabled = true;
+        wheel.scroll_visual_rows(&index, &buffer, 10_000);
+        assert_eq!(top_row(&wheel), top_row(&viewport));
+        assert_eq!(
+            (wheel.top_byte(), wheel.top_view_line_offset()),
+            (viewport.top_byte(), viewport.top_view_line_offset())
+        );
+    }
+
     /// A line with no decorations is resumable at every row — the case the whole
     /// design exists for, where the renderer never has to walk back.
     #[test]
@@ -2265,6 +3248,113 @@ mod tests {
         }
         let last = index.total_rows() - 1;
         assert_eq!(index.resumable_row_at_or_before(&buffer, last), (last, 0));
+    }
+
+    /// The wrap-off shortcut must be indistinguishable from the tokenising
+    /// pipeline wherever it fires. Anything it declines falls through, so
+    /// only agreement matters — a shape it refuses is not a failure.
+    ///
+    /// The corpus is deliberately awkward: the shapes that produce tokens
+    /// other than a plain run are exactly the ones a byte-range shortcut
+    /// could get wrong.
+    #[test]
+    fn flat_matches_full_pipeline() {
+        let chop = WrapRule::Chop { chars: 10_000 };
+        let decorations = IndexDecorations::default();
+        let bodies = [
+            "plain ascii line",
+            "",
+            "    leading spaces",
+            "trailing spaces   ",
+            "\tleading tab",
+            "mid\ttab\there",
+            "unicode \u{e9}\u{e8}\u{ea} accents",
+            "wide \u{4f60}\u{597d}\u{4e16}\u{754c}",
+            "emoji \u{1f600} here",
+            "   ",
+            "a",
+            "\u{7f}control",
+            "combining e\u{301}",
+            "rtl \u{5e9}\u{5dc}\u{5d5}\u{5dd}",
+            "many     interior     spaces",
+        ];
+        // Each body as its own line, plus a final line with no newline.
+        let text = format!("{}\nno trailing newline", bodies.join("\n"));
+        let mut buffer = Buffer::from_str(&text, 0, test_fs());
+        let line_count = buffer.line_count().unwrap_or(1).max(1);
+        assert!(
+            line_count > bodies.len(),
+            "corpus did not produce its lines"
+        );
+
+        let mut fired = 0usize;
+        for line in 0..line_count {
+            let Some(flat) = try_build_line_flat(&mut buffer, line, chop, 0, &decorations) else {
+                continue;
+            };
+            fired += 1;
+            let full = build_line(&mut buffer, line, chop, LineEnding::LF, 0, &decorations);
+            assert_eq!(
+                format!("{:?}", flat),
+                format!("{:?}", full),
+                "line {line} ({:?}) disagrees between the wrap-off shortcut \
+                 and the tokenising pipeline",
+                buffer
+                    .line_start_offset(line)
+                    .zip(buffer.line_start_offset(line + 1))
+                    .map(|(a, b)| text.get(a..b.min(text.len())).unwrap_or("")),
+            );
+        }
+        // Only the shortest lines fall through. Without a floor here the
+        // test would pass vacuously if the shortcut started declining
+        // everything.
+        assert!(
+            fired * 4 >= line_count * 3,
+            "the shortcut covered only {fired} of {line_count} lines, so it \
+             is no longer exercising what this test claims",
+        );
+    }
+
+    /// A line at or beyond the chop bound really does break, so the
+    /// shortcut must decline it rather than claim a single row.
+    #[test]
+    fn flat_declines_lines_that_reach_the_chop_bound() {
+        let chop = WrapRule::Chop { chars: 16 };
+        let decorations = IndexDecorations::default();
+        let text = format!("{}\nshort", "x".repeat(64));
+        let mut buffer = Buffer::from_str(&text, 0, test_fs());
+        assert!(
+            try_build_line_flat(&mut buffer, 0, chop, 0, &decorations).is_none(),
+            "the over-long line must fall through to the wrap machine",
+        );
+        assert!(
+            try_build_line_flat(&mut buffer, 1, chop, 0, &decorations).is_some(),
+            "the short line should still take the shortcut",
+        );
+        let full = build_line(&mut buffer, 0, chop, LineEnding::LF, 0, &decorations);
+        assert!(
+            full.row_starts.len() > 1,
+            "the corpus line was supposed to exceed the bound and wrap",
+        );
+    }
+
+    /// Soft wrap on is not this shortcut's business.
+    #[test]
+    fn flat_declines_when_soft_wrap_is_on() {
+        let decorations = IndexDecorations::default();
+        let mut buffer = Buffer::from_str("some text here", 0, test_fs());
+        assert!(try_build_line_flat(
+            &mut buffer,
+            0,
+            WrapRule::Word {
+                content_width: 40,
+                gutter_width: 0,
+                hanging_indent: false,
+            },
+            0,
+            &decorations,
+        )
+        .is_none());
     }
 }
 

@@ -8,7 +8,7 @@ use crate::model::buffer::Buffer;
 use crate::model::marker::MarkerList;
 use crate::view::overlay::{Overlay, OverlayFace, OverlayManager, OverlayNamespace};
 use crate::view::theme::Theme;
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier, Style};
 use std::ops::Range;
 
 /// Default rainbow bracket colors (cycle through these based on nesting depth)
@@ -31,8 +31,32 @@ pub fn bracket_colorization_namespace() -> OverlayNamespace {
     OverlayNamespace::from_string("bracket-colorization".to_string())
 }
 
-/// Bracket types we match
-const BRACKET_PAIRS: &[(char, char)] = &[('(', ')'), ('[', ']'), ('{', '}'), ('<', '>')];
+/// Bracket types we match.
+///
+/// Angle brackets are **not** in the common set: they are delimiters only in
+/// markup, and everywhere else `<` and `>` are comparison operators. See
+/// [`BracketHighlightSettings::angle_brackets`] and
+/// `Language::angle_brackets_are_delimiters`.
+const BRACKET_PAIRS: &[(char, char)] = &[('(', ')'), ('[', ']'), ('{', '}')];
+
+/// The set above plus `<`/`>`, for languages whose angle brackets really are
+/// delimiters.
+const BRACKET_PAIRS_WITH_ANGLES: &[(char, char)] =
+    &[('(', ')'), ('[', ']'), ('{', '}'), ('<', '>')];
+
+/// The pairs that count as brackets for this buffer.
+///
+/// `pub(crate)` because the go-to-matching-bracket command needs the same
+/// answer: two tables meant two surfaces disagreeing about whether `<` is a
+/// bracket, which is how #3090 survived in the jump command after the
+/// highlighter stopped counting it.
+pub(crate) fn bracket_pairs(angle_brackets: bool) -> &'static [(char, char)] {
+    if angle_brackets {
+        BRACKET_PAIRS_WITH_ANGLES
+    } else {
+        BRACKET_PAIRS
+    }
+}
 
 /// Maximum number of bytes to scan for bracket matching/nesting depth.
 /// Prevents O(n) scans on huge files from hanging the editor.
@@ -42,18 +66,22 @@ pub(crate) const MAX_BRACKET_SEARCH_BYTES: usize = 1_000_000;
 const BRACKET_SCAN_CHUNK: usize = 16 * 1024;
 
 /// Check if a character is an opening bracket
-fn is_opening_bracket(ch: char) -> bool {
-    BRACKET_PAIRS.iter().any(|(open, _)| *open == ch)
+fn is_opening_bracket(ch: char, angle_brackets: bool) -> bool {
+    bracket_pairs(angle_brackets)
+        .iter()
+        .any(|(open, _)| *open == ch)
 }
 
 /// Check if a character is a closing bracket
-fn is_closing_bracket(ch: char) -> bool {
-    BRACKET_PAIRS.iter().any(|(_, close)| *close == ch)
+fn is_closing_bracket(ch: char, angle_brackets: bool) -> bool {
+    bracket_pairs(angle_brackets)
+        .iter()
+        .any(|(_, close)| *close == ch)
 }
 
 /// Get the opening bracket for a closing bracket
-fn opening_for_closing(ch: char) -> Option<char> {
-    BRACKET_PAIRS
+fn opening_for_closing(ch: char, angle_brackets: bool) -> Option<char> {
+    bracket_pairs(angle_brackets)
         .iter()
         .find_map(|(open, close)| if *close == ch { Some(*open) } else { None })
 }
@@ -79,9 +107,119 @@ fn pos_in_ranges(ranges: &[Range<usize>], pos: usize) -> bool {
         .is_ok()
 }
 
+/// The bracket matching the one at `position` — `opening`/`closing` its
+/// pair, searched ahead of it when `forward` and behind it otherwise — no
+/// further than `search_bound` (an absolute byte) nor
+/// [`MAX_BRACKET_SEARCH_BYTES`]. Brackets inside `skip_ranges` (comments and
+/// strings) are ignored, so the match is structural punctuation (#2405).
+///
+/// `pub(crate)` for go-to-matching-bracket, which scans the same way but
+/// has no comment and string ranges to skip (they come from the
+/// highlighting of the frame being drawn), so it counts their brackets too.
+pub(crate) fn find_matching_bracket(
+    buffer: &Buffer,
+    position: usize,
+    opening: char,
+    closing: char,
+    forward: bool,
+    skip_ranges: &[Range<usize>],
+    search_bound: usize,
+) -> Option<usize> {
+    let buffer_len = buffer.len();
+    let open = opening as u8;
+    let close = closing as u8;
+    let mut depth: i32 = 1;
+
+    if forward {
+        let search_limit = (position + 1 + MAX_BRACKET_SEARCH_BYTES)
+            .min(buffer_len)
+            .min(search_bound.max(position + 1));
+        let mut pos = position + 1;
+        while pos < search_limit {
+            let chunk_end = (pos + BRACKET_SCAN_CHUNK).min(search_limit);
+            let chunk = buffer.slice_bytes(pos..chunk_end);
+            for (i, &b) in chunk.iter().enumerate() {
+                if pos_in_ranges(skip_ranges, pos + i) {
+                    continue;
+                }
+                if b == open {
+                    depth += 1;
+                } else if b == close {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(pos + i);
+                    }
+                }
+            }
+            pos = chunk_end;
+        }
+    } else {
+        let search_limit = position
+            .saturating_sub(MAX_BRACKET_SEARCH_BYTES)
+            .max(search_bound.min(position));
+        let mut pos = position;
+        while pos > search_limit {
+            let chunk_start = pos.saturating_sub(BRACKET_SCAN_CHUNK).max(search_limit);
+            let chunk = buffer.slice_bytes(chunk_start..pos);
+            for (i, &b) in chunk.iter().enumerate().rev() {
+                if pos_in_ranges(skip_ranges, chunk_start + i) {
+                    continue;
+                }
+                if b == close {
+                    depth += 1;
+                } else if b == open {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(chunk_start + i);
+                    }
+                }
+            }
+            pos = chunk_start;
+        }
+    }
+
+    None
+}
+
+/// The nearest opening bracket before `position` that its closing bracket
+/// doesn't close before `position` — the bracket enclosing it — with its
+/// pair: `(opening, closing, at)`. Searched no further back than
+/// [`MAX_BRACKET_SEARCH_BYTES`], each of `pairs` nesting on its own.
+pub(crate) fn find_enclosing_bracket(
+    buffer: &Buffer,
+    position: usize,
+    pairs: &[(char, char)],
+    skip_ranges: &[Range<usize>],
+) -> Option<(char, char, usize)> {
+    let search_limit = position.saturating_sub(MAX_BRACKET_SEARCH_BYTES);
+    let mut depths = vec![0usize; pairs.len()];
+    let mut pos = position.min(buffer.len());
+    while pos > search_limit {
+        let chunk_start = pos.saturating_sub(BRACKET_SCAN_CHUNK).max(search_limit);
+        let chunk = buffer.slice_bytes(chunk_start..pos);
+        for (i, &b) in chunk.iter().enumerate().rev() {
+            if pos_in_ranges(skip_ranges, chunk_start + i) {
+                continue;
+            }
+            for (depth, &(open, close)) in depths.iter_mut().zip(pairs) {
+                if b == close as u8 {
+                    *depth += 1;
+                } else if b == open as u8 {
+                    if *depth == 0 {
+                        return Some((open, close, chunk_start + i));
+                    }
+                    *depth -= 1;
+                }
+            }
+        }
+        pos = chunk_start;
+    }
+    None
+}
+
 /// Get the matching bracket pair for a character
-fn get_bracket_pair(ch: char) -> Option<(char, char, bool)> {
-    for &(open, close) in BRACKET_PAIRS {
+pub(crate) fn get_bracket_pair(ch: char, angle_brackets: bool) -> Option<(char, char, bool)> {
+    for &(open, close) in bracket_pairs(angle_brackets) {
         if ch == open {
             return Some((open, close, true)); // forward search
         }
@@ -105,6 +243,13 @@ pub struct BracketHighlightSettings {
     pub matching: bool,
     /// `editor.rainbow_brackets`: color brackets by nesting depth.
     pub rainbow: bool,
+    /// Whether `<` and `>` are brackets in this buffer's language. Not a
+    /// config toggle — it is the language's answer, filled in by
+    /// [`with_language`](Self::with_language) at the one place that knows
+    /// which buffer is being drawn. Off for a buffer whose language is
+    /// unknown, which is the safe end: a stray `<` then colours nothing
+    /// rather than recolouring every bracket after it (issue #3090).
+    pub angle_brackets: bool,
 }
 
 impl BracketHighlightSettings {
@@ -114,7 +259,16 @@ impl BracketHighlightSettings {
         Self {
             matching: editor.highlight_matching_brackets,
             rainbow: editor.highlight_matching_brackets && editor.rainbow_brackets,
+            angle_brackets: false,
         }
+    }
+
+    /// Resolve [`angle_brackets`](Self::angle_brackets) for the buffer's
+    /// language. `None` — no highlighter, or a grammar with no language
+    /// behind it — leaves them out.
+    pub fn with_language(mut self, language: Option<&fresh_languages::Language>) -> Self {
+        self.angle_brackets = language.is_some_and(|l| l.angle_brackets_are_delimiters());
+        self
     }
 }
 
@@ -123,6 +277,7 @@ impl Default for BracketHighlightSettings {
         Self {
             matching: true,
             rainbow: true,
+            angle_brackets: false,
         }
     }
 }
@@ -133,8 +288,17 @@ pub struct BracketHighlightOverlay {
     pub rainbow_colors: [Color; 6],
     /// Default bracket match highlight color (when rainbow is disabled)
     pub match_color: Color,
+    /// The attributes that mark the matched pair when rainbow is on (the
+    /// theme's `editor.bracket_rainbow_match_modifier`).
+    pub rainbow_match_modifier: Modifier,
     /// Last cursor position where we computed brackets
     last_cursor_pos: Option<usize>,
+    /// Whether `<`/`>` counted as brackets when the pair overlays were last
+    /// computed. Part of the short-circuit below: the pair the cursor sits on
+    /// is a function of the language too, so a language switch with a
+    /// stationary cursor has to re-derive rather than leave a stale `<`…`>`
+    /// pair painted (or a real one unpainted).
+    last_angle_brackets: Option<bool>,
     /// Whether depth-colorization overlays are currently present. Lets a
     /// disabled pass clear them exactly once instead of re-clearing (and
     /// reporting "updated") on every frame.
@@ -150,14 +314,13 @@ pub struct BracketHighlightOverlay {
 struct ColorizationCache {
     /// Bytes scanned for brackets.
     scan: Range<usize>,
-    /// Byte range the overlays were written into — the union of this pass's
-    /// scan range and the previous one's, which is what the next replace has
-    /// to cover to retract what scrolled out of view.
-    written: Range<usize>,
     buffer_version: u64,
     viewport: Range<usize>,
     colors: [Color; 6],
     skip_ranges: Vec<Range<usize>>,
+    /// Whether `<`/`>` counted as brackets — a language switch on the same
+    /// buffer changes the overlays this pass would produce.
+    angle_brackets: bool,
     /// The overlay set's removal counters when this pass ran — global, and
     /// for the colorization namespace. Anything that could have removed
     /// these overlays (a buffer switch, a plugin's `clearAllOverlays`, a
@@ -166,13 +329,25 @@ struct ColorizationCache {
     removal_epochs: (u64, u64),
 }
 
+/// The theme keys of the rainbow depths, in the order of `rainbow_colors`.
+const RAINBOW_KEYS: [&str; 6] = [
+    "editor.bracket_rainbow_1",
+    "editor.bracket_rainbow_2",
+    "editor.bracket_rainbow_3",
+    "editor.bracket_rainbow_4",
+    "editor.bracket_rainbow_5",
+    "editor.bracket_rainbow_6",
+];
+
 impl BracketHighlightOverlay {
     /// Create a new bracket highlight overlay manager
     pub fn new() -> Self {
         Self {
             rainbow_colors: DEFAULT_BRACKET_COLORS,
             match_color: Color::Rgb(255, 215, 0), // Gold
+            rainbow_match_modifier: Modifier::BOLD | Modifier::UNDERLINED,
             last_cursor_pos: None,
+            last_angle_brackets: None,
             colorization_active: false,
             colorization_cache: None,
         }
@@ -207,11 +382,14 @@ impl BracketHighlightOverlay {
             theme.bracket_rainbow_5,
             theme.bracket_rainbow_6,
         ];
-        let colors_changed =
-            self.match_color != new_match_color || self.rainbow_colors != new_rainbow_colors;
+        let new_rainbow_match_modifier = theme.bracket_rainbow_match_modifier;
+        let colors_changed = self.match_color != new_match_color
+            || self.rainbow_colors != new_rainbow_colors
+            || self.rainbow_match_modifier != new_rainbow_match_modifier;
         if colors_changed {
             self.match_color = new_match_color;
             self.rainbow_colors = new_rainbow_colors;
+            self.rainbow_match_modifier = new_rainbow_match_modifier;
         }
 
         let mut updated = false;
@@ -225,6 +403,7 @@ impl BracketHighlightOverlay {
                 viewport_start,
                 viewport_end,
                 skip_ranges,
+                settings.angle_brackets,
             );
         } else {
             updated |= self.clear_colorization(overlays, marker_list);
@@ -236,15 +415,20 @@ impl BracketHighlightOverlay {
         if !settings.matching {
             if self.last_cursor_pos.take().is_some() {
                 overlays.clear_namespace(&bracket_highlight_namespace(), marker_list);
+                self.last_angle_brackets = None;
                 updated = true;
             }
             return updated;
         }
 
-        if self.last_cursor_pos == Some(cursor_position) && !colors_changed {
+        if self.last_cursor_pos == Some(cursor_position)
+            && self.last_angle_brackets == Some(settings.angle_brackets)
+            && !colors_changed
+        {
             return updated;
         }
         self.last_cursor_pos = Some(cursor_position);
+        self.last_angle_brackets = Some(settings.angle_brackets);
         updated = true;
 
         // Clear existing bracket overlays
@@ -265,7 +449,7 @@ impl BracketHighlightOverlay {
         let ch = bytes[0] as char;
 
         // Get bracket pair info
-        let (opening, closing, forward) = match get_bracket_pair(ch) {
+        let (opening, closing, forward) = match get_bracket_pair(ch, settings.angle_brackets) {
             Some(pair) => pair,
             None => return true, // Not on a bracket
         };
@@ -276,167 +460,80 @@ impl BracketHighlightOverlay {
             return true;
         }
 
-        // Calculate nesting depth at cursor position for rainbow colors
-        let depth = if settings.rainbow {
-            self.calculate_nesting_depth(buffer, cursor_position, forward, skip_ranges)
+        // A match the frame cannot draw changes nothing on screen, so the
+        // search covers the drawn span plus a screenful either side and stops
+        // there. Unbounded by the viewport it was a megabyte of scanning per
+        // keystroke on a file that is one long line — for a bracket that could
+        // not have been highlighted wherever it turned out to be.
+        let margin = viewport_end
+            .saturating_sub(viewport_start)
+            .max(BRACKET_SCAN_CHUNK);
+        let search_bound = if forward {
+            viewport_end.saturating_add(margin)
         } else {
-            0
+            viewport_start.saturating_sub(margin)
         };
 
         // Find matching bracket
-        let matching_pos = self.find_matching_bracket(
+        let matching_pos = find_matching_bracket(
             buffer,
             cursor_position,
             opening,
             closing,
             forward,
             skip_ranges,
+            search_bound,
         );
 
-        // Determine color based on depth
-        let color = if settings.rainbow {
-            self.rainbow_colors[depth % self.rainbow_colors.len()]
+        // With rainbow on, the brackets already carry their depth color, so
+        // re-painting the pair in that color changed nothing on screen
+        // (issue #3084). Keep the color the colorization pass gave them — so
+        // the two passes can't disagree about depth — and emphasize the pair
+        // instead, with the theme's attributes. With rainbow off, the pair
+        // gets the match color.
+        let (face, theme_key) = if settings.rainbow {
+            (
+                OverlayFace::Style {
+                    style: Style::default().add_modifier(self.rainbow_match_modifier),
+                },
+                None,
+            )
         } else {
-            self.match_color
+            (
+                OverlayFace::Foreground {
+                    color: self.match_color,
+                },
+                Some("editor.bracket_match_fg"),
+            )
         };
 
         // Create overlay for the bracket at cursor
-        let cursor_face = OverlayFace::Foreground { color };
         let cursor_overlay = Overlay::with_namespace(
             marker_list,
             cursor_position..cursor_position + 1,
-            cursor_face,
+            face.clone(),
             ns.clone(),
         )
         .with_priority_value(10);
+        let cursor_overlay = match theme_key {
+            Some(key) => cursor_overlay.with_theme_key(key),
+            None => cursor_overlay,
+        };
         overlays.add(cursor_overlay);
 
         // Create overlay for the matching bracket if found
         if let Some(match_pos) = matching_pos {
-            let match_face = OverlayFace::Foreground { color };
-            let match_overlay = Overlay::with_namespace(
-                marker_list,
-                match_pos..match_pos + 1,
-                match_face,
-                ns.clone(),
-            )
-            .with_priority_value(10);
+            let match_overlay =
+                Overlay::with_namespace(marker_list, match_pos..match_pos + 1, face, ns.clone())
+                    .with_priority_value(10);
+            let match_overlay = match theme_key {
+                Some(key) => match_overlay.with_theme_key(key),
+                None => match_overlay,
+            };
             overlays.add(match_overlay);
         }
 
         updated
-    }
-
-    /// Calculate the nesting depth of a bracket at a position.
-    ///
-    /// Brackets inside `skip_ranges` (comments/strings) are ignored so the
-    /// depth reflects only structural punctuation (issue #2405).
-    fn calculate_nesting_depth(
-        &self,
-        buffer: &Buffer,
-        position: usize,
-        is_opening: bool,
-        skip_ranges: &[Range<usize>],
-    ) -> usize {
-        // Track nesting depth across all bracket types so rainbow colors follow
-        // overall nesting level. Bound the scan to avoid O(n) work on huge files.
-        let scan_start = position.saturating_sub(MAX_BRACKET_SEARCH_BYTES);
-        let mut stack: Vec<char> = Vec::new();
-        let mut pos = scan_start;
-
-        while pos < position {
-            let chunk_end = (pos + BRACKET_SCAN_CHUNK).min(position);
-            let chunk = buffer.slice_bytes(pos..chunk_end);
-            for (i, &b) in chunk.iter().enumerate() {
-                if pos_in_ranges(skip_ranges, pos + i) {
-                    continue;
-                }
-                let c = b as char;
-                if is_opening_bracket(c) {
-                    stack.push(c);
-                } else if is_closing_bracket(c) {
-                    if let Some(expected_open) = opening_for_closing(c) {
-                        if stack.last() == Some(&expected_open) {
-                            stack.pop();
-                        }
-                    }
-                }
-            }
-            pos = chunk_end;
-        }
-
-        // For opening brackets, depth is the current stack size.
-        // For closing brackets, depth is the stack size minus one (matching opening).
-        if is_opening {
-            stack.len()
-        } else {
-            stack.len().saturating_sub(1)
-        }
-    }
-
-    /// Find the matching bracket (bounded to MAX_BRACKET_SEARCH_BYTES).
-    ///
-    /// Brackets inside `skip_ranges` (comments/strings) are ignored so the
-    /// match reflects only structural punctuation (issue #2405).
-    fn find_matching_bracket(
-        &self,
-        buffer: &Buffer,
-        position: usize,
-        opening: char,
-        closing: char,
-        forward: bool,
-        skip_ranges: &[Range<usize>],
-    ) -> Option<usize> {
-        let buffer_len = buffer.len();
-        let open = opening as u8;
-        let close = closing as u8;
-        let mut depth: i32 = 1;
-
-        if forward {
-            let search_limit = (position + 1 + MAX_BRACKET_SEARCH_BYTES).min(buffer_len);
-            let mut pos = position + 1;
-            while pos < search_limit {
-                let chunk_end = (pos + BRACKET_SCAN_CHUNK).min(search_limit);
-                let chunk = buffer.slice_bytes(pos..chunk_end);
-                for (i, &b) in chunk.iter().enumerate() {
-                    if pos_in_ranges(skip_ranges, pos + i) {
-                        continue;
-                    }
-                    if b == open {
-                        depth += 1;
-                    } else if b == close {
-                        depth -= 1;
-                        if depth == 0 {
-                            return Some(pos + i);
-                        }
-                    }
-                }
-                pos = chunk_end;
-            }
-        } else {
-            let search_limit = position.saturating_sub(MAX_BRACKET_SEARCH_BYTES);
-            let mut pos = position;
-            while pos > search_limit {
-                let chunk_start = pos.saturating_sub(BRACKET_SCAN_CHUNK).max(search_limit);
-                let chunk = buffer.slice_bytes(chunk_start..pos);
-                for (i, &b) in chunk.iter().enumerate().rev() {
-                    if pos_in_ranges(skip_ranges, chunk_start + i) {
-                        continue;
-                    }
-                    if b == close {
-                        depth += 1;
-                    } else if b == open {
-                        depth -= 1;
-                        if depth == 0 {
-                            return Some(chunk_start + i);
-                        }
-                    }
-                }
-                pos = chunk_start;
-            }
-        }
-
-        None
     }
 
     /// Force clear all highlights (e.g., when switching buffers)
@@ -446,12 +543,14 @@ impl BracketHighlightOverlay {
         let color_ns = bracket_colorization_namespace();
         overlays.clear_namespace(&color_ns, marker_list);
         self.last_cursor_pos = None;
+        self.last_angle_brackets = None;
         self.colorization_active = false;
     }
 
     /// Force recalculation on next update
     pub fn invalidate(&mut self) {
         self.last_cursor_pos = None;
+        self.last_angle_brackets = None;
     }
 
     /// Drop the depth-colorization overlays. Returns whether anything was
@@ -474,6 +573,7 @@ impl BracketHighlightOverlay {
         true
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn update_colorization(
         &mut self,
         buffer: &Buffer,
@@ -482,6 +582,7 @@ impl BracketHighlightOverlay {
         viewport_start: usize,
         viewport_end: usize,
         skip_ranges: &[Range<usize>],
+        angle_brackets: bool,
     ) -> bool {
         if viewport_start >= viewport_end || buffer.is_empty() {
             return self.clear_colorization(overlays, marker_list);
@@ -507,6 +608,7 @@ impl BracketHighlightOverlay {
                 && cache.viewport == (viewport_start..viewport_end)
                 && cache.colors == self.rainbow_colors
                 && cache.skip_ranges == skip_ranges
+                && cache.angle_brackets == angle_brackets
                 && cache.removal_epochs == overlays.removal_epochs_for(&ns)
             {
                 return false;
@@ -519,79 +621,98 @@ impl BracketHighlightOverlay {
         }
 
         let mut stack: Vec<char> = Vec::new();
-        let mut new_overlays = Vec::new();
+        // What the viewport's brackets should look like: byte -> colour.
+        // Position -> nesting level (an index into `rainbow_colors` and
+        // `RAINBOW_KEYS`).
+        let mut wanted: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
 
         for (idx, byte) in bytes.iter().enumerate() {
             let pos = scan_start + idx;
             let c = *byte as char;
 
-            // Brackets inside comments/strings are prose/data, not structural
-            // punctuation — don't colorize them and don't let them affect the
-            // nesting depth of real brackets (issue #2405).
+            let opening = is_opening_bracket(c, angle_brackets);
+            if !opening && !is_closing_bracket(c, angle_brackets) {
+                continue;
+            }
+
+            // Brackets inside comments/strings are prose, not structure: don't
+            // colorize them and don't let them affect the nesting depth of
+            // real brackets (issue #2405). Checked only for brackets, because
+            // that is the only thing it can veto and this runs per byte.
             if pos_in_ranges(skip_ranges, pos) {
                 continue;
             }
 
-            if is_opening_bracket(c) {
+            if opening {
                 let depth = stack.len();
                 stack.push(c);
                 if pos >= viewport_start {
-                    let color = self.rainbow_colors[depth % self.rainbow_colors.len()];
-                    let face = OverlayFace::Foreground { color };
-                    let overlay =
-                        Overlay::with_namespace(marker_list, pos..pos + 1, face, ns.clone())
-                            .with_priority_value(6);
-                    new_overlays.push(overlay);
+                    wanted.insert(pos, depth % self.rainbow_colors.len());
                 }
                 continue;
             }
 
-            if is_closing_bracket(c) {
-                let depth = stack.len().saturating_sub(1);
-                if let Some(expected_open) = opening_for_closing(c) {
-                    if stack.last() == Some(&expected_open) {
-                        stack.pop();
-                    }
+            let depth = stack.len().saturating_sub(1);
+            if let Some(expected_open) = opening_for_closing(c, angle_brackets) {
+                if stack.last() == Some(&expected_open) {
+                    stack.pop();
                 }
-                if pos >= viewport_start {
-                    let color = self.rainbow_colors[depth % self.rainbow_colors.len()];
-                    let face = OverlayFace::Foreground { color };
-                    let overlay =
-                        Overlay::with_namespace(marker_list, pos..pos + 1, face, ns.clone())
-                            .with_priority_value(6);
-                    new_overlays.push(overlay);
-                }
+            }
+            if pos >= viewport_start {
+                wanted.insert(pos, depth % self.rainbow_colors.len());
             }
         }
 
-        self.colorization_active = !new_overlays.is_empty();
-        // Replace over the scanned bytes plus whatever the previous pass
-        // wrote — enough to retract the overlays that scrolled out of view,
-        // and nothing more. Passing `0..buffer.len()` here (as this used to)
-        // makes the replace's marker-tree query return *every* marker in the
-        // buffer, so the cost of one frame grew with the whole overlay set
-        // rather than with the viewport: ~230ms per frame on a 20k-line
-        // review diff, against ~3ms for the rest of the frame.
-        let written = match &self.colorization_cache {
-            // An edit moved every marker after it, so the overlays this
-            // namespace already owns are no longer where the cached range
-            // says they are — one of them can have been pushed clear of it.
-            // Retract across the buffer for that pass; edits are rare next
-            // to frames, and this is the range the pass always used before.
-            Some(cache) if cache.buffer_version != buffer.version() => 0..buffer.len(),
-            Some(cache) => cache.written.start.min(scan_start)..cache.written.end.max(scan_end),
-            None => scan_start..scan_end,
-        };
-        overlays.replace_range_in_namespace(&ns, &written, new_overlays, marker_list);
+        self.colorization_active = !wanted.is_empty();
+        // Reconcile against what this namespace already has rather than
+        // replacing it: its markers moved with any edit, so typing a letter
+        // leaves every overlay in place and costs no marker churn at all.
+        let stale: Vec<_> = overlays
+            .in_namespace(&ns)
+            .filter(|o| {
+                let range = o.range(marker_list);
+                let current = match o.face {
+                    OverlayFace::Foreground { color } if range.len() == 1 => {
+                        Some((color, o.theme_key))
+                    }
+                    _ => None,
+                };
+                let want = wanted
+                    .get(&range.start)
+                    .map(|&level| (self.rainbow_colors[level], Some(RAINBOW_KEYS[level])));
+                if current.is_some() && want == current {
+                    wanted.remove(&range.start);
+                    false
+                } else {
+                    true
+                }
+            })
+            .map(|o| o.handle.clone())
+            .collect();
+        for handle in &stale {
+            overlays.remove_by_handle(handle, marker_list);
+        }
+        overlays.extend(wanted.into_iter().map(|(pos, level)| {
+            // The level's key rides along, so the theme's attributes for that
+            // level apply too (and the inspector names it).
+            Overlay::with_namespace(
+                marker_list,
+                pos..pos + 1,
+                OverlayFace::Foreground {
+                    color: self.rainbow_colors[level],
+                },
+                ns.clone(),
+            )
+            .with_priority_value(6)
+            .with_theme_key(RAINBOW_KEYS[level])
+        }));
         self.colorization_cache = Some(ColorizationCache {
             scan: scan_start..scan_end,
-            // The next pass has to cover what this one wrote, but not what
-            // the one before it did — that has just been retracted.
-            written: scan_start..scan_end,
             buffer_version: buffer.version(),
             viewport: viewport_start..viewport_end,
             colors: self.rainbow_colors,
             skip_ranges: skip_ranges.to_vec(),
+            angle_brackets,
             removal_epochs: overlays.removal_epochs_for(&ns),
         });
         true
@@ -617,7 +738,116 @@ mod tests {
         overlays: &mut OverlayManager,
         markers: &mut MarkerList,
     ) -> bool {
-        overlay.update_colorization(buffer, overlays, markers, 0, buffer.len(), &[])
+        overlay.update_colorization(buffer, overlays, markers, 0, buffer.len(), &[], false)
+    }
+
+    /// The colour painted at `byte`, scanning the whole buffer.
+    fn colour_at(buffer: &Buffer, byte: usize, skip_ranges: &[Range<usize>]) -> Option<Color> {
+        let mut overlays = OverlayManager::new();
+        let mut markers = MarkerList::new();
+        let mut overlay = BracketHighlightOverlay::new();
+        overlay.update_colorization(
+            buffer,
+            &mut overlays,
+            &mut markers,
+            0,
+            buffer.len(),
+            skip_ranges,
+            false,
+        );
+        let ns = bracket_colorization_namespace();
+        let found = overlays.in_namespace(&ns).find_map(|o| {
+            let range = o.range(&markers);
+            match o.face {
+                OverlayFace::Foreground { color } if range.start == byte => Some(color),
+                _ => None,
+            }
+        });
+        found
+    }
+
+    /// The skip check sits behind the test for a bracket, so this pins that a
+    /// brace in a comment is still neither painted nor counted (issue #2405).
+    #[test]
+    fn a_bracket_in_a_skipped_span_is_neither_painted_nor_counted() {
+        // Two skipped spans, so the binary search has more than one entry.
+        let text = "# prose brace: {\n()\n# and a tail: }\n";
+        let prose = text.find('{').expect("the prose brace");
+        let pair = text.find('(').expect("the real pair");
+        let tail = text.find('}').expect("the tail brace");
+        let buffer = Buffer::from_str_test(text);
+        let skips = [prose..prose + 1, tail..tail + 1];
+
+        assert_eq!(colour_at(&buffer, prose, &skips), None, "not painted");
+
+        // The same file without the stray braces: the pair is at depth 0 both
+        // ways, so a skipped brace did not push it to 1.
+        let clean = Buffer::from_str_test(&text.replace(['{', '}'], " "));
+        assert_eq!(
+            colour_at(&buffer, pair, &skips),
+            colour_at(&clean, pair, &[]),
+            "a skipped brace must not shift the depth of real brackets"
+        );
+    }
+
+    /// One `update` as the renderer makes it, for a cursor that does not move.
+    fn matching_frame(
+        overlay: &mut BracketHighlightOverlay,
+        buffer: &Buffer,
+        overlays: &mut OverlayManager,
+        markers: &mut MarkerList,
+        cursor: usize,
+        angle_brackets: bool,
+    ) {
+        overlay.update(
+            buffer,
+            overlays,
+            markers,
+            &Theme::load_builtin("dark").expect("the built-in dark theme"),
+            BracketHighlightSettings {
+                matching: true,
+                rainbow: false,
+                angle_brackets,
+            },
+            cursor,
+            0,
+            buffer.len(),
+            &[],
+        );
+    }
+
+    /// The pair overlays are a function of the language as well as the
+    /// cursor, so the short-circuit that skips a frame for a stationary
+    /// cursor has to notice an angle-bracket change too. It did not: a
+    /// language switch with the caret parked on a `<` left the old `<`…`>`
+    /// pair painted until the caret moved.
+    #[test]
+    fn a_language_switch_redraws_the_pair_under_a_stationary_cursor() {
+        let buffer = Buffer::from_str_test("<span>hi</span>\n");
+        let mut overlays = OverlayManager::new();
+        let mut markers = MarkerList::new();
+        let mut overlay = BracketHighlightOverlay::new();
+
+        // Caret on the opening `<`, in a language where it is a delimiter.
+        matching_frame(&mut overlay, &buffer, &mut overlays, &mut markers, 0, true);
+        let with_angles = overlays.len();
+        assert!(with_angles > 0, "the tag's delimiters are a pair in markup");
+
+        // The same caret, in a language where it is not.
+        matching_frame(&mut overlay, &buffer, &mut overlays, &mut markers, 0, false);
+        assert_eq!(
+            overlays.len(),
+            0,
+            "the pair must be retracted without waiting for the caret to move"
+        );
+
+        // And back again.
+        matching_frame(&mut overlay, &buffer, &mut overlays, &mut markers, 0, true);
+        assert_eq!(
+            overlays.len(),
+            with_angles,
+            "switching back repaints it, again without moving the caret"
+        );
     }
 
     /// A frame that changed nothing the pass reads must do nothing. Without
@@ -692,88 +922,106 @@ mod tests {
         );
     }
 
+    /// An edit that adds or removes no bracket leaves the overlays in place:
+    /// their markers moved with it, so there is nothing to retract or re-add.
+    #[test]
+    fn typing_a_letter_keeps_the_bracket_overlays() {
+        let mut buffer = Buffer::from_str_test("fn a() { b(); }\n");
+        let mut overlays = OverlayManager::new();
+        let mut markers = MarkerList::new();
+        let mut overlay = BracketHighlightOverlay::new();
+        let handles = |overlays: &OverlayManager| -> std::collections::HashSet<_> {
+            overlays.all().iter().map(|o| o.handle.clone()).collect()
+        };
+        colorize_frame(&mut overlay, &buffer, &mut overlays, &mut markers);
+        let before = handles(&overlays);
+        assert_eq!(before.len(), 6);
+
+        markers.adjust_for_insert(0, 1);
+        buffer.insert(0, "x");
+        assert!(colorize_frame(
+            &mut overlay,
+            &buffer,
+            &mut overlays,
+            &mut markers
+        ));
+        assert_eq!(handles(&overlays), before);
+
+        // A bracket after the others adds its overlay and moves none of theirs.
+        let end = buffer.len();
+        markers.adjust_for_insert(end, 1);
+        buffer.insert(end, "(");
+        colorize_frame(&mut overlay, &buffer, &mut overlays, &mut markers);
+        let after = handles(&overlays);
+        assert_eq!(after.len(), 7);
+        assert_eq!(after.intersection(&before).count(), 6);
+    }
+
     #[test]
     fn test_bracket_pair_detection() {
-        assert!(is_opening_bracket('('));
-        assert!(is_opening_bracket('['));
-        assert!(is_opening_bracket('{'));
-        assert!(!is_opening_bracket(')'));
-        assert!(!is_opening_bracket('a'));
+        assert!(is_opening_bracket('(', false));
+        assert!(is_opening_bracket('[', false));
+        assert!(is_opening_bracket('{', false));
+        assert!(!is_opening_bracket(')', false));
+        assert!(!is_opening_bracket('a', false));
 
-        assert!(is_closing_bracket(')'));
-        assert!(is_closing_bracket(']'));
-        assert!(is_closing_bracket('}'));
-        assert!(!is_closing_bracket('('));
-        assert!(!is_closing_bracket('a'));
+        assert!(is_closing_bracket(')', false));
+        assert!(is_closing_bracket(']', false));
+        assert!(is_closing_bracket('}', false));
+        assert!(!is_closing_bracket('(', false));
+        assert!(!is_closing_bracket('a', false));
+    }
+
+    /// Issue #3090: `<` and `>` are brackets only where the language says
+    /// they are, and an unmatched one must not push a nesting level for the
+    /// brackets that follow.
+    #[test]
+    fn angle_brackets_count_only_for_markup_languages() {
+        assert!(!is_opening_bracket('<', false));
+        assert!(!is_closing_bracket('>', false));
+        assert_eq!(get_bracket_pair('<', false), None);
+
+        assert!(is_opening_bracket('<', true));
+        assert!(is_closing_bracket('>', true));
+        assert_eq!(get_bracket_pair('<', true), Some(('<', '>', true)));
     }
 
     #[test]
     fn test_get_bracket_pair() {
-        assert_eq!(get_bracket_pair('('), Some(('(', ')', true)));
-        assert_eq!(get_bracket_pair(')'), Some(('(', ')', false)));
-        assert_eq!(get_bracket_pair('['), Some(('[', ']', true)));
-        assert_eq!(get_bracket_pair(']'), Some(('[', ']', false)));
-        assert_eq!(get_bracket_pair('a'), None);
+        assert_eq!(get_bracket_pair('(', false), Some(('(', ')', true)));
+        assert_eq!(get_bracket_pair(')', false), Some(('(', ')', false)));
+        assert_eq!(get_bracket_pair('[', false), Some(('[', ']', true)));
+        assert_eq!(get_bracket_pair(']', false), Some(('[', ']', false)));
+        assert_eq!(get_bracket_pair('a', false), None);
     }
 
     #[test]
     fn test_find_matching_bracket_forward() {
         let buffer = Buffer::from_str_test("(hello)");
-        let overlay = BracketHighlightOverlay::new();
 
-        let result = overlay.find_matching_bracket(&buffer, 0, '(', ')', true, &[]);
+        let result = find_matching_bracket(&buffer, 0, '(', ')', true, &[], usize::MAX);
         assert_eq!(result, Some(6));
     }
 
     #[test]
     fn test_find_matching_bracket_backward() {
         let buffer = Buffer::from_str_test("(hello)");
-        let overlay = BracketHighlightOverlay::new();
 
-        let result = overlay.find_matching_bracket(&buffer, 6, '(', ')', false, &[]);
+        let result = find_matching_bracket(&buffer, 6, '(', ')', false, &[], 0);
         assert_eq!(result, Some(0));
     }
 
     #[test]
     fn test_find_matching_bracket_nested() {
         let buffer = Buffer::from_str_test("((inner))");
-        let overlay = BracketHighlightOverlay::new();
 
         // Outer opening bracket should match outer closing
-        let result = overlay.find_matching_bracket(&buffer, 0, '(', ')', true, &[]);
+        let result = find_matching_bracket(&buffer, 0, '(', ')', true, &[], usize::MAX);
         assert_eq!(result, Some(8));
 
         // Inner opening bracket should match inner closing
-        let result = overlay.find_matching_bracket(&buffer, 1, '(', ')', true, &[]);
+        let result = find_matching_bracket(&buffer, 1, '(', ')', true, &[], usize::MAX);
         assert_eq!(result, Some(7));
-    }
-
-    #[test]
-    fn test_nesting_depth() {
-        let buffer = Buffer::from_str_test("((()))");
-        let overlay = BracketHighlightOverlay::new();
-
-        // Outermost opening bracket: depth 0
-        assert_eq!(overlay.calculate_nesting_depth(&buffer, 0, true, &[]), 0);
-
-        // Second level opening bracket: depth 1
-        assert_eq!(overlay.calculate_nesting_depth(&buffer, 1, true, &[]), 1);
-
-        // Third level opening bracket: depth 2
-        assert_eq!(overlay.calculate_nesting_depth(&buffer, 2, true, &[]), 2);
-    }
-
-    #[test]
-    fn test_nesting_depth_mixed_types() {
-        let buffer = Buffer::from_str_test("({[]})");
-        let overlay = BracketHighlightOverlay::new();
-
-        assert_eq!(overlay.calculate_nesting_depth(&buffer, 0, true, &[]), 0);
-        assert_eq!(overlay.calculate_nesting_depth(&buffer, 1, true, &[]), 1);
-        assert_eq!(overlay.calculate_nesting_depth(&buffer, 2, true, &[]), 2);
-        assert_eq!(overlay.calculate_nesting_depth(&buffer, 3, false, &[]), 2);
-        assert_eq!(overlay.calculate_nesting_depth(&buffer, 4, false, &[]), 1);
-        assert_eq!(overlay.calculate_nesting_depth(&buffer, 5, false, &[]), 0);
     }
 
     #[test]
@@ -790,39 +1038,111 @@ mod tests {
     }
 
     #[test]
+    // A slice of byte ranges is the argument, not a range of values.
+    #[allow(clippy::single_range_in_vec_init)]
     fn test_find_matching_bracket_skips_comment_bracket() {
         // `( # ) )` — the first `)` sits inside a "comment" range and must be
         // ignored, so the opening `(` matches the second `)`.
         let buffer = Buffer::from_str_test("(a)b)");
-        let overlay = BracketHighlightOverlay::new();
 
         // Without skipping, `(` at 0 matches the `)` at 2.
         assert_eq!(
-            overlay.find_matching_bracket(&buffer, 0, '(', ')', true, &[]),
+            find_matching_bracket(&buffer, 0, '(', ')', true, &[], usize::MAX),
             Some(2)
         );
 
         // Treat byte 2 (the first `)`) as inside a comment: it should be
         // skipped, so the match becomes the `)` at 4.
         assert_eq!(
-            overlay.find_matching_bracket(&buffer, 0, '(', ')', true, &[2..3]),
+            find_matching_bracket(&buffer, 0, '(', ')', true, &[2..3], usize::MAX),
             Some(4)
         );
     }
 
     #[test]
-    fn test_nesting_depth_skips_comment_brackets() {
-        // `((x))` with the inner `(` at byte 1 treated as a comment bracket.
-        let buffer = Buffer::from_str_test("((x))");
-        let overlay = BracketHighlightOverlay::new();
-
-        // Normally the bracket at byte 2 would be depth 2.
-        assert_eq!(overlay.calculate_nesting_depth(&buffer, 2, true, &[]), 2);
-
-        // With byte 1 skipped, only the outer `(` counts -> depth 1.
+    // A slice of byte ranges is the argument, not a range of values.
+    #[allow(clippy::single_range_in_vec_init)]
+    fn test_find_enclosing_bracket() {
+        let pairs = bracket_pairs(false);
+        let buffer = Buffer::from_str_test("f(a, [b], {c}) x");
+        // Inside the parens, past closed `[...]` and `{...}`.
         assert_eq!(
-            overlay.calculate_nesting_depth(&buffer, 2, true, &[1..2]),
-            1
+            find_enclosing_bracket(&buffer, 13, pairs, &[]),
+            Some(('(', ')', 1))
         );
+        // Inside the brackets.
+        assert_eq!(
+            find_enclosing_bracket(&buffer, 6, pairs, &[]),
+            Some(('[', ']', 5))
+        );
+        // Outside everything.
+        assert_eq!(find_enclosing_bracket(&buffer, 15, pairs, &[]), None);
+        assert_eq!(find_enclosing_bracket(&buffer, 0, pairs, &[]), None);
+        // A `(` in a comment encloses nothing.
+        let buffer = Buffer::from_str_test("{ // (\n x");
+        assert_eq!(
+            find_enclosing_bracket(&buffer, 9, pairs, &[2..6]),
+            Some(('{', '}', 0))
+        );
+    }
+
+    /// Across the scan's chunk boundaries, both finders give what a naive
+    /// byte-at-a-time scan gives.
+    #[test]
+    fn test_bracket_finders_across_chunks() {
+        let mut text = "(".to_string();
+        text.push_str(&"[x]".repeat(BRACKET_SCAN_CHUNK));
+        text.push_str(" here ");
+        text.push_str(&"{y}".repeat(BRACKET_SCAN_CHUNK));
+        text.push(')');
+        let buffer = Buffer::from_str_test(&text);
+        let here = text.find("here").unwrap();
+        let pairs = bracket_pairs(false);
+        assert_eq!(
+            find_enclosing_bracket(&buffer, here, pairs, &[]),
+            Some(('(', ')', 0))
+        );
+        let last = text.len() - 1;
+        assert_eq!(
+            find_matching_bracket(&buffer, 0, '(', ')', true, &[], usize::MAX),
+            Some(last)
+        );
+        assert_eq!(
+            find_matching_bracket(&buffer, last, '(', ')', false, &[], 0),
+            Some(0)
+        );
+    }
+
+    fn naive_enclosing(text: &[u8], position: usize) -> Option<(char, char, usize)> {
+        let pairs = bracket_pairs(false);
+        let mut depths = vec![0usize; pairs.len()];
+        for at in (0..position).rev() {
+            for (depth, &(open, close)) in depths.iter_mut().zip(pairs) {
+                if text[at] == close as u8 {
+                    *depth += 1;
+                } else if text[at] == open as u8 {
+                    if *depth == 0 {
+                        return Some((open, close, at));
+                    }
+                    *depth -= 1;
+                }
+            }
+        }
+        None
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn prop_find_enclosing_bracket_is_the_naive_scan(
+            text in "[()\\[\\]{}a]{0,64}",
+            position in 0usize..70,
+        ) {
+            let buffer = Buffer::from_str_test(&text);
+            let position = position.min(text.len());
+            proptest::prop_assert_eq!(
+                find_enclosing_bracket(&buffer, position, bracket_pairs(false), &[]),
+                naive_enclosing(text.as_bytes(), position)
+            );
+        }
     }
 }

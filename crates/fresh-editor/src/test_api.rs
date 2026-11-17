@@ -29,6 +29,15 @@
 // one-directional contract documented in §2.1 of the design doc.
 pub use crate::input::keybindings::Action;
 
+/// The provenance gate's answer for the last frame — see
+/// `Editor::cells_provenance` (design §3.7.9).
+pub use crate::app::CellsProvenance;
+
+// The text pipeline's frame-cost counters (`view::ui::split_rendering::instrument`):
+// how many panes a frame placed, formatted and built rows for. The e2e harness
+// asserts the three agree around every frame.
+pub use crate::view::ui::split_rendering::instrument::{snapshot as frame_counters, FrameCounters};
+
 /// A test-side projection of `crate::model::cursor::Cursor`.
 ///
 /// Carries only the fields that semantic tests typically assert on
@@ -484,20 +493,21 @@ impl EditorTestApi for crate::app::Editor {
     }
 
     fn viewport_top_byte(&self) -> usize {
-        self.active_viewport().top_byte()
+        self.active_window().active_viewport().top_byte()
     }
 
     fn terminal_width(&self) -> u16 {
-        self.active_viewport().width
+        self.active_window().active_viewport().width
     }
 
     fn terminal_height(&self) -> u16 {
-        self.active_viewport().height
+        self.active_window().active_viewport().height
     }
 
     fn gutter_width(&self) -> u16 {
         let buffer = &self.active_state().buffer;
-        u16::try_from(self.active_viewport().gutter_width(buffer)).unwrap_or(u16::MAX)
+        u16::try_from(self.active_window().active_viewport().gutter_width(buffer))
+            .unwrap_or(u16::MAX)
     }
 
     fn hardware_cursor_position(&mut self) -> Option<(u16, u16)> {
@@ -507,7 +517,7 @@ impl EditorTestApi for crate::app::Editor {
         // before taking the mutable buffer borrow on the next
         // accessor call.
         let cursor = *self.active_cursors().primary();
-        let viewport = self.active_viewport().clone();
+        let viewport = self.active_window().active_viewport().clone();
         let viewport_height = viewport.height;
         let viewport_width = viewport.width;
         let buffer = &mut self.active_state_mut().buffer;
@@ -589,7 +599,7 @@ impl EditorTestApi for crate::app::Editor {
             input: p.input_str().to_string(),
             cursor_pos: p.cursor_byte(),
             suggestions: p.suggestions.iter().map(|s| s.text.clone()).collect(),
-            selected_suggestion: p.selected_suggestion,
+            selected_suggestion: p.selected_suggestion(),
         });
 
         ModalSnapshot {
@@ -836,15 +846,9 @@ impl EditorTestApi for crate::app::Editor {
         }
         let ns = VirtualTextNamespace::from_string(namespace.to_string());
         let state = self.active_state_mut();
-        state.virtual_texts.add_line(
-            &mut state.marker_list,
-            byte_offset,
-            text.to_string(),
-            style,
-            pos,
-            ns,
-            priority,
-        );
+        state
+            .virtual_texts
+            .add_line(byte_offset, text.to_string(), style, pos, ns, priority);
     }
 
     fn virtual_text_count(&self) -> usize {
@@ -855,9 +859,7 @@ impl EditorTestApi for crate::app::Editor {
         use crate::view::virtual_text::VirtualTextNamespace;
         let ns = VirtualTextNamespace::from_string(namespace.to_string());
         let state = self.active_state_mut();
-        state
-            .virtual_texts
-            .clear_namespace(&mut state.marker_list, &ns);
+        state.virtual_texts.clear_namespace(&ns);
     }
 
     fn add_margin_annotation(
@@ -899,16 +901,19 @@ impl EditorTestApi for crate::app::Editor {
     }
 
     fn top_line_number(&mut self) -> usize {
-        let top_byte = self.active_viewport().top_byte();
+        let top_byte = self.active_window().active_viewport().top_byte();
         self.active_state_mut().buffer.get_line_number(top_byte)
     }
 
     fn primary_scrollbar_geometry(&self) -> Option<(usize, usize, u16, u16)> {
-        let areas = self.get_split_areas();
-        let (_split, _buf, _content, scrollbar_rect, thumb_start, thumb_end) = areas.first()?;
+        let (split, _buf) = self.get_split_areas().into_iter().next()?;
+        // The bar is the tree's, and so is the thumb: the bar's own facts,
+        // on the track the tree gave it.
+        let scrollbar_rect = self.pane_vscroll_rect(split)?;
+        let (thumb_start, thumb_end, _) = self.bar_thumb(split, fresh_ui::Axis::Vertical)?;
         Some((
-            *thumb_start,
-            *thumb_end,
+            thumb_start,
+            thumb_end,
             scrollbar_rect.height,
             scrollbar_rect.y,
         ))

@@ -26,12 +26,14 @@ fn test_lsp_completion_popup_text_not_mangled() -> anyhow::Result<()> {
             content: PopupContentData::List {
                 items: vec![
                     PopupListItemData {
+                        id: "t28_21".into(),
                         text: "test_function".to_string(),
                         detail: Some("fn test_function() -> i32".to_string()),
                         icon: Some("λ".to_string()),
                         data: Some("test_function".to_string()),
                     },
                     PopupListItemData {
+                        id: "t34_21".into(),
                         text: "test_variable".to_string(),
                         detail: Some("let test_variable: String".to_string()),
                         icon: Some("v".to_string()),
@@ -110,6 +112,7 @@ fn test_lsp_completion_replaces_word() -> anyhow::Result<()> {
             transient: false,
             content: PopupContentData::List {
                 items: vec![PopupListItemData {
+                    id: "t112_29".into(),
                     text: "test_function".to_string(),
                     detail: Some("fn test_function()".to_string()),
                     icon: Some("λ".to_string()),
@@ -201,12 +204,14 @@ fn test_lsp_completion_popup() -> anyhow::Result<()> {
             content: PopupContentData::List {
                 items: vec![
                     PopupListItemData {
+                        id: "t203_21".into(),
                         text: "test_function".to_string(),
                         detail: Some("fn test_function()".to_string()),
                         icon: Some("λ".to_string()),
                         data: Some("test_function".to_string()),
                     },
                     PopupListItemData {
+                        id: "t209_21".into(),
                         text: "test_variable".to_string(),
                         detail: Some("let test_variable".to_string()),
                         icon: Some("v".to_string()),
@@ -372,18 +377,21 @@ fn test_lsp_completion_navigation() -> anyhow::Result<()> {
             content: PopupContentData::List {
                 items: vec![
                     PopupListItemData {
+                        id: "t374_21".into(),
                         text: "item1".to_string(),
                         detail: None,
                         icon: None,
                         data: Some("item1".to_string()),
                     },
                     PopupListItemData {
+                        id: "t380_21".into(),
                         text: "item2".to_string(),
                         detail: None,
                         icon: None,
                         data: Some("item2".to_string()),
                     },
                     PopupListItemData {
+                        id: "t386_21".into(),
                         text: "item3".to_string(),
                         detail: None,
                         icon: None,
@@ -442,6 +450,7 @@ fn test_lsp_completion_cancel() -> anyhow::Result<()> {
             transient: false,
             content: PopupContentData::List {
                 items: vec![PopupListItemData {
+                    id: "t444_29".into(),
                     text: "completion_item".to_string(),
                     detail: None,
                     icon: None,
@@ -499,12 +508,14 @@ fn test_lsp_completion_after_dot() -> anyhow::Result<()> {
             content: PopupContentData::List {
                 items: vec![
                     PopupListItemData {
+                        id: "t501_21".into(),
                         text: "len".to_string(),
                         detail: Some("fn len(&self) -> usize".to_string()),
                         icon: Some("λ".to_string()),
                         data: Some("len".to_string()),
                     },
                     PopupListItemData {
+                        id: "t507_21".into(),
                         text: "is_empty".to_string(),
                         detail: Some("fn is_empty(&self) -> bool".to_string()),
                         icon: Some("λ".to_string()),
@@ -562,6 +573,7 @@ fn test_lsp_completion_after_dot_with_partial() -> anyhow::Result<()> {
             transient: false,
             content: PopupContentData::List {
                 items: vec![PopupListItemData {
+                    id: "t564_29".into(),
                     text: "length".to_string(),
                     detail: Some("fn length(&self) -> usize".to_string()),
                     icon: Some("λ".to_string()),
@@ -618,12 +630,14 @@ fn test_lsp_completion_filtering() -> anyhow::Result<()> {
                 items: vec![
                     // Only items matching "test_" prefix should appear
                     PopupListItemData {
+                        id: "t620_21".into(),
                         text: "test_function".to_string(),
                         detail: Some("fn test_function()".to_string()),
                         icon: Some("λ".to_string()),
                         data: Some("test_function".to_string()),
                     },
                     PopupListItemData {
+                        id: "t626_21".into(),
                         text: "test_variable".to_string(),
                         detail: Some("let test_variable".to_string()),
                         icon: Some("v".to_string()),
@@ -710,12 +724,14 @@ fn test_lsp_completion_popup_size() -> anyhow::Result<()> {
             content: PopupContentData::List {
                 items: vec![
                     PopupListItemData {
+                        id: "t712_21".into(),
                         text: "test_function".to_string(),
                         detail: Some("fn test_function()".to_string()),
                         icon: Some("λ".to_string()),
                         data: Some("test_function".to_string()),
                     },
                     PopupListItemData {
+                        id: "t718_21".into(),
                         text: "test_variable".to_string(),
                         detail: Some("let test_variable".to_string()),
                         icon: Some("v".to_string()),
@@ -1354,12 +1370,14 @@ fn test_lsp_completion_popup_hides_background() -> anyhow::Result<()> {
             content: PopupContentData::List {
                 items: vec![
                     PopupListItemData {
+                        id: "t1356_21".into(),
                         text: "args".to_string(),
                         detail: Some("Args".to_string()),
                         icon: Some("v".to_string()),
                         data: Some("args".to_string()),
                     },
                     PopupListItemData {
+                        id: "t1362_21".into(),
                         text: "Args".to_string(),
                         detail: Some("Args".to_string()),
                         icon: Some("S".to_string()),
@@ -3753,7 +3771,6 @@ fn test_inlay_hints_render_on_screen() -> anyhow::Result<()> {
 
     // Add type hint after 'x' at position 5
     state.virtual_texts.add(
-        &mut state.marker_list,
         5,
         ": i32".to_string(),
         hint_style,
@@ -3763,7 +3780,6 @@ fn test_inlay_hints_render_on_screen() -> anyhow::Result<()> {
 
     // Add parameter hint before '10' at position 15 (after "let x = 5;\nfoo(")
     state.virtual_texts.add(
-        &mut state.marker_list,
         15,
         "count:".to_string(),
         hint_style,
@@ -3826,7 +3842,6 @@ fn test_inlay_hints_position_tracking() -> anyhow::Result<()> {
 
     let hint_style = Style::default().fg(Color::Rgb(128, 128, 128));
     state.virtual_texts.add(
-        &mut state.marker_list,
         5,
         ": i32".to_string(),
         hint_style,
@@ -3894,7 +3909,6 @@ fn test_inlay_hint_cleared_when_range_deleted() -> anyhow::Result<()> {
     }
     let hint_style = Style::default().fg(Color::Rgb(128, 128, 128));
     state.virtual_texts.add(
-        &mut state.marker_list,
         5,
         ": i32".to_string(),
         hint_style,
@@ -3922,6 +3936,90 @@ fn test_inlay_hint_cleared_when_range_deleted() -> anyhow::Result<()> {
         !screen_after.contains(": i32"),
         "inlay hint should vanish once its anchor range is deleted, screen:\n{}",
         screen_after
+    );
+
+    Ok(())
+}
+
+/// An inlay hint keeps its own colour beside a cell an overlay paints.
+///
+/// Injected hint cells borrow the overlays standing at the byte before them
+/// so a band's background continues behind them (see
+/// `overlay_extend_to_line_end_covers_inlay_hints`). The `(` in `package(...)`
+/// carries a bracket-colourisation overlay. That colour belongs to the
+/// bracket glyph, while both parameter hints keep their own colour.
+#[test]
+fn test_inlay_hint_keeps_its_colour_next_to_a_colourised_bracket() -> anyhow::Result<()> {
+    use crate::common::harness::HarnessOptions;
+    use fresh::app::Editor;
+    use lsp_types::{InlayHint, InlayHintLabel, Position};
+    use std::path::Path;
+
+    let mut harness = EditorTestHarness::create(
+        80,
+        20,
+        HarnessOptions::new()
+            .with_project_root()
+            .with_full_grammar_registry(),
+    )?;
+    let path = harness.project_dir().unwrap().join("sample.rs");
+    std::fs::write(
+        &path,
+        "fn main() { let wm = package(\"wm\", \"~0.4.2\"); }\n",
+    )?;
+    harness.open_file(Path::new(&path))?;
+    harness.render()?;
+
+    let hint = |character: u32, label: &str| InlayHint {
+        position: Position { line: 0, character },
+        label: InlayHintLabel::String(label.to_string()),
+        kind: None,
+        text_edits: None,
+        tooltip: None,
+        padding_left: None,
+        padding_right: None,
+        data: None,
+    };
+    // Parameter-name hints in front of each string argument. The first sits
+    // right after `(`, the second after a space.
+    Editor::apply_inlay_hints_to_state(
+        harness.editor_mut().active_state_mut(),
+        &[hint(29, "name:"), hint(35, "version:")],
+    );
+    harness.render()?;
+
+    let name_fg = {
+        let (x, y) = harness
+            .find_text_on_screen("name:")
+            .expect("name hint is not on screen");
+        harness.get_cell_style(x, y).and_then(|s| s.fg)
+    };
+    let version_fg = {
+        let (x, y) = harness
+            .find_text_on_screen("version:")
+            .expect("version hint is not on screen");
+        harness.get_cell_style(x, y).and_then(|s| s.fg)
+    };
+    let bracket_fg = {
+        let (x, y) = harness
+            .find_text_on_screen("package(")
+            .expect("the call is not on screen");
+        harness
+            .get_cell_style(x + "package".len() as u16, y)
+            .and_then(|s| s.fg)
+    };
+
+    assert_eq!(
+        name_fg,
+        version_fg,
+        "both parameter hints must use the hint colour.\nScreen:\n{}",
+        harness.screen_to_string(),
+    );
+    assert_ne!(
+        name_fg,
+        bracket_fg,
+        "a hint must not take the bracket colourisation of its neighbour.\nScreen:\n{}",
+        harness.screen_to_string(),
     );
 
     Ok(())
@@ -4829,6 +4927,7 @@ fn test_popup_home_key_selects_first_item() -> anyhow::Result<()> {
     // Show completion popup with many items
     let items: Vec<PopupListItemData> = (0..20)
         .map(|i| PopupListItemData {
+            id: format!("item{i}"),
             text: format!("item_{}", i),
             detail: None,
             icon: None,
@@ -4888,6 +4987,7 @@ fn test_popup_end_key_selects_last_item() -> anyhow::Result<()> {
     // Show completion popup with many items
     let items: Vec<PopupListItemData> = (0..20)
         .map(|i| PopupListItemData {
+            id: format!("item{i}"),
             text: format!("item_{}", i),
             detail: None,
             icon: None,
@@ -4942,6 +5042,7 @@ fn test_popup_mouse_wheel_scrolls() -> anyhow::Result<()> {
     // Show completion popup with many items (more than visible)
     let items: Vec<PopupListItemData> = (0..30)
         .map(|i| PopupListItemData {
+            id: format!("item{i}"),
             text: format!("completion_item_{}", i),
             detail: None,
             icon: None,
@@ -4971,14 +5072,14 @@ fn test_popup_mouse_wheel_scrolls() -> anyhow::Result<()> {
         "Popup should be visible before scroll"
     );
 
-    // Get initial scroll offset
-    let initial_offset = harness
-        .editor()
-        .active_state()
-        .popups
-        .top()
-        .map(|p| p.scroll_state().2)
-        .unwrap_or(0);
+    // What the user can see, not what the popup stores: the window belongs to
+    // the viewport in the shell's tree now, so `scroll_offset` is no longer
+    // where the answer lives — the top visible row is.
+    let before = harness.screen_to_string();
+    assert!(
+        before.contains("completion_item_0"),
+        "the list starts at the top. Screen:\n{before}"
+    );
 
     // Send scroll down event at a position over the popup (center of screen)
     let scroll_event = MouseEvent {
@@ -4996,20 +5097,10 @@ fn test_popup_mouse_wheel_scrolls() -> anyhow::Result<()> {
         "Popup should still be visible after scroll"
     );
 
-    // Verify scroll offset changed
-    let new_offset = harness
-        .editor()
-        .active_state()
-        .popups
-        .top()
-        .map(|p| p.scroll_state().2)
-        .unwrap_or(0);
-
+    let after = harness.screen_to_string();
     assert!(
-        new_offset > initial_offset,
-        "Scroll offset should increase after scroll down: {} -> {}",
-        initial_offset,
-        new_offset
+        !after.contains("completion_item_0"),
+        "the wheel scrolled the list past its first row. Screen:\n{after}"
     );
 
     Ok(())
@@ -5027,6 +5118,7 @@ fn test_popup_scrollbar_visible_for_long_list() -> anyhow::Result<()> {
     // Show completion popup with many items (more than max_height)
     let items: Vec<PopupListItemData> = (0..50)
         .map(|i| PopupListItemData {
+            id: format!("item{i}"),
             text: format!("item_{}", i),
             detail: None,
             icon: None,
@@ -5092,6 +5184,7 @@ fn test_popup_no_scrollbar_for_short_list() -> anyhow::Result<()> {
     // Show completion popup with few items (less than max_height)
     let items: Vec<PopupListItemData> = (0..3)
         .map(|i| PopupListItemData {
+            id: format!("item{i}"),
             text: format!("item_{}", i),
             detail: None,
             icon: None,
@@ -5145,6 +5238,7 @@ fn test_popup_mouse_wheel_scroll_up() -> anyhow::Result<()> {
     // Show completion popup with many items
     let items: Vec<PopupListItemData> = (0..30)
         .map(|i| PopupListItemData {
+            id: format!("item{i}"),
             text: format!("item_{}", i),
             detail: None,
             icon: None,
@@ -5180,13 +5274,25 @@ fn test_popup_mouse_wheel_scroll_up() -> anyhow::Result<()> {
     }
     harness.render()?;
 
-    let offset_after_down = harness
-        .editor()
-        .active_state()
-        .popups
-        .top()
-        .map(|p| p.scroll_state().2)
-        .unwrap_or(0);
+    // Read the window off the screen: the viewport in the shell's tree owns it
+    // now, so the top visible row is where the answer is.
+    let top_row = |h: &EditorTestHarness| -> String {
+        let screen = h.screen_to_string();
+        // The row's border hugs its text (`│item_15`), so this reads from the
+        // marker to the next space rather than splitting on whitespace.
+        screen
+            .lines()
+            .find_map(|l| {
+                let at = l.find("item_")?;
+                Some(l[at..].split(' ').next().unwrap_or("").to_string())
+            })
+            .unwrap_or_else(|| panic!("no row. Screen:\n{screen}"))
+    };
+    let after_down = top_row(&harness);
+    assert_ne!(
+        after_down, "item_0",
+        "five notches moved the window off the first row"
+    );
 
     // Now scroll up
     let scroll_up = MouseEvent {
@@ -5198,26 +5304,16 @@ fn test_popup_mouse_wheel_scroll_up() -> anyhow::Result<()> {
     harness.send_mouse(scroll_up)?;
     harness.render()?;
 
-    let offset_after_up = harness
-        .editor()
-        .active_state()
-        .popups
-        .top()
-        .map(|p| p.scroll_state().2)
-        .unwrap_or(0);
-
     // Verify popup is still visible
     assert!(
         harness.editor().active_state().popups.is_visible(),
         "Popup should still be visible after scroll up"
     );
 
-    // Verify scroll offset decreased
-    assert!(
-        offset_after_up < offset_after_down,
-        "Scroll offset should decrease after scroll up: {} -> {}",
-        offset_after_down,
-        offset_after_up
+    assert_ne!(
+        top_row(&harness),
+        after_down,
+        "scrolling up moved the window back toward the first row"
     );
 
     Ok(())
@@ -5274,18 +5370,21 @@ fn test_completion_type_to_filter_basic() -> anyhow::Result<()> {
             content: PopupContentData::List {
                 items: vec![
                     PopupListItemData {
+                        id: "t5268_21".into(),
                         text: "test_function".to_string(),
                         detail: Some("fn test_function()".to_string()),
                         icon: Some("λ".to_string()),
                         data: Some("test_function".to_string()),
                     },
                     PopupListItemData {
+                        id: "t5274_21".into(),
                         text: "test_variable".to_string(),
                         detail: Some("let test_variable".to_string()),
                         icon: Some("v".to_string()),
                         data: Some("test_variable".to_string()),
                     },
                     PopupListItemData {
+                        id: "t5280_21".into(),
                         text: "temp_file".to_string(),
                         detail: Some("let temp_file".to_string()),
                         icon: Some("v".to_string()),
@@ -5402,18 +5501,21 @@ fn test_completion_type_to_filter_uppercase() -> anyhow::Result<()> {
             content: PopupContentData::List {
                 items: vec![
                     PopupListItemData {
+                        id: "t5396_21".into(),
                         text: "WriteLine".to_string(),
                         detail: Some("void Console.WriteLine()".to_string()),
                         icon: Some("λ".to_string()),
                         data: Some("WriteLine".to_string()),
                     },
                     PopupListItemData {
+                        id: "t5402_21".into(),
                         text: "Write".to_string(),
                         detail: Some("void Console.Write()".to_string()),
                         icon: Some("λ".to_string()),
                         data: Some("Write".to_string()),
                     },
                     PopupListItemData {
+                        id: "t5408_21".into(),
                         text: "ReadLine".to_string(),
                         detail: Some("string Console.ReadLine()".to_string()),
                         icon: Some("λ".to_string()),
@@ -5524,6 +5626,7 @@ fn test_completion_type_to_filter_closes_on_no_match() -> anyhow::Result<()> {
             transient: false,
             content: PopupContentData::List {
                 items: vec![PopupListItemData {
+                    id: "t5518_29".into(),
                     text: "test_function".to_string(),
                     detail: None,
                     icon: None,
@@ -5603,6 +5706,7 @@ fn test_completion_backspace_refilters() -> anyhow::Result<()> {
             transient: false,
             content: PopupContentData::List {
                 items: vec![PopupListItemData {
+                    id: "t5597_29".into(),
                     text: "test_function".to_string(),
                     detail: None,
                     icon: None,
@@ -5726,18 +5830,21 @@ fn test_completion_type_to_filter_preserves_selection() -> anyhow::Result<()> {
             content: PopupContentData::List {
                 items: vec![
                     PopupListItemData {
+                        id: "lsp:0:0".into(),
                         text: "test_alpha".to_string(),
                         detail: None,
                         icon: None,
                         data: Some("test_alpha".to_string()),
                     },
                     PopupListItemData {
+                        id: "lsp:0:1".into(),
                         text: "test_beta".to_string(),
                         detail: None,
                         icon: None,
                         data: Some("test_beta".to_string()),
                     },
                     PopupListItemData {
+                        id: "lsp:0:2".into(),
                         text: "test_gamma".to_string(),
                         detail: None,
                         icon: None,
@@ -5754,6 +5861,9 @@ fn test_completion_type_to_filter_preserves_selection() -> anyhow::Result<()> {
     })?;
 
     harness.render()?;
+
+    // The rows carry the ids the editor gave the candidates above (the
+    // first response, in order), which is what a refilter finds them by.
 
     // Navigate to test_beta (second item)
     harness.send_key(KeyCode::Down, KeyModifiers::NONE)?;
@@ -5820,6 +5930,7 @@ fn test_completion_enter_dismisses_and_inserts_newline() -> anyhow::Result<()> {
             transient: false,
             content: PopupContentData::List {
                 items: vec![PopupListItemData {
+                    id: "t5814_29".into(),
                     text: "test_function".to_string(),
                     detail: None,
                     icon: Some("λ".to_string()),
@@ -5900,6 +6011,7 @@ fn test_completion_tab_accepts() -> anyhow::Result<()> {
             transient: false,
             content: PopupContentData::List {
                 items: vec![PopupListItemData {
+                    id: "t5894_29".into(),
                     text: "test_function".to_string(),
                     detail: None,
                     icon: Some("λ".to_string()),
@@ -5965,6 +6077,7 @@ fn test_completion_snippet_cursor_position() -> anyhow::Result<()> {
             transient: false,
             content: PopupContentData::List {
                 items: vec![PopupListItemData {
+                    id: "t5959_29".into(),
                     text: "println!".to_string(),
                     detail: Some("macro".to_string()),
                     icon: Some("m".to_string()),
@@ -6019,6 +6132,7 @@ fn test_completion_snippet_with_default() -> anyhow::Result<()> {
             transient: false,
             content: PopupContentData::List {
                 items: vec![PopupListItemData {
+                    id: "t6013_29".into(),
                     text: "fn".to_string(),
                     detail: Some("keyword".to_string()),
                     icon: Some("k".to_string()),
@@ -6076,6 +6190,7 @@ fn test_completion_plain_text_no_snippet() -> anyhow::Result<()> {
             transient: false,
             content: PopupContentData::List {
                 items: vec![PopupListItemData {
+                    id: "t6070_29".into(),
                     text: "my_variable".to_string(),
                     detail: Some("let my_variable".to_string()),
                     icon: Some("v".to_string()),
@@ -6652,6 +6767,7 @@ fn test_completion_ctrl_space_toggles_popup_off() -> anyhow::Result<()> {
             transient: false,
             content: PopupContentData::List {
                 items: vec![PopupListItemData {
+                    id: "t6646_29".into(),
                     text: "test_function".to_string(),
                     detail: None,
                     icon: Some("λ".to_string()),
@@ -8362,8 +8478,7 @@ log("STOPPED")
     // Also check the log for the final document content
     let final_content_line = log_content
         .lines()
-        .filter(|l| l.starts_with("DID_CHANGE_CONTENT:") || l.starts_with("DID_OPEN_CONTENT:"))
-        .last()
+        .rfind(|l| l.starts_with("DID_CHANGE_CONTENT:") || l.starts_with("DID_OPEN_CONTENT:"))
         .unwrap_or("");
     println!("Final server document: {}", final_content_line);
 
@@ -10117,16 +10232,27 @@ fn lsp_spawn_failure_writes_stub_log_for_view_log_popup() -> anyhow::Result<()> 
         }]),
     );
 
+    // Clear any pre-existing log *before* the editor exists, so the wait
+    // below can only be satisfied by a stub this test provoked.
+    //
+    // Ordering is load-bearing, not tidiness: the LSP config is already in
+    // the `Config` the harness is built from, so construction is a point at
+    // which the editor can reach `force_spawn` and write the stub. Deleting
+    // the file after construction races that write — and losing the race
+    // deletes the very stub the wait below is waiting for, which is not a
+    // failed assertion but a wait that can no longer resolve (a 180 s
+    // nextest kill) unless a later spawn attempt happens to rewrite it.
+    // Deleting first cannot lose: the only writer afterwards is this test's
+    // own failed spawn.
+    let log_path = fresh::services::log_dirs::lsp_log_path("pascal");
+    let _ = std::fs::remove_file(&log_path);
+
     let mut harness = EditorTestHarness::with_config_and_working_dir(
         100,
         30,
         config,
         temp_dir.path().to_path_buf(),
     )?;
-
-    // Snapshot any pre-existing log to detect the stub overwrite.
-    let log_path = fresh::services::log_dirs::lsp_log_path("pascal");
-    let _ = std::fs::remove_file(&log_path);
 
     // Open the file: triggers auto-spawn → spawn fails →
     // stub log is written.
@@ -10380,6 +10506,144 @@ fn test_no_hover_requests_while_modal_dialog_open() -> anyhow::Result<()> {
     assert!(
         !harness.screen_to_string().contains("Test hover content"),
         "no hover popup may render on top of the dialog"
+    );
+
+    Ok(())
+}
+
+/// A language server asking Fresh to delete a file must not get its way.
+///
+/// `workspace/applyEdit` is server-initiated: it arrives with no user
+/// confirmation and names any URI the server likes. Fresh used to honour the
+/// `Delete` resource operation with `std::fs::remove_dir_all` /
+/// `remove_file` — permanently, bypassing the system trash the file explorer
+/// deletes through — so a buggy server could take a directory with it. The
+/// operation is now reported and ignored.
+#[test]
+fn test_lsp_delete_resource_op_is_refused() -> anyhow::Result<()> {
+    use lsp_types::{
+        DeleteFile, DeleteFileOptions, DocumentChangeOperation, DocumentChanges, ResourceOp,
+        WorkspaceEdit,
+    };
+
+    let mut harness = EditorTestHarness::new(80, 30)?;
+
+    let temp_dir = tempfile::tempdir()?;
+
+    // A file the server asks to unlink, and a directory it asks to remove
+    // recursively — the two shapes the old code handled.
+    let doomed_file = temp_dir.path().join("keep-me.rs");
+    std::fs::write(&doomed_file, "fn main() {}\n")?;
+
+    let doomed_dir = temp_dir.path().join("keep-me-too");
+    std::fs::create_dir(&doomed_dir)?;
+    std::fs::write(doomed_dir.join("nested.rs"), "fn nested() {}\n")?;
+
+    let file_uri = fresh_core::file_uri::path_to_lsp_uri(&doomed_file).unwrap();
+    let dir_uri = fresh_core::file_uri::path_to_lsp_uri(&doomed_dir).unwrap();
+
+    let workspace_edit = WorkspaceEdit {
+        changes: None,
+        document_changes: Some(DocumentChanges::Operations(vec![
+            DocumentChangeOperation::Op(ResourceOp::Delete(DeleteFile {
+                uri: file_uri,
+                options: None,
+            })),
+            DocumentChangeOperation::Op(ResourceOp::Delete(DeleteFile {
+                uri: dir_uri,
+                options: Some(DeleteFileOptions {
+                    recursive: Some(true),
+                    ignore_if_not_exists: Some(true),
+                    annotation_id: None,
+                }),
+            })),
+        ])),
+        change_annotations: None,
+    };
+
+    harness
+        .editor_mut()
+        .handle_rename_response(0, Ok(workspace_edit))?;
+    harness.render()?;
+
+    assert!(
+        doomed_file.exists(),
+        "a server-requested delete must leave the file on disk"
+    );
+    assert!(
+        doomed_dir.join("nested.rs").exists(),
+        "a server-requested recursive delete must leave the directory on disk"
+    );
+
+    Ok(())
+}
+
+/// A language server asking Fresh to overwrite a file must not get its way.
+///
+/// `Create` with `overwrite` truncates the existing file to empty, and
+/// `Rename` with `overwrite` clobbers the destination. Both arrive through a
+/// server-initiated `workspace/applyEdit` — no confirmation, no trash — so
+/// both are reported and ignored, like the `Delete` operation beside them.
+#[test]
+fn test_lsp_resource_ops_refuse_to_overwrite() -> anyhow::Result<()> {
+    use lsp_types::{
+        CreateFile, CreateFileOptions, DocumentChangeOperation, DocumentChanges, RenameFile,
+        RenameFileOptions, ResourceOp, WorkspaceEdit,
+    };
+
+    let mut harness = EditorTestHarness::new(80, 30)?;
+    let temp_dir = tempfile::tempdir()?;
+
+    let created_over = temp_dir.path().join("created-over.rs");
+    std::fs::write(&created_over, "fn keep_me() {}\n")?;
+
+    let rename_src = temp_dir.path().join("src.rs");
+    std::fs::write(&rename_src, "fn moved() {}\n")?;
+    let rename_dst = temp_dir.path().join("dst.rs");
+    std::fs::write(&rename_dst, "fn also_keep_me() {}\n")?;
+
+    let workspace_edit = WorkspaceEdit {
+        changes: None,
+        document_changes: Some(DocumentChanges::Operations(vec![
+            DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                uri: fresh_core::file_uri::path_to_lsp_uri(&created_over).unwrap(),
+                options: Some(CreateFileOptions {
+                    overwrite: Some(true),
+                    ignore_if_exists: None,
+                }),
+                annotation_id: None,
+            })),
+            DocumentChangeOperation::Op(ResourceOp::Rename(RenameFile {
+                old_uri: fresh_core::file_uri::path_to_lsp_uri(&rename_src).unwrap(),
+                new_uri: fresh_core::file_uri::path_to_lsp_uri(&rename_dst).unwrap(),
+                options: Some(RenameFileOptions {
+                    overwrite: Some(true),
+                    ignore_if_exists: None,
+                }),
+                annotation_id: None,
+            })),
+        ])),
+        change_annotations: None,
+    };
+
+    harness
+        .editor_mut()
+        .handle_rename_response(0, Ok(workspace_edit))?;
+    harness.render()?;
+
+    assert_eq!(
+        std::fs::read_to_string(&created_over)?,
+        "fn keep_me() {}\n",
+        "a server-requested create must not truncate an existing file"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&rename_dst)?,
+        "fn also_keep_me() {}\n",
+        "a server-requested rename must not clobber the destination"
+    );
+    assert!(
+        rename_src.exists(),
+        "the refused rename leaves the source where it was"
     );
 
     Ok(())

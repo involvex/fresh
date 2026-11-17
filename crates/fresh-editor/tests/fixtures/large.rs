@@ -43,7 +43,7 @@ pub mod warning_domains;
 pub mod workspace;
 
 use anyhow::Result as AnyhowResult;
-use rust_i18n::t;
+use fresh_i18n::t;
 use std::path::Component;
 
 /// Shared per-tick housekeeping: process async messages, check timers, auto-save, etc.
@@ -1127,9 +1127,6 @@ impl Editor {
                 .expect("Default theme must exist")
         });
 
-        // Set terminal cursor color to match theme
-        theme.set_terminal_cursor_color();
-
         let keybindings = KeybindingResolver::new(&config);
 
         // Create an empty initial buffer
@@ -1166,12 +1163,8 @@ impl Editor {
         let root_uri = types::file_path_to_lsp_uri(&working_dir);
 
         // Create Tokio runtime for async I/O (LSP, file watching, git, etc.)
-        let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2) // Small pool for I/O tasks
-            .thread_name("editor-async")
-            .enable_all()
-            .build()
-            .ok();
+        let tokio_runtime =
+            fresh::services::runtime::LiveRuntime::multi_thread("editor-async", 2).ok();
 
         // Create async bridge for communication
         let async_bridge = AsyncBridge::new();
@@ -1185,7 +1178,7 @@ impl Editor {
 
         // Configure runtime and bridge if available
         if let Some(ref runtime) = tokio_runtime {
-            lsp.set_runtime(runtime.handle().clone(), async_bridge.clone());
+            lsp.set_runtime(runtime.clone(), async_bridge.clone());
         }
 
         // Configure LSP servers from config

@@ -23,9 +23,8 @@ pub use context_menu::FILE_EXPLORER_CONTEXT_MENU_WIDTH;
 pub use context_menu::NEW_TAB_MENU_WIDTH;
 pub use context_menu::TAB_CONTEXT_MENU_WIDTH;
 pub use context_menu::{
-    CloseSplitMenu, CloseSplitMenuItem, ContextMenu, ContextMenuHit, ContextMenuKind,
-    FileExplorerContextMenu, FileExplorerContextMenuItem, NewTabMenu, NewTabMenuItem,
-    TabContextMenu, TabContextMenuItem,
+    CloseSplitMenu, CloseSplitMenuItem, ContextMenu, ContextMenuKind, FileExplorerContextMenu,
+    FileExplorerContextMenuItem, NewTabMenu, NewTabMenuItem, TabContextMenu, TabContextMenuItem,
 };
 
 // drag re-exports
@@ -35,7 +34,7 @@ pub use drag::{TabDragState, TabDropZone};
 pub use hover::HoverTarget;
 
 // layout re-exports
-pub(crate) use layout::{ChromeLayout, WindowLayoutCache};
+pub(crate) use layout::ChromeLayout;
 pub use layout::{OverlayPreviewState, ViewLineMapping};
 
 // lsp_state re-exports
@@ -46,7 +45,10 @@ pub(crate) use lsp_state::{LspMessageEntry, LspProgressInfo};
 pub use lsp_uri::{file_path_to_lsp_uri, file_path_to_lsp_uri_with_translation, LspUri};
 
 // mouse re-exports
-pub(crate) use mouse::MouseState;
+pub(crate) use mouse::{
+    HorizontalGrab, MouseState, PointerDrag, SelectionDrag, SeparatorDrag, VerticalGrab,
+    VerticalScroll,
+};
 
 // search_state re-exports
 pub(super) use search_state::EventLineInfo;

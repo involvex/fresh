@@ -7,27 +7,36 @@ pub mod async_bridge;
 pub mod authority;
 pub mod clipboard;
 pub mod completion;
-pub mod counters;
+pub use fresh_editor_core::counters;
 pub mod editorconfig;
 pub mod env_provider;
+#[cfg(unix)]
+pub mod fd_wait;
 pub mod file_watcher;
 pub mod fs;
 #[cfg(target_os = "linux")]
-pub mod gpm;
+pub use fresh_input_parser::gpm;
 /// Outbound HTTP(S); the only place `ureq`/TLS is used (gated by `http`).
 pub mod http;
-pub mod live_grep_state;
-pub mod log_dirs;
+pub use fresh_editor_core::log_dirs;
 pub mod lsp;
-pub mod packages;
+pub use fresh_editor_core::packages;
 pub mod plugins;
-pub mod process_hidden;
-pub mod process_limits;
+/// The project's file list, shared by Quick Open and project search.
+pub mod project_files;
+pub use fresh_editor_core::process_hidden;
+// Lives in `fresh-editor-core`: the impl blocks hang off `types::ProcessLimits`,
+// which is defined down there.
+pub use fresh_editor_core::process_limits;
 pub mod recovery;
 pub mod release_checker;
 pub mod remote;
+/// Owning handles to a Tokio runtime (see [`runtime::LiveRuntime`]).
+pub mod runtime;
 pub mod signal_handler;
 pub mod status_log;
+pub mod stderr_redirect;
+pub mod stdin_spool;
 pub mod styled_html;
 pub mod telemetry;
 pub mod terminal;

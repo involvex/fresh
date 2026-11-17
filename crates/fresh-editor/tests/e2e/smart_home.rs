@@ -137,3 +137,58 @@ fn test_smart_home_runs_on_all_cursors() {
     harness.render().unwrap();
     harness.assert_buffer_content("Z    Xaaaaaa\nZ    Xbbbbbb");
 }
+
+/// Shift+Home is the selecting twin of Home (#3585): the first press selects
+/// back to the first non-whitespace character, the second extends the same
+/// selection to column 0. Typing over the selection shows which it covered.
+#[test]
+fn test_shift_home_selects_smartly() {
+    let mut harness = EditorTestHarness::new(80, 24).unwrap();
+    harness.type_text("    indented text").unwrap();
+
+    // Cursor at end of line. One Shift+Home: the text, not the indentation.
+    harness
+        .send_key(KeyCode::Home, KeyModifiers::SHIFT)
+        .unwrap();
+    harness.type_text("Z").unwrap();
+    harness.render().unwrap();
+    harness.assert_buffer_content("    Z");
+
+    harness.type_text(" more").unwrap();
+    // Two Shift+Home presses: the first stops at the first non-whitespace
+    // character, the second extends the same selection to column 0.
+    harness
+        .send_key(KeyCode::Home, KeyModifiers::SHIFT)
+        .unwrap();
+    harness
+        .send_key(KeyCode::Home, KeyModifiers::SHIFT)
+        .unwrap();
+    harness.type_text("Y").unwrap();
+    harness.render().unwrap();
+    harness.assert_buffer_content("Y");
+    harness.assert_screen_contains("Y");
+}
+
+/// With line wrapping on, an indent of multi-byte whitespace (here an
+/// ideographic space, U+3000, three bytes in UTF-8) must put the cursor on
+/// the character after it. Counting the indent in characters and adding the
+/// count to a byte position put the cursor inside the space instead, and
+/// the next edit there split the character.
+#[test]
+fn test_smart_home_multibyte_indent_with_line_wrap() {
+    let mut harness = EditorTestHarness::with_config(80, 24, config_with_line_wrap()).unwrap();
+    let _fixture = harness.load_buffer_from_text("\u{3000}abc").unwrap();
+    harness.render().unwrap();
+
+    harness.send_key(KeyCode::End, KeyModifiers::NONE).unwrap();
+    harness.send_key(KeyCode::Home, KeyModifiers::NONE).unwrap();
+    harness.type_text("X").unwrap();
+    harness.assert_buffer_content("\u{3000}Xabc");
+
+    // From just after X, Home goes back to the first non-whitespace
+    // character, and again to the line start.
+    harness.send_key(KeyCode::Home, KeyModifiers::NONE).unwrap();
+    harness.send_key(KeyCode::Home, KeyModifiers::NONE).unwrap();
+    harness.type_text("Z").unwrap();
+    harness.assert_buffer_content("Z\u{3000}Xabc");
+}

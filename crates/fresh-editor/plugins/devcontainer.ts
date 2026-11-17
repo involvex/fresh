@@ -1,4 +1,5 @@
 /// <reference path="./lib/fresh.d.ts" />
+import { ENV_DUMP, parseEnvDump } from "./lib/env_dump.ts";
 const editor = getEditor();
 
 /**
@@ -708,6 +709,7 @@ function devcontainer_run_lifecycle(): void {
   }
 
   const suggestions: PromptSuggestion[] = defined.map(([name, cmd]) => ({
+    id: name,
     text: name,
     description: formatLifecycleCommand(cmd!),
     value: name,
@@ -734,32 +736,32 @@ async function surfaceLifecycleResult(
   cmdName: string,
   label: string | null,
   cmdline: string,
-  result: { stdout: string; stderr: string; exit_code: number },
+  result: CommandResult,
 ): Promise<void> {
   // Status line: the at-a-glance signal. Detail lands in the
   // panel slot below.
-  if (result.exit_code === 0) {
+  if (result.code === 0) {
     editor.setStatus(editor.t("status.completed", { name: cmdName }));
   } else if (label !== null) {
     editor.setStatus(
       editor.t("status.failed_sub", {
         name: cmdName,
         label,
-        code: String(result.exit_code),
+        code: String(result.code),
       }),
     );
   } else {
     editor.setStatus(
       editor.t("status.failed", {
         name: cmdName,
-        code: String(result.exit_code),
+        code: String(result.code),
       }),
     );
   }
 
   const headerLine = label !== null
-    ? `--- ${cmdName} (${label}) — exit ${result.exit_code} ---\n`
-    : `--- ${cmdName} — exit ${result.exit_code} ---\n`;
+    ? `--- ${cmdName} (${label}) — exit ${result.code} ---\n`
+    : `--- ${cmdName} — exit ${result.code} ---\n`;
   const cmdLineText = `$ ${cmdline}\n`;
   const stdoutBlock = result.stdout.length > 0 ? result.stdout : "";
   const stderrBlock = result.stderr.length > 0
@@ -794,7 +796,7 @@ function readRemoteWorkspace(): string | null {
   return typeof raw === "string" && raw.length > 0 ? raw : null;
 }
 
-/// Pick the cwd to pass to lifecycle-command `spawnProcess` calls.
+/// Pick the cwd to pass to lifecycle-command `runOnTarget` calls.
 /// When attached to a Container authority, returns the recorded
 /// `remoteWorkspaceFolder` so `docker exec -w` lands inside the
 /// container. Otherwise returns undefined so the runtime fills
@@ -860,9 +862,9 @@ async function getOrComputeProbedEnv(): Promise<Record<string, string>> {
   // semantics (`BASH_ENV` sourcing) wouldn't see the user's
   // configured rc file.
   const baseEnv: Record<string, string> = config?.remoteEnv ?? {};
-  const [bin, probeArgs] = wrapWithEnv(baseEnv, "bash", [...flags, "-c", "env"]);
-  const result = await editor.spawnProcess(bin, probeArgs, cwd);
-  if (result.exit_code !== 0) {
+  const [bin, probeArgs] = wrapWithEnv(baseEnv, "bash", [...flags, "-c", ENV_DUMP]);
+  const result = await editor.runOnTarget(bin, probeArgs, cwd);
+  if (result.code !== 0) {
     editor.debug(
       `devcontainer: userEnvProbe (${probe}) failed: ${result.stderr.trim()}`,
     );
@@ -870,11 +872,8 @@ async function getOrComputeProbedEnv(): Promise<Record<string, string>> {
     return {};
   }
   const env: Record<string, string> = {};
-  for (const line of result.stdout.split("\n")) {
-    const eq = line.indexOf("=");
-    if (eq > 0) {
-      env[line.slice(0, eq)] = line.slice(eq + 1);
-    }
+  for (const [key, value] of parseEnvDump(result.stdout)) {
+    env[key] = value;
   }
   writeCachedProbedEnv(env);
   return env;
@@ -901,11 +900,8 @@ async function effectiveLifecycleEnv(): Promise<Record<string, string>> {
 /// authority's spawner can apply it to every `docker exec` (including
 /// the LSP `command_exists` probe and the LSP server spawn itself).
 ///
-/// Why pre-restart, not post-restart: `setAuthority` rebuilds the
-/// editor in place; the next plugin instance can't influence the
-/// already-installed authority's spawner without a second restart.
-/// We have one shot, here, while we still hold the host-side spawner
-/// and know which container we're talking to.
+/// Why before the install: the spawner is built from this payload, and an
+/// installed authority cannot be amended without installing a second one.
 ///
 /// Why bash login-interactive: per the dev-container spec, the
 /// default `userEnvProbe` is `loginInteractiveShell`. `bash -lic env`
@@ -935,7 +931,7 @@ async function captureContainerLoginEnv(
 
   // Compose `docker exec -i [-u USER] [-w WORKSPACE] <id> bash ...`
   // by hand: at this point the authority hasn't been installed yet,
-  // so `editor.spawnProcess` would route to the host. Use
+  // so `editor.runOnTarget` would route to the host. Use
   // `spawnHostProcess` and address the container directly via the
   // host docker CLI.
   const dockerArgs: string[] = ["exec", "-i"];
@@ -945,7 +941,7 @@ async function captureContainerLoginEnv(
   if (result.remoteWorkspaceFolder) {
     dockerArgs.push("-w", result.remoteWorkspaceFolder);
   }
-  dockerArgs.push(result.containerId, "bash", ...flags, "-c", "env");
+  dockerArgs.push(result.containerId, "bash", ...flags, "-c", ENV_DUMP);
 
   const probeResult = await editor.spawnHostProcess("docker", dockerArgs);
   if (probeResult.exit_code !== 0) {
@@ -962,12 +958,8 @@ async function captureContainerLoginEnv(
   // setup the user's shell exports and a non-shell exec wouldn't.
   const wanted = new Set(["PATH", "HOME", "LANG", "LC_ALL", "SHELL", "USER", "LOGNAME"]);
   const out: Array<[string, string]> = [];
-  for (const line of probeResult.stdout.split("\n")) {
-    const eq = line.indexOf("=");
-    if (eq <= 0) continue;
-    const key = line.slice(0, eq);
-    if (!wanted.has(key)) continue;
-    out.push([key, line.slice(eq + 1)]);
+  for (const [key, value] of parseEnvDump(probeResult.stdout)) {
+    if (wanted.has(key)) out.push([key, value]);
   }
   return out;
 }
@@ -1025,7 +1017,7 @@ async function runLifecycleObjectForm(
         cmdline = subcmd as string;
       }
       const [bin, args] = wrapWithEnv(env, origBin, origArgs);
-      const r = await editor.spawnProcess(bin, args, cwd);
+      const r = await editor.runOnTarget(bin, args, cwd);
       return { label, cmdline, result: r };
     }),
   );
@@ -1035,10 +1027,10 @@ async function runLifecycleObjectForm(
   // across N intermediate states. Failed entries first so the
   // user sees the failures even if stdout is enormous.
   const sorted = [...results].sort(
-    (a, b) => Number(a.result.exit_code === 0) - Number(b.result.exit_code === 0),
+    (a, b) => Number(a.result.code === 0) - Number(b.result.code === 0),
   );
   const sections = sorted.map(({ label, cmdline, result: r }) => {
-    const header = `--- ${cmdName} (${label}) — exit ${r.exit_code} ---\n`;
+    const header = `--- ${cmdName} (${label}) — exit ${r.code} ---\n`;
     const cmdLine = `$ ${cmdline}\n`;
     const stdoutBlock = r.stdout.length > 0 ? r.stdout : "";
     const stderrBlock = r.stderr.length > 0
@@ -1053,7 +1045,7 @@ async function runLifecycleObjectForm(
     entries: [{ text: sections.join("\n"), properties: { type: "log" } }],
   });
 
-  const failed = results.filter((r) => r.result.exit_code !== 0);
+  const failed = results.filter((r) => r.result.code !== 0);
   if (failed.length === 0) {
     editor.setStatus(editor.t("status.completed", { name: cmdName }));
     return;
@@ -1066,7 +1058,7 @@ async function runLifecycleObjectForm(
     editor.t("status.failed_sub", {
       name: cmdName,
       label: first.label,
-      code: String(first.result.exit_code),
+      code: String(first.result.code),
     }),
   );
 }
@@ -1086,7 +1078,7 @@ function devcontainer_show_features(): void {
     } else if (typeof opts === "string") {
       desc = opts;
     }
-    return { text: id, description: desc || "(default options)" };
+    return { id, text: id, description: desc || "(default options)" };
   });
 
   editor.startPrompt(editor.t("prompt.features"), "devcontainer-features");
@@ -1157,8 +1149,10 @@ async function devcontainer_show_ports(): Promise<void> {
     if (binding) {
       desc += ` → ${binding}`;
     }
-    return { text: String(port), description: desc };
-  });
+    return { id: `port:${key}`, text: String(port), description: desc };
+  })
+    // A config can list a port twice; it is one port, shown once.
+    .filter((s, i, all) => all.findIndex((o) => o.id === s.id) === i);
 
   // Surface runtime-only ports (exposed by the container but not
   // listed in forwardPorts) so users see the full picture.
@@ -1171,6 +1165,7 @@ async function devcontainer_show_ports(): Promise<void> {
       (!Number.isNaN(portNum) && config.forwardPorts.some((p) => p === portNum));
     if (alreadyListed) continue;
     suggestions.push({
+      id: `runtime:${key}`,
       text: portStr,
       description: `${key} · runtime only → ${binding}`,
     });
@@ -1594,7 +1589,7 @@ function buildContainerAuthorityPayload(
     args.push("-w", workspace);
   }
   // Apply the captured userEnvProbe env to the integrated terminal too, so it
-  // matches what LSP / spawnProcess get inside the container (issue #2355; see
+  // matches what LSP / runOnTarget get inside the container (issue #2355; see
   // docs/internal/uniform-env-activation-design.md). Mirrors the spawner's
   // `build_docker_exec_prefix`, which already passes these as `-e` flags;
   // without them the terminal would drop into `bash -l` with only whatever the
@@ -1887,11 +1882,10 @@ async function runDevcontainerUp(extraArgs: string[]): Promise<void> {
   // failure (no authority landed — surfaces as FailedAttach).
   writeAttachAttempt();
   // Persist `remoteWorkspaceFolder` so the post-restart plugin
-  // instance can pass it as the cwd to lifecycle commands. The
-  // runtime's `spawnProcess` auto-fills working_dir (host path)
-  // when cwd is omitted — that breaks `docker exec -w` for
-  // configs whose `workspaceFolder` differs from the host
-  // workspace path. See `lifecycleCwd()`.
+  // instance can pass it as the cwd to lifecycle commands: a
+  // command run without one does not land in `workspaceFolder`
+  // for configs where it differs from the host workspace path.
+  // See `lifecycleCwd()`.
   writeRemoteWorkspace(parsed.remoteWorkspaceFolder ?? null);
   editor.setAuthority(payload);
 }
@@ -2377,14 +2371,10 @@ function writeAttachDecision(value: AttachDecision): void {
 /// real choice between "not now" and "stop asking forever".
 let attachDismissedThisSession = false;
 
-/// Breadcrumb written before calling `editor.setAuthority(payload)`
-/// — setAuthority restarts the editor, so there's no clean callback
-/// to hook once the new authority is live. If the post-restart plugin
-/// instance sees this key with no matching container authority
-/// installed, the attach round-tripped through setAuthority but the
-/// core failed to construct the authority (rare: a rejected
-/// AuthorityPayload). We surface that as FailedAttach so users aren't
-/// stuck wondering why Connecting silently became Local.
+/// Breadcrumb written before `editor.setAuthority(payload)`. If it is still
+/// here with no container authority installed, core failed to construct the
+/// authority (rare: a rejected AuthorityPayload), and `settleAttachAttempt`
+/// surfaces that as FailedAttach rather than a silent fall back to Local.
 ///
 /// The key carries the epoch-ms timestamp of the attempt so stale
 /// entries from long-dormant sessions don't bleed into a fresh
@@ -2408,6 +2398,32 @@ function readAttachAttemptMs(): number | null {
     return Number.isFinite(n) ? n : null;
   }
   return null;
+}
+
+/// Settle an outstanding attach attempt, and say whether it surfaced a failure.
+/// Called from `authority_changed`, and from init for a relaunch mid-attach or
+/// a container that failed before any authority changed. Idempotent: the
+/// breadcrumb is cleared either way, so the second caller finds nothing to do.
+function settleAttachAttempt(): boolean {
+  const attemptMs = readAttachAttemptMs();
+  if (attemptMs === null) return false;
+
+  // Stale breadcrumbs (> 30 min) are dropped.
+  const MAX_AGE_MS = 30 * 60 * 1000;
+  if (Date.now() - attemptMs > MAX_AGE_MS) {
+    clearAttachAttempt();
+    return false;
+  }
+  if (editor.getAuthorityLabel().length > 0) {
+    // A container authority came up.
+    editor.clearRemoteIndicatorState();
+    clearAttachAttempt();
+    return false;
+  }
+  // No container landed. Surface it with the same popup as an in-flight failure.
+  enterFailedAttach(editor.t("indicator.error_restart_recovery"));
+  clearAttachAttempt();
+  return true;
 }
 
 function showAttachPrompt(): void {
@@ -2471,13 +2487,13 @@ editor.on("prompt_confirmed", async (data) => {
   if (typeof cmd === "string") {
     editor.setStatus(editor.t("status.running", { name: cmdName }));
     const [bin, args] = wrapWithEnv(env, "sh", ["-c", cmd]);
-    const result = await editor.spawnProcess(bin, args, cwd);
+    const result = await editor.runOnTarget(bin, args, cwd);
     await surfaceLifecycleResult(cmdName, null, cmd, result);
   } else if (Array.isArray(cmd)) {
     const [origBin, ...origArgs] = cmd;
     const [bin, args] = wrapWithEnv(env, origBin, origArgs);
     editor.setStatus(editor.t("status.running", { name: cmdName }));
-    const result = await editor.spawnProcess(bin, args, cwd);
+    const result = await editor.runOnTarget(bin, args, cwd);
     await surfaceLifecycleResult(cmdName, null, [origBin, ...origArgs].join(" "), result);
   } else {
     // Object form: see the rewritten parallel branch in
@@ -2508,6 +2524,9 @@ editor.on("action_popup_result", (data) => {
 });
 editor.on("authority_changed", (data) => {
   registerCommands();
+  // Attaching does not restart the editor, so this is where an attach's
+  // outcome is learned.
+  settleAttachAttempt();
   const label = (data as { label?: string } | undefined)?.label ?? "";
   if (label.startsWith("Container:")) {
     void runAutoForwardSweep();
@@ -2517,8 +2536,8 @@ editor.on("authority_changed", (data) => {
 });
 
 /// Re-register state-gated commands when the authority transitions
-/// (local ↔ container). Without this, after `setAuthority` lands a
-/// container we'd still have `Attach` / `Cancel Startup` in the
+/// (local ↔ container). Attaching does not reload the plugin, so without this
+/// we'd still have `Attach` / `Cancel Startup` in the
 /// palette and `Detach` / `Show Logs` missing.
 ///
 /// Also runs the auto-forward port-detection sweep when entering
@@ -2626,9 +2645,8 @@ function registerCommands(): void {
   // unconditionally. Commands that are only meaningful in one
   // mode are gated below — `attach` / `cancel_attach` only when
   // not already attached, `detach` / `show_forwarded_ports_panel` /
-  // `show_logs` only when attached. The plugin reloads after
-  // `setAuthority` AND we listen for `authority_changed` so this
-  // function runs on every transition.
+  // `show_logs` only when attached. `authority_changed` runs this on every
+  // transition; attaching does not reload the plugin.
   const attached = editor.getAuthorityLabel().startsWith("Container:");
   // Drop any stale state-gated registrations from the previous
   // mode before re-registering. `editor.unregisterCommand` is a
@@ -2767,32 +2785,10 @@ if (findConfig()) {
     const authorityLabel = editor.getAuthorityLabel();
     const alreadyAttached = authorityLabel.length > 0;
 
-    // Post-restart recovery: clear or surface a FailedAttach for
-    // attempts that round-tripped through setAuthority without
-    // landing a container. Stale breadcrumbs (> 30 min) are
-    // quietly dropped so an old attempt can't poison a fresh
-    // session years later.
-    const attemptMs = readAttachAttemptMs();
-    if (attemptMs !== null) {
-      const ageMs = Date.now() - attemptMs;
-      const MAX_AGE_MS = 30 * 60 * 1000;
-      if (ageMs > MAX_AGE_MS) {
-        clearAttachAttempt();
-      } else if (alreadyAttached) {
-        // Matching container authority came up — success path.
-        clearAttachAttempt();
-      } else {
-        // No container landed but we just tried. Surface it with the
-        // same proactive popup as an in-flight failure so users see
-        // Retry / Reopen Locally without having to click the
-        // indicator.
-        enterFailedAttach(editor.t("indicator.error_restart_recovery"));
-        clearAttachAttempt();
-        // Do not also show the attach prompt — the failed-attach
-        // popup is the right next surface; stacking a second popup
-        // on top would bury it.
-        return;
-      }
+    // Surface a failed attach if `authority_changed` did not get to it first.
+    if (settleAttachAttempt()) {
+      // Not the attach prompt too; a second popup would bury the failure.
+      return;
     }
 
     if (alreadyAttached) {

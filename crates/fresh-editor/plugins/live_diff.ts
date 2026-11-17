@@ -182,6 +182,12 @@ interface BufferDiffState {
    * old in-plugin reference cache did.
    */
   reloadRef: boolean;
+  /**
+   * A recompute found the buffer in a background window and waited for it
+   * (see `recompute`); `active_window_changed` runs it when the buffer's
+   * window comes back.
+   */
+  deferred: boolean;
   /** Token bumped on every scheduleRecompute; mismatched tokens are stale. */
   pendingToken: number;
   /**
@@ -320,18 +326,18 @@ function releaseBaseline(state: BufferDiffState): void {
 
 async function resolveDefaultBranch(filePath: string): Promise<string> {
   const cwd = fileDir(filePath);
-  const head = await editor.spawnProcess(
+  const head = await editor.runOnTarget(
     "git", ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd,
   );
-  if (head.exit_code === 0) {
+  if (head.code === 0) {
     const trimmed = head.stdout.trim();
     if (trimmed.startsWith("origin/")) return trimmed.substring("origin/".length);
     if (trimmed.length > 0) return trimmed;
   }
-  const main = await editor.spawnProcess(
+  const main = await editor.runOnTarget(
     "git", ["rev-parse", "--verify", "main"], cwd,
   );
-  if (main.exit_code === 0) return "main";
+  if (main.code === 0) return "main";
   return "master";
 }
 
@@ -966,6 +972,17 @@ async function recompute(bufferId: number): Promise<void> {
   const state = states.get(bufferId);
   if (!state) return;
   if (!isEnabledForBuffer(state)) return;
+  // Reading a buffer (`getBufferText`) and diffing it (`diffAgainstBaseline`)
+  // act on the active window only: one of another window's buffers — a HEAD
+  // move refreshes every buffer tracked here — is not found there. Wait for
+  // its window, keeping any reference reload pending. (A baseline's own load
+  // runs through the window that registered it, so a reload is not what
+  // needs the wait.)
+  if (editor.getBufferInfo(bufferId) === null) {
+    state.deferred = true;
+    return;
+  }
+  state.deferred = false;
   // Serialize recomputes per buffer. A recompute suspends at its `await`
   // points (baseline registration, buffer-text fetch, host diff). A second
   // trigger that arrives meanwhile must neither start a concurrent pass
@@ -1002,7 +1019,7 @@ async function recompute(bufferId: number): Promise<void> {
           }
         }
       }
-      await onePass();
+      await onePass(state);
     } while (state.rerunRequested);
   } finally {
     state.updating = false;
@@ -1010,7 +1027,9 @@ async function recompute(bufferId: number): Promise<void> {
 
   // A single diff pass. Early `return`s end this pass only; the wrapper's
   // `do…while` still honors any `rerunRequested` recorded meanwhile.
-  async function onePass(): Promise<void> {
+  // `state` is passed in because a hoisted function doesn't keep the
+  // narrowing above.
+  async function onePass(state: BufferDiffState): Promise<void> {
     const baselineId = await ensureBaseline(state);
     if (baselineId === null) {
       // No reference exists (file untracked, no repo, etc.).
@@ -1173,6 +1192,7 @@ function ensureState(bufferId: number): BufferDiffState | null {
     updating: false,
     rerunRequested: false,
     reloadRef: false,
+    deferred: false,
     pendingToken: 0,
     override: getStoredOverride(bufferId),
     lastBufferText: null,
@@ -1368,10 +1388,10 @@ async function discoverHeadLogPath(cwd: string): Promise<string | null> {
   // (e.g. `../.git/logs/HEAD` when the buffer is in a sub-directory), and the
   // file watcher compares against notify's canonical, `..`-free event paths —
   // a `..` in the watch path means the reflog event never matches (#2503).
-  const result = await editor.spawnProcess(
+  const result = await editor.runOnTarget(
     "git", ["rev-parse", "--absolute-git-dir"], cwd,
   );
-  if (result.exit_code !== 0) return null;
+  if (result.code !== 0) return null;
   const gitDir = result.stdout.trim();
   if (!gitDir) return null;
   return `${gitDir}/logs/HEAD`;
@@ -1450,6 +1470,17 @@ editor.on("path_changed", (args) => {
 editor.on("focus_gained", () => {
   ensureHeadWatch().catch((e) => editor.error(`live-diff: ${e}`));
   refreshGitReferences();
+  return true;
+});
+
+// A buffer whose recompute waited for its window catches up when that window
+// becomes active; the rest keep waiting.
+editor.on("active_window_changed", () => {
+  for (const state of states.values()) {
+    if (state.deferred) {
+      recompute(state.bufferId).catch((e) => editor.error(`live-diff: ${e}`));
+    }
+  }
   return true;
 });
 

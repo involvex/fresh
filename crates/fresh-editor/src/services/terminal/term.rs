@@ -16,7 +16,8 @@
 //! - `process_output`: Feed PTY bytes into the terminal emulator
 //! - `flush_new_scrollback`: Stream new scrollback lines to backing file
 //! - `append_visible_screen`: Append visible screen on mode exit
-//! - `backing_file_history_end`: Get truncation point for mode re-entry
+//! - `write_backing_file_tail` / `cut_backing_file_tail`: Write the visible
+//!   screen as the file's temporary tail, and take it back out
 //!
 //! ## State Tracking
 //!
@@ -36,14 +37,16 @@
 //! `backing_file_history_end` tracks the byte offset where scrollback ends in the
 //! backing file, used for truncation when re-entering terminal mode.
 
+use crate::model::filesystem::FileSystem;
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
+use fresh_editor_core::model::host_path::AsHostPath;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 // Keep a generous scrollback so sync-to-buffer can include deep history.
@@ -78,6 +81,10 @@ struct PtyWriteListener {
     /// `process_output` drains this after parsing to update the
     /// terminal's stored title.
     pending_title: Arc<Mutex<Option<String>>>,
+    /// Clipboard writes requested by the program via OSC 52. Drained by
+    /// the terminal manager after each read and forwarded to the editor's
+    /// clipboard, so a copy made inside the terminal reaches the host.
+    pending_clipboard: Arc<Mutex<Vec<String>>>,
 }
 
 impl PtyWriteListener {
@@ -85,6 +92,7 @@ impl PtyWriteListener {
         Self {
             write_queue: Arc::new(Mutex::new(Vec::new())),
             pending_title: Arc::new(Mutex::new(None)),
+            pending_clipboard: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -113,7 +121,15 @@ impl EventListener for PtyWriteListener {
                     *pending = Some(String::new());
                 }
             }
-            // Other events (ClipboardStore, etc.) are ignored for now.
+            // OSC 52 write. Only stores are forwarded; `ClipboardLoad`
+            // (OSC 52 read) stays ignored so a child can't read the
+            // host clipboard.
+            Event::ClipboardStore(_, text) => {
+                if let Ok(mut queue) = self.pending_clipboard.lock() {
+                    queue.push(text);
+                }
+            }
+            // Other events (ClipboardLoad, etc.) are ignored for now.
             _ => {}
         }
     }
@@ -466,11 +482,28 @@ pub struct TerminalState {
     pending_reflow_resync: bool,
     /// Byte offset in backing file where scrollback ends (for truncation)
     backing_file_history_end: u64,
+    /// Where the temporary visible-screen tail (written by
+    /// [`Self::write_backing_file_tail`]) ends in the backing file, while
+    /// one is there; it starts at `backing_file_history_end`.
+    ///
+    /// The tail is not scrollback: it is the screen as it was, the exit frame
+    /// the scroll-back view anchors to and what a checkpoint saves. The read
+    /// loop can't remove it (a scroll-back view may be reading those bytes),
+    /// so scrollback it streams meanwhile goes after it; whoever next deals
+    /// with the tail cuts it out from between the two
+    /// ([`Self::cut_backing_file_tail`]), so the file never keeps a screen
+    /// that later scrolled into history as well (fresh#3151, #3645). Those
+    /// writers run on the UI thread, which first has a view reading the file
+    /// lazily load the bytes past the history end (`pin_terminal_view_tail`).
+    backing_file_tail_end: Option<u64>,
     /// Queue of data to write back to the PTY (for DSR responses, etc.)
     pty_write_queue: Arc<Mutex<Vec<String>>>,
     /// Pending title set by the program via OSC 0/1/2 (shared with the
     /// event listener). Drained in `process_output` into `terminal_title`.
     pending_title: Arc<Mutex<Option<String>>>,
+    /// OSC 52 clipboard writes captured by the event listener, drained via
+    /// `drain_clipboard_queue`.
+    pending_clipboard: Arc<Mutex<Vec<String>>>,
     /// Working directory most recently reported by the shell via OSC 7, used
     /// to resolve relative paths the running program prints (e.g. for
     /// Ctrl+Click to open). `None` until the shell emits OSC 7.
@@ -495,6 +528,69 @@ pub struct PrependedHead {
     pub bytes: usize,
 }
 
+/// A terminal's backing file, as the tail's writers use it under the
+/// terminal's lock (see [`TerminalState::write_backing_file_tail`]).
+pub trait BackingFile {
+    /// How many bytes the file holds.
+    fn size(&mut self) -> io::Result<u64>;
+    /// The bytes from `offset` to the end (none past the end).
+    fn read_from(&mut self, offset: u64) -> io::Result<Vec<u8>>;
+    fn truncate(&mut self, len: u64) -> io::Result<()>;
+    fn append(&mut self, bytes: &[u8]) -> io::Result<()>;
+}
+
+/// The backing file at `path` on `fs`.
+pub struct BackingFileAt<'a> {
+    pub fs: &'a (dyn FileSystem + Send + Sync),
+    pub path: &'a Path,
+}
+
+impl BackingFile for BackingFileAt<'_> {
+    fn size(&mut self) -> io::Result<u64> {
+        Ok(self.fs.metadata(self.path.as_host())?.size)
+    }
+
+    fn read_from(&mut self, offset: u64) -> io::Result<Vec<u8>> {
+        let len = self.size()?;
+        if offset >= len {
+            return Ok(Vec::new());
+        }
+        self.fs
+            .read_range(self.path.as_host(), offset, (len - offset) as usize)
+    }
+
+    fn truncate(&mut self, len: u64) -> io::Result<()> {
+        self.fs.set_file_length(self.path.as_host(), len)
+    }
+
+    fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let mut file = self.fs.open_file_for_append(self.path.as_host())?;
+        file.write_all(bytes)?;
+        file.flush()
+    }
+}
+
+/// A backing file in memory, for tests.
+impl BackingFile for Vec<u8> {
+    fn size(&mut self) -> io::Result<u64> {
+        Ok(self.len() as u64)
+    }
+
+    fn read_from(&mut self, offset: u64) -> io::Result<Vec<u8>> {
+        Ok(self.get(offset as usize..).unwrap_or_default().to_vec())
+    }
+
+    fn truncate(&mut self, len: u64) -> io::Result<()> {
+        Vec::truncate(self, len as usize);
+        Ok(())
+    }
+
+    fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
 impl TerminalState {
     /// Create a new terminal state
     pub fn new(cols: u16, rows: u16) -> Self {
@@ -513,11 +609,18 @@ impl TerminalState {
             // down to `scrollback_lines` itself so the emulator never evicts a
             // row out from under the sync pointer. See SCROLLBACK_DRAIN_MARGIN.
             scrolling_history: scrollback_lines.saturating_add(SCROLLBACK_DRAIN_MARGIN),
+            // Answer the kitty keyboard protocol's query and track the flags a
+            // child pushes, so a TUI can ask for Shift+Enter and friends in
+            // CSI-u form (see `kitty_key_flags`). Not on Windows:
+            // there the child sits behind ConPTY, whose handling of CSI-u
+            // input is unverified.
+            kitty_keyboard: cfg!(not(windows)),
             ..Default::default()
         };
         let listener = PtyWriteListener::new();
         let pty_write_queue = listener.write_queue.clone();
         let pending_title = listener.pending_title.clone();
+        let pending_clipboard = listener.pending_clipboard.clone();
         let term = Term::new(config, &size, listener);
 
         Self {
@@ -533,8 +636,10 @@ impl TerminalState {
             history_overrun: false,
             pending_reflow_resync: false,
             backing_file_history_end: 0,
+            backing_file_tail_end: None,
             pty_write_queue,
             pending_title,
+            pending_clipboard,
             cwd: None,
             osc7: Osc7Scanner::default(),
             osc_activity: OscActivityScanner::default(),
@@ -563,6 +668,15 @@ impl TerminalState {
     /// The caller should write this data to the PTY writer.
     pub fn drain_pty_write_queue(&self) -> Vec<String> {
         if let Ok(mut queue) = self.pty_write_queue.lock() {
+            std::mem::take(&mut *queue)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Drain clipboard writes the program requested via OSC 52
+    pub fn drain_clipboard_queue(&self) -> Vec<String> {
+        if let Ok(mut queue) = self.pending_clipboard.lock() {
             std::mem::take(&mut *queue)
         } else {
             Vec::new()
@@ -719,6 +833,7 @@ impl TerminalState {
     }
 
     /// Mark as clean after rendering
+    #[cfg(test)]
     pub fn mark_clean(&mut self) {
         self.dirty = false;
     }
@@ -804,6 +919,7 @@ impl TerminalState {
             // Check flags
             let flags = cell.flags;
             let bold = flags.contains(Flags::BOLD);
+            let dim = flags.contains(Flags::DIM);
             let italic = flags.contains(Flags::ITALIC);
             let underline = flags.contains(Flags::UNDERLINE);
             let inverse = flags.contains(Flags::INVERSE);
@@ -813,6 +929,7 @@ impl TerminalState {
                 fg,
                 bg,
                 bold,
+                dim,
                 italic,
                 underline,
                 inverse,
@@ -820,6 +937,34 @@ impl TerminalState {
         }
 
         cells
+    }
+
+    /// The screen as it is now (not scrolled back) as plain text, for
+    /// searching it: one entry per logical line, the rows a wrap continues
+    /// joined, wide characters' spacer cells and right-edge padding left out.
+    pub fn screen_lines(&self) -> Vec<String> {
+        use alacritty_terminal::term::cell::Flags;
+        let grid = self.term.grid();
+        let rows = self.rows as i32;
+        let mut lines = Vec::new();
+        let mut line = String::new();
+        for row in 0..rows {
+            let cells = &grid[Line(row)];
+            for col in 0..self.cols as usize {
+                let cell = &cells[Column(col)];
+                if !cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    line.push(cell.c);
+                }
+            }
+            if !self.row_wraps(Line(row)) || row + 1 == rows {
+                lines.push(line.trim_end().to_string());
+                line.clear();
+            }
+        }
+        lines
     }
 
     /// Get all visible content as a string (for testing/debugging)
@@ -835,50 +980,6 @@ impl TerminalState {
         result
     }
 
-    /// Get all content including scrollback history as a string
-    /// Lines are in chronological order (oldest first)
-    ///
-    /// WARNING: This is O(total_history) and should NOT be used in hot paths.
-    /// For mode switching, use the incremental streaming architecture instead:
-    /// - `flush_new_scrollback()` during PTY reads
-    /// - `append_visible_screen()` on mode exit
-    #[allow(dead_code)]
-    pub fn full_content_string(&self) -> String {
-        use alacritty_terminal::grid::Dimensions;
-        use alacritty_terminal::index::{Column, Line};
-
-        let grid = self.term.grid();
-        let history_size = grid.history_size();
-        let mut result = String::new();
-
-        // First, add scrollback history (negative line indices)
-        // History lines go from -(history_size) to -1
-        for i in (1..=history_size).rev() {
-            let line = Line(-(i as i32));
-            let row_data = &grid[line];
-            let mut line_str = String::new();
-            for col in 0..self.cols as usize {
-                line_str.push(row_data[Column(col)].c);
-            }
-            let trimmed = line_str.trim_end();
-            result.push_str(trimmed);
-            result.push('\n');
-        }
-
-        // Then add visible screen content (line indices 0 to rows-1)
-        for row in 0..self.rows {
-            let line = self.get_line(row);
-            let line_str: String = line.iter().map(|c| c.c).collect();
-            let trimmed = line_str.trim_end();
-            result.push_str(trimmed);
-            if row < self.rows - 1 {
-                result.push('\n');
-            }
-        }
-
-        result
-    }
-
     /// Get the number of scrollback history lines
     pub fn history_size(&self) -> usize {
         use alacritty_terminal::grid::Dimensions;
@@ -888,11 +989,6 @@ impl TerminalState {
     /// Get the title (if set by escape sequence)
     pub fn title(&self) -> &str {
         &self.terminal_title
-    }
-
-    /// Set the terminal title (called when escape sequence is received)
-    pub fn set_title(&mut self, title: String) {
-        self.terminal_title = title;
     }
 
     /// Scroll to the bottom of the terminal (display offset = 0)
@@ -944,6 +1040,37 @@ impl TerminalState {
     /// send `\x1bOA` (SS3) instead of `\x1b[A` (CSI).
     pub fn is_app_cursor(&self) -> bool {
         self.term.mode().contains(TermMode::APP_CURSOR)
+    }
+
+    /// The kitty keyboard protocol flags the child has pushed, which decide
+    /// how keys are encoded for it (see `pty::kitty_encoded_key`). Empty
+    /// for a child that never enabled the protocol.
+    pub fn kitty_key_flags(&self) -> super::pty::KittyKeyFlags {
+        use super::pty::KittyKeyFlags as F;
+        let mode = self.term.mode();
+        [
+            (TermMode::DISAMBIGUATE_ESC_CODES, F::DISAMBIGUATE),
+            (TermMode::REPORT_EVENT_TYPES, F::REPORT_EVENT_TYPES),
+            (TermMode::REPORT_ALTERNATE_KEYS, F::REPORT_ALTERNATE_KEYS),
+            (TermMode::REPORT_ALL_KEYS_AS_ESC, F::REPORT_ALL_KEYS),
+            (TermMode::REPORT_ASSOCIATED_TEXT, F::REPORT_ASSOCIATED_TEXT),
+        ]
+        .into_iter()
+        .filter(|(term_mode, _)| mode.contains(*term_mode))
+        .fold(F::empty(), |flags, (_, flag)| flags | flag)
+    }
+
+    /// Check if the child asked for bracketed paste (DECSET 2004).
+    ///
+    /// Every line editor worth the name — bash/zsh/fish's readline, and the
+    /// input box of a TUI like an agent CLI — turns this on so it can tell a
+    /// paste apart from typing. Text sent to such a child *without* the
+    /// `ESC [ 200 ~` … `ESC [ 201 ~` wrapper is read as keystrokes: each
+    /// newline is an Enter that submits the line before it, so a multi-line
+    /// paste runs (or sends) every line but the last and only the tail is
+    /// left on the input line.
+    pub fn is_bracketed_paste(&self) -> bool {
+        self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
     // =========================================================================
@@ -1237,27 +1364,53 @@ impl TerminalState {
 
         for col in 0..self.cols as usize {
             let cell = &row_data[Column(col)];
+            // A wide character fills two columns, and the second is a spacer
+            // cell holding a blank. So is the last column of a row whose next
+            // character was too wide to fit and wrapped. Neither is text:
+            // written out, every CJK character in the scrollback gained a
+            // space after it (sinelaw/fresh#3235).
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
             let fg = color_to_rgb(&cell.fg);
             let bg = color_to_rgb(&cell.bg);
             let flags = cell.flags;
             let bold = flags.contains(Flags::BOLD);
+            let dim = flags.contains(Flags::DIM);
             let italic = flags.contains(Flags::ITALIC);
             let underline = flags.contains(Flags::UNDERLINE);
 
             let fg_changed = fg != sgr.fg;
             let bg_changed = bg != sgr.bg;
             let bold_changed = bold != sgr.bold;
+            let dim_changed = dim != sgr.dim;
             let italic_changed = italic != sgr.italic;
             let underline_changed = underline != sgr.underline;
 
-            if fg_changed || bg_changed || bold_changed || italic_changed || underline_changed {
+            if fg_changed
+                || bg_changed
+                || bold_changed
+                || dim_changed
+                || italic_changed
+                || underline_changed
+            {
                 let mut codes: Vec<String> = Vec::new();
 
                 // A turned-off attribute requires a full reset + reapply.
-                if (sgr.bold && !bold) || (sgr.italic && !italic) || (sgr.underline && !underline) {
+                if (sgr.bold && !bold)
+                    || (sgr.dim && !dim)
+                    || (sgr.italic && !italic)
+                    || (sgr.underline && !underline)
+                {
                     codes.push("0".to_string());
                     if bold {
                         codes.push("1".to_string());
+                    }
+                    if dim {
+                        codes.push("2".to_string());
                     }
                     if italic {
                         codes.push("3".to_string());
@@ -1274,6 +1427,9 @@ impl TerminalState {
                 } else {
                     if bold_changed && bold {
                         codes.push("1".to_string());
+                    }
+                    if dim_changed && dim {
+                        codes.push("2".to_string());
                     }
                     if italic_changed && italic {
                         codes.push("3".to_string());
@@ -1304,6 +1460,7 @@ impl TerminalState {
                 sgr.fg = fg;
                 sgr.bg = bg;
                 sgr.bold = bold;
+                sgr.dim = dim;
                 sgr.italic = italic;
                 sgr.underline = underline;
             }
@@ -1327,17 +1484,72 @@ impl TerminalState {
         self.backing_file_history_end = offset;
     }
 
+    /// The read loop streamed scrollback to the backing file, which is now
+    /// `file_len` long. With no tail there, that is where history ends;
+    /// with one, the lines wait after it until it is cut out.
+    pub fn scrollback_streamed(&mut self, file_len: u64) {
+        if self.backing_file_tail_end.is_none() {
+            self.backing_file_history_end = file_len;
+        }
+    }
+
+    /// Take the visible-screen tail out of the backing file, if one is there,
+    /// keeping whatever scrollback the read loop streamed in after it: the
+    /// file is cut back to the history end and those lines appended again.
+    /// Costs what was streamed since the tail was written.
+    pub fn cut_backing_file_tail(&mut self, file: &mut impl BackingFile) -> io::Result<()> {
+        let Some(tail_end) = self.backing_file_tail_end else {
+            return Ok(());
+        };
+        let after = file.read_from(tail_end)?;
+        file.truncate(self.backing_file_history_end)?;
+        self.backing_file_tail_end = None;
+        file.append(&after)?;
+        self.backing_file_history_end += after.len() as u64;
+        Ok(())
+    }
+
+    /// Bring the backing file up to date with the screen as it is now: the
+    /// old tail cut out, every line that has scrolled off written, and the
+    /// visible screen after them as the new tail. For scroll-back entry and
+    /// workspace checkpoints. Returns what [`Self::append_visible_screen`]
+    /// returns.
+    pub fn write_backing_file_tail(
+        &mut self,
+        file: &mut impl BackingFile,
+    ) -> io::Result<PrependedHead> {
+        self.cut_backing_file_tail(file)?;
+        let mut scrollback = Vec::new();
+        self.flush_new_scrollback(&mut scrollback)?;
+        file.append(&scrollback)?;
+        self.backing_file_history_end = file.size()?;
+        let mut screen = Vec::new();
+        let head = self.append_visible_screen(&mut screen)?;
+        // Claimed before it is written: a part-written tail is cut off too
+        self.backing_file_tail_end = Some(u64::MAX);
+        let appended = file.append(&screen);
+        // Where it ends, even part-written, so scrollback the read loop
+        // streams after it is kept when it is cut
+        if let Ok(end) = file.size() {
+            self.backing_file_tail_end = Some(end);
+        }
+        appended?;
+        Ok(head)
+    }
+
     /// Get the number of scrollback lines that have been synced to the backing file.
     pub fn synced_history_lines(&self) -> usize {
         self.synced_history_lines
     }
 
     /// Reset sync state (e.g., when starting fresh or after truncation).
+    #[cfg(test)]
     pub fn reset_sync_state(&mut self) {
         self.synced_history_lines = 0;
         self.synced_logical_lines = 0;
         self.pending_reflow_resync = false;
         self.backing_file_history_end = 0;
+        self.backing_file_tail_end = None;
     }
 }
 
@@ -1352,6 +1564,8 @@ pub struct TerminalCell {
     pub bg: Option<(u8, u8, u8)>,
     /// Bold flag
     pub bold: bool,
+    /// Dim (faint) flag — SGR 2
+    pub dim: bool,
     /// Italic flag
     pub italic: bool,
     /// Underline flag
@@ -1367,6 +1581,7 @@ impl Default for TerminalCell {
             fg: None,
             bg: None,
             bold: false,
+            dim: false,
             italic: false,
             underline: false,
             inverse: false,
@@ -1381,13 +1596,19 @@ struct SgrState {
     fg: Option<(u8, u8, u8)>,
     bg: Option<(u8, u8, u8)>,
     bold: bool,
+    dim: bool,
     italic: bool,
     underline: bool,
 }
 
 impl SgrState {
     fn has_style(&self) -> bool {
-        self.fg.is_some() || self.bg.is_some() || self.bold || self.italic || self.underline
+        self.fg.is_some()
+            || self.bg.is_some()
+            || self.bold
+            || self.dim
+            || self.italic
+            || self.underline
     }
 }
 
@@ -1474,6 +1695,45 @@ mod tests {
         let state = TerminalState::new(80, 24);
         assert_eq!(state.size(), (80, 24));
         assert!(state.is_dirty());
+    }
+
+    /// SGR 2 must survive the grid: alacritty records it as `Flags::DIM`, and
+    /// both readback paths — the live cell grid and the ANSI serialization
+    /// used for scrollback — have to carry it, or dim text renders at full
+    /// brightness and is indistinguishable from normal text (issue #3123).
+    #[test]
+    fn dim_attribute_survives_the_grid() {
+        let mut state = TerminalState::new(40, 4);
+        state.process_output(b"\x1b[2mDIM\x1b[0m|\x1b[1mBOLD\x1b[0m|PLAIN");
+
+        let cells = state.get_line(0);
+        // "DIM" is dim and not bold; "BOLD" is bold and not dim.
+        for (i, c) in "DIM".chars().enumerate() {
+            assert_eq!(cells[i].c, c);
+            assert!(cells[i].dim, "cell {i} lost its dim attribute");
+            assert!(!cells[i].bold);
+        }
+        assert!(!cells[3].dim, "the reset after DIM was not honoured");
+        for (i, c) in "BOLD".chars().enumerate() {
+            let cell = &cells[4 + i];
+            assert_eq!(cell.c, c);
+            assert!(cell.bold);
+            assert!(!cell.dim);
+        }
+
+        // The serialized form emits `ESC[2m` — the same shape bold already
+        // got, which is what made the loss specific to SGR 2.
+        let mut out = Vec::new();
+        state
+            .append_visible_screen(&mut out)
+            .expect("serialization failed");
+        let text = String::from_utf8(out).expect("not utf-8");
+        let first = text.lines().next().unwrap_or_default();
+        assert!(
+            first.contains("\x1b[2m") && first.contains("DIM"),
+            "dim was dropped on serialization: {first:?}"
+        );
+        assert!(first.contains("\x1b[1m"), "bold regressed: {first:?}");
     }
 
     #[test]
@@ -1625,6 +1885,30 @@ mod tests {
             max = max.max(c);
         }
         (min, max)
+    }
+
+    /// Wide (CJK) characters are written to the scrollback as themselves, not
+    /// followed by the blank spacer cell that fills their second column —
+    /// including one wrapped to the next row because it did not fit in the
+    /// last column (sinelaw/fresh#3235).
+    #[test]
+    fn test_wide_chars_stored_without_spacer_cells() {
+        let mut state = TerminalState::new(9, 24);
+        // `ab你好世` is 8 columns, so `界` (2 wide) cannot fit in the 9th and
+        // wraps, leaving a leading spacer at the end of the first row.
+        state.process_output("你好世界test\r\nab你好世界x\r\n".as_bytes());
+        for _ in 0..24 {
+            state.process_output(b"y\r\n");
+        }
+        let mut sink: Vec<u8> = Vec::new();
+        state.flush_new_scrollback(&mut sink).unwrap();
+        let text = String::from_utf8_lossy(&sink);
+        let lines: Vec<&str> = text.lines().take(2).collect();
+        assert_eq!(
+            lines,
+            ["你好世界test", "ab你好世界x"],
+            "scrollback:\n{text}"
+        );
     }
 
     /// A wrapped line is stored as ONE unwrapped logical line in the backing
@@ -2338,6 +2622,21 @@ mod tests {
         assert!(state.content_string().contains("helloworld"));
     }
 
+    /// An OSC 52 write from the program is queued for the host clipboard;
+    /// an OSC 52 read is not answered.
+    #[test]
+    fn test_osc52_clipboard_store_is_queued() {
+        let mut state = TerminalState::new(80, 24);
+        // "aGVsbG8=" is base64 for "hello".
+        state.process_output(b"\x1b]52;c;aGVsbG8=\x07");
+        assert_eq!(state.drain_clipboard_queue(), vec!["hello".to_string()]);
+        assert!(state.drain_clipboard_queue().is_empty());
+
+        state.process_output(b"\x1b]52;c;?\x07");
+        assert!(state.drain_clipboard_queue().is_empty());
+        assert!(state.drain_pty_write_queue().is_empty());
+    }
+
     /// OSC 7 with a `file://host/path` payload, BEL-terminated, updates the
     /// tracked cwd. The emulator still drops the sequence (no stray output).
     #[test]
@@ -2419,5 +2718,101 @@ mod tests {
         state.process_output(b"\x1b]7;relative/path\x07");
         // The relative payload is ignored; the previous valid cwd is kept.
         assert_eq!(state.cwd(), Some(std::path::Path::new("/good")));
+    }
+
+    #[test]
+    fn test_screen_lines_join_wrapped_rows_and_drop_spacers() {
+        let mut state = TerminalState::new(10, 4);
+        state.process_output("日本 ok\r\n".as_bytes());
+        state.process_output(b"0123456789ABCDE\r\n");
+        let lines = state.screen_lines();
+        assert_eq!(lines[0], "日本 ok");
+        assert_eq!(lines[1], "0123456789ABCDE");
+        assert!(lines[2..].iter().all(String::is_empty), "{lines:?}");
+    }
+
+    /// The backing file under every interleaving of its writers, modelled
+    /// on a byte vector: what it holds is what the terminal printed, every
+    /// line once and in order — the scrollback, then (when a tail is there)
+    /// the screen.
+    mod backing_file_model {
+        use super::*;
+        use proptest::prelude::*;
+
+        #[derive(Debug, Clone)]
+        enum Op {
+            /// The program prints this many lines; the read loop streams
+            /// what scrolled off (`manager.rs`, the PTY read loop).
+            Output(usize),
+            /// A checkpoint or scroll-back entry writes the screen as the tail
+            /// (`Window::sync_terminal_backing_files`,
+            /// `sync_terminal_to_buffer`).
+            Sync,
+            /// Scroll-back mode is left: the tail is cut back out
+            /// (`enter_terminal_mode`).
+            EndVisit,
+        }
+
+        /// What the PTY read loop does with output (`manager.rs`).
+        fn read_loop(state: &mut TerminalState, file: &mut Vec<u8>) {
+            if state.flush_new_scrollback(file).unwrap() > 0 {
+                state.scrollback_streamed(file.len() as u64);
+            }
+        }
+
+        /// The printed lines the file holds, in order.
+        fn printed_lines(file: &[u8]) -> Vec<String> {
+            String::from_utf8_lossy(file)
+                .lines()
+                .map(|l| l.trim_end().to_string())
+                .filter(|l| l.starts_with('L'))
+                .collect()
+        }
+
+        fn op() -> impl Strategy<Value = Op> {
+            prop_oneof![
+                (1usize..12).prop_map(Op::Output),
+                Just(Op::Sync),
+                Just(Op::EndVisit),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn backing_file_holds_each_printed_line_once(
+                ops in prop::collection::vec(op(), 0..40)
+            ) {
+                let mut state = TerminalState::new(80, 5);
+                let mut file = Vec::new();
+                let mut printed = Vec::new();
+                for op in &ops {
+                    // The history so far: no writer changes it, only adds to
+                    // it, so what a view reads of it stays put
+                    let history = file[..state.backing_file_history_end as usize].to_vec();
+                    match op {
+                        Op::Output(n) => {
+                            for _ in 0..*n {
+                                let line = format!("L{:04}", printed.len());
+                                state.process_output(format!("{line}\r\n").as_bytes());
+                                printed.push(line);
+                            }
+                            read_loop(&mut state, &mut file);
+                        }
+                        Op::Sync => {
+                            state.write_backing_file_tail(&mut file).unwrap();
+                        }
+                        Op::EndVisit => state.cut_backing_file_tail(&mut file).unwrap(),
+                    }
+                    prop_assert_eq!(&file[..history.len()], &history[..]);
+                    // The history is lines printed, in order, none twice
+                    let lines = printed_lines(&file[..state.backing_file_history_end as usize]);
+                    prop_assert_eq!(&lines[..], &printed[..lines.len()]);
+                }
+                // Read as a restored session reads it: with the screen as it
+                // is now on the end
+                state.write_backing_file_tail(&mut file).unwrap();
+                prop_assert_eq!(printed_lines(&file), printed);
+            }
+        }
     }
 }

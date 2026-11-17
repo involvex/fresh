@@ -12,11 +12,22 @@
 //!    which contrasts on every theme.
 //!
 //! 2. **Theme inspector popup is empty + has a dead button on the toolbar.**
-//!    The search-options toolbar doesn't record per-cell theme keys, so
+//!    The search-options toolbar didn't record per-cell theme keys, so
 //!    Ctrl+Right-clicking it produced a popup with a blank `Region:` and a
-//!    "▶ Open in Theme Editor" button that did nothing. The inspector now
-//!    shows an explanatory message and omits the non-functional button when
-//!    no theme key is recorded for the clicked cell.
+//!    "▶ Open in Theme Editor" button that did nothing. The inspector grew a
+//!    fallback for that — an explanatory message, and no button — and this
+//!    file asserted it here, on the toolbar.
+//!
+//!    **The toolbar is no longer that case.** It is a described surface now,
+//!    and `FoldProvenance` files every described item's resolved key pair as
+//!    the display list is folded (`app/render.rs`), so the cell under the
+//!    pointer answers with the very keys test 1 pins: `ui.menu_active_fg` on
+//!    `ui.menu_active_bg`. The button is live, and asserting the fallback
+//!    here would be asserting that the provenance is still missing. So the
+//!    second test asserts what the inspector reports instead. The fallback
+//!    itself is unchanged and still covers a cell that genuinely records
+//!    nothing — an item whose ink resolved to literal colours rather than to
+//!    a key (defect F.2 in the retained-mode plan).
 
 use crate::common::harness::EditorTestHarness;
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -29,18 +40,27 @@ fn open_replace(harness: &mut EditorTestHarness) {
         .send_key(KeyCode::Char('r'), KeyModifiers::CONTROL)
         .unwrap();
     harness.render().unwrap();
-    // The toolbar should now be on screen with Case Sensitive checked
-    // (its default state).
+    // The toolbar should now be on screen with Case Sensitive checked —
+    // `dracula_config` presets it on, because what both tests below need
+    // is a *checked* option to read the style of, and the shipped default
+    // for `editor.search.case_sensitive` is off.
     harness.assert_screen_contains("Case Sensitive");
+}
+
+/// Dracula, with the Case toggle preset on so the toolbar shows a checked
+/// option the moment Replace opens.
+fn dracula_config() -> Config {
+    let mut config = Config {
+        theme: "dracula".into(),
+        ..Default::default()
+    };
+    config.editor.search.case_sensitive = true;
+    config
 }
 
 #[test]
 fn test_dracula_checked_option_is_visible() {
-    let config = Config {
-        theme: "dracula".into(),
-        ..Default::default()
-    };
-    let mut harness = EditorTestHarness::with_config(120, 30, config).unwrap();
+    let mut harness = EditorTestHarness::with_config(120, 30, dracula_config()).unwrap();
 
     let (active_fg, active_bg) = {
         let theme = harness.editor().theme();
@@ -84,13 +104,13 @@ fn test_dracula_checked_option_is_visible() {
     );
 }
 
+/// Ctrl+Right-click on the toolbar opens the theme inspector *on the
+/// toolbar's own keys*: the checked option is painted from the
+/// `menu_active_*` pair (test 1 above pins that), so that is what the popup
+/// must name, and the "Open in Theme Editor" button has somewhere to go.
 #[test]
-fn test_theme_inspector_shows_message_instead_of_dead_button_on_toolbar() {
-    let config = Config {
-        theme: "dracula".into(),
-        ..Default::default()
-    };
-    let mut harness = EditorTestHarness::with_config(120, 30, config).unwrap();
+fn test_theme_inspector_reports_the_toolbars_theme_keys() {
+    let mut harness = EditorTestHarness::with_config(120, 30, dracula_config()).unwrap();
 
     harness.type_text("hello").unwrap();
     harness.render().unwrap();
@@ -120,8 +140,12 @@ fn test_theme_inspector_shows_message_instead_of_dead_button_on_toolbar() {
         .unwrap();
     harness.render().unwrap();
 
-    // The toolbar has no recorded theme key, so the inspector must show a
-    // clear message rather than a button that silently does nothing.
-    harness.assert_screen_contains("No theme key recorded here.");
-    harness.assert_screen_not_contains("Open in Theme Editor");
+    // The clicked cell is the checked "Case Sensitive" option, which test 1
+    // pins to the `menu_active_*` pair — so those are the keys the inspector
+    // must report, and it must not fall back to the no-key message.
+    harness.assert_screen_contains("ui.menu_active_fg");
+    harness.assert_screen_contains("ui.menu_active_bg");
+    harness.assert_screen_not_contains("No theme key recorded here.");
+    // With a key to open, the button is offered again.
+    harness.assert_screen_contains("Open in Theme Editor");
 }

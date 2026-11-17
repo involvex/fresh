@@ -5,8 +5,8 @@
 //! - Copy with formatting (HTML with syntax highlighting)
 //! - Multi-cursor add above/below/at next match
 
+use fresh_i18n::t;
 use ratatui::style::{Modifier, Style};
-use rust_i18n::t;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -258,9 +258,22 @@ impl Editor {
                 }
             }
 
-            // Calculate column bounds (min and max columns for the rectangle)
+            // Calculate column bounds (min and max columns for the rectangle).
+            // The span is half-open — `min_col..max_col` — the same unit the
+            // painter and `convert_block_selection_to_cursors` use.
             let min_col = block_anchor.column.min(cursor_2d.column);
             let max_col = block_anchor.column.max(cursor_2d.column);
+
+            // A zero-width rectangle selects no text. It is a legitimate
+            // gesture — Alt+Shift+Down with no horizontal movement is how you
+            // ask for a vertical column of cursors — and it paints nothing on
+            // screen, so it must copy nothing too. Extracting from it used to
+            // yield one empty string per line, which the join below turned
+            // into a column of bare newlines that a later paste inserted as
+            // blank lines (issue #3150).
+            if min_col == max_col {
+                continue;
+            }
 
             // Calculate line bounds using byte positions
             let start_byte = anchor_byte.min(cursor_byte);
@@ -487,6 +500,7 @@ impl Editor {
                     Some(info.key.clone())
                 };
                 crate::input::commands::Suggestion {
+                    id: info.key.clone(),
                     description_spans: None,
                     text: info.name.clone(),
                     description,
@@ -498,7 +512,7 @@ impl Editor {
             })
             .collect();
 
-        self.active_window_mut().prompt = Some(crate::view::prompt::Prompt::with_suggestions(
+        self.set_prompt(crate::view::prompt::Prompt::with_suggestions(
             "Copy with theme: ".to_string(),
             PromptType::CopyWithFormattingTheme,
             suggestions,
@@ -506,7 +520,7 @@ impl Editor {
 
         if let Some(prompt) = self.active_window_mut().prompt.as_mut() {
             if !prompt.suggestions.is_empty() {
-                prompt.selected_suggestion = Some(current_index);
+                prompt.select_suggestion(Some(current_index));
                 prompt.set_input_plain(current_theme_key.to_string());
             }
         }
@@ -542,7 +556,7 @@ impl Editor {
                 .iter()
                 .rev()
                 .map(|range| {
-                    let deleted_text = state.get_text_range(range.start, range.end);
+                    let deleted_text = state.get_edit_text(range.start, range.end);
                     Event::Delete {
                         range: range.clone(),
                         deleted_text,
@@ -554,8 +568,8 @@ impl Editor {
             // Apply events with atomic undo using bulk edit for O(n) performance
             if events.len() > 1 {
                 // Use optimized bulk edit for multi-cursor cut
-                if let Some(bulk_edit) = self.apply_events_as_bulk_edit(events, "Cut".to_string()) {
-                    self.active_event_log_mut().append(bulk_edit);
+                if let Some(applied) = self.apply_events_as_bulk_edit(events, "Cut".to_string()) {
+                    self.active_event_log_mut().append(applied);
                 }
             } else if let Some(event) = events.into_iter().next() {
                 self.log_and_apply_event(&event);
@@ -598,7 +612,7 @@ impl Editor {
                 .iter()
                 .rev()
                 .map(|range| {
-                    let deleted_text = state.get_text_range(range.start, range.end);
+                    let deleted_text = state.get_edit_text(range.start, range.end);
                     Event::Delete {
                         range: range.clone(),
                         deleted_text,
@@ -610,10 +624,10 @@ impl Editor {
             // Apply events with atomic undo using bulk edit for O(n) performance
             if events.len() > 1 {
                 // Use optimized bulk edit for multi-cursor cut
-                if let Some(bulk_edit) =
+                if let Some(applied) =
                     self.apply_events_as_bulk_edit(events, "Cut line".to_string())
                 {
-                    self.active_event_log_mut().append(bulk_edit);
+                    self.active_event_log_mut().append(applied);
                 }
             } else if let Some(event) = events.into_iter().next() {
                 self.log_and_apply_event(&event);
@@ -772,7 +786,7 @@ impl Editor {
             for (cursor_id, range) in &cursor_selections {
                 let deleted_text = self
                     .active_state_mut()
-                    .get_text_range(range.start, range.end);
+                    .get_edit_text(range.start, range.end);
                 delete_events.push(Event::Delete {
                     range: range.clone(),
                     deleted_text,
@@ -871,7 +885,6 @@ impl Editor {
                 .iter()
                 .map(|&pos| {
                     let id = state.virtual_texts.add(
-                        &mut state.marker_list,
                         pos,
                         "▍".to_string(),
                         placeholder_style,
@@ -998,8 +1011,7 @@ impl Editor {
                 .iter()
                 .enumerate()
                 .filter_map(|(i, a)| {
-                    let mid = state.virtual_texts.marker_id_of(a.virtual_text_id)?;
-                    let pos = state.marker_list.get_position(mid)?;
+                    let pos = state.virtual_texts.position_of(a.virtual_text_id)?;
                     Some((i, pos))
                 })
                 .collect()
@@ -1043,7 +1055,7 @@ impl Editor {
                 };
                 events.push(Event::Insert {
                     position: *pos,
-                    text: text_for_anchor,
+                    text: text_for_anchor.into(),
                     // No cursor moves on this insert: the user has
                     // been editing freely, and yanking their cursor
                     // to the paste site (which might be far away)
@@ -1075,9 +1087,7 @@ impl Editor {
             return;
         };
         for anchor in pending.anchors {
-            state
-                .virtual_texts
-                .remove(&mut state.marker_list, anchor.virtual_text_id);
+            state.virtual_texts.remove(anchor.virtual_text_id);
         }
     }
 
@@ -1156,7 +1166,8 @@ impl Editor {
 
     /// Route a terminal-initiated bracketed paste to a focused
     /// floating panel (Orchestrator picker / New-Session form / plugin
-    /// overlay) or focused dock when one owns the keyboard.
+    /// overlay), focused dock, or a panel mounted into the active
+    /// buffer (Search & Replace) when one owns the keyboard.
     ///
     /// Bracketed paste arrives as a single `Event::Paste` rather than
     /// per-key events, so — unlike typed characters and `Ctrl+V` — it
@@ -1173,6 +1184,7 @@ impl Editor {
     /// hidden buffer). Returns `false` when no panel owns the keyboard,
     /// so the caller falls back to the normal `paste_text` path.
     pub(crate) fn paste_bracketed_into_focused_panel(&mut self, text: &str) -> bool {
+        self.mark_plugin_snapshot_dirty();
         // The Settings dialog is a capture-all modal overlay that owns the
         // keyboard above any panel. A bracketed paste must reach its focused
         // text input (or be swallowed when no field is focused) rather than
@@ -1200,8 +1212,52 @@ impl Editor {
             super::PanelSlot::Floating
         } else if self.dock.as_ref().is_some_and(|d| d.focused) {
             super::PanelSlot::Dock
+        } else if let Some(i) = self.focused_sidebar_panel() {
+            super::PanelSlot::Sidebar(i)
         } else {
-            return false;
+            // No floating panel or dock owns the keyboard — but a panel
+            // mounted *into the active buffer* still can. The Search &
+            // Replace panel is one: a widget panel rendered into a
+            // read-only widget buffer in a split, so it matches none of
+            // the slots above. Its `Ctrl+V` works because the key event
+            // reaches `Action::Paste`, which routes to the focused Text
+            // widget via `focused_text_widget_panel_for_buffer`; a
+            // bracketed paste never passes through there, fell through
+            // to `paste_text`, and was refused by the read-only gate
+            // ("Editing disabled in this buffer" — issue #1960). Route
+            // it to the same widget the key path targets.
+            //
+            // Only when the editor pane itself owns the keyboard. A panel
+            // mounted into a buffer owns the paste only while nothing is
+            // layered over that buffer: with the menu open (or a prompt,
+            // modal, context menu or key-capturing popup up) the paste is
+            // that layer's, and letting it through to the panel underneath
+            // would be the very bug the doc comment above says this
+            // function exists to prevent — text landing in a field the
+            // user cannot see. Ask the overlay stack rather than naming
+            // the layers here, so a new overlay is covered by declaring
+            // itself and not by being added to a list.
+            if !self.editor_base_owns_keyboard() {
+                return false;
+            }
+            // The file explorer is inside the editor's own layer, so the
+            // check above does not speak for it. `Action::Paste` routes it
+            // to `file_explorer_paste`; a bracketed paste there has never
+            // been wired up, and this is not the change that should wire
+            // it — decline and leave that path exactly as it was.
+            if self.active_window().key_context
+                == crate::input::keybindings::KeyContext::FileExplorer
+            {
+                return false;
+            }
+            let buffer_id = self.active_buffer();
+            let Some(panel_id) = self.focused_text_widget_panel_for_buffer(buffer_id) else {
+                return false;
+            };
+            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+            self.handle_widget_insert_str(&panel_id, &normalized);
+            self.set_status_message(t!("clipboard.pasted").to_string());
+            return true;
         };
         let Some(panel_id) = self.panel(slot).map(|f| f.panel_key.clone()) else {
             return false;
@@ -1231,6 +1287,7 @@ impl Editor {
     /// - Atomic undo (single undo step for entire operation)
     /// - Routing to prompt if one is open
     pub fn paste_text(&mut self, paste_text: String) {
+        self.mark_plugin_snapshot_dirty();
         if paste_text.is_empty() {
             return;
         }
@@ -1247,10 +1304,12 @@ impl Editor {
             return;
         }
 
-        // If the focused split is a live terminal, send paste to its PTY
+        // If the focused split is a live terminal, send paste to its PTY —
+        // as a paste, bracketed when the child asked for DECSET 2004, so a
+        // multi-line paste arrives as one block instead of as a run of Enter
+        // keys that submits every line but the tail.
         if self.active_window().focused_terminal_live() {
-            self.active_window_mut()
-                .send_terminal_input(normalized.as_bytes());
+            self.active_window_mut().send_terminal_paste(&normalized);
             return;
         }
 
@@ -1322,7 +1381,7 @@ impl Editor {
                 .map(|(cursor_id, selection, insert_position, virtual_cols)| {
                     let deleted_text = selection
                         .as_ref()
-                        .map(|r| state.get_text_range(r.start, r.end));
+                        .map(|r| state.get_edit_text(r.start, r.end));
                     (
                         cursor_id,
                         selection,
@@ -1363,7 +1422,7 @@ impl Editor {
             }
             events.push(Event::Insert {
                 position: insert_position,
-                text,
+                text: text.into(),
                 cursor_id,
             });
         }
@@ -1371,8 +1430,8 @@ impl Editor {
         // Apply events with atomic undo using bulk edit for O(n) performance
         if events.len() > 1 {
             // Use optimized bulk edit for multi-cursor paste
-            if let Some(bulk_edit) = self.apply_events_as_bulk_edit(events, "Paste".to_string()) {
-                self.active_event_log_mut().append(bulk_edit);
+            if let Some(applied) = self.apply_events_as_bulk_edit(events, "Paste".to_string()) {
+                self.active_event_log_mut().append(applied);
             }
         } else if let Some(event) = events.into_iter().next() {
             self.log_and_apply_event(&event);
@@ -1401,6 +1460,17 @@ impl Editor {
     #[doc(hidden)]
     pub fn set_system_clipboard_reader_for_test(&mut self, reader: fn() -> Option<String>) {
         self.system_clipboard_reader = Some(reader);
+    }
+
+    /// Stand in for the system clipboard a terminal paste reads, for tests:
+    /// one that holds no text (an image) can't be had from a real host
+    /// deterministically. Read even in internal-only mode.
+    #[doc(hidden)]
+    pub fn set_system_clipboard_probe_for_test(
+        &mut self,
+        probe: fn() -> crate::services::clipboard::SystemClipboard,
+    ) {
+        self.system_clipboard_probe = Some(probe);
     }
 
     /// Paste from internal clipboard only (for testing)
@@ -1458,9 +1528,13 @@ impl Editor {
             return;
         };
 
+        // Buffers carry canonicalized paths, verbatim (`\\?\...`) on Windows;
+        // user-facing strings must not leak the prefix (issue #3296).
+        let path = crate::primitives::path_utils::strip_verbatim_prefix(&path);
+        let working_dir = crate::primitives::path_utils::strip_verbatim_prefix(self.working_dir());
         let path_str = if relative {
-            path.strip_prefix(self.working_dir())
-                .unwrap_or(&path)
+            path.strip_prefix(working_dir.as_ref())
+                .unwrap_or(path.as_ref())
                 .to_string_lossy()
                 .into_owned()
         } else {

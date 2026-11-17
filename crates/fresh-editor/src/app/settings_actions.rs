@@ -11,7 +11,8 @@ use crate::config::Config;
 use crate::config_io::{ConfigLayer, ConfigResolver};
 use crate::types::LspServerConfig;
 use anyhow::Result as AnyhowResult;
-use rust_i18n::t;
+use fresh_editor_core::model::host_path::AsHostPath;
+use fresh_i18n::t;
 
 use super::Editor;
 
@@ -184,17 +185,19 @@ impl Editor {
             lsp.set_universal_configs(universal_servers);
         }
 
-        // Propagate editor config to all split and buffer view states
-        for view_state in self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
-            .expect("active window must have a populated split layout")
-            .values_mut()
-        {
-            view_state.show_line_numbers = self.config.editor.line_numbers;
-            for buf_state in view_state.keyed_states.values_mut() {
-                buf_state.rulers = self.config.editor.rulers.clone();
+        for window in self.windows.values_mut() {
+            window.resync_global_display_defaults();
+        }
+        // `rulers` has no override and no view that opts out, so it goes to
+        // every view state — including the ones the sweep above skips.
+        let rulers = self.config.editor.rulers.clone();
+        for window in self.windows.values_mut() {
+            if let Some(view_states) = window.buffers.split_view_states_mut() {
+                for view_state in view_states.values_mut() {
+                    for (_, buf_state) in view_state.buffer_states_mut() {
+                        buf_state.rulers = rulers.clone();
+                    }
+                }
             }
         }
 
@@ -208,24 +211,23 @@ impl Editor {
         // and width are shadows of config, not read live on each render).
         self.active_window_mut().file_explorer_width = self.config.file_explorer.width;
         self.active_window_mut().file_explorer_side = self.config.file_explorer.side;
+        self.quick_open_registry
+            .set_file_ignore_patterns(&self.config.file_explorer.custom_ignore_patterns);
         let active_id = self.active_window;
         if let Some(explorer) = self
             .windows
             .get_mut(&active_id)
             .and_then(|w| w.file_explorer.as_mut())
         {
+            let root = explorer.tree().root_path().to_path_buf();
             let patterns = explorer.ignore_patterns_mut();
             patterns.set_show_hidden(self.config.file_explorer.show_hidden);
             patterns.set_show_gitignored(self.config.file_explorer.show_gitignored);
             patterns.set_respect_gitignore(self.config.file_explorer.respect_gitignore);
-            // Apply configured custom ignore patterns (this wiring was missing, so the
-            // `custom_ignore_patterns` config field had no effect).
-            patterns.clear_custom_patterns();
-            for pattern in &self.config.file_explorer.custom_ignore_patterns {
-                patterns.add_custom_pattern(pattern.clone());
-            }
+            patterns.set_custom_patterns(&root, &self.config.file_explorer.custom_ignore_patterns);
             explorer.set_compact_directories(self.config.file_explorer.compact_directories);
         }
+        self.sync_quick_open_file_visibility();
 
         // On Windows, switch mouse tracking mode when mouse_hover_enabled changes.
         // Mode 1003 (all motion) is used for hover; mode 1002 (cell motion) otherwise.
@@ -266,6 +268,12 @@ impl Editor {
                 if let Ok(resolved_config) = resolver.resolve() {
                     self.set_config(resolved_config);
                     self.refresh_open_buffer_settings_from_config();
+                    // Again, now the config is normalized: the earlier pass saw
+                    // the raw tree, so a key the resolver rewrites (`wrap_column`'s
+                    // zero sentinel) would leave views holding an unsaved value.
+                    for window in self.windows.values_mut() {
+                        window.resync_global_display_defaults();
+                    }
                     self.invalidate_live_editor_layout_after_settings_save();
                 }
                 // Tell plugins the config moved under them. Fired once,
@@ -322,14 +330,13 @@ impl Editor {
 
             if let Some((_, view_states)) = window.buffers.splits_mut() {
                 for view_state in view_states.values_mut() {
-                    view_state.invalidate_layout();
-                    for buffer_view_state in view_state.keyed_states.values_mut() {
+                    for (_, buffer_view_state) in view_state.buffer_states_mut() {
                         buffer_view_state.viewport.wrap_row_cache.clear();
                     }
                 }
             }
 
-            window.layout_cache.view_line_mappings.clear();
+            window.clear_pane_rows();
         }
     }
 
@@ -360,11 +367,13 @@ impl Editor {
 
         // Create parent directory if needed
         if let Some(parent) = path.parent() {
-            self.authority().filesystem.create_dir_all(parent)?;
+            self.authority()
+                .filesystem
+                .create_dir_all(parent.as_host())?;
         }
 
         // Create file with template if it doesn't exist
-        if !self.authority().filesystem.exists(&path) {
+        if !self.authority().filesystem.exists(path.as_host()) {
             let template = match layer {
                 ConfigLayer::User => {
                     r#"{
@@ -397,7 +406,7 @@ impl Editor {
             };
             self.authority()
                 .filesystem
-                .write_file(&path, template.as_bytes())?;
+                .write_file(path.as_host(), template.as_bytes())?;
         }
 
         // Close settings and open the config file
@@ -436,23 +445,8 @@ impl Editor {
         Ok(())
     }
 
-    /// Navigate settings up
-    pub fn settings_navigate_up(&mut self) {
-        if let Some(ref mut state) = self.settings_state {
-            state.select_prev();
-        }
-    }
-
-    /// Navigate settings down
-    pub fn settings_navigate_down(&mut self) {
-        if let Some(ref mut state) = self.settings_state {
-            state.select_next();
-        }
-    }
-
     /// Activate/toggle the currently selected setting
     pub fn settings_activate_current(&mut self) {
-        use crate::view::settings::items::SettingControl;
         use crate::view::settings::FocusPanel;
 
         // Check if we're in the Footer panel - handle button activation
@@ -509,101 +503,19 @@ impl Editor {
             return;
         }
 
-        // Get the current item's control type to determine action
-        let control_type = {
-            if let Some(ref state) = self.settings_state {
-                state.current_item().map(|item| match &item.control {
-                    SettingControl::Toggle(_) => "toggle",
-                    SettingControl::Number(_) => "number",
-                    SettingControl::Dropdown(_) => "dropdown",
-                    SettingControl::Text(_) => "text",
-                    SettingControl::TextList(_) => "textlist",
-                    SettingControl::DualList(_) => "duallist",
-                    SettingControl::Map(_) => "map",
-                    SettingControl::ObjectArray(_) => "objectarray",
-                    SettingControl::Json(_) => "json",
-                    SettingControl::Complex { .. } => "complex",
-                })
-            } else {
-                None
-            }
-        };
-
-        // Perform the action based on control type
-        match control_type {
-            Some("toggle") => {
-                if let Some(ref mut state) = self.settings_state {
-                    if let Some(item) = state.current_item_mut() {
-                        if let SettingControl::Toggle(ref mut toggle_state) = item.control {
-                            toggle_state.checked = !toggle_state.checked;
-                        }
-                    }
-                    state.on_value_changed();
-                }
-            }
-            Some("dropdown") => {
-                // Toggle dropdown open/closed, or confirm selection if open
-                if let Some(ref mut state) = self.settings_state {
-                    if state.is_dropdown_open() {
-                        state.dropdown_confirm();
-                    } else {
-                        state.dropdown_toggle();
-                    }
-                }
-            }
-            Some("textlist") => {
-                // Enter text editing mode for TextList controls
-                if let Some(ref mut state) = self.settings_state {
-                    state.start_editing();
-                }
-            }
-            Some("map") => {
-                // For Map controls: check if map has a value schema (supports entry dialogs)
-                if let Some(ref mut state) = self.settings_state {
-                    if let Some(item) = state.current_item_mut() {
-                        if let SettingControl::Map(ref mut map_state) = item.control {
-                            if map_state.focused_entry.is_none() {
-                                // On add-new row: open dialog with empty key
-                                if map_state.value_schema.is_some() {
-                                    state.open_add_entry_dialog();
-                                }
-                            } else if map_state.value_schema.is_some() {
-                                // Map has schema: open entry dialog
-                                state.open_entry_dialog();
-                            } else {
-                                // For other maps: toggle expanded
-                                if let Some(idx) = map_state.focused_entry {
-                                    if map_state.expanded.contains(&idx) {
-                                        map_state.expanded.retain(|&i| i != idx);
-                                    } else {
-                                        map_state.expanded.push(idx);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    state.on_value_changed();
-                }
-            }
-            Some("text") => {
-                // For Text controls: enter text editing mode
-                if let Some(ref mut state) = self.settings_state {
-                    state.start_editing();
-                }
-            }
-            Some("number") => {
-                // For Number controls: enter number editing mode
-                if let Some(ref mut state) = self.settings_state {
-                    state.start_number_editing();
-                }
-            }
-            _ => {}
+        // The control's kind acts: a toggle flips, a number opens its
+        // draft, a dropdown its list (or, open, commits and closes it), a
+        // text field or a JSON editor its editor, a dual list takes the
+        // keyboard (or, live, moves the item under its cursor across), a
+        // map's or an object array's list opens its cursor's row, a text
+        // list opens its add row (or makes its draft an item).
+        if let Some(ref mut state) = self.settings_state {
+            state.activate_current();
         }
     }
 
     /// Increment the current setting value (for Number and Dropdown controls)
     pub fn settings_increment_current(&mut self) {
-        use crate::view::settings::items::SettingControl;
         use crate::view::settings::FocusPanel;
 
         // Check if we're in the Footer panel - navigate buttons instead
@@ -626,35 +538,15 @@ impl Editor {
             return;
         }
 
-        let control_type = {
-            if let Some(ref state) = self.settings_state {
-                state.current_item().map(|item| match &item.control {
-                    SettingControl::Number(_) => "number",
-                    SettingControl::Dropdown(_) => "dropdown",
-                    _ => "other",
-                })
-            } else {
-                None
-            }
-        };
-
         // Number inc/dec removed — direct typing only. Action still
         // exists for Dropdown cycling.
-        if let Some("dropdown") = control_type {
-            if let Some(ref mut state) = self.settings_state {
-                if let Some(item) = state.current_item_mut() {
-                    if let SettingControl::Dropdown(ref mut dropdown_state) = item.control {
-                        dropdown_state.select_next();
-                    }
-                }
-                state.on_value_changed();
-            }
+        if let Some(ref mut state) = self.settings_state {
+            state.cycle_dropdown(1);
         }
     }
 
     /// Decrement the current setting value (for Number and Dropdown controls)
     pub fn settings_decrement_current(&mut self) {
-        use crate::view::settings::items::SettingControl;
         use crate::view::settings::FocusPanel;
 
         // Check if we're in the Footer panel - navigate buttons instead
@@ -681,29 +573,10 @@ impl Editor {
             return;
         }
 
-        let control_type = {
-            if let Some(ref state) = self.settings_state {
-                state.current_item().map(|item| match &item.control {
-                    SettingControl::Number(_) => "number",
-                    SettingControl::Dropdown(_) => "dropdown",
-                    _ => "other",
-                })
-            } else {
-                None
-            }
-        };
-
         // Number inc/dec removed — direct typing only. Action still
         // exists for Dropdown cycling.
-        if let Some("dropdown") = control_type {
-            if let Some(ref mut state) = self.settings_state {
-                if let Some(item) = state.current_item_mut() {
-                    if let SettingControl::Dropdown(ref mut dropdown_state) = item.control {
-                        dropdown_state.select_prev();
-                    }
-                }
-                state.on_value_changed();
-            }
+        if let Some(ref mut state) = self.settings_state {
+            state.cycle_dropdown(-1);
         }
     }
 

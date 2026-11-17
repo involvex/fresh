@@ -7,22 +7,10 @@ use super::types::{
     generate_buffer_id, path_hash, ChunkedRecoveryData, ChunkedRecoveryIndex, RecoveryChunk,
     RecoveryEntry, RecoveryMetadata, SessionInfo,
 };
-use crate::input::input_history::get_data_dir;
-use std::fs::{self, File};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-
-/// Determines which recovery directory to use.
-#[derive(Debug, Clone)]
-pub enum RecoveryScope {
-    /// Standalone mode: recovery scoped by working directory.
-    /// Directory: `recovery/default/{cwd_hash}/`
-    Standalone { working_dir: PathBuf },
-    /// Named daemon (`fresh -a NAME`): recovery scoped by daemon name.
-    /// Directory: `recovery/sessions/{name}/`
-    Session { name: String },
-}
 
 /// Recovery storage manager
 ///
@@ -41,104 +29,9 @@ impl RecoveryStorage {
     /// Session lock file name
     const SESSION_LOCK: &'static str = "session.lock";
 
-    /// Create a new recovery storage manager (legacy flat layout)
-    pub fn new() -> io::Result<Self> {
-        let recovery_dir = Self::get_recovery_dir()?;
-        Ok(Self { recovery_dir })
-    }
-
     /// Create a recovery storage with a custom directory (for testing)
     pub fn with_dir(recovery_dir: PathBuf) -> Self {
         Self { recovery_dir }
-    }
-
-    /// Create a recovery storage scoped to a named daemon or working directory.
-    pub fn with_scope(base_recovery_dir: &Path, scope: &RecoveryScope) -> Self {
-        let recovery_dir = match scope {
-            RecoveryScope::Standalone { working_dir } => {
-                let hash = crate::workspace::encode_path_for_filename(working_dir);
-                base_recovery_dir.join("default").join(hash)
-            }
-            RecoveryScope::Session { name } => {
-                // Sanitize daemon name for filesystem safety
-                let safe_name: String = name
-                    .chars()
-                    .map(|c| {
-                        if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                            c
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
-                base_recovery_dir.join("sessions").join(safe_name)
-            }
-        };
-        Self { recovery_dir }
-    }
-
-    /// Get the recovery directory path
-    pub fn get_recovery_dir() -> io::Result<PathBuf> {
-        let data_dir = get_data_dir()?;
-        Ok(data_dir.join("recovery"))
-    }
-
-    /// Migrate old flat-layout recovery files into a scoped directory.
-    ///
-    /// If recovery files exist directly in `base_dir` (old layout), moves them
-    /// into the provided scoped subdirectory. This is a one-time migration.
-    pub fn migrate_flat_layout(base_recovery_dir: &Path, scope: &RecoveryScope) -> io::Result<()> {
-        // Check if old-style session.lock exists at the flat level
-        let old_lock = base_recovery_dir.join(Self::SESSION_LOCK);
-        if !old_lock.exists() {
-            return Ok(());
-        }
-
-        // Check that the new layout dirs don't already exist
-        let default_dir = base_recovery_dir.join("default");
-        let sessions_dir = base_recovery_dir.join("sessions");
-        if default_dir.exists() || sessions_dir.exists() {
-            // Already migrated (or partially migrated)
-            return Ok(());
-        }
-
-        // Determine destination directory
-        let dest = match scope {
-            RecoveryScope::Standalone { working_dir } => {
-                let hash = crate::workspace::encode_path_for_filename(working_dir);
-                base_recovery_dir.join("default").join(hash)
-            }
-            RecoveryScope::Session { name } => {
-                let safe_name: String = name
-                    .chars()
-                    .map(|c| {
-                        if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                            c
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
-                base_recovery_dir.join("sessions").join(safe_name)
-            }
-        };
-
-        fs::create_dir_all(&dest)?;
-
-        // Move all files (not directories) from base_recovery_dir to dest
-        for entry in fs::read_dir(base_recovery_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_file() {
-                let file_name = path.file_name().unwrap();
-                let dest_path = dest.join(file_name);
-                // Copy then delete (safer than rename across filesystems)
-                fs::copy(&path, &dest_path)?;
-                fs::remove_file(&path)?;
-            }
-        }
-
-        Ok(())
     }
 
     /// Ensure the recovery directory exists
@@ -155,44 +48,13 @@ impl RecoveryStorage {
     // Session lock management
     // ========================================================================
 
-    /// Get the path to the session lock file
+    /// The lock file an earlier version's editor kept in its store while it
+    /// ran (see `store`), read to leave a still-running one's store alone.
     fn session_lock_path(&self) -> PathBuf {
         self.recovery_dir.join(Self::SESSION_LOCK)
     }
 
-    /// Create a session lock file for crash detection
-    pub fn create_session_lock(&self) -> io::Result<SessionInfo> {
-        self.ensure_dir()?;
-
-        let info = SessionInfo::new();
-        let json = serde_json::to_string_pretty(&info).map_err(io::Error::other)?;
-
-        self.atomic_write(&self.session_lock_path(), json.as_bytes())?;
-        Ok(info)
-    }
-
-    /// Update the session lock timestamp (heartbeat)
-    pub fn update_session_lock(&self) -> io::Result<()> {
-        let path = self.session_lock_path();
-        if path.exists() {
-            // Just update the file's mtime by rewriting it
-            let info = SessionInfo::new();
-            let json = serde_json::to_string_pretty(&info).map_err(io::Error::other)?;
-            self.atomic_write(&path, json.as_bytes())?;
-        }
-        Ok(())
-    }
-
-    /// Remove the session lock file (clean shutdown)
-    pub fn remove_session_lock(&self) -> io::Result<()> {
-        let path = self.session_lock_path();
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
-        Ok(())
-    }
-
-    /// Read the session lock file
+    /// Read an earlier version's session lock file
     pub fn read_session_lock(&self) -> io::Result<Option<SessionInfo>> {
         let path = self.session_lock_path();
         if !path.exists() {
@@ -203,14 +65,6 @@ impl RecoveryStorage {
         let info: SessionInfo = serde_json::from_str(&content)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         Ok(Some(info))
-    }
-
-    /// Check if there was a crash (lock file exists but process not running)
-    pub fn detect_crash(&self) -> io::Result<bool> {
-        match self.read_session_lock()? {
-            Some(info) => Ok(!info.is_running()),
-            None => Ok(false),
-        }
     }
 
     // ========================================================================
@@ -280,7 +134,7 @@ impl RecoveryStorage {
     /// ## File Layout
     ///
     /// - `{id}.meta.json` - Contains RecoveryMetadata with embedded ChunkedRecoveryIndex
-    /// - `{id}.chunk.0`, `{id}.chunk.1`, ... - Raw binary content for each chunk
+    /// - `{id}.chunk.0` - Every chunk's raw content, one after another
     #[allow(clippy::too_many_arguments)]
     pub fn save_recovery(
         &self,
@@ -292,6 +146,39 @@ impl RecoveryStorage {
         original_file_size: usize,
         final_size: usize,
     ) -> io::Result<RecoveryMetadata> {
+        self.save_recovery_owned(
+            id,
+            chunks,
+            original_path,
+            buffer_name,
+            line_count,
+            original_file_size,
+            final_size,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// [`Self::save_recovery`], recording the project root the buffer is
+    /// edited in (see [`RecoveryMetadata::root`]) and, for a file on another
+    /// host, which one (see [`RecoveryMetadata::host`]). `workspace_id` writes
+    /// the stamp earlier versions filed entries by, for their tests.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_recovery_owned(
+        &self,
+        id: &str,
+        chunks: Vec<RecoveryChunk>,
+        original_path: Option<&Path>,
+        buffer_name: Option<&str>,
+        line_count: Option<usize>,
+        original_file_size: usize,
+        final_size: usize,
+        workspace_id: Option<&str>,
+        root: Option<&Path>,
+        host: Option<&str>,
+    ) -> io::Result<RecoveryMetadata> {
+        let remote = host.is_some();
         self.ensure_dir()?;
 
         let (meta_path, _content_path) = self.recovery_paths(id);
@@ -302,19 +189,24 @@ impl RecoveryStorage {
         // Create chunked data structure
         let chunked_data = ChunkedRecoveryData::new(original_file_size, final_size, chunks);
 
-        // Write each chunk to a separate file
-        let mut total_chunk_bytes = 0u64;
-        for (i, chunk) in chunked_data.chunks.iter().enumerate() {
-            let chunk_path = self.chunk_path(id, i);
-            self.atomic_write(&chunk_path, &chunk.content)?;
-            total_chunk_bytes += chunk.content.len() as u64;
-        }
+        // Every chunk's content goes in one file, however many chunks there
+        // are (see `ChunkedRecoveryIndex::packed`)
+        let content = chunked_data
+            .chunks
+            .iter()
+            .fold(Vec::new(), |mut all, chunk| {
+                all.extend_from_slice(&chunk.content);
+                all
+            });
+        self.atomic_write(&self.chunk_path(id, 0), &content)?;
+        let total_chunk_bytes = content.len() as u64;
 
         // Create the index (metadata without binary content)
         let index = chunked_data.to_index();
 
-        // Get original file's mtime if it exists
-        let original_mtime = original_path.and_then(|p| {
+        // Get original file's mtime if it exists. A remote file's path
+        // names nothing on this host.
+        let original_mtime = original_path.filter(|_| !remote).and_then(|p| {
             fs::metadata(p)
                 .ok()
                 .and_then(|m| m.modified().ok())
@@ -333,6 +225,7 @@ impl RecoveryStorage {
                     original_mtime,
                     chunked_data.chunks.len(),
                     original_file_size,
+                    workspace_id.map(|w| w.to_string()),
                 )
             })
         } else {
@@ -344,11 +237,29 @@ impl RecoveryStorage {
                 original_mtime,
                 chunked_data.chunks.len(),
                 original_file_size,
+                workspace_id.map(|w| w.to_string()),
             )
         };
 
-        // Update metadata fields
+        // Update metadata fields. The buffer is the same, but what it is for
+        // may not be: a Save As names it, or names it anew.
+        metadata.original_path = original_path.map(|p| p.to_path_buf());
+        metadata.buffer_name = buffer_name.map(|s| s.to_string());
+        metadata.original_mtime = original_mtime;
+        metadata.remote = remote;
+        metadata.host = host.map(str::to_owned);
         metadata.original_file_size = original_file_size;
+        // This content is newer than anything a save recorded before it
+        // (see `SaveIntent`), so that save no longer says anything about it.
+        metadata.saving = None;
+        if let Some(workspace_id) = workspace_id {
+            metadata.workspace_id = Some(workspace_id.to_string());
+        }
+        // Rewritten every save, so it follows a buffer moved to a window on
+        // another root (Extract Tab to New Workspace)
+        if let Some(root) = root {
+            metadata.root = Some(root.to_path_buf());
+        }
         metadata.update(total_chunk_bytes, line_count, chunked_data.chunks.len());
 
         // Create combined metadata with embedded chunk index
@@ -404,9 +315,7 @@ impl RecoveryStorage {
             None => return Ok(None),
         };
 
-        // Load content for each chunk from its file
-        let mut chunks = Vec::with_capacity(index.chunks.len());
-        for (i, chunk_meta) in index.chunks.iter().enumerate() {
+        let read = |i: usize| -> io::Result<Vec<u8>> {
             let chunk_path = self.chunk_path(id, i);
             if !chunk_path.exists() {
                 return Err(io::Error::new(
@@ -414,17 +323,53 @@ impl RecoveryStorage {
                     format!("Chunk file {} not found", chunk_path.display()),
                 ));
             }
-
             let content = fs::read(&chunk_path)?;
             crate::services::counters::global().inc_recovery_chunks(1);
             crate::services::counters::global().inc_recovery_bytes(content.len() as u64);
-
-            chunks.push(RecoveryChunk {
-                offset: chunk_meta.offset,
-                original_len: chunk_meta.original_len,
-                content,
-            });
-        }
+            Ok(content)
+        };
+        // Each chunk's content: its slice of the one file, or (an entry an
+        // earlier version wrote) a file of its own
+        let contents = if index.packed {
+            let all = read(0)?;
+            let total: usize = index.chunks.iter().map(|c| c.size).sum();
+            // A lone chunk cut short is handed back as it is, as a chunk
+            // file of its own was: the caller weighs it against the size
+            // the metadata recorded (`RecoveryResult::RecoveredPartial`).
+            // Cut short across several, which chunk lost bytes can't be
+            // told, and more than the index accounts for is not this
+            // entry's content.
+            let short_single = index.chunks.len() == 1 && all.len() < total;
+            if total != all.len() && !short_single {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "recovery entry {id} holds {} bytes of content, its index {total}",
+                        all.len()
+                    ),
+                ));
+            }
+            let mut rest = all.as_slice();
+            index
+                .chunks
+                .iter()
+                .map(|c| {
+                    let (content, after) = rest.split_at(c.size.min(rest.len()));
+                    rest = after;
+                    content.to_vec()
+                })
+                .collect()
+        } else {
+            (0..index.chunks.len())
+                .map(read)
+                .collect::<io::Result<Vec<_>>>()?
+        };
+        let chunks = index
+            .chunks
+            .iter()
+            .zip(contents)
+            .map(|(meta, content)| RecoveryChunk::new(meta.offset, meta.original_len, content))
+            .collect();
 
         Ok(Some(ChunkedRecoveryData::new(
             index.original_size,
@@ -513,12 +458,23 @@ impl RecoveryStorage {
 
     /// Load a complete recovery entry
     pub fn load_entry(&self, id: &str) -> io::Result<Option<RecoveryEntry>> {
-        let (meta_path, content_path) = self.recovery_paths(id);
+        let (meta_path, _) = self.recovery_paths(id);
 
         if !meta_path.exists() {
             return Ok(None);
         }
 
+        let has_content = !self.list_chunk_paths(id)?.is_empty();
+        self.entry_from_metadata(id, has_content).map(Some)
+    }
+
+    /// Build the entry for `id`, whose metadata file exists, given whether
+    /// any of its content files do. Split out of [`Self::load_entry`] so
+    /// [`Self::list_entries`] can answer the content question from the one
+    /// directory listing it already made, rather than listing the whole
+    /// directory again for every entry in it.
+    fn entry_from_metadata(&self, id: &str, has_content: bool) -> io::Result<RecoveryEntry> {
+        let (meta_path, content_path) = self.recovery_paths(id);
         let metadata = self.read_metadata(id)?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -526,18 +482,43 @@ impl RecoveryStorage {
             )
         })?;
 
-        // Require at least one chunk file
-        let chunk_paths = self.list_chunk_paths(id)?;
-        if chunk_paths.is_empty() {
-            return Ok(None);
+        // Metadata with no content is not an absent entry, it is a broken
+        // one: the two are separate atomic writes, so a crash between them
+        // leaves exactly this. Reporting it as absent told callers the
+        // content was gone, and one of them deletes the only reference to
+        // it on that word.
+        if !has_content {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("recovery entry {id} has metadata but no content files"),
+            ));
         }
 
-        Ok(Some(RecoveryEntry {
+        Ok(RecoveryEntry {
             id: id.to_string(),
             metadata,
             content_path,
             metadata_path: meta_path,
-        }))
+        })
+    }
+
+    /// Whether an entry was ever recorded for `id`, usable or not.
+    ///
+    /// `list_entries` can only offer entries it can actually load, so a
+    /// caller that finds `id` missing from it learns nothing about why. This
+    /// separates the three reasons: `Ok(false)` is the only one that means
+    /// the content is gone, `Ok(true)` means it is there but unusable (a
+    /// half-written entry, which a later session may well read), and `Err`
+    /// means this process cannot tell — the directory is unreadable.
+    pub fn entry_recorded(&self, id: &str) -> io::Result<bool> {
+        let (meta_path, _) = self.recovery_paths(id);
+        // `Path::exists` folds every error into `false`, including the
+        // "cannot look" ones, which is the conflation being removed here.
+        match fs::metadata(&meta_path) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Delete recovery files for a buffer
@@ -566,21 +547,29 @@ impl RecoveryStorage {
             return Ok(Vec::new());
         }
 
-        let mut entries = Vec::new();
-
+        // One pass over the directory answers both questions: which entries
+        // have metadata, and which have content. Asking `load_entry` per
+        // entry listed the whole directory again each time, which made a
+        // daemon with hundreds of hot-exit buffers spend most of its first
+        // second before the first frame re-reading this one directory.
+        let meta_suffix = format!(".{}", Self::META_EXT);
+        let mut ids = Vec::new();
+        let mut with_content = std::collections::HashSet::new();
         for entry in fs::read_dir(&self.recovery_dir)? {
             let entry = entry?;
-            let path = entry.path();
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if let Some(id) = name.strip_suffix(&meta_suffix) {
+                ids.push(id.to_string());
+            } else if let Some((id, _)) = name.rsplit_once(".chunk.") {
+                with_content.insert(id.to_string());
+            }
+        }
 
-            // Look for .meta.json files
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(&format!(".{}", Self::META_EXT)) {
-                    // Extract the ID (everything before .meta.json)
-                    let id = name.trim_end_matches(&format!(".{}", Self::META_EXT));
-                    if let Ok(Some(entry)) = self.load_entry(id) {
-                        entries.push(entry);
-                    }
-                }
+        let mut entries = Vec::new();
+        for id in ids {
+            if let Ok(entry) = self.entry_from_metadata(&id, with_content.contains(&id)) {
+                entries.push(entry);
             }
         }
 
@@ -590,166 +579,15 @@ impl RecoveryStorage {
         Ok(entries)
     }
 
-    /// Clean up orphaned files (content without metadata or vice versa)
-    pub fn cleanup_orphans(&self) -> io::Result<usize> {
-        if !self.recovery_dir.exists() {
-            return Ok(0);
-        }
-
-        let mut cleaned = 0;
-        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        for entry in fs::read_dir(&self.recovery_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                // Skip session lock
-                if name == Self::SESSION_LOCK {
-                    continue;
-                }
-
-                // Extract ID from various file types
-                let id = if name.ends_with(&format!(".{}", Self::META_EXT)) {
-                    name.trim_end_matches(&format!(".{}", Self::META_EXT))
-                        .to_string()
-                } else if name.ends_with(&format!(".{}", Self::CONTENT_EXT)) {
-                    name.trim_end_matches(&format!(".{}", Self::CONTENT_EXT))
-                        .to_string()
-                } else if name.contains(".chunk.") {
-                    // Handle chunk files like "id.chunk.0"
-                    name.split(".chunk.").next().unwrap_or("").to_string()
-                } else {
-                    // Unknown file type, skip
-                    continue;
-                };
-
-                if id.is_empty() || seen_ids.contains(&id) {
-                    continue;
-                }
-                seen_ids.insert(id.clone());
-
-                let (meta_path, _content_path) = self.recovery_paths(&id);
-                let chunk_paths = self.list_chunk_paths(&id).unwrap_or_default();
-
-                // Need meta + chunk files
-                let is_valid = meta_path.exists() && !chunk_paths.is_empty();
-
-                if !is_valid {
-                    if let Err(e) = fs::remove_file(&meta_path) {
-                        tracing::warn!(
-                            "Failed to remove orphan metadata {}: {}",
-                            meta_path.display(),
-                            e
-                        );
-                    }
-                    if let Err(e) = self.delete_chunk_files(&id) {
-                        tracing::warn!("Failed to remove orphan chunk files for {}: {}", id, e);
-                    }
-                    cleaned += 1;
-                }
-            }
-        }
-
-        Ok(cleaned)
-    }
-
-    /// Clean up all recovery files (after successful recovery or user dismissal)
-    pub fn cleanup_all(&self) -> io::Result<usize> {
-        if !self.recovery_dir.exists() {
-            return Ok(0);
-        }
-
-        let mut cleaned = 0;
-
-        for entry in fs::read_dir(&self.recovery_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                // Don't delete the session lock
-                if name == Self::SESSION_LOCK {
-                    continue;
-                }
-
-                if fs::remove_file(&path).is_ok() {
-                    cleaned += 1;
-                }
-            }
-        }
-
-        Ok(cleaned)
-    }
-
-    // ========================================================================
-    // In-place write recovery
-    // ========================================================================
-
-    /// List all in-place write recovery entries that need attention.
-    ///
-    /// Returns entries where:
-    /// - The process that created them is no longer running (crash occurred)
-    /// - The temp file still exists (has data to recover)
-    pub fn list_inplace_write_recoveries(
-        &self,
-    ) -> io::Result<Vec<super::types::InplaceWriteRecovery>> {
-        if !self.recovery_dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut entries = Vec::new();
-
-        for entry in fs::read_dir(&self.recovery_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".inplace.json") {
-                    // Try to parse the metadata
-                    if let Ok(content) = fs::read_to_string(&path) {
-                        if let Ok(recovery) =
-                            serde_json::from_str::<super::types::InplaceWriteRecovery>(&content)
-                        {
-                            // Only include if:
-                            // 1. The creating process is not running (crashed)
-                            // 2. The temp file still exists
-                            if !recovery.is_in_progress() && recovery.temp_path.exists() {
-                                entries.push(recovery);
-                            } else if !recovery.temp_path.exists() {
-                                // Clean up orphaned metadata (temp file was deleted)
-                                if let Err(e) = fs::remove_file(&path) {
-                                    tracing::warn!("Failed to remove orphaned inplace recovery metadata {}: {}", path.display(), e);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Sort by start time (oldest first)
-        entries.sort_by_key(|e| e.started_at);
-        Ok(entries)
-    }
-
-    /// Clean up an in-place write recovery entry and its temp file.
-    pub fn cleanup_inplace_write_recovery(
-        &self,
-        recovery: &super::types::InplaceWriteRecovery,
-    ) -> io::Result<()> {
-        // Delete the temp file
-        if recovery.temp_path.exists() {
-            fs::remove_file(&recovery.temp_path)?;
-        }
-
-        // Delete the metadata file
-        let hash = path_hash(&recovery.dest_path);
-        let meta_path = self.recovery_dir.join(format!("{}.inplace.json", hash));
-        if meta_path.exists() {
-            fs::remove_file(&meta_path)?;
-        }
-
-        Ok(())
+    /// Remove temp files [`Self::atomic_write`] left behind when its process
+    /// died between creating and renaming them; nothing else ever deletes
+    /// them. One whose process is still running (another editor sharing this
+    /// directory, mid-write) is left alone. Returns how many were removed.
+    pub fn remove_stale_temp_files(&self) -> io::Result<usize> {
+        super::types::remove_orphaned_temp_files(
+            &crate::model::filesystem::StdFileSystem,
+            &self.recovery_dir,
+        )
     }
 
     // ========================================================================
@@ -763,25 +601,7 @@ impl RecoveryStorage {
     /// page cache survives), but system crashes/power loss could leave corrupted recovery
     /// files. Async I/O would let us have both safety and performance.
     fn atomic_write(&self, target: &Path, content: &[u8]) -> io::Result<()> {
-        let temp_path = target.with_extension("tmp");
-
-        // Write to temp file
-        let mut file = File::create(&temp_path)?;
-        file.write_all(content)?;
-        drop(file);
-
-        // Atomic rename
-        fs::rename(&temp_path, target)?;
-
-        Ok(())
-    }
-}
-
-impl Default for RecoveryStorage {
-    fn default() -> Self {
-        Self::new().unwrap_or_else(|_| Self {
-            recovery_dir: std::env::temp_dir().join("fresh-recovery"),
-        })
+        super::types::write_atomically(target, content)
     }
 }
 
@@ -796,26 +616,6 @@ mod tests {
             recovery_dir: temp_dir.path().to_path_buf(),
         };
         (storage, temp_dir)
-    }
-
-    #[test]
-    fn test_session_lock_lifecycle() {
-        let (storage, _temp) = create_test_storage();
-
-        // Create lock
-        let info = storage.create_session_lock().unwrap();
-        assert_eq!(info.pid, std::process::id());
-
-        // Read lock
-        let read_info = storage.read_session_lock().unwrap().unwrap();
-        assert_eq!(read_info.pid, info.pid);
-
-        // Lock should show as running (it's our process)
-        assert!(read_info.is_running());
-
-        // Remove lock
-        storage.remove_session_lock().unwrap();
-        assert!(storage.read_session_lock().unwrap().is_none());
     }
 
     #[test]
@@ -865,6 +665,48 @@ mod tests {
         assert_eq!(entries.len(), 2);
     }
 
+    /// `list_entries` reads the directory once and pairs metadata with
+    /// content from that one listing. The pairing must agree with
+    /// `load_entry`'s: an id that is a prefix of another keeps only its own
+    /// chunks, metadata without content is a broken entry and is left out,
+    /// and a chunk with no metadata is not an entry.
+    #[test]
+    fn test_list_entries_pairs_metadata_with_content_in_one_pass() {
+        let (storage, temp) = create_test_storage();
+        let save = |id: &str| {
+            let chunks = vec![RecoveryChunk::new(0, 0, b"content".to_vec())];
+            storage
+                .save_recovery(id, chunks, None, Some(id), None, 0, 7)
+                .unwrap();
+        };
+        for i in 0..300 {
+            save(&format!("buf{i:03}"));
+        }
+        save("a");
+        save("ab");
+        save("broken");
+        for path in storage.list_chunk_paths("broken").unwrap() {
+            fs::remove_file(path).unwrap();
+        }
+        fs::write(temp.path().join("orphan.chunk.0"), b"no metadata").unwrap();
+
+        let mut ids: Vec<String> = storage
+            .list_entries()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        ids.sort();
+        let mut want: Vec<String> = (0..300).map(|i| format!("buf{i:03}")).collect();
+        want.push("a".into());
+        want.push("ab".into());
+        want.sort();
+        assert_eq!(ids, want);
+        // the one-pass listing and the per-id lookup agree on the broken entry
+        assert!(storage.load_entry("broken").is_err());
+        assert!(storage.load_entry("a").unwrap().is_some());
+    }
+
     #[test]
     fn test_delete_recovery() {
         let (storage, _temp) = create_test_storage();
@@ -885,27 +727,33 @@ mod tests {
         assert!(storage.load_entry(id).unwrap().is_none());
     }
 
+    /// A temp file `atomic_write` left behind when its process died is
+    /// removed; one of a live process, and anything that isn't such a temp
+    /// file, is kept.
     #[test]
-    fn test_cleanup_orphans() {
-        let (storage, _temp) = create_test_storage();
-        storage.ensure_dir().unwrap();
+    fn remove_stale_temp_files_only_removes_dead_processes_temp_files() {
+        let (storage, temp) = create_test_storage();
+        let dir = temp.path();
+        // Far above any pid_max, so never a running process.
+        let dead = format!(".abc.chunk.0.{}.3.tmp", 2_000_000_000u32);
+        let live = format!(".abc.chunk.1.{}.4.tmp", std::process::id());
+        let kept = [
+            live.as_str(),
+            "abc.meta.json",
+            "foo.tmp",
+            ".inplace-notes.txt-2000000000-17.tmp",
+            ".2000000000.3.tmp",
+        ];
+        for name in kept.iter().chain([&dead.as_str()]) {
+            fs::write(dir.join(name), b"x").unwrap();
+        }
 
-        // Create an orphan content file (no metadata)
-        let orphan_content = storage.recovery_dir.join("orphan.content");
-        fs::write(&orphan_content, b"orphan").unwrap();
+        assert_eq!(storage.remove_stale_temp_files().unwrap(), 1);
 
-        // Create a complete entry
-        let chunks = vec![RecoveryChunk::new(0, 0, b"content".to_vec())];
-        storage
-            .save_recovery("complete", chunks, None, Some("Test"), None, 0, 7)
-            .unwrap();
-
-        // Cleanup should remove the orphan
-        let cleaned = storage.cleanup_orphans().unwrap();
-        assert_eq!(cleaned, 1);
-
-        // Complete entry should still exist
-        assert!(storage.load_entry("complete").unwrap().is_some());
+        assert!(!dir.join(&dead).exists());
+        for name in kept {
+            assert!(dir.join(name).exists(), "{name} must be kept");
+        }
     }
 
     #[test]
@@ -922,9 +770,12 @@ mod tests {
         let read_content = fs::read(&target).unwrap();
         assert_eq!(read_content, content);
 
-        // Temp file should not exist
-        let temp_path = target.with_extension("tmp");
-        assert!(!temp_path.exists());
+        // No temp file should be left behind
+        let names: Vec<_> = fs::read_dir(&storage.recovery_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["test.txt"]);
     }
 
     // ========================================================================
@@ -962,17 +813,10 @@ mod tests {
         assert_eq!(metadata.chunk_count, 2);
         assert_eq!(metadata.original_file_size, original_size);
 
-        // Verify chunk files exist
-        assert!(storage.chunk_path(id, 0).exists());
-        assert!(storage.chunk_path(id, 1).exists());
-        assert!(!storage.chunk_path(id, 2).exists()); // Only 2 chunks
-
-        // Verify chunk file contents
-        let chunk0_content = fs::read(storage.chunk_path(id, 0)).unwrap();
-        assert_eq!(chunk0_content, b"INSERTED_AT_START");
-
-        let chunk1_content = fs::read(storage.chunk_path(id, 1)).unwrap();
-        assert_eq!(chunk1_content, b"REPLACED");
+        // Both chunks' content is in the one chunk file, in order
+        assert_eq!(storage.list_chunk_paths(id).unwrap().len(), 1);
+        let content = fs::read(storage.chunk_path(id, 0)).unwrap();
+        assert_eq!(content, b"INSERTED_AT_STARTREPLACED");
 
         // Verify metadata file contains chunked_index
         let (meta_path, _) = storage.recovery_paths(id);
@@ -1058,6 +902,122 @@ mod tests {
         assert_eq!(reconstructed, expected);
     }
 
+    /// However many chunks an entry has, its content is one file: a
+    /// replace-all in a large file made one file per match (issue #3645).
+    #[test]
+    fn test_many_chunks_are_one_file_and_read_back_in_order() {
+        let (storage, _temp) = create_test_storage();
+        let chunks: Vec<_> = (0..5000)
+            .map(|i| RecoveryChunk::new(i * 10, i % 3, format!("c{i}").into_bytes()))
+            .collect();
+        let final_size: usize = 50_000 + chunks.iter().map(|c| c.size()).sum::<usize>()
+            - chunks.iter().map(|c| c.original_len).sum::<usize>();
+        let id = "many";
+        storage
+            .save_recovery(id, chunks.clone(), None, None, None, 50_000, final_size)
+            .unwrap();
+
+        assert_eq!(storage.list_chunk_paths(id).unwrap().len(), 1);
+        let read = storage.read_chunked_content(id).unwrap().unwrap();
+        assert_eq!(read.chunks.len(), chunks.len());
+        for (got, want) in read.chunks.iter().zip(&chunks) {
+            assert_eq!(
+                (got.offset, got.original_len, &got.content),
+                (want.offset, want.original_len, &want.content)
+            );
+        }
+    }
+
+    /// An entry an earlier version wrote, one `.chunk.N` file per chunk and
+    /// no `packed` in its index, still loads; saving over it leaves only the
+    /// one file.
+    #[test]
+    fn test_entry_with_a_file_per_chunk_still_loads() {
+        let (storage, temp) = create_test_storage();
+        let id = "legacy";
+        let meta = serde_json::json!({
+            "original_path": null,
+            "buffer_name": null,
+            "created_at": 1,
+            "updated_at": 1,
+            "content_size": 7,
+            "line_count": null,
+            "original_mtime": null,
+            "format_version": 2,
+            "chunk_count": 2,
+            "original_file_size": 100,
+            "chunked_index": {
+                "original_size": 100,
+                "final_size": 104,
+                "chunks": [
+                    { "offset": 0, "original_len": 0, "size": 3 },
+                    { "offset": 50, "original_len": 3, "size": 4 }
+                ]
+            }
+        });
+        fs::write(
+            temp.path().join(format!("{id}.meta.json")),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
+        fs::write(temp.path().join(format!("{id}.chunk.0")), b"abc").unwrap();
+        fs::write(temp.path().join(format!("{id}.chunk.1")), b"defg").unwrap();
+
+        let read = storage.read_chunked_content(id).unwrap().unwrap();
+        let chunks: Vec<_> = read
+            .chunks
+            .iter()
+            .map(|c| (c.offset, c.original_len, c.content.as_slice()))
+            .collect();
+        assert_eq!(chunks, vec![(0, 0, &b"abc"[..]), (50, 3, &b"defg"[..])]);
+
+        let chunks = vec![RecoveryChunk::new(1, 1, b"x".to_vec())];
+        storage
+            .save_recovery(id, chunks, None, None, None, 100, 100)
+            .unwrap();
+        assert_eq!(
+            storage.list_chunk_paths(id).unwrap(),
+            vec![storage.chunk_path(id, 0)]
+        );
+        let read = storage.read_chunked_content(id).unwrap().unwrap();
+        assert_eq!(read.chunks.len(), 1);
+        assert_eq!(read.chunks[0].content, b"x");
+    }
+
+    /// Content that doesn't add up to what the index says, across several
+    /// chunks, is a broken entry, never chunks cut at the wrong places. A
+    /// lone chunk cut short comes back short, for the caller to weigh
+    /// against the recorded size.
+    #[test]
+    fn test_content_shorter_or_longer_than_its_index_is_an_error() {
+        let (storage, _temp) = create_test_storage();
+        let id = "torn";
+        let chunks = vec![
+            RecoveryChunk::new(0, 0, b"one".to_vec()),
+            RecoveryChunk::new(9, 0, b"two".to_vec()),
+        ];
+        storage
+            .save_recovery(id, chunks, None, None, None, 10, 16)
+            .unwrap();
+        for content in [&b"onetw"[..], &b"onetwothree"[..]] {
+            fs::write(storage.chunk_path(id, 0), content).unwrap();
+            let err = storage.read_chunked_content(id).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+
+        let id = "torn-single";
+        let chunks = vec![RecoveryChunk::new(0, 0, b"whole".to_vec())];
+        storage
+            .save_recovery(id, chunks, None, None, None, 0, 5)
+            .unwrap();
+        fs::write(storage.chunk_path(id, 0), b"who").unwrap();
+        let read = storage.read_chunked_content(id).unwrap().unwrap();
+        assert_eq!(read.chunks[0].content, b"who");
+        fs::write(storage.chunk_path(id, 0), b"whole and more").unwrap();
+        let err = storage.read_chunked_content(id).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
     #[test]
     fn test_chunked_recovery_delete() {
         let (storage, _temp) = create_test_storage();
@@ -1078,8 +1038,6 @@ mod tests {
         let (meta_path, _) = storage.recovery_paths(id);
         assert!(meta_path.exists());
         assert!(storage.chunk_path(id, 0).exists());
-        assert!(storage.chunk_path(id, 1).exists());
-        assert!(storage.chunk_path(id, 2).exists());
 
         // Delete recovery
         storage.delete_recovery(id).unwrap();
@@ -1089,35 +1047,6 @@ mod tests {
         assert!(!storage.chunk_path(id, 0).exists());
         assert!(!storage.chunk_path(id, 1).exists());
         assert!(!storage.chunk_path(id, 2).exists());
-    }
-
-    #[test]
-    fn test_chunked_recovery_cleanup_orphan_chunks() {
-        let (storage, _temp) = create_test_storage();
-        storage.ensure_dir().unwrap();
-
-        // Create orphan chunk files (no metadata)
-        let orphan_chunk0 = storage.chunk_path("orphan", 0);
-        let orphan_chunk1 = storage.chunk_path("orphan", 1);
-        fs::write(&orphan_chunk0, b"orphan chunk 0").unwrap();
-        fs::write(&orphan_chunk1, b"orphan chunk 1").unwrap();
-
-        // Create a valid entry
-        let chunks = vec![RecoveryChunk::new(0, 0, b"valid".to_vec())];
-        storage
-            .save_recovery("valid", chunks, None, None, None, 100, 105)
-            .unwrap();
-
-        // Cleanup orphans
-        let cleaned = storage.cleanup_orphans().unwrap();
-        assert_eq!(cleaned, 1); // One orphan ID cleaned up
-
-        // Orphan chunks should be gone
-        assert!(!orphan_chunk0.exists());
-        assert!(!orphan_chunk1.exists());
-
-        // Valid entry should still exist
-        assert!(storage.load_entry("valid").unwrap().is_some());
     }
 
     #[test]
@@ -2023,132 +1952,38 @@ mod tests {
         }
     }
 
-    // ========================================================================
-    // Migration tests (Task 5.2)
-    // ========================================================================
-
+    /// An entry whose metadata is present but whose content is not must not
+    /// read as "no such entry": metadata and chunks are separate atomic
+    /// writes, so a crash between them leaves exactly this, and the entry
+    /// is broken, not gone.
     #[test]
-    fn test_migrate_flat_layout_to_standalone_scope() {
-        let temp_dir = TempDir::new().unwrap();
-        let base_dir = temp_dir.path().join("recovery");
-        fs::create_dir_all(&base_dir).unwrap();
+    fn an_entry_whose_content_is_missing_does_not_read_as_absent() {
+        let (storage, temp) = create_test_storage();
+        let id = "unsaved_halfwritten";
+        storage
+            .save_recovery_owned(
+                id,
+                vec![RecoveryChunk::new(0, 0, b"unsaved work".to_vec())],
+                None,
+                None,
+                Some(1),
+                0,
+                12,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
 
-        // Create old flat-layout files: session.lock, meta, and chunk
-        fs::write(base_dir.join("session.lock"), b"{}").unwrap();
-        fs::write(base_dir.join("abc123.meta.json"), b"{\"fake\": true}").unwrap();
-        fs::write(base_dir.join("abc123.chunk.0"), b"chunk data").unwrap();
+        // Lose the content, keep the metadata — a crash between the two
+        // writes, or a chunk whose rename never landed.
+        std::fs::remove_file(temp.path().join(format!("{id}.chunk.0"))).unwrap();
 
-        let scope = RecoveryScope::Standalone {
-            working_dir: PathBuf::from("/home/user/project"),
-        };
-
-        RecoveryStorage::migrate_flat_layout(&base_dir, &scope).unwrap();
-
-        // Old files should be moved to default/{cwd_hash}/
-        assert!(!base_dir.join("session.lock").exists());
-        assert!(!base_dir.join("abc123.meta.json").exists());
-        assert!(!base_dir.join("abc123.chunk.0").exists());
-
-        // default/ directory should exist with the scoped subdirectory
-        let hash = crate::workspace::encode_path_for_filename(Path::new("/home/user/project"));
-        let scoped_dir = base_dir.join("default").join(&hash);
-        assert!(scoped_dir.exists());
-        assert!(scoped_dir.join("session.lock").exists());
-        assert!(scoped_dir.join("abc123.meta.json").exists());
-        assert!(scoped_dir.join("abc123.chunk.0").exists());
-
-        // Verify content was preserved
-        assert_eq!(
-            fs::read(scoped_dir.join("abc123.chunk.0")).unwrap(),
-            b"chunk data"
-        );
-    }
-
-    #[test]
-    fn test_migrate_flat_layout_to_session_scope() {
-        let temp_dir = TempDir::new().unwrap();
-        let base_dir = temp_dir.path().join("recovery");
-        fs::create_dir_all(&base_dir).unwrap();
-
-        // Create old flat-layout files
-        fs::write(base_dir.join("session.lock"), b"{}").unwrap();
-        fs::write(base_dir.join("buf1.meta.json"), b"{}").unwrap();
-
-        let scope = RecoveryScope::Session {
-            name: "my-session".into(),
-        };
-
-        RecoveryStorage::migrate_flat_layout(&base_dir, &scope).unwrap();
-
-        // Files should be moved to sessions/my-session/
-        let scoped_dir = base_dir.join("sessions").join("my-session");
-        assert!(scoped_dir.join("session.lock").exists());
-        assert!(scoped_dir.join("buf1.meta.json").exists());
-    }
-
-    #[test]
-    fn test_migrate_skips_when_no_flat_files() {
-        let temp_dir = TempDir::new().unwrap();
-        let base_dir = temp_dir.path().join("recovery");
-        fs::create_dir_all(&base_dir).unwrap();
-
-        // No session.lock = nothing to migrate
-        let scope = RecoveryScope::Standalone {
-            working_dir: PathBuf::from("/tmp"),
-        };
-
-        RecoveryStorage::migrate_flat_layout(&base_dir, &scope).unwrap();
-
-        // default/ should NOT have been created
-        assert!(!base_dir.join("default").exists());
-    }
-
-    #[test]
-    fn test_migrate_skips_when_already_migrated() {
-        let temp_dir = TempDir::new().unwrap();
-        let base_dir = temp_dir.path().join("recovery");
-        fs::create_dir_all(&base_dir).unwrap();
-
-        // Old flat files exist
-        fs::write(base_dir.join("session.lock"), b"{}").unwrap();
-        fs::write(base_dir.join("old.meta.json"), b"{}").unwrap();
-
-        // But new layout dirs also exist (partial migration)
-        fs::create_dir_all(base_dir.join("default")).unwrap();
-
-        let scope = RecoveryScope::Standalone {
-            working_dir: PathBuf::from("/tmp"),
-        };
-
-        RecoveryStorage::migrate_flat_layout(&base_dir, &scope).unwrap();
-
-        // Old files should still be in place (not moved again)
-        assert!(base_dir.join("session.lock").exists());
-        assert!(base_dir.join("old.meta.json").exists());
-    }
-
-    #[test]
-    fn test_with_scope_creates_correct_directory() {
-        let temp_dir = TempDir::new().unwrap();
-        let base_dir = temp_dir.path().join("recovery");
-        fs::create_dir_all(&base_dir).unwrap();
-
-        // Standalone scope
-        let scope = RecoveryScope::Standalone {
-            working_dir: PathBuf::from("/home/user/project"),
-        };
-        let storage = RecoveryStorage::with_scope(&base_dir, &scope);
-        let hash = crate::workspace::encode_path_for_filename(Path::new("/home/user/project"));
-        assert_eq!(storage.recovery_dir, base_dir.join("default").join(&hash));
-
-        // Session scope
-        let scope = RecoveryScope::Session {
-            name: "test-session".into(),
-        };
-        let storage = RecoveryStorage::with_scope(&base_dir, &scope);
-        assert_eq!(
-            storage.recovery_dir,
-            base_dir.join("sessions").join("test-session")
+        assert!(
+            !matches!(storage.load_entry(id), Ok(None)),
+            "a metadata file with no content must not be reported as absent: \
+             absence is the one answer that licenses destroying the only \
+             reference to the content"
         );
     }
 }

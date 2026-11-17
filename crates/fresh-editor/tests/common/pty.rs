@@ -1,0 +1,462 @@
+//! A real controlling terminal for tests that drive the `fresh` *binary*.
+//!
+//! Most tests here drive the editor in-process through `EditorTestHarness`.
+//! A few properties only exist in the process itself — what `main` does on
+//! its way in and out, and what it forwards to a daemon it spawns — and
+//! those need the binary, which in turn needs a terminal it will accept:
+//! `fresh` reopens stdin from `/dev/tty` when stdin is a pipe, and the
+//! daemon client refuses to attach without a tty.
+//!
+//! So: allocate a pty, hand the child the slave as its controlling
+//! terminal, and read the ANSI it writes back through `vt100` — the same
+//! emulator the in-process visual tests use. Reads block until the child
+//! writes, which is the semantic wait CONTRIBUTING asks for: no sleeps, no
+//! deadlines, and `cargo nextest` supplies the outer timeout.
+//!
+//! Linux and macOS. The slave's name comes from `ptsname_r` on Linux and
+//! from `ptsname` (under a lock, since it returns a static buffer) on macOS,
+//! which has no `ptsname_r`; everything else here is POSIX. Most callers are
+//! still Linux-gated for reasons of their own (`XDG_*` isolation, `/proc`).
+//! The ones that are not are what put the macOS-only failure of #3683 —
+//! keys never reaching an editor whose stdin was reopened from `/dev/tty` —
+//! in front of CI's macOS runner.
+#![cfg(any(target_os = "linux", target_os = "macos"))]
+
+use std::ffi::CStr;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// A pty pair plus the child attached to its slave.
+pub struct PtyChild {
+    /// Our end. Writing to it is typing; reading from it is the screen.
+    master: File,
+    child: Child,
+    parser: vt100::Parser,
+}
+
+/// Where the child's stdin comes from.
+pub enum ChildStdin {
+    /// The terminal itself — an ordinary interactive launch.
+    Terminal,
+    /// A pipe carrying `bytes`, closed straight after — `… | fresh -`.
+    /// The child still gets the pty as its controlling terminal, which is
+    /// exactly the shape `fresh -` needs: a pipe on fd 0 *and* a
+    /// `/dev/tty` to reopen for keystrokes.
+    Piped(Vec<u8>),
+    /// `/dev/null` — `fresh file </dev/null`. Not a terminal, so the editor
+    /// reopens stdin from `/dev/tty` just as it does for a pipe.
+    Null,
+    /// `/dev/tty` itself, opened in the child once the pty is its
+    /// controlling terminal — `fresh file </dev/tty`. A terminal already, so
+    /// the editor keeps it as it is: fd 0 is `/dev/tty` with no reopen.
+    DevTty,
+}
+
+/// Whether this environment can hand out a pty at all.
+///
+/// Mirrors `tests/terminal_restore_live.rs`: a sandbox without `/dev/ptmx`
+/// should skip these tests rather than fail them, since what they cover is
+/// the editor's behaviour, not the runner's.
+pub fn pty_available() -> bool {
+    match open_pty() {
+        Ok((master, _)) => {
+            drop(master);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Spawn `command` with the pty's slave as its controlling terminal.
+///
+/// `rows`/`cols` size both the pty and the `vt100` screen the output is
+/// parsed into.
+pub fn spawn_on_pty(
+    mut command: Command,
+    stdin: ChildStdin,
+    cols: u16,
+    rows: u16,
+) -> std::io::Result<PtyChild> {
+    let (master, slave_path) = open_pty()?;
+    // `O_NOCTTY`: the slave is the child's terminal, never ours.
+    let slave = {
+        use std::os::unix::fs::OpenOptionsExt;
+        File::options()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(&slave_path)?
+    };
+    // After the slave is open: macOS refuses `TIOCSWINSZ` on a master whose
+    // slave has never been opened (ENOTTY). Linux takes it either way.
+    resize(&master, cols, rows)?;
+
+    match &stdin {
+        // `DevTty` starts from the slave and swaps it for `/dev/tty` below.
+        ChildStdin::Terminal | ChildStdin::DevTty => {
+            command.stdin(Stdio::from(slave.try_clone()?));
+        }
+        ChildStdin::Piped(_) => {
+            command.stdin(Stdio::piped());
+        }
+        ChildStdin::Null => {
+            command.stdin(Stdio::null());
+        }
+    }
+    let stdin_from_dev_tty = matches!(stdin, ChildStdin::DevTty);
+    command.stdout(Stdio::from(slave.try_clone()?));
+    command.stderr(Stdio::from(slave.try_clone()?));
+
+    // SAFETY: runs in the forked child between fork and exec, where only
+    // async-signal-safe calls are allowed. `setsid` and `ioctl` are both
+    // such calls and touch no allocator or lock this process holds.
+    // `setsid` drops the inherited controlling terminal, which is what lets
+    // `TIOCSCTTY` on fd 1 (always the pty slave, in every stdin shape)
+    // adopt ours in its place. `open`, `dup2` and `close` for `DevTty` are
+    // async-signal-safe too, and the path is a literal, so nothing allocates.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // `as _`: the constant is `c_uint` on macOS, `c_ulong` on glibc.
+            if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCSCTTY as _, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if stdin_from_dev_tty {
+                let tty = libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR);
+                if tty == -1 || libc::dup2(tty, libc::STDIN_FILENO) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                libc::close(tty);
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = command.spawn()?;
+    // The parent's copy of the slave must go before any read of the master
+    // returns EOF: while *anyone* holds the slave open, a read just blocks.
+    drop(slave);
+
+    if let ChildStdin::Piped(bytes) = stdin {
+        let mut pipe = child.stdin.take().expect("piped stdin");
+        // A launch that leaves the pipe unread (`… | fresh FILE`) drops its
+        // read end when it reopens fd 0 from `/dev/tty`. If that wins the
+        // race with this write, the write is EPIPE — which is the editor
+        // doing its job, not a failure to spawn it.
+        match pipe.write_all(&bytes) {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            other => other?,
+        }
+        // Dropping closes the write end, so the child sees EOF on the pipe.
+    }
+
+    Ok(PtyChild {
+        master,
+        child,
+        parser: vt100::Parser::new(rows, cols, 0),
+    })
+}
+
+/// How long a wait on a pty child may run before it reports failure.
+///
+/// Twice `.config/nextest.toml`'s 60s slow-timeout period and well inside
+/// the 180s at which it terminates the test, for the same reason
+/// [`EditorTestHarness::wait_until`](super::harness::EditorTestHarness::wait_until)
+/// carries the same bound: a wait for something that never arrives should
+/// fail as *this test*, naming the screen it was waiting on, rather than
+/// hang until nextest kills the whole run three slow-timeout periods later
+/// — which reads as a broken build rather than as one unmet condition, and
+/// takes the rest of the shard's output down with it.
+const PTY_WAIT_DEADLINE: Duration = Duration::from_secs(120);
+
+/// What one bounded read off the pty did, so a caller's loop can re-check
+/// its own predicate and report in its own terms.
+enum Pumped {
+    /// Bytes were fed to the parser, or the poll woke with nothing to do.
+    Progress,
+    /// The child exited or closed the pty.
+    Closed,
+    /// The deadline passed.
+    TimedOut,
+}
+
+impl PtyChild {
+    /// Wait for the pty to become readable, then read once, giving up at
+    /// `deadline`.
+    ///
+    /// Polls rather than blocking in `read`, so the deadline is honoured
+    /// even when the child says nothing at all — a child that goes quiet is
+    /// precisely the case a blocking read cannot bound.
+    fn pump_once(&mut self, deadline: Instant, buf: &mut [u8]) -> Result<Pumped, String> {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(Pumped::TimedOut);
+        }
+        let mut fds = libc::pollfd {
+            fd: self.master.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialized `pollfd` over our own live master fd.
+        let ready = unsafe {
+            libc::poll(
+                &mut fds,
+                1,
+                left.as_millis().min(i32::MAX as u128) as libc::c_int,
+            )
+        };
+        if ready <= 0 {
+            return Ok(Pumped::Progress);
+        }
+        match self.master.read(buf) {
+            Ok(0) => Ok(Pumped::Closed),
+            Ok(n) => {
+                self.parser.process(&buf[..n]);
+                Ok(Pumped::Progress)
+            }
+            // The pty reports the last slave closing as EIO, not EOF.
+            Err(e) if e.raw_os_error() == Some(libc::EIO) => Ok(Pumped::Closed),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Ok(Pumped::Progress),
+            Err(e) => Err(format!("reading from pty: {e}")),
+        }
+    }
+
+    /// Read from the pty until `predicate` holds for the rendered screen.
+    ///
+    /// Waits as long as the child keeps the terminal open, up to
+    /// [`PTY_WAIT_DEADLINE`]. Returns an error if the child exits (or closes
+    /// the pty), or if the deadline passes, without the screen ever
+    /// satisfying `predicate` — with the last screen in the message so a
+    /// failure says what was actually rendered.
+    pub fn wait_for_screen<F>(&mut self, predicate: F) -> Result<(), String>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let deadline = Instant::now() + PTY_WAIT_DEADLINE;
+        let mut buf = [0u8; 8192];
+        let timed_out = loop {
+            if predicate(&self.screen()) {
+                return Ok(());
+            }
+            match self.pump_once(deadline, &mut buf)? {
+                Pumped::Progress => {}
+                Pumped::Closed => break false,
+                Pumped::TimedOut => break true,
+            }
+        };
+
+        if predicate(&self.screen()) {
+            return Ok(());
+        }
+        if timed_out {
+            return Err(format!(
+                "the expected screen never arrived within {:.0}s; last screen was:\n{}",
+                PTY_WAIT_DEADLINE.as_secs_f64(),
+                self.screen()
+            ));
+        }
+        Err(format!(
+            "child ended without the expected screen; last screen was:\n{}",
+            self.screen()
+        ))
+    }
+
+    /// As [`wait_for_screen`](Self::wait_for_screen), but reading the parsed
+    /// *grid* and giving up after `budget` instead of blocking until the
+    /// child closes the pty.
+    ///
+    /// **For a predicate whose failure is silence, over what a terminal
+    /// would show.** The grid rather than the text because a frame can change
+    /// only colour — an occurrence highlight appearing changes no character.
+    /// `wait_for_screen` only
+    /// returns when the child writes or exits, so a test asserting that a
+    /// frame *arrives on its own* — nothing typed, nothing to provoke output
+    /// — has no failure mode short of the outer test timeout. This one turns
+    /// that into an ordinary assertion with the last screen in the message.
+    ///
+    /// The budget is a ceiling, not a sleep: the predicate is re-checked
+    /// after every read, so a passing case returns as soon as the frame lands.
+    pub fn wait_for_cells_within<F>(&mut self, budget: Duration, predicate: F) -> Result<(), String>
+    where
+        F: Fn(&vt100::Screen) -> bool,
+    {
+        let deadline = Instant::now() + budget;
+        let mut buf = [0u8; 8192];
+        loop {
+            if predicate(self.parser.screen()) {
+                return Ok(());
+            }
+            match self.pump_once(deadline, &mut buf)? {
+                Pumped::Progress => {}
+                Pumped::Closed | Pumped::TimedOut => break,
+            }
+        }
+
+        if predicate(self.parser.screen()) {
+            return Ok(());
+        }
+        Err(format!(
+            "the expected screen never arrived; last screen was:\n{}",
+            self.screen()
+        ))
+    }
+
+    /// The rendered screen, one line per row.
+    pub fn screen(&self) -> String {
+        let screen = self.parser.screen();
+        let (rows, cols) = screen.size();
+        (0..rows)
+            .map(|row| {
+                (0..cols)
+                    .map(|col| {
+                        screen
+                            .cell(row, col)
+                            .map(|cell| cell.contents())
+                            .unwrap_or_default()
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Type `bytes` at the child, as a terminal would deliver them.
+    pub fn send(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.master.write_all(bytes)?;
+        self.master.flush()
+    }
+
+    /// Drain the pty until the child closes it, then reap the child.
+    ///
+    /// Reaping without draining risks a deadlock: the child's teardown
+    /// output (leaving the alt screen, mode resets, a last repaint) goes
+    /// into a pty buffer — a few KB on Linux — and a child that fills it
+    /// blocks in `write` forever while we block in `wait`.
+    pub fn drain_and_wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        // A predicate that is never satisfied reads to EOF, which is what
+        // the child closing the pty on exit produces.
+        let _ = self.wait_for_screen(|_| false);
+        self.child.wait()
+    }
+
+    /// This child's pid, for a test that needs to signal it.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// The modes the child has put the terminal in — alternate screen,
+    /// mouse reporting, bracketed paste — as a terminal emulator sees them.
+    pub fn modes(&self) -> &vt100::Screen {
+        self.parser.screen()
+    }
+
+    /// Whether the pty is in cooked mode: keystrokes echoed and lines
+    /// buffered, which is what a shell needs and what raw mode takes away.
+    ///
+    /// Read from the master end, so it is still answerable after the child
+    /// has gone — which is the moment a test cares about.
+    pub fn cooked(&self) -> bool {
+        // SAFETY: `tcgetattr` only fills the struct it is handed, and the
+        // fd is our own live master end.
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(self.master.as_raw_fd(), &mut termios) } != 0 {
+            return false;
+        }
+        termios.c_lflag & libc::ECHO != 0 && termios.c_lflag & libc::ICANON != 0
+    }
+
+    /// Kill the child and reap it. Safe to call after it already exited.
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for PtyChild {
+    fn drop(&mut self) {
+        // A test that fails mid-wait must not leave an editor running on a
+        // pty nobody is reading.
+        self.kill();
+    }
+}
+
+/// `posix_openpt` + `grantpt` + `unlockpt`, returning our end and the path
+/// of the slave.
+fn open_pty() -> std::io::Result<(File, PathBuf)> {
+    // SAFETY: plain libc calls on a fd we own for the rest of this
+    // function; every failure is converted from `errno` before use.
+    unsafe {
+        let master_fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        if master_fd == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let master = File::from_raw_fd(master_fd);
+
+        if libc::grantpt(master_fd) == -1 || libc::unlockpt(master_fd) == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        Ok((master, PathBuf::from(slave_name(master_fd)?)))
+    }
+}
+
+/// The path of the slave belonging to the pty master `master_fd`.
+#[cfg(target_os = "linux")]
+fn slave_name(master_fd: libc::c_int) -> std::io::Result<String> {
+    // `c_char`, not `i8`: it is unsigned on aarch64/arm Linux (and
+    // ppc64le, s390x, riscv64), where a `[i8; N]` would not coerce to
+    // the `*mut c_char` `ptsname_r` wants. aarch64 is a shipped target.
+    let mut name = [0 as libc::c_char; 128];
+    // SAFETY: `name` is a writable buffer of the length passed.
+    if unsafe { libc::ptsname_r(master_fd, name.as_mut_ptr(), name.len()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: on success `ptsname_r` leaves a NUL-terminated string in `name`.
+    unsafe { CStr::from_ptr(name.as_ptr()) }
+        .to_str()
+        .map(str::to_string)
+        .map_err(|e| std::io::Error::other(format!("pty name is not UTF-8: {e}")))
+}
+
+/// The path of the slave belonging to the pty master `master_fd`.
+///
+/// macOS has no `ptsname_r`. `ptsname` returns a buffer shared by the whole
+/// process, so tests running on parallel threads take turns, and the name is
+/// copied out before the lock is released.
+#[cfg(target_os = "macos")]
+fn slave_name(master_fd: libc::c_int) -> std::io::Result<String> {
+    static PTSNAME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _turn = PTSNAME.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: `master_fd` is an open, unlocked pty master; the returned
+    // pointer is only read while the lock is held.
+    let name = unsafe { libc::ptsname(master_fd) };
+    if name.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: non-null `ptsname` results are NUL-terminated strings.
+    unsafe { CStr::from_ptr(name) }
+        .to_str()
+        .map(str::to_string)
+        .map_err(|e| std::io::Error::other(format!("pty name is not UTF-8: {e}")))
+}
+
+fn resize(master: &File, cols: u16, rows: u16) -> std::io::Result<()> {
+    let size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: `master` is an open pty master and `size` outlives the call.
+    if unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}

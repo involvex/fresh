@@ -42,6 +42,15 @@ use std::ops::Deref;
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use fresh_winterm::win32_input::{self, Utf16Joiner, Win32Key};
+
+mod encode;
+#[cfg(target_os = "linux")]
+pub mod gpm;
+pub mod keypad;
+pub mod media_modifier;
+
+pub use encode::mouse_to_sgr;
 
 /// A key press, as the terminal reported it, plus the character the key
 /// actually types on the user's keyboard layout when the chord's own spelling
@@ -148,6 +157,56 @@ impl Event {
     }
 }
 
+/// **The one motion-coalescing rule, for every input path.**
+///
+/// Offer `ev` to the event queued just before it: when both are pointer
+/// motion of the same kind (`Moved`, or `Drag` with the same button) and the
+/// same modifiers, `ev` replaces `last` and `None` comes back; otherwise `ev`
+/// comes back to be queued.
+///
+/// A terminal sends a report for every cell the pointer crosses, and each one
+/// an editor handles costs a relayout (a divider drag reflows every pane and
+/// resizes every visible PTY) — so a burst that lands while a frame is being
+/// painted has to come out as the one report that is still true, or the
+/// divider falls further behind the pointer the farther it is pulled. Only a
+/// run of the *same* motion collapses: `Drag(Left)` never swallows
+/// `Drag(Right)`, a modifier change ends the run, and presses, releases,
+/// wheel notches and keys are never touched — each means something at the
+/// moment it happened.
+///
+/// The direct terminal reader and the session server both queue through
+/// this, so a drag behaves the same whichever one the input came in by.
+pub fn coalesce_motion_into(last: Option<&mut Event>, ev: Event) -> Option<Event> {
+    fn run(ev: &Event) -> Option<(MouseEventKind, KeyModifiers)> {
+        match ev {
+            Event::Mouse(m)
+                if matches!(m.kind, MouseEventKind::Moved | MouseEventKind::Drag(_)) =>
+            {
+                Some((m.kind, m.modifiers))
+            }
+            _ => None,
+        }
+    }
+    match last {
+        Some(last) if run(&ev).is_some() && run(last) == run(&ev) => {
+            *last = ev;
+            None
+        }
+        _ => Some(ev),
+    }
+}
+
+/// [`coalesce_motion_into`] over a whole batch.
+pub fn coalesce_motion(events: Vec<Event>) -> Vec<Event> {
+    let mut out: Vec<Event> = Vec::with_capacity(events.len());
+    for ev in events {
+        if let Some(ev) = coalesce_motion_into(out.last_mut(), ev) {
+            out.push(ev);
+        }
+    }
+    out
+}
+
 impl From<crossterm::event::Event> for Event {
     fn from(event: crossterm::event::Event) -> Self {
         use crossterm::event::Event as C;
@@ -241,6 +300,9 @@ pub struct InputParser {
     /// Accumulated bracketed-paste content (including the trailing end marker
     /// until it is recognised and stripped).
     paste: Vec<u8>,
+    /// The characters of successive win32-input-mode reports, which may split
+    /// one character into a surrogate pair.
+    win32_text: Utf16Joiner,
 }
 
 impl Default for InputParser {
@@ -255,6 +317,7 @@ impl InputParser {
             state: State::Ground,
             buffer: Vec::with_capacity(32),
             paste: Vec::new(),
+            win32_text: Utf16Joiner::default(),
         }
     }
 
@@ -544,17 +607,23 @@ impl InputParser {
             b'F' => Some(KeyCode::End),
             // Application-keypad forms (DECPAM). Without these the numeric
             // keypad went silent whenever application keypad mode was active.
-            b'M' => Some(KeyCode::Enter),       // keypad Enter
-            b'E' => Some(KeyCode::KeypadBegin), // keypad Begin (the "5" key)
-            b'X' => Some(KeyCode::Char('=')),   // keypad Equal
-            b'j' => Some(KeyCode::Char('*')),   // keypad Multiply
-            b'k' => Some(KeyCode::Char('+')),   // keypad Add
-            b'l' => Some(KeyCode::Char(',')),   // keypad Separator
-            b'm' => Some(KeyCode::Char('-')),   // keypad Subtract
-            b'n' => Some(KeyCode::Char('.')),   // keypad Decimal
-            b'o' => Some(KeyCode::Char('/')),   // keypad Divide
+            //
+            // Which keypad key each byte *is* is this encoding's own business;
+            // what that key normalises to is `keypad`'s, so the codes come from
+            // there rather than being spelled out a second time. A name that
+            // did not resolve would take the key silently out of service, which
+            // is what `ss3_application_keypad_forms` covers byte by byte.
+            b'M' => crate::keypad::code_for_keysym("kp_enter"),
+            b'E' => crate::keypad::code_for_keysym("kp_begin"),
+            b'X' => crate::keypad::code_for_keysym("kp_equal"),
+            b'j' => crate::keypad::code_for_keysym("kp_multiply"),
+            b'k' => crate::keypad::code_for_keysym("kp_add"),
+            b'l' => crate::keypad::code_for_keysym("kp_separator"),
+            b'm' => crate::keypad::code_for_keysym("kp_subtract"),
+            b'n' => crate::keypad::code_for_keysym("kp_decimal"),
+            b'o' => crate::keypad::code_for_keysym("kp_divide"),
             // Keypad digits 0–9 (`ESC O p` … `ESC O y`).
-            b'p'..=b'y' => Some(KeyCode::Char((b'0' + (byte - b'p')) as char)),
+            b'p'..=b'y' => crate::keypad::code_for_digit(byte - b'p'),
             _ => None,
         };
         if let Some(code) = keycode {
@@ -692,7 +761,7 @@ impl InputParser {
         // paste pays for a full marker comparison.
         if byte == b'~' && self.paste.ends_with(PASTE_END) {
             let content_len = self.paste.len() - PASTE_END.len();
-            let text = sanitize_paste(&self.paste[..content_len]);
+            let text = sanitize_paste(&win32_input::decode_text(&self.paste[..content_len]));
             self.paste.clear();
             self.state = State::Ground;
             out.push(Event::Paste(text));
@@ -704,7 +773,7 @@ impl InputParser {
             // Emitting here bounds memory; discarding rather than returning to
             // ground keeps the tail from being sprayed out as keystrokes.
             tracing::trace!("InputParser: paste exceeded {} bytes, flushing", MAX_PASTE);
-            let text = sanitize_paste(&self.paste);
+            let text = sanitize_paste(&win32_input::decode_text(&self.paste));
             self.paste.clear();
             self.state = State::PasteOverflow;
             out.push(Event::Paste(text));
@@ -794,17 +863,20 @@ impl InputParser {
                     tracing::trace!("InputParser: unrecognised CSI {:?} M/m, dropping", params);
                 }
             }
-            // Shift+Tab. The event type still rides in the modifier field for
-            // emulators that send one here, so decode it the same way; the
-            // modifiers are fixed because the key *is* the shifted Tab.
+            // Shift+Tab. The key *is* the shifted Tab, so SHIFT is always set,
+            // but the modifier field still says what else was held: WezTerm
+            // sends Ctrl+Shift+Tab as `CSI 1 ; 5 Z` when the kitty protocol is
+            // off. Dropping that field made Ctrl+Shift+Tab plain Shift+Tab. The
+            // event type rides in the same field for emulators that send one.
             b'Z' => out.push(Event::key(KeyEvent::new_with_kind(
                 KeyCode::BackTab,
-                KeyModifiers::SHIFT,
+                modifiers_of(&params) | KeyModifiers::SHIFT,
                 kind_of(&params),
             ))),
             b'I' => out.push(Event::FocusGained),
             b'O' => out.push(Event::FocusLost),
             b'u' => self.dispatch_csi_u(&params, out),
+            b'_' => self.dispatch_win32_input(&params, out),
             other => {
                 tracing::trace!("InputParser: unknown CSI final {:#04x}, dropping", other);
             }
@@ -915,6 +987,123 @@ impl InputParser {
             )));
         }
     }
+
+    /// Dispatch a win32-input-mode key report, `CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`.
+    ///
+    /// On Windows the console hands fresh its input as VT text
+    /// (`ENABLE_VIRTUAL_TERMINAL_INPUT`), and ConPTY's VT encoding drops every
+    /// modifier the legacy encoding has no spelling for: Ctrl+Tab arrives as a
+    /// plain Tab and Ctrl+Shift+E as Ctrl+E. With win32-input-mode
+    /// (`CSI ? 9001 h`) the terminal reports each key as the console's own
+    /// KEY_EVENT record instead — virtual key, scan code, UTF-16 unit, key-down
+    /// flag, control-key state and repeat count — so the modifiers survive.
+    ///
+    /// Key-ups and keys that type nothing (a bare Shift or Ctrl, the IME's
+    /// Hankaku/Zenkaku toggle) are dropped. What remains is spelled the way the
+    /// same chord arrives over the kitty protocol, so a keymap cannot tell which
+    /// encoding the terminal spoke.
+    fn dispatch_win32_input(&mut self, params: &[u8], out: &mut Vec<Event>) {
+        let Some(key) = Win32Key::parse(params) else {
+            tracing::trace!("InputParser: malformed win32-input-mode report, dropping");
+            return;
+        };
+        if !key.down {
+            return;
+        }
+        let Some((event, layout_char)) = self.win32_key_event(&key) else {
+            return;
+        };
+        for _ in 0..key.repeat.clamp(1, win32_input::MAX_REPEAT) {
+            out.push(Event::Key(KeyPress::with_layout_char(event, layout_char)));
+        }
+    }
+
+    /// The key event a win32-input-mode key-down stands for, together with the
+    /// character it types when the chord keeps its base spelling (`Ctrl+Shift+1`
+    /// is the digit key, and `!` is what it types), or `None` for a key that
+    /// types nothing (or the first half of a surrogate pair).
+    fn win32_key_event(&mut self, key: &Win32Key) -> Option<(KeyEvent, Option<char>)> {
+        let mut modifiers = key.modifiers();
+        if let Some(code) = key.functional_key() {
+            self.win32_text.reset();
+            // Shift+Tab is BackTab, as over the legacy encoding (`CSI Z`).
+            let code = if code == KeyCode::Tab && modifiers == KeyModifiers::SHIFT {
+                KeyCode::BackTab
+            } else {
+                code
+            };
+            return Some((KeyEvent::new(code, modifiers), None));
+        }
+        // An IME commits text, and an emoji picker types a character outside
+        // the BMP, one UTF-16 unit per report.
+        let ch = self.win32_text.push(key.unicode)?;
+        if key.unicode == 0 || ch.is_control() {
+            // Ctrl turns a letter's character into its C0 code (Ctrl+E types
+            // 0x05), and some layouts report no character at all for a Ctrl or
+            // Alt chord. The virtual key still names the key, and naming it is
+            // what keeps Shift: Ctrl+Shift+E stays Ctrl+Shift+e rather than
+            // collapsing onto Ctrl+E.
+            if let Some(base) = key.letter_or_digit() {
+                return Some((KeyEvent::new(KeyCode::Char(base), modifiers), None));
+            }
+            // Any other key: read its C0 code the way the legacy encoding would
+            // (Ctrl+[ is Escape), keeping Alt.
+            if key.unicode == 0 || key.unicode >= 0x20 {
+                return None;
+            }
+            let byte = key.unicode as u8;
+            return Some((
+                KeyEvent::new(
+                    byte_to_keycode(byte),
+                    c0_control_modifier(byte) | (modifiers & KeyModifiers::ALT),
+                ),
+                None,
+            ));
+        }
+        // A printable character. Windows reports AltGr as Ctrl+Alt; when that
+        // chord types a character, the character is what the user pressed for.
+        if modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+            modifiers.remove(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        }
+        // Ctrl+Shift+1 types `!`, but the binding is on the digit key: keep the
+        // base spelling the kitty protocol reports for the same chord and carry
+        // the typed character alongside, the way `dispatch_csi_u` does. Without
+        // this the win32 and kitty spellings of one chord disagree, and a
+        // `ctrl+shift+1` binding fires only from one of them.
+        if modifiers.contains(KeyModifiers::CONTROL) {
+            if let Some(base) = key.letter_or_digit() {
+                return Some((
+                    KeyEvent::new(KeyCode::Char(base), modifiers),
+                    win32_layout_char(base, ch, modifiers),
+                ));
+            }
+        }
+        // Without Ctrl the character already carries the shift (Shift+E types
+        // `E`), exactly as over the legacy encoding.
+        if !modifiers.contains(KeyModifiers::CONTROL) {
+            modifiers.remove(KeyModifiers::SHIFT);
+        }
+        Some((KeyEvent::new(KeyCode::Char(ch), modifiers), None))
+    }
+}
+
+/// The character a Ctrl chord types on the current layout, when the chord's own
+/// spelling does not say so — the win32 form of [`hidden_layout_char`].
+///
+/// Windows fills `Uc` with the character the key types, so `Ctrl+Shift+1`
+/// arrives as `!` on a US layout and as `/` on a German one (`Shift+7`). The
+/// chord keeps its base key either way; this is the typed character the keymap
+/// gets to look at.
+fn win32_layout_char(base: char, typed: char, modifiers: KeyModifiers) -> Option<char> {
+    if !modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) {
+        return None;
+    }
+    // Same rule as the kitty path: a letter's shifted character is its
+    // uppercase, which the chord's SHIFT bit already says.
+    if typed == base || uppercase_letter(base) == Some(typed) {
+        return None;
+    }
+    Some(typed)
 }
 
 /// The event type encoded in the second sub-parameter of a kitty modifier field
@@ -1076,8 +1265,12 @@ fn functional_or_char(codepoint: u32) -> Option<KeyCode> {
 /// Map a kitty keyboard-protocol functional key (encoded as a Private Use Area
 /// codepoint) to a crossterm [`KeyCode`]. Returns `None` for PUA codepoints the
 /// protocol does not assign, so they are dropped rather than inserted as text.
-fn kitty_functional_key(cp: u32) -> Option<KeyCode> {
-    use crossterm::event::{MediaKeyCode as M, ModifierKeyCode as Mod};
+///
+/// Public because it is the honest answer to "which keys can arrive here",
+/// and a test that wants to check every one of them against something else —
+/// that the keybinding config can *name* each, say — has no other way to
+/// enumerate them without restating the list and testing the restatement.
+pub fn kitty_functional_key(cp: u32) -> Option<KeyCode> {
     Some(match cp {
         57358 => KeyCode::CapsLock,
         57359 => KeyCode::ScrollLock,
@@ -1087,56 +1280,17 @@ fn kitty_functional_key(cp: u32) -> Option<KeyCode> {
         57363 => KeyCode::Menu,
         // F13–F35.
         57376..=57398 => KeyCode::F(13 + (cp - 57376) as u8),
-        // Keypad digits 0–9.
-        57399..=57408 => KeyCode::Char((b'0' + (cp - 57399) as u8) as char),
-        57409 => KeyCode::Char('.'), // KP_DECIMAL
-        57410 => KeyCode::Char('/'), // KP_DIVIDE
-        57411 => KeyCode::Char('*'), // KP_MULTIPLY
-        57412 => KeyCode::Char('-'), // KP_SUBTRACT
-        57413 => KeyCode::Char('+'), // KP_ADD
-        57414 => KeyCode::Enter,     // KP_ENTER
-        57415 => KeyCode::Char('='), // KP_EQUAL
-        57416 => KeyCode::Char(','), // KP_SEPARATOR
-        57417 => KeyCode::Left,      // KP_LEFT
-        57418 => KeyCode::Right,     // KP_RIGHT
-        57419 => KeyCode::Up,        // KP_UP
-        57420 => KeyCode::Down,      // KP_DOWN
-        57421 => KeyCode::PageUp,    // KP_PAGE_UP
-        57422 => KeyCode::PageDown,  // KP_PAGE_DOWN
-        57423 => KeyCode::Home,      // KP_HOME
-        57424 => KeyCode::End,       // KP_END
-        57425 => KeyCode::Insert,    // KP_INSERT
-        57426 => KeyCode::Delete,    // KP_DELETE
-        57427 => KeyCode::KeypadBegin,
-        // Media keys.
-        57428 => KeyCode::Media(M::Play),
-        57429 => KeyCode::Media(M::Pause),
-        57430 => KeyCode::Media(M::PlayPause),
-        57431 => KeyCode::Media(M::Reverse),
-        57432 => KeyCode::Media(M::Stop),
-        57433 => KeyCode::Media(M::FastForward),
-        57434 => KeyCode::Media(M::Rewind),
-        57435 => KeyCode::Media(M::TrackNext),
-        57436 => KeyCode::Media(M::TrackPrevious),
-        57437 => KeyCode::Media(M::Record),
-        57438 => KeyCode::Media(M::LowerVolume),
-        57439 => KeyCode::Media(M::RaiseVolume),
-        57440 => KeyCode::Media(M::MuteVolume),
-        // Standalone modifier keys.
-        57441 => KeyCode::Modifier(Mod::LeftShift),
-        57442 => KeyCode::Modifier(Mod::LeftControl),
-        57443 => KeyCode::Modifier(Mod::LeftAlt),
-        57444 => KeyCode::Modifier(Mod::LeftSuper),
-        57445 => KeyCode::Modifier(Mod::LeftHyper),
-        57446 => KeyCode::Modifier(Mod::LeftMeta),
-        57447 => KeyCode::Modifier(Mod::RightShift),
-        57448 => KeyCode::Modifier(Mod::RightControl),
-        57449 => KeyCode::Modifier(Mod::RightAlt),
-        57450 => KeyCode::Modifier(Mod::RightSuper),
-        57451 => KeyCode::Modifier(Mod::RightHyper),
-        57452 => KeyCode::Modifier(Mod::RightMeta),
-        57453 => KeyCode::Modifier(Mod::IsoLevel3Shift),
-        57454 => KeyCode::Modifier(Mod::IsoLevel5Shift),
+        // The whole keypad, from the table `keypad` shares with the config
+        // key-name parser — one definition, so a name that binds and a key
+        // that arrives cannot drift apart.
+        57399..=crate::keypad::KP_BEGIN => return crate::keypad::code_for_kitty_codepoint(cp),
+        // The media and standalone-modifier keys, from the table
+        // `media_modifier` shares with the config key-name parser — same
+        // reason as the keypad above: a key that arrives and a name that
+        // binds cannot drift apart if there is only one of them.
+        crate::media_modifier::FIRST..=crate::media_modifier::LAST => {
+            return crate::media_modifier::code_for_kitty_codepoint(cp)
+        }
         _ => return None,
     })
 }
@@ -1215,6 +1369,208 @@ fn sgr_mouse_event(params: &[u8], pressed: bool) -> Option<Event> {
     // Left/Middle/Right — and, when bit 6 is set too (buttons 12-15), onto the
     // wheel. Decoding them would manufacture clicks and scrolls the user never
     // made, so drop them, as crossterm does.
+    let kind = sgr_mouse_kind(cb, pressed)?;
+    let modifiers = mouse_modifiers(cb);
+
+    Some(Event::Mouse(MouseEvent {
+        kind,
+        column: cx.saturating_sub(1),
+        row: cy.saturating_sub(1),
+        modifiers,
+    }))
+}
+
+/// What one byte did to a [`MouseReportScanner`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MouseScan {
+    /// The byte cannot belong to a mouse report, even as the start of one.
+    NotAReport,
+    /// The byte began or continued a report that is not finished yet.
+    Partial,
+    /// The byte closed a report. `kind` is `None` for a report with no
+    /// `MouseEventKind` counterpart (buttons 8-15): still a real report whose
+    /// bytes were consumed, just not one that maps to an event.
+    Complete { kind: Option<MouseEventKind> },
+}
+
+/// Where a [`MouseReportScanner`] is within a report.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScanState {
+    /// Between reports.
+    Ground,
+    /// Seen `ESC`.
+    Esc,
+    /// Seen `ESC[`.
+    Csi,
+    /// Inside SGR parameters.
+    Sgr,
+    /// Inside an X10 report: how many of its three payload bytes have arrived.
+    X10(u8),
+}
+
+/// Recognises mouse reports in a raw byte stream, one byte at a time, and
+/// tracks whether a button is currently held.
+///
+/// This is deliberately *not* [`InputParser`]. That one decodes everything and
+/// yields events; this one answers two narrower questions a caller may have
+/// while holding raw bytes it is not otherwise parsing:
+///
+/// * "Is a button down right now?" — for a client that only relays bytes
+///   onwards and never parses them itself.
+/// * "Do these bytes form a mouse report, and was it the release?" — for
+///   teardown, which reads byte by byte and must stop at the first byte that is
+///   not part of a report rather than consuming input meant for the shell
+///   (sinelaw/fresh#3474).
+///
+/// Classification goes through the same `Cb` logic as the full decoders, so the
+/// two cannot drift apart on questions like whether `Cb` 3 counts as a press.
+pub struct MouseReportScanner {
+    state: ScanState,
+    /// The SGR report's first parameter (`Cb`) while it is being read.
+    cb: u32,
+    /// Still accumulating `Cb` — true until the first `;`.
+    on_first_param: bool,
+    /// The X10 report's button byte, held until its third byte closes it.
+    x10_cb: u8,
+    button_down: bool,
+}
+
+impl Default for MouseReportScanner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MouseReportScanner {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            state: ScanState::Ground,
+            cb: 0,
+            on_first_param: true,
+            x10_cb: 0,
+            button_down: false,
+        }
+    }
+
+    /// Whether a button is held: a press has been seen and no release since.
+    #[must_use]
+    pub const fn button_down(&self) -> bool {
+        self.button_down
+    }
+
+    /// Feed a run of bytes, keeping [`button_down`](Self::button_down) current.
+    ///
+    /// Bytes that are not part of a report are skipped, so this is safe to hand
+    /// a stream with ordinary keystrokes mixed in.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            let _ = self.step(b);
+        }
+    }
+
+    /// Offer one byte.
+    ///
+    /// A byte that does not fit where the scanner is resyncs it and is retried
+    /// from the start, so an `ESC` arriving mid-report begins a new one rather
+    /// than being discarded. Only a byte that cannot start a report either
+    /// comes back as [`MouseScan::NotAReport`].
+    pub fn step(&mut self, byte: u8) -> MouseScan {
+        if let Some(scan) = self.offer(byte) {
+            return scan;
+        }
+        self.state = ScanState::Ground;
+        self.offer(byte).unwrap_or(MouseScan::NotAReport)
+    }
+
+    /// One transition, or `None` when the byte does not fit the current state.
+    fn offer(&mut self, byte: u8) -> Option<MouseScan> {
+        match (self.state, byte) {
+            (ScanState::Ground, 0x1b) => {
+                self.state = ScanState::Esc;
+                Some(MouseScan::Partial)
+            }
+            (ScanState::Esc, b'[') => {
+                self.state = ScanState::Csi;
+                Some(MouseScan::Partial)
+            }
+            (ScanState::Csi, b'<') => {
+                self.cb = 0;
+                self.on_first_param = true;
+                self.state = ScanState::Sgr;
+                Some(MouseScan::Partial)
+            }
+            (ScanState::Csi, b'M') => {
+                self.state = ScanState::X10(0);
+                Some(MouseScan::Partial)
+            }
+            (ScanState::Sgr, b'0'..=b'9') => {
+                if self.on_first_param {
+                    self.cb = self
+                        .cb
+                        .saturating_mul(10)
+                        .saturating_add(u32::from(byte - b'0'));
+                }
+                Some(MouseScan::Partial)
+            }
+            (ScanState::Sgr, b';') => {
+                self.on_first_param = false;
+                Some(MouseScan::Partial)
+            }
+            // `M` closes a press, `m` a release.
+            (ScanState::Sgr, b'M' | b'm') => {
+                // `Cb` is one byte in every mouse protocol, so a parameter past
+                // 255 is malformed rather than a high button.
+                let kind = u8::try_from(self.cb)
+                    .ok()
+                    .and_then(|cb| sgr_mouse_kind(cb, byte == b'M'));
+                Some(self.complete(kind))
+            }
+            (ScanState::X10(0), _) => {
+                self.x10_cb = byte.wrapping_sub(32);
+                self.state = ScanState::X10(1);
+                Some(MouseScan::Partial)
+            }
+            (ScanState::X10(n), _) if n < 2 => {
+                self.state = ScanState::X10(n + 1);
+                Some(MouseScan::Partial)
+            }
+            // The third payload byte closes an X10 report.
+            (ScanState::X10(_), _) => Some(self.complete(x10_mouse_kind(self.x10_cb))),
+            _ => None,
+        }
+    }
+
+    /// Finish a report: update the held-button state and return to ground.
+    fn complete(&mut self, kind: Option<MouseEventKind>) -> MouseScan {
+        match kind {
+            Some(MouseEventKind::Down(_)) => self.button_down = true,
+            Some(MouseEventKind::Up(_)) => self.button_down = false,
+            // Drag implies a button is held, but the press that began it has
+            // already said so; motion and wheel notches say nothing about it.
+            _ => {}
+        }
+        self.state = ScanState::Ground;
+        MouseScan::Complete { kind }
+    }
+}
+
+/// Classify an SGR report from its `Cb` byte and which terminator closed it
+/// (`M` pressed, `m` released).
+///
+/// Shared by [`sgr_mouse_event`], which also needs the coordinates, and by
+/// [`MouseReportScanner`], which only needs to know what the report was. Having
+/// one copy is what stops the two disagreeing about, say, whether `Cb` 3 is a
+/// press.
+///
+/// `None` for reports with no `MouseEventKind` counterpart.
+fn sgr_mouse_kind(cb: u8, pressed: bool) -> Option<MouseEventKind> {
+    // Bit 7 is xterm's high-button extension: the button number is
+    // `(cb & 3) | (cb & 0xC0) >> 4`, so bit 7 marks buttons 8-15. `MouseButton`
+    // has no representation for those, and their low bits alias onto
+    // Left/Middle/Right — and, when bit 6 is set too (buttons 12-15), onto the
+    // wheel. Decoding them would manufacture clicks and scrolls the user never
+    // made, so drop them, as crossterm does.
     if cb & 0b1000_0000 != 0 {
         return None;
     }
@@ -1227,9 +1583,7 @@ fn sgr_mouse_event(params: &[u8], pressed: bool) -> Option<Event> {
         _ => MouseButton::Left, // 3 = no button; never used as a real button
     };
 
-    let modifiers = mouse_modifiers(cb);
-
-    let kind = if cb & 64 != 0 {
+    Some(if cb & 64 != 0 {
         match button_bits {
             0 => MouseEventKind::ScrollUp,
             1 => MouseEventKind::ScrollDown,
@@ -1249,14 +1603,52 @@ fn sgr_mouse_event(params: &[u8], pressed: bool) -> Option<Event> {
         MouseEventKind::Down(button)
     } else {
         MouseEventKind::Up(button)
+    })
+}
+
+/// Classify a legacy X10 report from its already de-biased `Cb` byte.
+///
+/// Same bit layout as SGR, but there is no `m` terminator: a release is
+/// reported as button 3, so which button came up is simply not encoded.
+///
+/// `None` for reports with no `MouseEventKind` counterpart.
+fn x10_mouse_kind(cb: u8) -> Option<MouseEventKind> {
+    // Buttons 8-15 are unrepresentable — see `sgr_mouse_kind`.
+    if cb & 0b1000_0000 != 0 {
+        return None;
+    }
+
+    let button_bits = cb & 0b11;
+    let button = match button_bits {
+        0 => MouseButton::Left,
+        1 => MouseButton::Middle,
+        2 => MouseButton::Right,
+        _ => MouseButton::Left, // 3 = no button / release
     };
 
-    Some(Event::Mouse(MouseEvent {
-        kind,
-        column: cx.saturating_sub(1),
-        row: cy.saturating_sub(1),
-        modifiers,
-    }))
+    Some(if cb & 64 != 0 {
+        // Wheel: buttons 4-7 are up, down, left and right.
+        match button_bits {
+            0 => MouseEventKind::ScrollUp,
+            1 => MouseEventKind::ScrollDown,
+            2 => MouseEventKind::ScrollLeft,
+            _ => MouseEventKind::ScrollRight,
+        }
+    } else if cb & 32 != 0 {
+        // Motion. With a button held this is a drag; button 3 means no button
+        // is down, i.e. bare pointer movement under DECSET 1003. Reading the
+        // whole class as a press produced a click flood on every mouse move —
+        // the X10 half of the same bug `sgr_mouse_kind` documents.
+        if button_bits == 3 {
+            MouseEventKind::Moved
+        } else {
+            MouseEventKind::Drag(button)
+        }
+    } else if button_bits == 3 {
+        MouseEventKind::Up(MouseButton::Left)
+    } else {
+        MouseEventKind::Down(button)
+    })
 }
 
 /// Decode the Shift/Alt/Ctrl bits of a mouse report's `Cb` byte. The bit
@@ -1290,41 +1682,7 @@ fn x10_mouse_event(buf: [u8; 3]) -> Option<Event> {
     let cy = buf[2].wrapping_sub(32);
 
     // Buttons 8-15 are unrepresentable — see `sgr_mouse_event`.
-    if cb & 0b1000_0000 != 0 {
-        return None;
-    }
-
-    let button_bits = cb & 0b11;
-    let button = match button_bits {
-        0 => MouseButton::Left,
-        1 => MouseButton::Middle,
-        2 => MouseButton::Right,
-        _ => MouseButton::Left, // 3 = no button / release
-    };
-
-    let kind = if cb & 64 != 0 {
-        // Wheel: buttons 4-7 are up, down, left and right.
-        match button_bits {
-            0 => MouseEventKind::ScrollUp,
-            1 => MouseEventKind::ScrollDown,
-            2 => MouseEventKind::ScrollLeft,
-            _ => MouseEventKind::ScrollRight,
-        }
-    } else if cb & 32 != 0 {
-        // Motion. With a button held this is a drag; button 3 means no button
-        // is down, i.e. bare pointer movement under DECSET 1003. Reading the
-        // whole class as a press produced a click flood on every mouse move —
-        // the X10 half of the same bug `sgr_mouse_event` documents.
-        if button_bits == 3 {
-            MouseEventKind::Moved
-        } else {
-            MouseEventKind::Drag(button)
-        }
-    } else if button_bits == 3 {
-        MouseEventKind::Up(MouseButton::Left)
-    } else {
-        MouseEventKind::Down(button)
-    };
+    let kind = x10_mouse_kind(cb)?;
 
     Some(Event::Mouse(MouseEvent {
         kind,
@@ -1369,13 +1727,14 @@ fn utf8_char_width(first_byte: u8) -> usize {
     }
 }
 
-/// CONTROL for C0 control characters — except Tab, LF, CR and Esc, which are
-/// their own keys and carry no modifier.
+/// CONTROL for C0 control characters — except Tab, CR and Esc, which are
+/// their own keys and carry no modifier. LF is Ctrl+J: a terminal in raw mode
+/// sends CR for Enter, and LF only for Ctrl+J.
 ///
 /// Shared by the ground-state mapping and the `ESC <byte>` (Alt+key) mapping so
 /// both agree that `0x10` is Ctrl+P.
 fn c0_control_modifier(byte: u8) -> KeyModifiers {
-    if byte < 32 && byte != 9 && byte != 10 && byte != 13 && byte != 27 {
+    if byte < 32 && byte != 9 && byte != 13 && byte != 27 {
         KeyModifiers::CONTROL
     } else {
         KeyModifiers::empty()
@@ -1383,8 +1742,7 @@ fn c0_control_modifier(byte: u8) -> KeyModifiers {
 }
 
 /// Convert a single ground-state byte to a key event, attaching CONTROL for
-/// C0 control characters (except Tab, LF, CR and Esc, which are their own
-/// keys).
+/// C0 control characters (except Tab, CR and Esc, which are their own keys).
 fn byte_to_event(byte: u8) -> Event {
     Event::key(KeyEvent::new(
         byte_to_keycode(byte),
@@ -1397,7 +1755,10 @@ fn byte_to_keycode(byte: u8) -> KeyCode {
     match byte {
         0 => KeyCode::Char('@'), // Ctrl+@
         9 => KeyCode::Tab,
-        10 | 13 => KeyCode::Enter,                          // LF or CR
+        // Only CR is Enter. LF is Ctrl+J (the `1..=26` arm), which programs in
+        // the integrated terminal tell apart from Enter — e.g. to insert a
+        // newline rather than submit (sinelaw/fresh#3169).
+        13 => KeyCode::Enter,
         1..=26 => KeyCode::Char((b'a' + byte - 1) as char), // Ctrl+A..Ctrl+Z
         27 => KeyCode::Esc,
         28..=30 => KeyCode::Char((b'\\' + byte - 28) as char), // Ctrl+\, Ctrl+], Ctrl+^

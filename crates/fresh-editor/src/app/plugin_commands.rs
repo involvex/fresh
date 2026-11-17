@@ -8,23 +8,12 @@ use crate::view::overlay::{OverlayHandle, OverlayNamespace};
 use crate::view::split::{BufferViewState, SplitViewState};
 use anyhow::Result as AnyhowResult;
 use fresh_core::api::{
-    GrepMatch, JsCallbackId, LayoutHints, MenuPosition, OverlayOptions, PluginResponse,
-    ReplaceResult,
+    JsCallbackId, LayoutHints, MenuPosition, OverlayOptions, PluginResponse, ReplaceResult,
 };
+use fresh_editor_core::model::host_path::AsHostPath;
 use std::sync::Arc;
 
 use super::Editor;
-
-/// Directory names to always skip during project file walking.
-const IGNORED_DIRS: &[&str] = &[
-    ".git",
-    "node_modules",
-    "target",
-    "__pycache__",
-    ".hg",
-    ".svn",
-    ".DS_Store",
-];
 
 /// Does `item` answer to `needle` — either as its action id or as its
 /// display label?
@@ -68,41 +57,17 @@ pub(super) struct BeginSearchArgs {
     pub whole_words: bool,
     pub file_glob: String,
     pub source_buffer_id: usize,
+    /// Search only this buffer, as it is (not 0), instead of the project.
+    pub buffer_id: usize,
     pub handle_id: u64,
 }
 
-/// Return whether a workspace-relative file path is included by a
-/// comma-separated set of globs from the search panel.
-///
-/// Patterns with a path separator match the whole relative path (`src/**`),
-/// while patterns without one match the basename at any depth (`*.rs`).
-/// Whitespace around comma-separated patterns is ignored.
-fn search_file_glob_matches(file_glob: &str, relative_path: &str) -> bool {
-    let relative_path = relative_path.trim_start_matches(['/', '\\']);
-    let file_name = relative_path
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(relative_path);
-    let mut has_pattern = false;
-
-    for pattern in file_glob
-        .split(',')
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-    {
-        has_pattern = true;
-        let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
-        let matches = if crate::primitives::glob_match::is_path_pattern(pattern) {
-            crate::primitives::glob_match::path_glob_matches(pattern, relative_path)
-        } else {
-            crate::primitives::glob_match::filename_glob_matches(pattern, file_name)
-        };
-        if matches {
-            return true;
-        }
-    }
-
-    !has_pattern
+/// What a diff-baseline load reads through: the owning window's backend and
+/// its buffer's encoding (`Editor::baseline_source`).
+struct BaselineSource {
+    filesystem: Arc<dyn crate::model::filesystem::FileSystem + Send + Sync>,
+    spawner: Arc<dyn crate::services::remote::ProcessSpawner>,
+    encoding: crate::model::encoding::Encoding,
 }
 
 impl Editor {
@@ -120,6 +85,7 @@ impl Editor {
         namespace: Option<OverlayNamespace>,
         range: std::ops::Range<usize>,
         options: OverlayOptions,
+        compose_only: bool,
     ) {
         if let Some(state) = self
             .windows
@@ -128,21 +94,94 @@ impl Editor {
             .buffer_state_mut(buffer_id)
         {
             let face = OverlayFace::from_options(options.clone());
-            let event = Event::AddOverlay {
+            // Added directly rather than through an `AddOverlay` event, which
+            // has no `compose_only`: that event's only effect is this add.
+            // Overlays are ephemeral, not added to the event log for undo/redo.
+            let mut overlay = state.build_overlay(
                 namespace,
                 range,
                 face,
-                priority: 10,
-                message: None,
-                extend_to_line_end: options.extend_to_line_end,
-                url: options.url.clone(),
-            };
-            state.apply(&mut Cursors::default(), &event);
-            // Note: Overlays are ephemeral, not added to event log for undo/redo
+                10,
+                None,
+                options.extend_to_line_end,
+                options.url.clone(),
+            );
+            overlay.compose_only = compose_only;
+            state.overlays.add(overlay);
 
             // Request a re-render so overlays added asynchronously (e.g. after
             // an external process returns) become visible without requiring
             // the user to type or scroll.
+            #[cfg(feature = "plugins")]
+            {
+                self.plugin_render_requested = true;
+            }
+        }
+    }
+
+    /// Handle SetSyntaxRegions: a plugin-composed buffer says where its
+    /// code is and in what language (see `SyntaxRegion`). Only a virtual
+    /// buffer can be told this — a file has a grammar of its own that a
+    /// plugin must not take away — and each language is resolved here,
+    /// through the catalog, so a region named by a path gets the grammar
+    /// the editor would open that file with.
+    pub(super) fn handle_set_syntax_regions(
+        &mut self,
+        buffer_id: BufferId,
+        regions: Vec<fresh_core::api::SyntaxRegion>,
+    ) {
+        use crate::primitives::highlight_engine::{DeclaredRegion, HighlightEngine};
+
+        let registry = std::sync::Arc::clone(&self.grammar_registry);
+        let window = self
+            .windows
+            .get_mut(&self.active_window)
+            .expect("active window present");
+        let is_virtual = window
+            .buffer_metadata
+            .get(&buffer_id)
+            .is_some_and(|meta| meta.is_virtual());
+        if !is_virtual {
+            tracing::warn!(
+                "SetSyntaxRegions: {:?} is not a plugin-composed buffer; ignored",
+                buffer_id
+            );
+            return;
+        }
+        let mut resolved: std::collections::HashMap<String, Option<usize>> =
+            std::collections::HashMap::new();
+        let declared: Vec<DeclaredRegion> = regions
+            .into_iter()
+            .map(|region| {
+                let syntax_index =
+                    *resolved
+                        .entry(region.language)
+                        .or_insert_with_key(|language| {
+                            let found = registry.embedded_syntax_index(language);
+                            if found.is_none() {
+                                tracing::warn!(
+                                    "SetSyntaxRegions: no grammar for {:?}; its rows stay plain",
+                                    language
+                                );
+                            }
+                            found
+                        });
+                DeclaredRegion {
+                    start: region.start,
+                    end: region.end,
+                    syntax_index,
+                    prefix: region.prefix,
+                    streams: region.streams,
+                }
+            })
+            .collect();
+        if let Some(state) = window.buffer_state_mut(buffer_id) {
+            if state.highlighter.hosts_declared_regions() {
+                state.highlighter.set_declared_regions(declared);
+            } else {
+                state.highlighter =
+                    HighlightEngine::declared_region_host(registry.syntax_set_arc(), declared);
+            }
             #[cfg(feature = "plugins")]
             {
                 self.plugin_render_requested = true;
@@ -281,6 +320,7 @@ impl Editor {
         color: (u8, u8, u8),
         use_bg: bool,
         before: bool,
+        epoch: Option<u64>,
     ) {
         if let Some(state) = self
             .windows
@@ -306,13 +346,15 @@ impl Editor {
             };
 
             // Remove any existing virtual text with this ID first
-            state
-                .virtual_texts
-                .remove_by_id(&mut state.marker_list, &virtual_text_id);
+            state.virtual_texts.remove_by_id(&virtual_text_id);
+
+            let position = match state.map_plugin_coord(position, epoch) {
+                Some(p) => p,
+                None => return,
+            };
 
             // Add the new virtual text
             state.virtual_texts.add_with_id(
-                &mut state.marker_list,
                 position,
                 text,
                 style,
@@ -338,6 +380,9 @@ impl Editor {
         bold: bool,
         italic: bool,
         before: bool,
+        epoch: Option<u64>,
+        pad_to_column: Option<u32>,
+        compose_only: bool,
     ) {
         if let Some(state) = self
             .windows
@@ -387,12 +432,17 @@ impl Editor {
             }
 
             // Replace any existing virtual text with this ID.
-            state
-                .virtual_texts
-                .remove_by_id(&mut state.marker_list, &virtual_text_id);
+            state.virtual_texts.remove_by_id(&virtual_text_id);
+
+            // After the removal: an unmappable epoch drops the hint rather than
+            // guessing a byte, and returning earlier would strand the stale one
+            // under this id.
+            let position = match state.map_plugin_coord(position, epoch) {
+                Some(p) => p,
+                None => return,
+            };
 
             state.virtual_texts.add_with_id_and_theme_keys(
-                &mut state.marker_list,
                 position,
                 text,
                 fallback,
@@ -401,6 +451,8 @@ impl Editor {
                 vtext_position,
                 0, // priority
                 virtual_text_id,
+                pad_to_column,
+                compose_only,
             );
         }
     }
@@ -417,9 +469,7 @@ impl Editor {
             .expect("active window present")
             .buffer_state_mut(buffer_id)
         {
-            state
-                .virtual_texts
-                .remove_by_id(&mut state.marker_list, &virtual_text_id);
+            state.virtual_texts.remove_by_id(&virtual_text_id);
         }
     }
 
@@ -435,9 +485,7 @@ impl Editor {
             .expect("active window present")
             .buffer_state_mut(buffer_id)
         {
-            state
-                .virtual_texts
-                .remove_by_prefix(&mut state.marker_list, &prefix);
+            state.virtual_texts.remove_by_prefix(&prefix);
         }
     }
 
@@ -449,7 +497,7 @@ impl Editor {
             .expect("active window present")
             .buffer_state_mut(buffer_id)
         {
-            state.virtual_texts.clear(&mut state.marker_list);
+            state.virtual_texts.clear();
         }
     }
 
@@ -476,6 +524,7 @@ impl Editor {
         gutter_color_spec: Option<fresh_core::api::OverlayColorSpec>,
         text_overlays: Vec<fresh_core::api::VirtualLineTextOverlay>,
         epoch: Option<u64>,
+        compose_only: bool,
     ) {
         use crate::view::theme::named_color_from_str;
         use crate::view::virtual_text::{VirtualTextNamespace, VirtualTextPosition};
@@ -541,7 +590,6 @@ impl Editor {
             let ns = VirtualTextNamespace::from_string(namespace);
 
             state.virtual_texts.add_line_with_theme_keys(
-                &mut state.marker_list,
                 position,
                 text,
                 style,
@@ -553,6 +601,7 @@ impl Editor {
                 gutter_glyph,
                 gutter_color_fallback,
                 text_overlays,
+                compose_only,
             );
         }
     }
@@ -571,9 +620,7 @@ impl Editor {
         {
             use crate::view::virtual_text::VirtualTextNamespace;
             let ns = VirtualTextNamespace::from_string(namespace);
-            state
-                .virtual_texts
-                .clear_namespace(&mut state.marker_list, &ns);
+            state.virtual_texts.clear_namespace(&ns);
         }
     }
 
@@ -602,9 +649,7 @@ impl Editor {
                 None => return,
             };
             let ns = VirtualTextNamespace::from_string(namespace);
-            state
-                .virtual_texts
-                .clear_lines_in_range(&mut state.marker_list, &ns, start, end);
+            state.virtual_texts.clear_lines_in_range(&ns, start, end);
         }
     }
 
@@ -629,12 +674,9 @@ impl Editor {
                 Some(r) => r,
                 None => return,
             };
-            state.virtual_texts.clear_inline_in_range(
-                &mut state.marker_list,
-                &id_prefix,
-                start,
-                end,
-            );
+            state
+                .virtual_texts
+                .clear_inline_in_range(&id_prefix, start, end);
         }
     }
 
@@ -651,6 +693,7 @@ impl Editor {
         replacement: Option<String>,
         epoch: Option<u64>,
         activation: Option<fresh_core::api::MarkerActivation>,
+        compose_only: bool,
     ) {
         if let Some(state) = self
             .windows
@@ -682,6 +725,7 @@ impl Editor {
                 start..end,
                 replacement,
                 activation,
+                compose_only,
             );
             #[cfg(feature = "plugins")]
             {
@@ -816,6 +860,7 @@ impl Editor {
     // ==================== Soft Break Commands ====================
 
     /// Handle AddSoftBreak command
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_add_soft_break(
         &mut self,
         buffer_id: BufferId,
@@ -1086,11 +1131,8 @@ impl Editor {
         let leaf_id = LeafId(split_id);
         // Get the buffer for this split
         if let Some(buffer_id) = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
+            .active_window()
+            .split_manager()
             .buffer_for_split(leaf_id)
         {
             self.focus_split(leaf_id, buffer_id);
@@ -1125,25 +1167,15 @@ impl Editor {
         // Switch per-buffer view state — the new buffer's own decorations
         // and compose_width will be restored (or defaults if first time)
         if let Some(view_state) = self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
-            .expect("active window must have a populated split layout")
+            .active_window_mut()
+            .split_view_states_mut()
             .get_mut(&leaf_id)
         {
-            view_state.switch_buffer(buffer_id);
+            view_state.set_buffer_tab(buffer_id);
         }
 
         // If this is the active split, update active buffer with all side effects
-        if self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split()
-            == leaf_id
-        {
+        if self.active_window().split_manager().active_split() == leaf_id {
             self.set_active_buffer(buffer_id);
         }
     }
@@ -1173,11 +1205,7 @@ impl Editor {
     /// - a lone top-level leaf (no parent container) or unknown id → no-op,
     ///   `false`. Never panics (issue #2770, follow-up to #2774).
     pub(super) fn handle_set_split_ratio(&mut self, split_id: SplitId, ratio: f32) -> bool {
-        let manager = self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_manager_mut())
-            .expect("active window must have a populated split layout");
+        let manager = self.active_window_mut().split_manager_mut();
 
         // Try the id as a container directly first (preserves behavior for a
         // real container id); `set_ratio` is a no-op returning `false` on a
@@ -1210,10 +1238,8 @@ impl Editor {
     pub(super) fn handle_distribute_splits_evenly(&mut self) {
         // The split_ids parameter is currently ignored - we distribute ALL splits evenly
         // A future enhancement could distribute only the specified splits
-        self.windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_manager_mut())
-            .expect("active window must have a populated split layout")
+        self.active_window_mut()
+            .split_manager_mut()
             .distribute_splits_evenly();
         // Every pane just changed size — reflow through the layout funnel.
         self.relayout();
@@ -1226,62 +1252,63 @@ impl Editor {
     /// the inner leaves of all grouped subtrees stored in `grouped_subtrees`,
     /// mirroring `handle_scroll_buffer_to_line` — buffer-group panel buffers
     /// are not represented in `split_manager`'s tree, so the basic lookup
-    /// returns nothing for them.
+    /// returns nothing for them. That walk is
+    /// [`Editor::splits_showing_buffer`], shared with the widget runtime's
+    /// own caret moves so the two cannot drift.
     pub(super) fn handle_set_buffer_cursor(&mut self, buffer_id: BufferId, position: usize) {
-        // Find all splits that display this buffer (main tree + grouped subtrees).
-        let mut splits: Vec<crate::app::LeafId> = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .splits_for_buffer(buffer_id);
-        for node in self.active_window().grouped_subtrees.values() {
-            if let crate::view::split::SplitNode::Grouped { layout, .. } = node {
-                for inner_leaf in layout.leaf_split_ids() {
-                    if let Some(vs) = self
-                        .windows
-                        .get(&self.active_window)
-                        .and_then(|w| w.buffers.splits())
-                        .map(|(_, vs)| vs)
-                        .expect("active window must have a populated split layout")
-                        .get(&inner_leaf)
-                    {
-                        if vs.active_buffer == buffer_id && !splits.contains(&inner_leaf) {
-                            splits.push(inner_leaf);
-                        }
-                    }
-                }
-            }
-        }
-        let active_split = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split();
-
         tracing::debug!(
-            "SetBufferCursor: buffer_id={:?}, position={}, found {} splits: {:?}, active={:?}",
+            "SetBufferCursor: buffer_id={:?}, position={}",
             buffer_id,
             position,
-            splits.len(),
-            splits,
-            active_split
         );
+        self.seat_buffer_cursor(buffer_id, position);
+    }
 
-        if splits.is_empty() {
-            tracing::warn!("No splits found for buffer {:?}", buffer_id);
-        }
-
-        let _ = active_split;
-        if self.active_window().buffers.get(&buffer_id).is_none() {
-            tracing::warn!("Buffer {:?} not found for SetBufferCursor", buffer_id);
+    /// `scrollToWidget`: move the panel's page to the widget the plugin
+    /// names.
+    ///
+    /// A buffer-mounted panel is described, and a *page* panel is one
+    /// viewport the tree owns (`WidgetPanelOptions::page`); "take me to
+    /// this widget" is a command on that window, answered by the layout that
+    /// measured the page (`fresh_ui::behavior::Anchor`). `Top` puts the
+    /// widget's band on the window's top row; `Minimal` moves the window
+    /// only as far as it takes to bring the band into view — following
+    /// focus, where a Tab between two controls of one card should not move
+    /// the page. A panel that is not a page has nothing to scroll: its lists
+    /// window themselves and follow their own selection.
+    pub(super) fn handle_scroll_to_widget(
+        &mut self,
+        buffer_id: BufferId,
+        key: &str,
+        align: fresh_core::api::ScrollAlign,
+    ) {
+        let Some(anchor) = self
+            .widget_registry
+            .panels_for_buffer(buffer_id)
+            .into_iter()
+            .find_map(|pk| self.page_anchors.get(&pk).cloned())
+        else {
+            tracing::debug!("ScrollToWidget: no page panel in buffer {buffer_id:?} for {key:?}");
             return;
+        };
+        let Some(node) = self
+            .widget_registry
+            .panels_for_buffer(buffer_id)
+            .into_iter()
+            .filter_map(|pk| self.widget_registry.get(&pk))
+            .find_map(|p| crate::widgets::find_widget_by_key(&p.spec, key))
+            .and_then(crate::view::shell::widgets::node_key_of)
+        else {
+            tracing::debug!("ScrollToWidget: no widget {key:?} in buffer {buffer_id:?}");
+            return;
+        };
+        match align {
+            fresh_core::api::ScrollAlign::Minimal => anchor.reveal_key(node),
+            fresh_core::api::ScrollAlign::Top => anchor.top_key(node),
         }
-        self.active_window_mut()
-            .set_buffer_cursor_in_splits(buffer_id, position, &splits);
+        // The command is applied by the next layout, which the stale mark
+        // asks for.
+        self.shell_description_stale = true;
     }
 
     /// Handle SetSplitScroll command
@@ -1290,20 +1317,17 @@ impl Editor {
         let leaf_id = LeafId(split_id);
         // Resolve buffer_id BEFORE delegating so the read happens
         // outside the active window's mutable borrow.
-        let buffer_id = if let Some(id) = self.split_manager().buffer_for_split(leaf_id) {
+        let buffer_id = if let Some(id) = self
+            .active_window()
+            .split_manager()
+            .buffer_for_split(leaf_id)
+        {
             id
         } else {
             tracing::warn!("SetSplitScroll: buffer for split {:?} not found", split_id);
             return;
         };
-        if !self
-            .active_window()
-            .buffers
-            .splits()
-            .expect("active window must have a populated split layout")
-            .1
-            .contains_key(&leaf_id)
-        {
+        if !self.active_window().splits().1.contains_key(&leaf_id) {
             tracing::warn!("SetSplitScroll: split {:?} not found", split_id);
             return;
         }
@@ -1370,40 +1394,51 @@ impl Editor {
         text: String,
     ) {
         let text_len = text.len();
-        if let Some(state) = self
+        let event = Event::Insert {
+            position,
+            text: text.into(),
+            cursor_id: CursorId(0),
+        };
+        // Deriving the change reads the line up to the edit to convert byte
+        // offsets into UTF-16 positions; on a one-long-line file that is
+        // megabytes per edit, and it is wasted when the buffer has no server
+        // to receive it.
+        let lsp_changes = if self.active_window().lsp_change_could_be_sent(buffer_id) {
+            self.active_window()
+                .collect_lsp_changes_for_buffer(buffer_id, &event)
+        } else {
+            Vec::new()
+        };
+        let edited = if let Some(state) = self
             .windows
             .get_mut(&self.active_window)
             .expect("active window present")
             .buffer_state_mut(buffer_id)
         {
-            let event = Event::Insert {
-                position,
-                text,
-                cursor_id: CursorId(0),
-            };
             // Apply to buffer with dummy cursors (real cursors adjusted below)
             state.apply(&mut Cursors::default(), &event);
             if let Some(log) = self.active_window_mut().event_logs.get_mut(&buffer_id) {
                 log.append(event);
             }
-        }
+            true
+        } else {
+            false
+        };
         // Adjust cursors in all splits that display this buffer
         for leaf_id in self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
+            .active_window()
+            .split_manager()
             .splits_for_buffer(buffer_id)
         {
             if let Some(view_state) = self
-                .windows
-                .get_mut(&self.active_window)
-                .and_then(|w| w.split_view_states_mut())
-                .expect("active window must have a populated split layout")
+                .active_window_mut()
+                .split_view_states_mut()
                 .get_mut(&leaf_id)
             {
-                view_state.cursors.adjust_for_edit(position, 0, text_len);
+                view_state
+                    .buffer_tab_state_mut()
+                    .cursors
+                    .adjust_for_edit(position, 0, text_len);
             }
         }
         // Keep search-match highlights consistent with the edit (issue #2414).
@@ -1413,6 +1448,10 @@ impl Editor {
         // decorations (e.g. markdown table borders) keep stale coordinates.
         #[cfg(feature = "plugins")]
         self.shift_plugin_markers_for_edit(buffer_id, position, 0, text_len);
+        if edited {
+            self.active_window_mut()
+                .send_lsp_changes_for_buffer(buffer_id, lsp_changes);
+        }
     }
 
     /// Handle DeleteRange command
@@ -1423,51 +1462,75 @@ impl Editor {
     ) {
         let delete_start = range.start;
         let delete_len = range.end.saturating_sub(range.start);
-        if let Some(state) = self
+        let deleted_text = self
+            .windows
+            .get_mut(&self.active_window)
+            .expect("active window present")
+            .buffer_state_mut(buffer_id)
+            .map(|state| state.get_edit_text(range.start, range.end))
+            .unwrap_or_default();
+        let removed_newline = deleted_text.contains('\n');
+        let event = Event::Delete {
+            range,
+            deleted_text,
+            cursor_id: CursorId(0),
+        };
+        // Gated as in `handle_insert_text`.
+        let lsp_changes = if self.active_window().lsp_change_could_be_sent(buffer_id) {
+            self.active_window()
+                .collect_lsp_changes_for_buffer(buffer_id, &event)
+        } else {
+            Vec::new()
+        };
+        let edited = if let Some(state) = self
             .windows
             .get_mut(&self.active_window)
             .expect("active window present")
             .buffer_state_mut(buffer_id)
         {
-            let deleted_text = state.get_text_range(range.start, range.end);
-            let event = Event::Delete {
-                range,
-                deleted_text,
-                cursor_id: CursorId(0),
-            };
             // Apply to buffer with dummy cursors (real cursors adjusted below)
             state.apply(&mut Cursors::default(), &event);
             if let Some(log) = self.active_window_mut().event_logs.get_mut(&buffer_id) {
                 log.append(event);
             }
-        }
+            true
+        } else {
+            false
+        };
         // Adjust cursors in all splits that display this buffer
         for leaf_id in self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
+            .active_window()
+            .split_manager()
             .splits_for_buffer(buffer_id)
         {
             if let Some(view_state) = self
-                .windows
-                .get_mut(&self.active_window)
-                .and_then(|w| w.split_view_states_mut())
-                .expect("active window must have a populated split layout")
+                .active_window_mut()
+                .split_view_states_mut()
                 .get_mut(&leaf_id)
             {
-                view_state
-                    .cursors
-                    .adjust_for_edit(delete_start, delete_len, 0);
+                view_state.buffer_tab_state_mut().cursors.adjust_for_edit(
+                    delete_start,
+                    delete_len,
+                    0,
+                );
             }
         }
         // Keep search-match highlights consistent with the edit (issue #2414).
         self.reevaluate_plugin_edit_search_overlays(buffer_id, delete_start, 0);
         // Plugin edits bypass apply_event_to_active_buffer; shift plugin interval
-        // markers here too so plugin-tracked decorations ride the deletion.
+        // markers here too so plugin-tracked decorations ride the deletion, and
+        // bring the plugin line-offer set across it for the same reason.
         #[cfg(feature = "plugins")]
         self.shift_plugin_markers_for_edit(buffer_id, delete_start, delete_len, 0);
+        if edited {
+            self.active_window_mut()
+                .send_lsp_changes_for_buffer(buffer_id, lsp_changes);
+        }
+        if removed_newline {
+            self.handle_refresh_lines(buffer_id);
+        } else {
+            self.adjust_seen_byte_ranges_for_edit(buffer_id, delete_start, delete_len, 0);
+        }
     }
 
     /// Re-evaluate the active window's search-match overlays around a region a
@@ -1515,22 +1578,46 @@ impl Editor {
         // Read cursor position first to avoid borrow conflicts
         let cursor_pos = self.active_cursors().primary().position;
         let text_len = text.len();
+        let inserted_newline = text.contains('\n');
         let event = Event::Insert {
             position: cursor_pos,
-            text,
+            text: text.into(),
             cursor_id: CursorId(0),
         };
-        let split_id = self.split_manager().active_split();
+        let split_id = self.effective_active_split();
         let active_buf = self.active_buffer();
-        self.active_window_mut()
+        // Gated as in `handle_insert_text`.
+        let lsp_changes = if self.active_window().lsp_change_could_be_sent(active_buf) {
+            self.active_window()
+                .collect_lsp_changes_for_buffer(active_buf, &event)
+        } else {
+            Vec::new()
+        };
+        let edited = self
+            .active_window_mut()
             .apply_event_to_buffer(active_buf, split_id, &event);
         self.active_event_log_mut().append(event);
-        // This path bypasses apply_event_to_active_buffer (it's how the markdown
-        // plugins insert a newline on Enter, etc.), so shift plugin interval
-        // markers here or plugin-tracked decorations (markdown table borders)
-        // keep stale coordinates and corrupt.
+        // Bypasses apply_event_to_active_buffer (this is how the markdown plugins
+        // insert a newline on Enter), so the cross-cutting work it does happens
+        // here: markers, or plugin-tracked decorations keep stale coordinates and
+        // corrupt, and the line-offer set below.
         #[cfg(feature = "plugins")]
         self.shift_plugin_markers_for_edit(active_buf, cursor_pos, 0, text_len);
+        // Only for an edit that landed, as in the two handlers above: a change
+        // sent for one that did not diverges the server with no path back.
+        if edited {
+            self.active_window_mut()
+                .send_lsp_changes_for_buffer(active_buf, lsp_changes);
+        }
+        if inserted_newline {
+            // Shifting the ranges is not enough when the line count changes: the
+            // rows below only shift, so they stay "seen" and never re-fire, while
+            // a new line landing on an old byte offset re-uses the decoration id
+            // derived from it and evicts the decoration of the line that moved.
+            self.handle_refresh_lines(active_buf);
+        } else {
+            self.adjust_seen_byte_ranges_for_edit(active_buf, cursor_pos, 0, text_len);
+        }
     }
 
     /// Handle DeleteSelection command
@@ -1551,7 +1638,7 @@ impl Editor {
                 .iter()
                 .rev()
                 .map(|range| {
-                    let deleted_text = state.get_text_range(range.start, range.end);
+                    let deleted_text = state.get_edit_text(range.start, range.end);
                     Event::Delete {
                         range: range.clone(),
                         deleted_text,
@@ -1585,10 +1672,8 @@ impl Editor {
         // reported instead of masquerading as success (#2769).
         let target_split_id = LeafId(SplitId(split_id));
         if !self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_manager_mut())
-            .expect("active window must have a populated split layout")
+            .active_window_mut()
+            .split_manager_mut()
             .set_active_split(target_split_id)
         {
             tracing::error!("Failed to switch to split {}", split_id);
@@ -1603,6 +1688,42 @@ impl Editor {
 
         // Jump to the specified location (or default to start)
         self.jump_to_line_column(line, column);
+        Ok(())
+    }
+
+    /// Handle PreviewFileInSplit: browse a file in `split_id` as the
+    /// editor's single preview tab, without moving focus there.
+    ///
+    /// The two failure modes are deliberately not alike. A split id that
+    /// doesn't resolve is the plugin's bug and is reported (#2769) — the
+    /// same rule `handle_open_file_in_split` follows. A file that won't
+    /// preview is not: a browse walks over whatever the search matched,
+    /// including files that are unreadable, or large enough that loading
+    /// them would have to ask about their encoding
+    /// (`LargeFileEncodingConfirmation`), and neither a dialog nor an error
+    /// belongs in the middle of a live result list. Skip it and log — the
+    /// same thing the explorer's arrow-key preview does — and leave the
+    /// full story for the deliberate open the user makes with Enter.
+    pub(super) fn handle_preview_file_in_split(
+        &mut self,
+        split_id: usize,
+        path: std::path::PathBuf,
+        line: Option<usize>,
+        column: Option<usize>,
+    ) -> AnyhowResult<()> {
+        let target_split = LeafId(SplitId(split_id));
+        if !self
+            .windows
+            .get(&self.active_window)
+            .and_then(|w| w.buffers.splits())
+            .is_some_and(|(_, view_states)| view_states.contains_key(&target_split))
+        {
+            anyhow::bail!("previewFileInSplit: split {} does not exist", split_id);
+        }
+
+        if let Err(e) = self.preview_file_in_split(&path, target_split, line, column) {
+            tracing::debug!("previewFileInSplit: skipping preview for {:?}: {}", path, e);
+        }
         Ok(())
     }
 
@@ -1749,46 +1870,6 @@ impl Editor {
         );
     }
 
-    /// Handle MoveTabLeft command - move active tab left in its split
-    pub(super) fn handle_move_tab_left(&mut self) {
-        let split_id = self.split_manager().active_split();
-        if let Some(buffer_id) = self.split_manager().get_buffer_id(split_id.into()) {
-            if let Some(view_state) = self.split_view_states_mut().get_mut(&split_id) {
-                use crate::view::split::TabTarget;
-                if let Some(current_idx) = view_state
-                    .open_buffers
-                    .iter()
-                    .position(|t| *t == TabTarget::Buffer(buffer_id))
-                {
-                    if current_idx > 0 {
-                        view_state.open_buffers.swap(current_idx, current_idx - 1);
-                        tracing::info!("Moved tab left in split {:?}", split_id);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Handle MoveTabRight command - move active tab right in its split
-    pub(super) fn handle_move_tab_right(&mut self) {
-        let split_id = self.split_manager().active_split();
-        if let Some(buffer_id) = self.split_manager().get_buffer_id(split_id.into()) {
-            if let Some(view_state) = self.split_view_states_mut().get_mut(&split_id) {
-                use crate::view::split::TabTarget;
-                if let Some(current_idx) = view_state
-                    .open_buffers
-                    .iter()
-                    .position(|t| *t == TabTarget::Buffer(buffer_id))
-                {
-                    if current_idx < view_state.open_buffers.len() - 1 {
-                        view_state.open_buffers.swap(current_idx, current_idx + 1);
-                        tracing::info!("Moved tab right in split {:?}", split_id);
-                    }
-                }
-            }
-        }
-    }
-
     // ==================== View/Layout Commands ====================
 
     /// Handle SetLayoutHints command
@@ -1803,16 +1884,18 @@ impl Editor {
         split_id: Option<SplitId>,
         hints: LayoutHints,
     ) {
+        // With no split named, the pane the user is in — a shown group's
+        // focused panel, as for `setViewMode` — not the pane showing it.
         let target_split = split_id
             .map(LeafId)
-            .unwrap_or(self.split_manager().active_split());
+            .unwrap_or_else(|| self.effective_active_split());
         let term_w = self.terminal_width;
         let term_h = self.terminal_height;
         let active_id = self.active_window;
         let view_state = self
             .windows
             .get_mut(&active_id)
-            .and_then(|w| w.split_view_states_mut())
+            .and_then(|w| w.buffers.split_view_states_mut())
             .expect("active window must have a populated split layout")
             .entry(target_split)
             .or_insert_with(|| SplitViewState::with_buffer(term_w, term_h, buffer_id));
@@ -1824,6 +1907,8 @@ impl Editor {
     /// Handle SetViewMode command
     pub(super) fn handle_set_view_mode(&mut self, buffer_id: BufferId, mode: &str) {
         use crate::state::ViewMode;
+        // Says so when the id is another window's (see `plugin_buffer_guard`).
+        let _ = self.plugin_buffer_in_active_window(buffer_id, "setViewMode");
         let view_mode = match mode {
             "page_view" | "compose" => ViewMode::PageView,
             _ => ViewMode::Source,
@@ -1831,59 +1916,16 @@ impl Editor {
         // Set on the specified buffer's per-split view state.
         // Use buffer_id to target the correct buffer (not just the active one)
         // so that "toggle compose all" can affect non-active buffers.
-        let active_split = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split();
+        // In the pane the user is in, on `buffer_id`'s own state — created
+        // when the pane has none yet, never borrowed from whatever buffer
+        // the pane has as its tab.
+        let active_split = self.effective_active_split();
         if let Some(view_state) = self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
-            .expect("active window must have a populated split layout")
+            .active_window_mut()
+            .split_view_states_mut()
             .get_mut(&active_split)
         {
-            if let Some(buf_state) = view_state.buffer_state_mut(buffer_id) {
-                buf_state.view_mode = view_mode;
-            } else {
-                // Buffer not yet in this split — fall back to setting on active
-                view_state.view_mode = view_mode;
-            }
-        }
-    }
-
-    /// Handle SetViewState command — persist plugin state in BufferViewState
-    pub(super) fn handle_set_view_state(
-        &mut self,
-        buffer_id: BufferId,
-        key: String,
-        value: Option<serde_json::Value>,
-    ) {
-        let active_split = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split();
-        if let Some(view_state) = self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
-            .expect("active window must have a populated split layout")
-            .get_mut(&active_split)
-        {
-            let buf_state = view_state.ensure_buffer_state(buffer_id);
-            match value {
-                Some(v) => {
-                    buf_state.plugin_state.insert(key, v);
-                }
-                None => {
-                    buf_state.plugin_state.remove(&key);
-                }
-            }
+            view_state.ensure_buffer_state(buffer_id).view_mode = view_mode;
         }
     }
 
@@ -1981,10 +2023,11 @@ impl Editor {
     /// must use [`Self::handle_set_line_numbers_default`] instead — see issue
     /// #2931 for what happens when the two are conflated.
     pub(super) fn handle_set_line_numbers(&mut self, buffer_id: BufferId, enabled: bool) {
-        self.with_active_split_buffer_view(buffer_id, |vs| {
-            vs.line_numbers_override = Some(enabled);
-            vs.show_line_numbers = enabled;
-        });
+        self.active_window_mut()
+            .with_active_split_buffer_view(buffer_id, |vs| {
+                vs.line_numbers_override = Some(enabled);
+                vs.show_line_numbers = enabled;
+            });
     }
 
     /// Handle SetLineNumbersDefault command
@@ -2005,82 +2048,11 @@ impl Editor {
         enabled: Option<bool>,
     ) {
         let default_line_numbers = self.config.editor.line_numbers;
-        self.with_active_split_buffer_view(buffer_id, |vs| {
-            vs.line_numbers_plugin_override = enabled;
-            vs.show_line_numbers = vs.line_numbers_visible(default_line_numbers);
-        });
-    }
-
-    /// Run `f` against `buffer_id`'s view state in the active split, falling
-    /// back to the split's active buffer when this split has no state for that
-    /// buffer yet.
-    ///
-    /// Shared by the two line-number entry points so they cannot drift apart
-    /// on which view state they land on.
-    fn with_active_split_buffer_view(
-        &mut self,
-        buffer_id: BufferId,
-        f: impl FnOnce(&mut BufferViewState),
-    ) {
-        let active_split = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split();
-        if let Some(view_state) = self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
-            .expect("active window must have a populated split layout")
-            .get_mut(&active_split)
-        {
-            if let Some(buf_state) = view_state.buffer_state_mut(buffer_id) {
-                f(buf_state);
-            } else {
-                // Buffer not yet in this split — fall back to the active one,
-                // which `SplitViewState` derefs to.
-                f(view_state);
-            }
-        }
-    }
-
-    /// Handle SetFoldIndicators command
-    ///
-    /// Per-(split, buffer) like `SetLineNumbers`, and for the same reason:
-    /// compose mode is itself per-split, so a source-mode split showing the
-    /// same buffer must keep its own gutter.
-    ///
-    /// Writes `fold_indicators_plugin_override`, never the user's
-    /// `fold_indicators_override` — see `BufferViewState` for why those are
-    /// two fields. `None` withdraws the plugin's opinion.
-    pub(super) fn handle_set_fold_indicators(
-        &mut self,
-        buffer_id: BufferId,
-        enabled: Option<bool>,
-    ) {
-        let active_split = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(mgr, _)| mgr)
-            .expect("active window must have a populated split layout")
-            .active_split();
-        if let Some(view_state) = self
-            .windows
-            .get_mut(&self.active_window)
-            .and_then(|w| w.split_view_states_mut())
-            .expect("active window must have a populated split layout")
-            .get_mut(&active_split)
-        {
-            if let Some(buf_state) = view_state.buffer_state_mut(buffer_id) {
-                buf_state.fold_indicators_plugin_override = enabled;
-            } else {
-                // Buffer not yet in this split — fall back to setting on active
-                view_state.fold_indicators_plugin_override = enabled;
-            }
-        }
+        self.active_window_mut()
+            .with_active_split_buffer_view(buffer_id, |vs| {
+                vs.line_numbers_plugin_override = enabled;
+                vs.show_line_numbers = vs.line_numbers_visible(default_line_numbers);
+            });
     }
 
     /// Handle SetIndentationGuide command
@@ -2090,69 +2062,18 @@ impl Editor {
     /// `EditorState`, so it follows the buffer wherever it's shown — including a
     /// buffer-group detail panel that isn't the focused split, and across the
     /// panel's per-commit buffer retargets.
-    pub(super) fn handle_set_indentation_guide(&mut self, buffer_id: BufferId, enabled: bool) {
+    pub(super) fn handle_set_indentation_guide(
+        &mut self,
+        buffer_id: BufferId,
+        enabled: Option<bool>,
+    ) {
         if let Some(state) = self
             .windows
             .get_mut(&self.active_window)
             .expect("active window present")
             .buffer_state_mut(buffer_id)
         {
-            state.indentation_guide_override = Some(enabled);
-        }
-    }
-
-    /// Handle SetLineWrap command
-    ///
-    /// With no `split_id`, the wrap flag lands on every split showing
-    /// `buffer_id` — including a buffer-group panel, whose leaf is not in
-    /// the main split tree and is never the "active split". Aiming at the
-    /// active split there set the flag on whatever pane happened to be
-    /// focused and left the panel alone, so a panel plugin asking for wrap
-    /// (git-log's commit-detail pane, where a lock-file diff is unreadable
-    /// unwrapped) silently got none. Falls back to the active split when
-    /// the buffer isn't on screen anywhere.
-    pub(super) fn handle_set_line_wrap(
-        &mut self,
-        buffer_id: BufferId,
-        split_id: Option<SplitId>,
-        enabled: bool,
-    ) {
-        let targets: Vec<LeafId> = match split_id {
-            Some(id) => vec![LeafId(id)],
-            None => {
-                let showing: Vec<LeafId> = self
-                    .windows
-                    .get(&self.active_window)
-                    .and_then(|w| w.buffers.splits())
-                    .map(|(_, vs)| vs)
-                    .expect("active window must have a populated split layout")
-                    .iter()
-                    .filter(|(_, vs)| vs.active_buffer == buffer_id)
-                    .map(|(leaf_id, _)| *leaf_id)
-                    .collect();
-                if showing.is_empty() {
-                    vec![self
-                        .windows
-                        .get(&self.active_window)
-                        .and_then(|w| w.buffers.splits())
-                        .map(|(mgr, _)| mgr)
-                        .expect("active window must have a populated split layout")
-                        .active_split()]
-                } else {
-                    showing
-                }
-            }
-        };
-        for target_split in targets {
-            if let Some(view_state) = self
-                .windows
-                .get_mut(&self.active_window)
-                .and_then(|w| w.split_view_states_mut())
-                .expect("active window must have a populated split layout")
-                .get_mut(&target_split)
-            {
-                view_state.viewport.line_wrap_enabled = enabled;
-            }
+            state.indentation_guide_override = enabled;
         }
     }
 
@@ -2396,7 +2317,7 @@ impl Editor {
             },
         );
         prompt.overlay = floating_overlay;
-        self.active_window_mut().prompt = Some(prompt);
+        self.set_prompt(prompt);
 
         // Fire the prompt_changed hook immediately with empty input
         // This allows plugins to initialize the prompt state
@@ -2432,7 +2353,7 @@ impl Editor {
             initial_value.clone(),
         );
         prompt.overlay = floating_overlay;
-        self.active_window_mut().prompt = Some(prompt);
+        self.set_prompt(prompt);
 
         // Fire the prompt_changed hook immediately with the initial value
         use crate::services::plugins::hooks::HookArgs;
@@ -2488,7 +2409,7 @@ impl Editor {
 
         // Create an async prompt (uses special prompt type)
         use crate::view::prompt::{Prompt, PromptType};
-        self.active_window_mut().prompt = Some(Prompt::with_initial_text(
+        self.set_prompt(Prompt::with_initial_text(
             label,
             PromptType::AsyncPrompt,
             initial_value.clone(),
@@ -2522,6 +2443,7 @@ impl Editor {
                     fresh_core::command::CommandSource::Plugin(name) => CommandSource::Plugin(name),
                 });
                 EditorSuggestion {
+                    id: s.id,
                     text: s.text,
                     description: s.description,
                     description_spans: s.description_spans,
@@ -2537,20 +2459,17 @@ impl Editor {
             // Set original_suggestions for Rust-side filtering (used by prompts that
             // don't handle their own filtering like theme editor dropdowns)
             prompt.original_suggestions = Some(internal_suggestions.clone());
-            prompt.suggestions = internal_suggestions;
+            // A plugin's list is its whole answer for this input.
+            prompt.set_suggestions(internal_suggestions, false);
             // Select first suggestion by default (or the specified index)
-            prompt.selected_suggestion = if prompt.suggestions.is_empty() {
+            prompt.select_suggestion(if prompt.suggestions.is_empty() {
                 None
             } else {
                 let idx = selected_index
                     .map(|i| (i as usize).min(prompt.suggestions.len() - 1))
                     .unwrap_or(0);
                 Some(idx)
-            };
-            // A fresh result list re-engages keep-selection-visible scrolling
-            // (issue #2119): a stale manual-scroll latch from the previous
-            // query must not suppress it.
-            prompt.manual_scroll = false;
+            });
             // Track that suggestions were set for this input value.
             // If filter_suggestions is called with the same input, we skip filtering
             // because the plugin has already provided filtered results.
@@ -2593,17 +2512,20 @@ impl Editor {
     }
 
     /// Handle DefineMode command
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_define_mode(
         &mut self,
         name: String,
         bindings: Vec<(String, String)>,
+        shortcuts: Vec<String>,
+        scoped: Vec<(String, Vec<String>)>,
         read_only: bool,
         allow_text_input: bool,
         inherit_normal_bindings: bool,
         plugin_name: Option<String>,
     ) {
-        use super::parse_key_string;
         use crate::input::buffer_mode::BufferMode;
+        use crate::input::keybindings::parse_key_seq;
         use crate::input::keybindings::{Action, KeyContext};
 
         let mode = BufferMode::new(name.clone())
@@ -2621,49 +2543,28 @@ impl Editor {
 
         let mode_context = KeyContext::Mode(name.clone());
 
-        // Parse key bindings from strings
-        // Key strings can be single keys ("g", "C-f") or chord sequences ("g g", "z z")
         for (key_str, command) in &bindings {
-            let parts: Vec<&str> = key_str.split_whitespace().collect();
-
-            if parts.len() == 1 {
-                // Single key binding
-                if let Some((code, modifiers)) = parse_key_string(key_str) {
-                    let action = Action::from_str(command, &std::collections::HashMap::new())
-                        .unwrap_or_else(|| Action::PluginAction(command.clone()));
-                    self.keybindings.write().unwrap().load_plugin_default(
-                        mode_context.clone(),
-                        code,
-                        modifiers,
-                        action,
-                    );
-                } else {
-                    tracing::warn!("Failed to parse key binding: {}", key_str);
-                }
-            } else {
-                // Chord sequence (multiple keys separated by space)
-                let mut sequence = Vec::new();
-                let mut parse_failed = false;
-
-                for part in &parts {
-                    if let Some((code, modifiers)) = parse_key_string(part) {
-                        sequence.push((code, modifiers));
-                    } else {
-                        tracing::warn!("Failed to parse key in chord: {} (in {})", part, key_str);
-                        parse_failed = true;
-                        break;
+            let Some(seq) = parse_key_seq(key_str) else {
+                tracing::warn!("Failed to parse key binding: {}", key_str);
+                continue;
+            };
+            let action = Action::from_str(command, &std::collections::HashMap::new())
+                .unwrap_or_else(|| Action::PluginAction(command.clone()));
+            let mut kb = self.keybindings.write().unwrap();
+            match seq.single() {
+                Some(key) => {
+                    if shortcuts.contains(key_str) {
+                        kb.set_mode_shortcut(&name, key.code(), key.mods());
                     }
+                    if let Some((_, widgets)) = scoped.iter().find(|(k, _)| k == key_str) {
+                        kb.set_mode_binding_scope(&name, key.code(), key.mods(), widgets.clone());
+                    }
+                    kb.load_plugin_default(mode_context.clone(), key.code(), key.mods(), action)
                 }
-
-                if !parse_failed && !sequence.is_empty() {
-                    tracing::debug!("Adding chord binding: {:?} -> {}", sequence, command);
-                    let action = Action::from_str(command, &std::collections::HashMap::new())
-                        .unwrap_or_else(|| Action::PluginAction(command.clone()));
-                    self.keybindings.write().unwrap().load_plugin_chord_default(
-                        mode_context.clone(),
-                        sequence,
-                        action,
-                    );
+                None => {
+                    tracing::debug!("Adding chord binding: {} -> {}", seq, command);
+                    let sequence = seq.keys().iter().map(|k| (k.code(), k.mods())).collect();
+                    kb.load_plugin_chord_default(mode_context.clone(), sequence, action)
                 }
             }
         }
@@ -2689,10 +2590,12 @@ impl Editor {
                         for (key_code, modifiers) in mode_bindings.keys() {
                             let label =
                                 crate::input::keybindings::format_keybinding(key_code, modifiers);
-                            if let Some((_key_str, cmd)) = bindings
-                                .iter()
-                                .find(|(k, _)| parse_key_string(k) == Some((*key_code, *modifiers)))
-                            {
+                            if let Some((_key_str, cmd)) = bindings.iter().find(|(k, _)| {
+                                parse_key_seq(k).and_then(|s| s.single())
+                                    == Some(crate::input::keybindings::Key::new(
+                                        *key_code, *modifiers,
+                                    ))
+                            }) {
                                 let key = format!("{}\0{}", cmd, name);
                                 snapshot.keybinding_labels.insert(key, label);
                             }
@@ -2873,10 +2776,13 @@ impl Editor {
         use super::diff_baselines::{BaselineEntry, BaselineSpec};
 
         let buffer_id = self.resolve_buffer_id(buffer_id);
+        // Like every buffer command, registration names one of the active
+        // window's buffers; that window owns the baseline from here on.
+        let window_id = self.active_window;
         let path = {
             let Some(state) = self
                 .windows
-                .get_mut(&self.active_window)
+                .get_mut(&window_id)
                 .expect("active window present")
                 .buffer_state_mut(buffer_id)
             else {
@@ -2943,6 +2849,7 @@ impl Editor {
                 baseline_id,
                 BaselineEntry {
                     buffer_id,
+                    window_id,
                     spec: spec.clone(),
                     generation: 0,
                     content: None,
@@ -2963,6 +2870,13 @@ impl Editor {
     }
 
     /// Shared off-loop launch for registration and refresh loads.
+    ///
+    /// Everything the load reads comes from the window that owns the
+    /// baseline (`BaselineEntry::window_id`): the encoding its buffer's bytes
+    /// were decoded with, and the filesystem and process spawner of that
+    /// window's authority. A refresh can run while another window is active —
+    /// a HEAD move refreshes every buffer's baseline — and must still read
+    /// the file from the backend the buffer came from.
     fn spawn_baseline_load(
         &mut self,
         baseline_id: u64,
@@ -2970,6 +2884,9 @@ impl Editor {
         callback_id: JsCallbackId,
         is_registration: bool,
     ) {
+        // Held here, not inside the capability — see `OffLoop`: the capability
+        // rides into the spawned task, and an owning runtime in there would
+        // keep the work running after the editor has gone.
         let Some(runtime) = self.tokio_runtime.clone() else {
             self.plugin_manager
                 .read()
@@ -2984,21 +2901,51 @@ impl Editor {
                 .reject_callback(callback_id, "No async bridge available".to_string());
             return;
         };
+        let Some(source) = self.baseline_source(baseline_id) else {
+            self.plugin_manager.read().unwrap().reject_callback(
+                callback_id,
+                format!("baseline {baseline_id}'s window is gone"),
+            );
+            return;
+        };
         super::plugin_offloop::load_diff_baseline(
+            &runtime,
             super::plugin_offloop::OffLoop {
-                filesystem: self.authority().filesystem.clone(),
-                runtime,
+                filesystem: source.filesystem,
                 sender,
+                cancel: Arc::default(),
             },
             super::plugin_offloop::BaselineLoadRequest {
                 baseline_id,
                 spec,
-                spawner: self.authority().process_spawner.clone(),
+                spawner: source.spawner,
                 store: self.diff_baselines.clone(),
                 callback_id,
+                encoding: source.encoding,
                 is_registration,
             },
         );
+    }
+
+    /// What a load of `baseline_id` reads through, taken from the window
+    /// that owns it. `None` when the baseline or its window is gone.
+    fn baseline_source(&self, baseline_id: u64) -> Option<BaselineSource> {
+        let (window_id, buffer_id) = {
+            let inner = self.diff_baselines.inner.lock().ok()?;
+            let entry = inner.entries.get(&baseline_id)?;
+            (entry.window_id, entry.buffer_id)
+        };
+        let window = self.windows.get(&window_id)?;
+        let authority = window.authority();
+        Some(BaselineSource {
+            filesystem: authority.filesystem.clone(),
+            spawner: authority.process_spawner.clone(),
+            // Decode the baseline the way the buffer's own bytes were decoded.
+            encoding: window
+                .buffer_state(buffer_id)
+                .map(|state| state.buffer.encoding())
+                .unwrap_or_default(),
+        })
     }
 
     /// Diff a buffer's live content against a registered baseline.
@@ -3046,7 +2993,7 @@ impl Editor {
                     Ok(fresh_core::api::DiffBaselineResult {
                         revision: state.buffer.version(),
                         fidelity: FIDELITY_EXACT.to_string(),
-                        hunks: fresh_core::diff::compute_line_diff(&content.text, &new_text),
+                        hunks: super::diff_baselines::diff_texts(&content.text, &new_text),
                     })
                 }
             }
@@ -3113,6 +3060,226 @@ impl Editor {
                 .unwrap()
                 .reject_callback(callback_id, e),
         }
+    }
+
+    /// Handle `compareBuffers`: diff two live buffers host-side, in their
+    /// own bytes, so neither text crosses the plugin bridge.
+    ///
+    /// Only the copy of the two texts happens here, on the editor thread
+    /// (~10 ms for two 9 MB files); the diff (~200 ms for the same pair)
+    /// runs on a blocking worker and comes back as a `PluginCallbackResult`,
+    /// so typing doesn't wait on it.
+    pub(super) fn handle_compare_buffers(
+        &mut self,
+        left_id: BufferId,
+        right_id: BufferId,
+        callback_id: JsCallbackId,
+    ) {
+        let window = self
+            .windows
+            .get_mut(&self.active_window)
+            .expect("active window present");
+        let mut read = |id: BufferId| -> Result<(Vec<u8>, u64), String> {
+            let meta = window.buffer_metadata.get(&id);
+            let binary = meta.is_some_and(|m| m.binary);
+            // The messages reach the user (a plugin shows them), so they
+            // name the file, not the buffer id.
+            let name = meta
+                .map(|m| m.display_name.clone())
+                .unwrap_or_else(|| format!("buffer {}", id.0));
+            let state = window
+                .buffer_state_mut(id)
+                .ok_or_else(|| format!("{name} is not open"))?;
+            if binary || state.buffer.is_binary() {
+                return Err(format!("{name} is a binary file"));
+            }
+            if state.buffer.is_large_file() {
+                return Err(format!("{name} is too large to compare"));
+            }
+            let len = state.buffer.len();
+            let bytes = state
+                .buffer
+                .get_text_range_mut(0, len)
+                .map_err(|e| format!("cannot read {name}: {e}"))?;
+            Ok((bytes, state.buffer.version()))
+        };
+        let ((left, left_version), (right, right_version)) =
+            match read(left_id).and_then(|left| Ok((left, read(right_id)?))) {
+                Ok(texts) => texts,
+                Err(e) => {
+                    self.plugin_manager
+                        .read()
+                        .unwrap()
+                        .reject_callback(callback_id, e);
+                    return;
+                }
+            };
+        let diff = move || {
+            let lines = |text: &[u8]| text.split_inclusive(|b| *b == b'\n').count() as u32;
+            let value = fresh_core::api::CompareResult {
+                hunks: fresh_core::diff::compare_texts(&left, &right),
+                left_lines: lines(&left),
+                right_lines: lines(&right),
+                left_len: left.len(),
+                right_len: right.len(),
+                left_version,
+                right_version,
+            };
+            serde_json::to_string(&value).map_err(|e| e.to_string())
+        };
+        match (&self.tokio_runtime, &self.async_bridge) {
+            (Some(runtime), Some(bridge)) => {
+                let sender = bridge.sender();
+                let request_id = callback_id.as_u64();
+                runtime.spawn_blocking(move || {
+                    #[allow(clippy::let_underscore_must_use)]
+                    let _ = sender.send(
+                        crate::services::async_bridge::AsyncMessage::PluginCallbackResult {
+                            request_id,
+                            result: diff(),
+                        },
+                    );
+                });
+            }
+            _ => {
+                let plugins = self.plugin_manager.read().unwrap();
+                match diff() {
+                    Ok(json) => plugins.resolve_callback(callback_id, json),
+                    Err(e) => plugins.reject_callback(callback_id, e),
+                }
+            }
+        }
+    }
+
+    /// Handle `replaceRange`: one edit, logged as one undo step.
+    pub(super) fn handle_replace_range(
+        &mut self,
+        buffer_id: BufferId,
+        start: usize,
+        end: usize,
+        text: String,
+        expected_version: Option<u64>,
+        callback_id: JsCallbackId,
+    ) {
+        let applied = self.replace_range_as_one_edit(buffer_id, start, end, text, expected_version);
+        self.plugin_manager
+            .read()
+            .unwrap()
+            .resolve_callback(callback_id, applied.to_string());
+    }
+
+    /// Replace `start..end` with `text` the way `handle_delete_range` and
+    /// `handle_insert_text` each edit, but logged as a single `Batch` so one
+    /// undo takes the whole replacement back. `false`, with nothing changed,
+    /// for a read-only or binary buffer, a range outside it, or a buffer that
+    /// is no longer at `expected_version`.
+    fn replace_range_as_one_edit(
+        &mut self,
+        buffer_id: BufferId,
+        start: usize,
+        end: usize,
+        text: String,
+        expected_version: Option<u64>,
+    ) -> bool {
+        let window = self
+            .windows
+            .get_mut(&self.active_window)
+            .expect("active window present");
+        if window
+            .buffer_metadata
+            .get(&buffer_id)
+            .is_some_and(|m| m.read_only || m.binary)
+        {
+            return false;
+        }
+        let Some(state) = window.buffer_state_mut(buffer_id) else {
+            return false;
+        };
+        if start > end
+            || end > state.buffer.len()
+            || state.buffer.is_binary()
+            || expected_version.is_some_and(|v| v != state.buffer.version())
+        {
+            return false;
+        }
+        let deleted_text = state.get_edit_text(start, end);
+        let (removed, inserted) = (end - start, text.len());
+        let touches_newline = deleted_text.contains('\n') || text.contains('\n');
+        let delete = Event::Delete {
+            range: start..end,
+            deleted_text,
+            cursor_id: CursorId(0),
+        };
+        let insert = Event::Insert {
+            position: start,
+            text: text.into(),
+            cursor_id: CursorId(0),
+        };
+
+        // Each half's LSP change is read against the text it applies to, so
+        // the insert's is taken after the delete is applied.
+        let lsp = self.active_window().lsp_change_could_be_sent(buffer_id);
+        let mut lsp_changes = Vec::new();
+        let mut events = Vec::new();
+        for event in [delete, insert] {
+            let empty = match &event {
+                Event::Delete { range, .. } => range.is_empty(),
+                Event::Insert { text, .. } => text.is_empty(),
+                _ => false,
+            };
+            if empty {
+                continue;
+            }
+            if lsp {
+                lsp_changes.extend(
+                    self.active_window()
+                        .collect_lsp_changes_for_buffer(buffer_id, &event),
+                );
+            }
+            if let Some(state) = self.active_window_mut().buffer_state_mut(buffer_id) {
+                state.apply(&mut Cursors::default(), &event);
+            }
+            events.push(event);
+        }
+        if events.is_empty() {
+            return true;
+        }
+        if let Some(log) = self.active_window_mut().event_logs.get_mut(&buffer_id) {
+            log.append(Event::Batch {
+                events,
+                description: "Replace range".to_string(),
+            });
+        }
+
+        for leaf_id in self
+            .active_window()
+            .split_manager()
+            .splits_for_buffer(buffer_id)
+        {
+            if let Some(view_state) = self
+                .active_window_mut()
+                .split_view_states_mut()
+                .get_mut(&leaf_id)
+            {
+                view_state
+                    .buffer_tab_state_mut()
+                    .cursors
+                    .adjust_for_edit(start, removed, inserted);
+            }
+        }
+        // As for the single edits: search highlights, plugin markers, the
+        // language server, and the plugin line set all follow the edit.
+        self.reevaluate_plugin_edit_search_overlays(buffer_id, start, inserted);
+        #[cfg(feature = "plugins")]
+        self.shift_plugin_markers_for_edit(buffer_id, start, removed, inserted);
+        self.active_window_mut()
+            .send_lsp_changes_for_buffer(buffer_id, lsp_changes);
+        if touches_newline {
+            self.handle_refresh_lines(buffer_id);
+        } else {
+            self.adjust_seen_byte_ranges_for_edit(buffer_id, start, removed, inserted);
+        }
+        true
     }
 
     /// Batched baseline line fetch: `(start_line, count)` ranges in, lines
@@ -3217,21 +3384,624 @@ impl Editor {
         }
     }
 
-    /// Handle GrepProject: snapshot what only the editor thread can see, then
-    /// hand the walk-and-search to [`plugin_offloop::grep_project`].
+    /// The runtime and bridge sender, or `None` after rejecting the callback.
+    fn off_loop_parts(
+        &self,
+        callback_id: fresh_core::api::JsCallbackId,
+    ) -> Option<(
+        crate::services::runtime::LiveRuntime,
+        std::sync::mpsc::Sender<crate::services::async_bridge::AsyncMessage>,
+    )> {
+        let Some(runtime) = self.tokio_runtime.clone() else {
+            self.plugin_manager
+                .read()
+                .unwrap()
+                .reject_callback(callback_id, "No tokio runtime available".to_string());
+            return None;
+        };
+        let Some(sender) = self.async_bridge.as_ref().map(|b| b.sender()) else {
+            self.plugin_manager
+                .read()
+                .unwrap()
+                .reject_callback(callback_id, "No async bridge available".to_string());
+            return None;
+        };
+        Some((runtime, sender))
+    }
+
+    /// The `{id, platform, home, label}` a plugin gets back for a machine.
+    pub(super) fn machine_info(
+        authority: &crate::services::authority::Authority,
+        id: u64,
+    ) -> serde_json::Value {
+        let platform = crate::services::authority::platform_label(authority);
+        serde_json::json!({
+            "id": id,
+            "platform": platform,
+            "home": authority
+                .filesystem
+                .home_dir()
+                .unwrap_or_default()
+                .to_string_lossy(),
+            "label": authority.display_label,
+        })
+    }
+
+    /// Open a machine without attaching it to a window.
+    pub(super) fn handle_open_machine(
+        &mut self,
+        payload: serde_json::Value,
+        callback_id: fresh_core::api::JsCallbackId,
+    ) {
+        // Borrow a window's own authority instead of building one from a spec.
+        if payload.get("kind").and_then(serde_json::Value::as_str) == Some("window") {
+            let window = payload
+                .get("window")
+                .and_then(serde_json::Value::as_u64)
+                .map(fresh_core::WindowId)
+                .unwrap_or(self.active_window);
+            let window_id = window;
+            let Some(window) = self.windows.get(&window_id) else {
+                self.plugin_manager
+                    .read()
+                    .unwrap()
+                    .reject_callback(callback_id, format!("openMachine: no window {window_id:?}"));
+                return;
+            };
+            let id = self.next_machine_id;
+            self.next_machine_id += 1;
+            let info = Self::machine_info(window.authority(), id);
+            self.open_machines.insert(
+                id,
+                super::OpenMachine::new(super::OpenMachineKind::Window(window_id)),
+            );
+            self.send_plugin_response(fresh_core::api::PluginResponse::MachineOpened {
+                request_id: callback_id.into(),
+                info,
+            });
+            return;
+        }
+
+        // A transport spec: connect with no window to hang it on. The connect
+        // runs on the runtime and settles this same callback.
+        if matches!(
+            payload.get("kind").and_then(serde_json::Value::as_str),
+            Some("ssh") | Some("kubectl-exec")
+        ) {
+            let transport = match serde_json::from_value::<
+                crate::services::authority::RemoteTransportSpec,
+            >(payload)
+            {
+                Ok(transport) => transport,
+                Err(err) => {
+                    self.plugin_manager
+                        .read()
+                        .unwrap()
+                        .reject_callback(callback_id, format!("openMachine: {err}"));
+                    return;
+                }
+            };
+            let spec = crate::services::authority::RemoteAgentSpec {
+                transport,
+                base_env: Vec::new(),
+                window: false,
+                label: None,
+                command: None,
+                adopt_window: None,
+            };
+            // The callback id doubles as the connect's request id, so the
+            // connect's reject path settles this promise on failure.
+            self.start_remote_connect(spec, None, callback_id.into(), true);
+            return;
+        }
+
+        let parsed =
+            match serde_json::from_value::<crate::services::authority::AuthorityPayload>(payload) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    self.plugin_manager
+                        .read()
+                        .unwrap()
+                        .reject_callback(callback_id, format!("openMachine: {err}"));
+                    return;
+                }
+            };
+        // Shares the editor's trust and env handles, so spawners are gated like
+        // the active window's.
+        let trust = Arc::clone(&self.authority().workspace_trust);
+        let env = Arc::clone(&self.authority().env_provider);
+        let authority =
+            match crate::services::authority::Authority::from_plugin_payload(parsed, trust, env) {
+                Ok(authority) => authority,
+                Err(err) => {
+                    self.plugin_manager
+                        .read()
+                        .unwrap()
+                        .reject_callback(callback_id, format!("openMachine: {err}"));
+                    return;
+                }
+            };
+
+        let id = self.next_machine_id;
+        self.next_machine_id += 1;
+        let info = Self::machine_info(&authority, id);
+        let connection =
+            self.open_connection(crate::services::authority::Connection::plain(authority));
+        self.open_machines.insert(
+            id,
+            super::OpenMachine::new(super::OpenMachineKind::Owned(connection)),
+        );
+        // A response, not a bare resolve: the runtime records the handle
+        // against the plugin that asked, so an unload closes it.
+        self.send_plugin_response(fresh_core::api::PluginResponse::MachineOpened {
+            request_id: callback_id.into(),
+            info,
+        });
+    }
+
+    /// Close a machine opened by `openMachine`. Idempotent.
+    pub(super) fn handle_close_machine(
+        &mut self,
+        machine: u64,
+        callback_id: Option<fresh_core::api::JsCallbackId>,
+    ) {
+        // Set the handle's cancel flag so a walk in flight stops, and drop the
+        // handle before pruning: pruning is by reference count, so a handle
+        // still held in a local would keep the carrier alive.
+        let closed = self.open_machines.remove(&machine);
+        let was_open = closed.is_some();
+        if let Some(open) = closed {
+            open.cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.prune_connections();
+        if let Some(callback_id) = callback_id {
+            self.plugin_manager
+                .read()
+                .unwrap()
+                .resolve_callback(callback_id, was_open.to_string());
+        }
+    }
+
+    /// The cancel flag of `machine`'s handle, so closing the handle stops its
+    /// work. Work with no machine gets a flag nothing ever sets.
+    fn cancel_for(&self, machine: Option<u64>) -> Arc<std::sync::atomic::AtomicBool> {
+        machine
+            .and_then(|id| self.open_machines.get(&id))
+            .map_or_else(Arc::default, |open| Arc::clone(&open.cancel))
+    }
+
+    /// The filesystem for `machine`, or the active window's when `None`.
+    fn filesystem_for(
+        &self,
+        machine: Option<u64>,
+        callback_id: fresh_core::api::JsCallbackId,
+    ) -> Option<Arc<dyn crate::model::filesystem::FileSystem + Send + Sync>> {
+        self.authority_for(machine, callback_id)
+            .map(|authority| authority.filesystem.clone())
+    }
+
+    /// The authority `machine` names, or the active window's when `None`.
+    /// Returns `None` after rejecting the callback: a closed handle or window
+    /// is an error, never a silent fall back to this machine.
+    fn authority_for(
+        &self,
+        machine: Option<u64>,
+        callback_id: fresh_core::api::JsCallbackId,
+    ) -> Option<&crate::services::authority::Authority> {
+        self.machine_authority(machine)
+            .map_err(|msg| {
+                self.plugin_manager
+                    .read()
+                    .unwrap()
+                    .reject_callback(callback_id, msg)
+            })
+            .ok()
+    }
+
+    /// The authority behind `machine` (the active window's when `None`), or
+    /// why there is none.
+    fn machine_authority(
+        &self,
+        machine: Option<u64>,
+    ) -> Result<&crate::services::authority::Authority, String> {
+        let Some(id) = machine else {
+            return Ok(self.authority());
+        };
+        match self.open_machines.get(&id).map(|m| &m.kind) {
+            Some(super::OpenMachineKind::Owned(connection)) => Ok(&connection.authority),
+            Some(super::OpenMachineKind::Window(window)) => self
+                .windows
+                .get(window)
+                .map(|window| window.authority())
+                .ok_or_else(|| format!("machine {id}'s window has closed")),
+            None => Err(format!("machine {id} is not open")),
+        }
+    }
+
+    /// Read environment variables from a machine. See `PluginCommand::MachineEnv`.
+    pub(super) fn handle_machine_env(
+        &mut self,
+        machine: Option<u64>,
+        names: Vec<String>,
+        callback_id: fresh_core::api::JsCallbackId,
+    ) {
+        let Some(authority) = self.authority_for(machine, callback_id) else {
+            return;
+        };
+
+        // Not `session_spec() == Local`: a docker-exec container is Local too,
+        // but its environment is the container's.
+        if authority.env_is_this_process() {
+            let mut found = serde_json::Map::new();
+            for name in names {
+                if let Ok(value) = std::env::var(&name) {
+                    found.insert(name, serde_json::Value::String(value));
+                }
+            }
+            self.plugin_manager
+                .read()
+                .unwrap()
+                .resolve_callback(callback_id, serde_json::Value::Object(found).to_string());
+            return;
+        }
+
+        // Anything else is asked with `printenv` through its spawner, off the
+        // editor thread.
+        let filesystem = authority.filesystem.clone();
+        let spawner = authority.process_spawner.clone();
+        let Some((runtime, sender)) = self.off_loop_parts(callback_id) else {
+            return;
+        };
+        super::plugin_offloop::remote_env(
+            &runtime,
+            super::plugin_offloop::OffLoop {
+                filesystem,
+                sender,
+                cancel: self.cancel_for(machine),
+            },
+            super::plugin_offloop::RemoteEnvRequest {
+                names,
+                spawner,
+                callback_id,
+            },
+        );
+    }
+
+    /// Hand a subtree walk to the off-loop worker.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn handle_walk_tree(
+        &mut self,
+        machine: Option<u64>,
+        root: String,
+        skip_dirs: Vec<String>,
+        include_hidden: bool,
+        include_dirs: bool,
+        max_depth: usize,
+        max_entries: usize,
+        callback_id: fresh_core::api::JsCallbackId,
+    ) {
+        let Some((runtime, sender)) = self.off_loop_parts(callback_id) else {
+            return;
+        };
+        let Some(filesystem) = self.filesystem_for(machine, callback_id) else {
+            return;
+        };
+        super::plugin_offloop::walk_tree(
+            &runtime,
+            super::plugin_offloop::OffLoop {
+                filesystem,
+                sender,
+                cancel: self.cancel_for(machine),
+            },
+            super::plugin_offloop::WalkTreeRequest {
+                root: std::path::PathBuf::from(root),
+                skip_dirs,
+                include_hidden,
+                include_dirs,
+                // 0 means no limit.
+                max_depth: if max_depth == 0 {
+                    usize::MAX
+                } else {
+                    max_depth
+                },
+                max_entries: if max_entries == 0 {
+                    usize::MAX
+                } else {
+                    max_entries
+                },
+                callback_id,
+            },
+        );
+    }
+
+    /// Hand a batch of bounded reads to the off-loop worker.
+    pub(super) fn handle_read_file_prefixes(
+        &mut self,
+        machine: Option<u64>,
+        requests: Vec<(String, usize)>,
+        callback_id: fresh_core::api::JsCallbackId,
+    ) {
+        let Some((runtime, sender)) = self.off_loop_parts(callback_id) else {
+            return;
+        };
+        let Some(filesystem) = self.filesystem_for(machine, callback_id) else {
+            return;
+        };
+        super::plugin_offloop::read_file_prefixes(
+            &runtime,
+            super::plugin_offloop::OffLoop {
+                filesystem,
+                sender,
+                cancel: self.cancel_for(machine),
+            },
+            super::plugin_offloop::ReadPrefixesRequest {
+                requests: requests
+                    .into_iter()
+                    .map(|(path, max_bytes)| (std::path::PathBuf::from(path), max_bytes))
+                    .collect(),
+                callback_id,
+            },
+        );
+    }
+
+    /// Hand a command on the authority's machine to the off-loop worker.
+    pub(super) fn handle_run_on_target(
+        &mut self,
+        machine: Option<u64>,
+        program: String,
+        args: Vec<String>,
+        cwd: Option<String>,
+        stdout_to: Option<std::path::PathBuf>,
+        callback_id: fresh_core::api::JsCallbackId,
+    ) {
+        let Some((runtime, sender)) = self.off_loop_parts(callback_id) else {
+            return;
+        };
+        // Like a command that cannot start, a machine that is gone resolves
+        // with -1: callers written for `spawnProcess` expect a result.
+        let authority = match self.machine_authority(machine) {
+            Ok(authority) => authority,
+            Err(reason) => {
+                let result = serde_json::json!({ "code": -1, "stdout": "", "stderr": reason });
+                self.plugin_manager
+                    .read()
+                    .unwrap()
+                    .resolve_callback(callback_id, result.to_string());
+                return;
+            }
+        };
+        let spawner = authority.process_spawner.clone();
+        let filesystem = authority.filesystem.clone();
+        // Killed by the handle's `kill()` (`KillHostProcess`, keyed by the
+        // callback id); dropped when the run settles.
+        let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
+        self.host_process_handles
+            .insert(callback_id.as_u64(), kill_tx);
+        super::plugin_offloop::run_on_target(
+            &runtime,
+            super::plugin_offloop::OffLoop {
+                filesystem,
+                sender,
+                cancel: self.cancel_for(machine),
+            },
+            super::plugin_offloop::RunOnTargetRequest {
+                program,
+                args,
+                cwd,
+                stdout_to,
+                kill_rx,
+                spawner,
+                callback_id,
+            },
+        );
+    }
+
+    /// What a project search needs from the editor thread, with the search
+    /// of every open buffer it must see as it is queued (see
+    /// `OpenBufferSearch`): a modified one, and an unnamed source buffer
+    /// that no walk can reach. Clean open buffers cost only their id. The
+    /// open-buffer searches stop when `handle` is cancelled. An invalid
+    /// regex is an error.
+    fn prepare_project_search(
+        &mut self,
+        pattern: String,
+        opts: crate::model::filesystem::FileSearchOptions,
+        file_glob: String,
+        source_buffer_id: usize,
+        handle: &Arc<fresh_core::api::SearchHandleState>,
+    ) -> Result<super::plugin_offloop::ProjectSearch, String> {
+        use super::plugin_offloop::search_file_glob_matches;
+        let query = opts
+            .query(&pattern)
+            .map_err(|e| format!("Invalid regex: {}", e))?;
+        let max_results = opts.max_matches;
+        let root = self.working_dir().to_path_buf();
+        // The name a file is shown and glob-matched under: relative and
+        // `/`-separated when it is in the root, as the project walk gives it.
+        // The workspace filesystem's rules, bound before the closure so it
+        // does not need to borrow `self`.
+        let style = self.authority().filesystem.style();
+        let shown_path = |path: &std::path::Path| {
+            // Split under the *filesystem's* rules rather than the client's.
+            // `rel_to_slash_string` upstream keeps a backslash in a name on a
+            // POSIX *client*, which is right as far as it goes; asking the
+            // path itself extends that to a POSIX host seen from a Windows
+            // client, where `Path::components` would split `a\b.txt` in two
+            // and name a file that does not exist.
+            match path.as_host().under(style).rel_to(root.as_host()) {
+                Some(rel) => rel,
+                None => path.to_string_lossy().into_owned(),
+            }
+        };
+
+        let window = self.active_window;
+        let mut open_paths = std::collections::HashSet::new();
+        let mut clean_buffers = std::collections::HashMap::new();
+        let mut source_result = None;
+        let mut source_file = None;
+        let mut open_results = Vec::new();
+        let mut jobs = Vec::new();
+        for (bid, state) in self
+            .windows
+            .get(&self.active_window)
+            .map(|w| &w.buffers)
+            .expect("active window present")
+        {
+            let is_source = bid.0 == source_buffer_id;
+            let path = state.buffer.file_path().map(|p| p.to_path_buf());
+            let shown = path.as_deref().map_or("[No Name]".to_string(), &shown_path);
+            if !search_file_glob_matches(&file_glob, &shown) {
+                continue;
+            }
+            let file = match &path {
+                Some(path) if !state.buffer.is_modified() => {
+                    clean_buffers.insert(path.clone(), *bid);
+                    if is_source {
+                        // The listing can miss a file the user has open
+                        // (outside the root, hidden, gitignored): it goes
+                        // ahead of the walk instead.
+                        source_file = Some(path.clone());
+                    }
+                    continue;
+                }
+                Some(path) => path.to_string_lossy().into_owned(),
+                None if is_source => "[No Name]".to_string(),
+                None => continue,
+            };
+            let (reply, receiver) = tokio::sync::oneshot::channel();
+            let job = super::open_buffer_search::OpenBufferSearch::new(
+                window,
+                *bid,
+                file,
+                query.clone(),
+                max_results,
+                &state.buffer,
+                Arc::clone(handle),
+                // The search's task may have stopped waiting; nothing to do then.
+                Box::new(move |found| drop(reply.send(found))),
+            );
+            jobs.push(job);
+            if is_source {
+                source_result = Some(receiver);
+            } else {
+                open_results.push(receiver);
+            }
+            if let Some(path) = path {
+                open_paths.insert(path);
+            }
+        }
+        for job in jobs {
+            self.start_open_buffer_search(job);
+        }
+
+        let custom_ignore = crate::view::file_tree::ignore::CustomIgnore::new(
+            &root,
+            &self.config.file_explorer.custom_ignore_patterns,
+        );
+        Ok(super::plugin_offloop::ProjectSearch {
+            pattern,
+            opts,
+            max_results,
+            file_glob,
+            root,
+            spawner: self.authority().process_spawner.clone(),
+            custom_ignore,
+            source_file,
+            open_paths,
+            source_result,
+            open_results,
+            clean_buffers,
+        })
+    }
+
+    /// Search one buffer, of whichever window holds it, as it is — a slice per tick,
+    /// like an open buffer in a project search — into `handle`: a
+    /// `beginSearch` (or `searchBuffer`) of just that buffer.
+    fn search_one_buffer(
+        &mut self,
+        buffer_id: BufferId,
+        pattern: &str,
+        opts: crate::model::filesystem::FileSearchOptions,
+        handle: &Arc<fresh_core::api::SearchHandleState>,
+    ) -> Result<(), String> {
+        let query = opts
+            .query(pattern)
+            .map_err(|e| format!("Invalid regex: {}", e))?;
+        // Buffer ids are unique across windows: the buffer may be another
+        // workspace's (Universal Search's "All workspaces").
+        let window_id = if self.active_window().buffers.contains_key(&buffer_id) {
+            self.active_window
+        } else {
+            self.windows
+                .iter()
+                .find(|(_, w)| w.buffers.contains_key(&buffer_id))
+                .map(|(id, _)| *id)
+                .ok_or_else(|| format!("Buffer {} not found", buffer_id.0))?
+        };
+        let window = self
+            .windows
+            .get(&window_id)
+            .ok_or_else(|| format!("Buffer {} not found", buffer_id.0))?;
+        let state = window
+            .buffers
+            .get(&buffer_id)
+            .ok_or_else(|| format!("Buffer {} not found", buffer_id.0))?;
+        let file = state
+            .buffer
+            .file_path()
+            .map_or("[No Name]".to_string(), |p| {
+                // A remote window's root is canonical from the connect, and
+                // its canonicalize is a round trip: not on this thread.
+                if window.authority_spec.is_remote() {
+                    return p.to_string_lossy().into_owned();
+                }
+                super::plugin_offloop::rooted_like_the_walk(
+                    p,
+                    &window.root,
+                    &*window.authority().filesystem,
+                )
+                .to_string_lossy()
+                .into_owned()
+            });
+        let max = opts.max_matches;
+        let reply_to = Arc::clone(handle);
+        // One more than is kept, to tell a capped search from one that found
+        // exactly `max`.
+        let job = super::open_buffer_search::OpenBufferSearch::new(
+            window_id,
+            buffer_id,
+            file,
+            query,
+            max.saturating_add(1),
+            &state.buffer,
+            Arc::clone(handle),
+            Box::new(move |mut found| {
+                let mut state = match reply_to.state.lock() {
+                    Ok(s) => s,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                state.truncated = found.len() > max;
+                found.truncate(max);
+                state.total_seen += found.len();
+                state.pending.extend(found);
+                state.done = true;
+            }),
+        );
+        self.start_open_buffer_search(job);
+        Ok(())
+    }
+
+    /// Handle GrepProject: a project search (see `prepare_project_search` and
+    /// [`plugin_offloop::project_search`]) whose matches settle the callback
+    /// when it is done.
     ///
-    /// The project walk, the per-file greps and the callback resolution all
-    /// happen on the tokio runtime; a second grep from the same plugin
-    /// supersedes and cancels the first, so a plugin looping on `grepProject`
-    /// collapses instead of queueing.
-    ///
-    /// What stays on the editor thread is the snapshot, and it is not free:
-    /// `search_hybrid_plan` copies the loaded bytes of every *modified* open
-    /// buffer, because the piece tree cannot cross threads. Unmodified buffers
-    /// cost only their id, and unloaded regions of a modified one are recorded
-    /// as file offsets rather than copied — but a large fully-loaded dirty
-    /// buffer is copied in full, once per call. Worth knowing before adding
-    /// anything else to this path.
+    /// It searches the project's files by Quick Open's rules, hidden and
+    /// gitignored files left out (see [`crate::services::project_files`]). A
+    /// second grep from the same plugin supersedes and cancels the first, so
+    /// a plugin looping on `grepProject` collapses instead of queueing; the
+    /// superseded one rejects rather than settling with a truncated answer.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_grep_project(
         &mut self,
         plugin_name: String,
@@ -3242,112 +4012,69 @@ impl Editor {
         whole_words: bool,
         callback_id: JsCallbackId,
     ) {
-        if pattern.is_empty() {
-            let json = serde_json::to_string(&Vec::<GrepMatch>::new())
-                .unwrap_or_else(|_| "[]".to_string());
-            self.plugin_manager
+        let reject = |editor: &Self, message: String| {
+            editor
+                .plugin_manager
                 .read()
                 .unwrap()
-                .resolve_callback(callback_id, json);
-            return;
-        }
-
-        let fs_opts = make_search_opts(fixed_string, case_sensitive, whole_words, max_results);
-        let regex = match crate::model::filesystem::build_search_regex(&pattern, &fs_opts) {
-            Ok(re) => re,
-            Err(e) => {
-                self.plugin_manager
-                    .read()
-                    .unwrap()
-                    .reject_callback(callback_id, format!("Invalid regex: {}", e));
-                return;
-            }
+                .reject_callback(callback_id, message);
         };
-
-        // Snapshot open buffers. Dirty ones become `HybridSearchPlan`s (the
-        // piece tree is not `Send`); clean ones only contribute their id so
-        // matches stay attributable to a buffer.
-        let mut dirty_plans = std::collections::HashMap::new();
-        let mut clean_buffers = std::collections::HashMap::new();
-        for (bid, state) in self
-            .windows
-            .get_mut(&self.active_window)
-            .map(|w| &mut w.buffers)
-            .expect("active window present")
-        {
-            let Some(path) = state.buffer.file_path().map(|p| p.to_path_buf()) else {
-                continue;
-            };
-            if state.buffer.is_modified() {
-                if let Some(plan) = state.buffer.search_hybrid_plan() {
-                    dirty_plans.insert(path, (*bid, plan));
-                    continue;
-                }
-            }
-            clean_buffers.insert(path, *bid);
-        }
-
-        let Some(runtime) = self.tokio_runtime.clone() else {
+        if pattern.is_empty() {
             self.plugin_manager
                 .read()
                 .unwrap()
-                .reject_callback(callback_id, "No tokio runtime available".to_string());
+                .resolve_callback(callback_id, "[]".to_string());
             return;
+        }
+        // Held here, not inside the capability — see `OffLoop`: the capability
+        // rides into the spawned task, and an owning runtime in there would
+        // keep the work running after the editor has gone.
+        let Some(runtime) = self.tokio_runtime.clone() else {
+            return reject(self, "No tokio runtime available".to_string());
         };
         let Some(sender) = self.async_bridge.as_ref().map(|b| b.sender()) else {
-            self.plugin_manager
-                .read()
-                .unwrap()
-                .reject_callback(callback_id, "No async bridge available".to_string());
-            return;
+            return reject(self, "No async bridge available".to_string());
         };
 
-        // Coalesce per plugin: a plugin looping on `grepProject` (one call per
-        // keystroke, say) collapses to its latest request instead of queueing.
-        // Keyed by plugin because the token used to be a single editor-wide
-        // slot, so any plugin's grep cancelled every other plugin's — and the
-        // loser settled with whatever partial results it happened to hold, with
-        // no way for its caller to tell. The superseded request now rejects
-        // instead, so a caller that really did want both answers hears about it
-        // rather than believing a truncated one.
-        if let Some(prev) = self.grep_project_cancel.remove(&plugin_name) {
-            prev.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Coalesce per plugin: a plugin looping on `grepProject` collapses to
+        // its latest request. Keyed by plugin so one plugin's grep never
+        // cancels another's.
+        let handle = Arc::new(fresh_core::api::SearchHandleState::new());
+        if let Some(prev) = self
+            .grep_project_cancel
+            .insert(plugin_name, Arc::clone(&handle))
+        {
+            prev.cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.grep_project_cancel
-            .insert(plugin_name, Arc::clone(&cancel));
 
+        let opts = make_search_opts(fixed_string, case_sensitive, whole_words, max_results);
+        let search = match self.prepare_project_search(pattern, opts, String::new(), 0, &handle) {
+            Ok(search) => search,
+            Err(e) => return reject(self, e),
+        };
         super::plugin_offloop::grep_project(
+            &runtime,
             super::plugin_offloop::OffLoop {
                 filesystem: self.authority().filesystem.clone(),
-                runtime,
                 sender,
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
-            super::plugin_offloop::GrepProjectRequest {
-                pattern,
-                opts: fs_opts,
-                regex,
-                max_results,
-                root: self.working_dir().to_path_buf(),
-                ignored_dirs: IGNORED_DIRS,
-                callback_id,
-                dirty_plans,
-                clean_buffers,
-                cancel,
-            },
+            search,
+            handle,
+            callback_id,
         );
     }
 
     // ==================== Pull-Based Streaming Search ====================
 
-    /// Handle BeginSearch: spawn the parallel searcher tasks for a streaming
-    /// search whose `SearchHandleState` was pre-registered by the plugin in
-    /// the shared `SearchHandleRegistry`. Producers write matches directly
-    /// into the handle's `pending` vec; the consumer drains via
-    /// `_searchHandleTake` at its own cadence — there are no per-chunk JS
-    /// dispatches. Aborts when the handle's `cancel` flag flips (set by
-    /// `_searchHandleCancel` or by the next `BeginSearch` superseding this
-    /// one).
+    /// Handle BeginSearch: a project search (see `prepare_project_search` and
+    /// [`plugin_offloop::project_search`]) streaming into the
+    /// `SearchHandleState` the plugin pre-registered in the shared
+    /// `SearchHandleRegistry`. The consumer drains it via `_searchHandleTake`
+    /// at its own cadence — there are no per-chunk JS dispatches. Aborts
+    /// when the handle's `cancel` flag flips (set by `_searchHandleCancel`
+    /// or by the next `BeginSearch` superseding this one).
     pub(super) fn handle_begin_search(&mut self, args: BeginSearchArgs) {
         let BeginSearchArgs {
             pattern,
@@ -3357,6 +4084,7 @@ impl Editor {
             whole_words,
             file_glob,
             source_buffer_id,
+            buffer_id,
             handle_id,
         } = args;
         // Look up the handle the plugin pre-registered. If it's missing
@@ -3377,356 +4105,52 @@ impl Editor {
             return;
         };
 
-        // Helper: mark the handle as terminal so the consumer's next take()
-        // observes `done = true` and the JS wrapper stops pumping.
-        let finish_with = |handle: &Arc<fresh_core::api::SearchHandleState>,
-                           truncated: bool,
-                           error: Option<String>| {
+        // Mark the handle as terminal so the consumer's next take() observes
+        // `done = true` and the JS wrapper stops pumping.
+        let finish_with = |error: Option<String>| {
             let mut state = match handle.state.lock() {
                 Ok(s) => s,
                 Err(poisoned) => poisoned.into_inner(),
             };
             state.done = true;
-            if truncated {
-                state.truncated = true;
-            }
-            if let Some(e) = error {
-                state.error = Some(e);
-            }
+            state.error = error;
         };
-
         if pattern.is_empty() {
-            finish_with(&handle, false, None);
+            return finish_with(None);
+        }
+        // 0 finds them all.
+        let max_results = if max_results == 0 {
+            usize::MAX
+        } else {
+            max_results
+        };
+        let opts = make_search_opts(fixed_string, case_sensitive, whole_words, max_results);
+        if buffer_id != 0 {
+            if let Err(e) = self.search_one_buffer(BufferId(buffer_id), &pattern, opts, &handle) {
+                finish_with(Some(e));
+            }
             return;
         }
-
-        let fs_opts = make_search_opts(fixed_string, case_sensitive, whole_words, max_results);
-        let regex = match crate::model::filesystem::build_search_regex(&pattern, &fs_opts) {
-            Ok(re) => re,
-            Err(e) => {
-                finish_with(&handle, false, Some(format!("Invalid regex: {}", e)));
-                return;
-            }
+        let Some(runtime) = self.tokio_runtime.clone() else {
+            return finish_with(Some("No tokio runtime available".to_string()));
         };
 
-        // Snapshot dirty buffers' search plans on the main thread (same
-        // reasoning as the legacy streaming path: piece tree isn't Send).
-        let mut dirty_plans: std::collections::HashMap<
-            std::path::PathBuf,
-            (BufferId, crate::model::buffer::HybridSearchPlan),
-        > = std::collections::HashMap::new();
-        for (bid, state) in self
-            .windows
-            .get_mut(&self.active_window)
-            .map(|w| &mut w.buffers)
-            .expect("active window present")
-        {
-            if let Some(path) = state.buffer.file_path().map(|p| p.to_path_buf()) {
-                if state.buffer.is_modified() {
-                    if let Some(plan) = state.buffer.search_hybrid_plan() {
-                        dirty_plans.insert(path, (*bid, plan));
-                    }
-                }
-            }
-        }
-
-        // An unnamed/unsaved buffer has no on-disk file, so the project walk
-        // below can never reach it (`search_hybrid_plan` also bails without a
-        // path). When the plugin passes the source buffer id and that buffer
-        // has no path, search its in-memory content here on the main thread
-        // (the piece tree isn't `Send`) and seed the results with matches that
-        // carry the buffer id so a later replace can target it directly.
-        if source_buffer_id != 0 {
-            let bid = BufferId(source_buffer_id);
-            let content = self
-                .windows
-                .get_mut(&self.active_window)
-                .and_then(|w| w.buffers.get_mut(&bid))
-                .filter(|state| state.buffer.file_path().is_none())
-                .and_then(|state| state.buffer.to_string());
-            if let Some(content) =
-                content.filter(|_| search_file_glob_matches(&file_glob, "[No Name]"))
-            {
-                let bytes = content.as_bytes();
-                let mut grep_matches: Vec<GrepMatch> = Vec::new();
-                let mut running_line = 1usize;
-                let mut counted_to = 0usize;
-                for mat in regex.find_iter(bytes) {
-                    if grep_matches.len() >= max_results {
-                        break;
-                    }
-                    let start = mat.start();
-                    let end = mat.end();
-                    running_line += bytes[counted_to..start]
-                        .iter()
-                        .filter(|&&b| b == b'\n')
-                        .count();
-                    counted_to = start;
-                    let line_start = bytes[..start]
-                        .iter()
-                        .rposition(|&b| b == b'\n')
-                        .map(|p| p + 1)
-                        .unwrap_or(0);
-                    let line_end = bytes[start..]
-                        .iter()
-                        .position(|&b| b == b'\n')
-                        .map(|p| start + p)
-                        .unwrap_or(bytes.len());
-                    grep_matches.push(GrepMatch {
-                        file: "[No Name]".to_string(),
-                        buffer_id: source_buffer_id,
-                        byte_offset: start,
-                        length: end - start,
-                        line: running_line,
-                        column: start - line_start + 1,
-                        context: String::from_utf8_lossy(&bytes[line_start..line_end]).into_owned(),
-                    });
-                }
-                if !grep_matches.is_empty() {
-                    let count = grep_matches.len();
-                    let mut state = match handle.state.lock() {
-                        Ok(s) => s,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    state.pending.extend(grep_matches);
-                    state.total_seen += count;
-                }
-            }
-        }
-
-        let filesystem = self.authority().filesystem.clone();
-        let filesystem_walker = self.authority().filesystem.clone();
-        let cwd = self.working_dir().to_path_buf();
-        let query_len = pattern.len();
-
-        // The project walk below is rooted at `cwd`, so a source buffer backed
-        // by a file *outside* the workspace root (e.g. opened from /tmp) is
-        // never reached and a current-file search finds nothing. Queue that
-        // file explicitly so it flows through the same per-file search path
-        // (which also handles the dirty-buffer hybrid plan). In-root files are
-        // left to the walk to avoid searching them twice.
-        let out_of_root_source = (source_buffer_id != 0)
-            .then_some(BufferId(source_buffer_id))
-            .and_then(|bid| {
-                self.windows
-                    .get(&self.active_window)
-                    .and_then(|w| w.buffers.get(&bid))
-            })
-            .and_then(|state| state.buffer.file_path().map(|p| p.to_path_buf()))
-            .filter(|path| !path.starts_with(&cwd))
-            .filter(|path| search_file_glob_matches(&file_glob, &path.to_string_lossy()));
-
-        let Some(runtime) = &self.tokio_runtime else {
-            finish_with(
-                &handle,
-                false,
-                Some("No tokio runtime available".to_string()),
-            );
-            return;
+        let search = match self.prepare_project_search(
+            pattern,
+            opts,
+            file_glob,
+            source_buffer_id,
+            &handle,
+        ) {
+            Ok(search) => search,
+            Err(e) => return finish_with(Some(e)),
         };
-
-        let handle_for_task = Arc::clone(&handle);
-        runtime.spawn(async move {
-            let (path_tx, mut path_rx) = tokio::sync::mpsc::channel::<std::path::PathBuf>(256);
-
-            let walker_handle = Arc::clone(&handle_for_task);
-            let walk_tx = path_tx.clone();
-            let walk_file_glob = file_glob.clone();
-            tokio::task::spawn_blocking(move || {
-                if let Err(e) = filesystem_walker.walk_files(
-                    &cwd,
-                    IGNORED_DIRS,
-                    &walker_handle.cancel,
-                    &mut |path, rel| {
-                        if search_file_glob_matches(&walk_file_glob, rel) {
-                            walk_tx.blocking_send(path.to_path_buf()).is_ok()
-                        } else {
-                            true
-                        }
-                    },
-                ) {
-                    tracing::warn!("BeginSearch walk_files failed: {}", e);
-                }
-            });
-
-            if let Some(path) = out_of_root_source {
-                // The receive loop below is the only consumer and is still
-                // alive, so a send error here just means the search was
-                // cancelled — discarding the path is correct.
-                path_tx.send(path).await.ok();
-            }
-            // Drop our retained sender so the receive loop terminates once the
-            // walker's clone is also dropped.
-            drop(path_tx);
-
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(8));
-            let match_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let mut joins: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-
-            while let Some(file_path) = path_rx.recv().await {
-                if handle_for_task
-                    .cancel
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    break;
-                }
-                if match_count.load(std::sync::atomic::Ordering::Relaxed) >= max_results {
-                    break;
-                }
-
-                let permit = match semaphore.clone().acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => break,
-                };
-
-                let fs = filesystem.clone();
-                let match_count = match_count.clone();
-                let regex = regex.clone();
-                let pattern = pattern.clone();
-                let fs_opts = fs_opts.clone();
-                let dirty_plan = dirty_plans.remove(&file_path);
-                let task_handle = Arc::clone(&handle_for_task);
-
-                // Push matches into the shared state under the handle's
-                // mutex. Lock contention is bounded — the consumer's
-                // `take()` is O(1) (a `mem::take` swap of the pending
-                // vec).
-                let push_matches =
-                    move |task_handle: &Arc<fresh_core::api::SearchHandleState>,
-                          file_matches: Vec<GrepMatch>| {
-                        let count = file_matches.len();
-                        let mut state = match task_handle.state.lock() {
-                            Ok(s) => s,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        state.pending.extend(file_matches);
-                        state.total_seen += count;
-                    };
-
-                let join = tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-
-                    if task_handle
-                        .cancel
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        return;
-                    }
-                    let current = match_count.load(std::sync::atomic::Ordering::Relaxed);
-                    if current >= max_results {
-                        return;
-                    }
-                    let remaining = max_results - current;
-
-                    if let Some((bid, plan)) = dirty_plan {
-                        let matches = match plan
-                            .execute(&*fs, &pattern, &fs_opts, &regex, remaining, query_len)
-                        {
-                            Ok(m) => m,
-                            Err(e) => {
-                                tracing::debug!(
-                                    "BeginSearch: hybrid search failed {:?}: {}",
-                                    file_path,
-                                    e
-                                );
-                                return;
-                            }
-                        };
-
-                        if !matches.is_empty() {
-                            let file_str = file_path.to_string_lossy().to_string();
-                            let file_matches: Vec<GrepMatch> = matches
-                                .into_iter()
-                                .map(|m| GrepMatch {
-                                    file: file_str.clone(),
-                                    buffer_id: bid.0,
-                                    byte_offset: m.byte_offset,
-                                    length: m.length,
-                                    line: m.line,
-                                    column: m.column,
-                                    context: m.context,
-                                })
-                                .collect();
-                            match_count.fetch_add(
-                                file_matches.len(),
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                            push_matches(&task_handle, file_matches);
-                        }
-                    } else {
-                        let fs_opts = crate::model::filesystem::FileSearchOptions {
-                            fixed_string,
-                            case_sensitive,
-                            whole_word: whole_words,
-                            max_matches: remaining,
-                        };
-                        let mut cursor = crate::model::filesystem::FileSearchCursor::new();
-                        while !cursor.done {
-                            if task_handle
-                                .cancel
-                                .load(std::sync::atomic::Ordering::Relaxed)
-                            {
-                                break;
-                            }
-                            let current = match_count.load(std::sync::atomic::Ordering::Relaxed);
-                            if current >= max_results {
-                                break;
-                            }
-
-                            let batch =
-                                match fs.search_file(&file_path, &pattern, &fs_opts, &mut cursor) {
-                                    Ok(b) => b,
-                                    Err(e) => {
-                                        tracing::debug!(
-                                            "search_file failed {:?}: {}",
-                                            file_path,
-                                            e
-                                        );
-                                        break;
-                                    }
-                                };
-                            if batch.is_empty() {
-                                continue;
-                            }
-
-                            match_count
-                                .fetch_add(batch.len(), std::sync::atomic::Ordering::Relaxed);
-                            let file_str = file_path.to_string_lossy().to_string();
-                            let file_matches: Vec<GrepMatch> = batch
-                                .into_iter()
-                                .map(|m| GrepMatch {
-                                    file: file_str.clone(),
-                                    buffer_id: 0,
-                                    byte_offset: m.byte_offset,
-                                    length: m.length,
-                                    line: m.line,
-                                    column: m.column,
-                                    context: m.context,
-                                })
-                                .collect();
-                            push_matches(&task_handle, file_matches);
-                        }
-                    }
-                });
-
-                joins.push(join);
-            }
-
-            for join in joins {
-                drop(join.await);
-            }
-
-            let total = match_count.load(std::sync::atomic::Ordering::Relaxed);
-            let truncated = total >= max_results;
-            let mut state = match handle_for_task.state.lock() {
-                Ok(s) => s,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if truncated {
-                state.truncated = true;
-            }
-            state.done = true;
-        });
+        super::plugin_offloop::project_search(
+            &runtime,
+            self.authority().filesystem.clone(),
+            search,
+            Arc::clone(&handle),
+        );
     }
 
     // ==================== Replace In Buffer ====================
@@ -3738,6 +4162,7 @@ impl Editor {
         buffer_id: usize,
         matches: Vec<(usize, usize)>,
         replacement: String,
+        regex: Option<fresh_core::api::ReplaceRegex>,
         callback_id: JsCallbackId,
     ) {
         if matches.is_empty() {
@@ -3760,6 +4185,18 @@ impl Editor {
         let explicit_buffer = (buffer_id != 0)
             .then_some(BufferId(buffer_id))
             .filter(|bid| self.buffers().contains_key(bid));
+        // The file's one buffer is in another workspace: refused. The matches
+        // were found here, possibly in the file on disk, and nothing here can
+        // tell whether they still hold in that buffer.
+        if explicit_buffer.is_none() {
+            if let Some(elsewhere) = self.file_open_in_other_window(&file_path) {
+                self.plugin_manager.read().unwrap().reject_callback(
+                    callback_id,
+                    format!("{}: {}", file_path.display(), elsewhere),
+                );
+                return;
+            }
+        }
         let buffer_id = if let Some(bid) = explicit_buffer {
             bid
         } else if let Some((&bid, _)) = self
@@ -3786,10 +4223,8 @@ impl Editor {
                     // whole split.  Strip the buffer from every split's tab
                     // list so only the panel split holds the panel buffer.
                     for view_state in self
-                        .windows
-                        .get_mut(&self.active_window)
-                        .and_then(|w| w.split_view_states_mut())
-                        .expect("active window must have a populated split layout")
+                        .active_window_mut()
+                        .split_view_states_mut()
                         .values_mut()
                     {
                         view_state.remove_buffer(bid);
@@ -3806,24 +4241,102 @@ impl Editor {
             }
         };
 
+        // Another running editor has the file open: it is read-only here, and
+        // a replace saved from here would write over that editor's version
+        if self
+            .active_window()
+            .buffer_metadata
+            .get(&buffer_id)
+            .is_some_and(|meta| meta.open_elsewhere.is_some())
+        {
+            let hidden = self
+                .active_window()
+                .buffer_metadata
+                .get(&buffer_id)
+                .is_some_and(|meta| meta.hidden_from_tabs);
+            if hidden {
+                if let Err(e) = self.force_close_buffer(buffer_id) {
+                    tracing::debug!("Failed to close the replace buffer of {file_path:?}: {e}");
+                }
+            }
+            self.plugin_manager.read().unwrap().reject_callback(
+                callback_id,
+                format!(
+                    "{} is open in another Fresh; it is read-only here",
+                    file_path.display()
+                ),
+            );
+            return;
+        }
+
         // Sort matches by byte offset descending — editing from end backwards
         // prevents earlier edits from shifting later offsets
         let mut sorted_matches = matches;
         sorted_matches.sort_by_key(|a| std::cmp::Reverse(a.0));
 
+        // Owned tuples for helpers that don't take references. A regex
+        // replace expands `$1` / `${name}` against each match's own text,
+        // using the regex the search found the matches with.
+        let edits_owned: Vec<(usize, usize, String)> = match regex {
+            None => sorted_matches
+                .iter()
+                .map(|&(offset, len)| (offset, len, replacement.clone()))
+                .collect(),
+            Some(regex) => {
+                let opts =
+                    make_search_opts(false, regex.case_sensitive, regex.whole_words, usize::MAX);
+                let re = match opts.query(&regex.pattern) {
+                    Ok(query) => query.regex,
+                    Err(e) => {
+                        self.plugin_manager
+                            .read()
+                            .unwrap()
+                            .reject_callback(callback_id, format!("Invalid regex: {}", e));
+                        return;
+                    }
+                };
+                let Some(state) = self
+                    .windows
+                    .get_mut(&self.active_window)
+                    .expect("active window present")
+                    .buffer_state_mut(buffer_id)
+                else {
+                    self.plugin_manager.read().unwrap().reject_callback(
+                        callback_id,
+                        format!("Buffer for {:?} is gone", file_path),
+                    );
+                    return;
+                };
+                let expanded: AnyhowResult<Vec<(usize, usize, String)>> = sorted_matches
+                    .iter()
+                    .map(|&(offset, len)| {
+                        let text =
+                            state
+                                .buffer
+                                .expand_replacement(&re, offset, len, &replacement)?;
+                        Ok((offset, len, text))
+                    })
+                    .collect();
+                match expanded {
+                    Ok(edits) => edits,
+                    Err(e) => {
+                        self.plugin_manager.read().unwrap().reject_callback(
+                            callback_id,
+                            format!("Failed to read matches in {:?}: {}", file_path, e),
+                        );
+                        return;
+                    }
+                }
+            }
+        };
+
         // Build bulk edits: (start, del_len, replacement)
-        let edits: Vec<(usize, usize, &str)> = sorted_matches
+        let edits: Vec<(usize, usize, &str)> = edits_owned
             .iter()
-            .map(|&(offset, len)| (offset, len, replacement.as_str()))
+            .map(|(offset, len, text)| (*offset, *len, text.as_str()))
             .collect();
 
         let replacements = edits.len();
-
-        // Owned tuples for helpers that don't take references.
-        let edits_owned: Vec<(usize, usize, String)> = sorted_matches
-            .iter()
-            .map(|&(offset, len)| (offset, len, replacement.clone()))
-            .collect();
         // Merged edit-lengths list for marker/margin replay on undo/redo.
         // Mirrors the merging logic in `apply_events_as_bulk_edit`.
         let edit_lengths: Vec<(usize, usize, usize)> = {
@@ -3863,26 +4376,14 @@ impl Editor {
             for &(pos, del_len, ins_len) in &edit_lengths {
                 if del_len > 0 && ins_len > 0 {
                     if ins_len > del_len {
-                        state.marker_list.adjust_for_insert(pos, ins_len - del_len);
-                        state.margins.adjust_for_insert(pos, ins_len - del_len);
-                        state
-                            .scrollbar_markers
-                            .adjust_for_insert(pos, ins_len - del_len);
+                        state.adjust_markers_for_insert(pos, ins_len - del_len);
                     } else if del_len > ins_len {
-                        state.marker_list.adjust_for_delete(pos, del_len - ins_len);
-                        state.margins.adjust_for_delete(pos, del_len - ins_len);
-                        state
-                            .scrollbar_markers
-                            .adjust_for_delete(pos, del_len - ins_len);
+                        state.adjust_markers_for_delete(pos, del_len - ins_len);
                     }
                 } else if del_len > 0 {
-                    state.marker_list.adjust_for_delete(pos, del_len);
-                    state.margins.adjust_for_delete(pos, del_len);
-                    state.scrollbar_markers.adjust_for_delete(pos, del_len);
+                    state.adjust_markers_for_delete(pos, del_len);
                 } else if ins_len > 0 {
-                    state.marker_list.adjust_for_insert(pos, ins_len);
-                    state.margins.adjust_for_insert(pos, ins_len);
-                    state.scrollbar_markers.adjust_for_insert(pos, ins_len);
+                    state.adjust_markers_for_insert(pos, ins_len);
                 }
             }
 
@@ -3897,7 +4398,10 @@ impl Editor {
             // it as an external change, and reverts the buffer from disk,
             // wiping the event log we're about to append (see bug #1).
             if let Some(path) = state.buffer.file_path().map(|p| p.to_path_buf()) {
-                if let Err(e) = state.buffer.save_to_file(&path) {
+                if let Err(e) = state
+                    .buffer
+                    .save_to_file(&path, &self.dir_context.recovery_dir())
+                {
                     self.plugin_manager.read().unwrap().reject_callback(
                         callback_id,
                         format!("Failed to save file {:?}: {}", path, e),
@@ -3952,9 +4456,6 @@ impl Editor {
                     event_log.mark_saved();
                 }
             }
-            self.active_window_mut()
-                .invalidate_layouts_for_buffer(buffer_id);
-
             // Notify LSP with full document content (bulk edits collapse
             // incremental ranges).
             let full_content_change = self
@@ -4011,10 +4512,10 @@ impl Editor {
 
     /// Handle StartAnimationVirtualBuffer: resolve the virtual buffer's
     /// current on-screen Rect, then delegate to `handle_start_animation_area`.
-    /// If the rect isn't in the cached split layout yet (common when the
+    /// If the retained layout has no rect for it yet (common when the
     /// buffer was just created and no render pass has placed it), the
     /// request is queued and drained at the top of the next render pass
-    /// once `split_areas` has been recomputed.
+    /// once the frame's layout has placed the panes.
     pub(super) fn handle_start_animation_virtual_buffer(
         &mut self,
         id: u64,
@@ -4044,9 +4545,154 @@ impl Editor {
     }
 }
 
+impl crate::app::window::Window {
+    /// Handle MoveTabLeft command - move active tab left in its split
+    pub(super) fn handle_move_tab_left(&mut self) {
+        let split_id = self.split_manager().active_split();
+        // The tab the pane shows — a group tab while a group is shown, not
+        // the buffer tab behind it.
+        if let Some(view_state) = self.split_view_states_mut().get_mut(&split_id) {
+            let active = view_state.active_target();
+            if let Some(current_idx) = view_state.open_buffers.iter().position(|t| *t == active) {
+                if current_idx > 0 {
+                    view_state.open_buffers.swap(current_idx, current_idx - 1);
+                    tracing::info!("Moved tab left in split {:?}", split_id);
+                }
+            }
+        }
+    }
+
+    /// Handle MoveTabRight command - move active tab right in its split
+    pub(super) fn handle_move_tab_right(&mut self) {
+        let split_id = self.split_manager().active_split();
+        // The tab the pane shows — a group tab while a group is shown, not
+        // the buffer tab behind it.
+        if let Some(view_state) = self.split_view_states_mut().get_mut(&split_id) {
+            let active = view_state.active_target();
+            if let Some(current_idx) = view_state.open_buffers.iter().position(|t| *t == active) {
+                if current_idx < view_state.open_buffers.len() - 1 {
+                    view_state.open_buffers.swap(current_idx, current_idx + 1);
+                    tracing::info!("Moved tab right in split {:?}", split_id);
+                }
+            }
+        }
+    }
+
+    /// Handle SetViewState command — persist plugin state in BufferViewState
+    pub(super) fn handle_set_view_state(
+        &mut self,
+        buffer_id: BufferId,
+        key: String,
+        value: Option<serde_json::Value>,
+    ) {
+        let active_split = self.split_manager().active_split();
+        if let Some(view_state) = self.split_view_states_mut().get_mut(&active_split) {
+            let buf_state = view_state.ensure_buffer_state(buffer_id);
+            match value {
+                Some(v) => {
+                    buf_state.plugin_state.insert(key, v);
+                }
+                None => {
+                    buf_state.plugin_state.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Run `f` against `buffer_id`'s view state in the active split, creating
+    /// it when this split has none for that buffer yet — so the setting is
+    /// there when the buffer is shown here. Never another buffer's state:
+    /// this used to fall back to whatever buffer the split had as its tab,
+    /// handing one buffer's line-number setting to another.
+    ///
+    /// Shared by the two line-number entry points so they cannot drift apart
+    /// on which view state they land on.
+    fn with_active_split_buffer_view(
+        &mut self,
+        buffer_id: BufferId,
+        f: impl FnOnce(&mut BufferViewState),
+    ) {
+        // The pane the user is in — a shown group's focused panel, not the
+        // pane showing the group.
+        let active_split = self.effective_active_split();
+        if let Some(view_state) = self.split_view_states_mut().get_mut(&active_split) {
+            f(view_state.ensure_buffer_state(buffer_id));
+        }
+    }
+
+    /// Handle SetFoldIndicators command
+    ///
+    /// Per-(split, buffer) like `SetLineNumbers`, and for the same reason:
+    /// compose mode is itself per-split, so a source-mode split showing the
+    /// same buffer must keep its own gutter.
+    ///
+    /// Writes `fold_indicators_plugin_override`, never the user's
+    /// `fold_indicators_override` — see `BufferViewState` for why those are
+    /// two fields. `None` withdraws the plugin's opinion.
+    pub(super) fn handle_set_fold_indicators(
+        &mut self,
+        buffer_id: BufferId,
+        enabled: Option<bool>,
+    ) {
+        // On `buffer_id`'s own state in the pane the user is in — created
+        // when the pane has none yet, never another buffer's.
+        let active_split = self.effective_active_split();
+        if let Some(view_state) = self.split_view_states_mut().get_mut(&active_split) {
+            view_state
+                .ensure_buffer_state(buffer_id)
+                .fold_indicators_plugin_override = enabled;
+        }
+    }
+
+    /// Handle SetLineWrap command
+    ///
+    /// With no `split_id`, the wrap flag lands on every split showing
+    /// `buffer_id` — including a buffer-group panel, whose leaf is not in
+    /// the main split tree and is never the "active split". Aiming at the
+    /// active split there set the flag on whatever pane happened to be
+    /// focused and left the panel alone, so a panel plugin asking for wrap
+    /// (git-log's commit-detail pane, where a lock-file diff is unreadable
+    /// unwrapped) silently got none. Falls back to the active split when
+    /// the buffer isn't on screen anywhere.
+    pub(super) fn handle_set_line_wrap(
+        &mut self,
+        buffer_id: BufferId,
+        split_id: Option<SplitId>,
+        enabled: bool,
+    ) {
+        let targets: Vec<LeafId> = match split_id {
+            Some(id) => vec![LeafId(id)],
+            None => {
+                let showing: Vec<LeafId> = self
+                    .split_view_states()
+                    .iter()
+                    .filter(|(_, vs)| vs.buffer_tab() == buffer_id)
+                    .map(|(leaf_id, _)| *leaf_id)
+                    .collect();
+                if showing.is_empty() {
+                    vec![self.effective_active_split()]
+                } else {
+                    showing
+                }
+            }
+        };
+        // On `buffer_id`'s own view state in each target — never on
+        // whatever buffer the target pane happens to have as its tab, which
+        // for the active-split fallback is some other buffer entirely.
+        for target_split in targets {
+            if let Some(view_state) = self.split_view_states_mut().get_mut(&target_split) {
+                view_state
+                    .ensure_buffer_state(buffer_id)
+                    .viewport
+                    .line_wrap_enabled = enabled;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::search_file_glob_matches;
+    use crate::app::plugin_offloop::search_file_glob_matches;
     use crate::app::Editor;
     use crate::config::Config;
     use crate::config_io::DirectoryContext;
@@ -4070,6 +4716,107 @@ mod tests {
         )
         .unwrap();
         (editor, temp_dir)
+    }
+
+    /// A replace in a file whose one buffer is in another workspace is
+    /// refused: nothing here can tell whether the matches still hold in that
+    /// buffer, and the save would write it out. Neither the buffer nor the
+    /// file changes, and no second buffer is opened here.
+    #[test]
+    fn a_replace_in_a_file_another_workspace_has_open_is_refused() {
+        let (mut editor, temp) = make_editor();
+        let file = temp.path().join("f.txt");
+        std::fs::write(&file, "hello world\n").unwrap();
+        let file = file.canonicalize().unwrap();
+        let home = editor.active_window_id();
+        let other_root = temp.path().join("other");
+        std::fs::create_dir(&other_root).unwrap();
+        let other = editor.create_window_at(other_root, "other".to_string());
+        editor.set_active_window(other);
+        let buffer = editor.open_file(&file).unwrap();
+        editor.set_active_window(home);
+
+        editor.handle_replace_in_buffer(
+            file.clone(),
+            0,
+            vec![(0, 5)],
+            "HOWDY".to_string(),
+            None,
+            fresh_core::api::JsCallbackId::new(1),
+        );
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world\n");
+        let text = editor.windows[&other]
+            .buffers
+            .get(&buffer)
+            .and_then(|s| s.buffer.to_string());
+        assert_eq!(text.as_deref(), Some("hello world\n"));
+        assert!(
+            editor.windows[&home]
+                .buffers
+                .iter()
+                .all(|(_, s)| s.buffer.file_path() != Some(file.as_path())),
+            "a second buffer for the file was opened"
+        );
+    }
+
+    /// A Live Diff baseline loads through the window that owns it, whichever
+    /// window is active: a HEAD move refreshes the baselines of every window's
+    /// buffers, and a load that looked at the active window decoded with the
+    /// wrong encoding (UTF-8 for a buffer it did not hold) and read through
+    /// the wrong backend.
+    #[test]
+    fn a_baseline_loads_through_the_window_that_owns_it() {
+        use crate::app::diff_baselines::{BaselineEntry, BaselineSpec};
+        use crate::model::encoding::Encoding;
+        let (mut editor, temp) = make_editor();
+        let path = temp.path().join("wide.txt");
+        let utf16: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain("hi\n".encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        std::fs::write(&path, utf16).unwrap();
+        let buffer_id = editor.open_file(&path).unwrap();
+        let owner = editor.active_window_id();
+        editor.diff_baselines.inner.lock().unwrap().entries.insert(
+            1,
+            BaselineEntry {
+                buffer_id,
+                window_id: owner,
+                spec: BaselineSpec::Disk { path },
+                generation: 0,
+                content: None,
+            },
+        );
+
+        let other_root = temp.path().join("other");
+        std::fs::create_dir(&other_root).unwrap();
+        let other = editor.create_window_at(other_root, "other".to_string());
+        editor.set_active_window(other);
+        assert_eq!(editor.active_window_id(), other);
+
+        let source = editor.baseline_source(1).expect("the owner is open");
+        assert_eq!(source.encoding, Encoding::Utf16Le);
+        let owner_spawner = &editor.windows[&owner].authority().process_spawner;
+        assert!(
+            !Arc::ptr_eq(owner_spawner, &editor.authority().process_spawner),
+            "each window has its own backend"
+        );
+        assert!(
+            Arc::ptr_eq(&source.spawner, owner_spawner),
+            "the load spawns through the owner's backend, not the active one's"
+        );
+
+        // A closed owner takes its baselines with it.
+        assert!(editor.close_window(owner));
+        assert!(editor.baseline_source(1).is_none());
+        assert!(editor
+            .diff_baselines
+            .inner
+            .lock()
+            .unwrap()
+            .entries
+            .is_empty());
     }
 
     #[test]
@@ -4115,8 +4862,9 @@ mod tests {
             },
         );
 
-        let active_split = editor.split_manager().active_split();
+        let active_split = editor.active_window().split_manager().active_split();
         let view_state = editor
+            .active_window()
             .split_view_states()
             .get(&active_split)
             .expect("split view state");

@@ -8,8 +8,6 @@
 // This tests both single-edit (Insert/Delete) and BulkEdit paths at the
 // integration level (EditorState + EventLog + Cursors, no harness).
 
-mod common;
-
 use fresh::model::cursor::Cursors;
 use fresh::model::event::{CursorId, Event, EventLog};
 use fresh::model::filesystem::StdFileSystem;
@@ -38,7 +36,7 @@ fn setup_state(initial_text: &str) -> (EditorState, Cursors, EventLog) {
     if !initial_text.is_empty() {
         let event = Event::Insert {
             position: 0,
-            text: initial_text.to_string(),
+            text: initial_text.to_string().into(),
             cursor_id: cursors.primary_id(),
         };
         state.apply(&mut cursors, &event);
@@ -58,9 +56,7 @@ fn add_margin_indicator(state: &mut EditorState, byte_offset: usize) -> MarkerId
 
 /// Add a virtual text marker at a byte offset. Returns the MarkerId for later queries.
 fn add_virtual_text(state: &mut EditorState, byte_offset: usize) -> MarkerId {
-    let _vtext_id = state.virtual_texts.add(
-        &mut state.marker_list,
-        byte_offset,
+    let _vtext_id = state.virtual_texts.add(byte_offset,
         "hint".to_string(),
         Style::default().fg(Color::Gray),
         VirtualTextPosition::AfterChar,
@@ -70,7 +66,7 @@ fn add_virtual_text(state: &mut EditorState, byte_offset: usize) -> MarkerId {
     // We need to query it back since add() returns VirtualTextId not MarkerId
     let results = state
         .virtual_texts
-        .query_range(&state.marker_list, 0, state.buffer.len().max(1));
+        .query_range(0, state.buffer.len().max(1));
     // Find the one at our position
     for (pos, vtext) in &results {
         if *pos == byte_offset {
@@ -85,7 +81,7 @@ fn get_vtext_positions(state: &EditorState) -> Vec<usize> {
     let buf_len = state.buffer.len().max(1);
     state
         .virtual_texts
-        .query_range(&state.marker_list, 0, buf_len)
+        .query_range(0, buf_len)
         .into_iter()
         .map(|(pos, _)| pos)
         .collect()
@@ -131,7 +127,7 @@ impl SingleEditOp {
                 let pos = pos.min(buf_len);
                 let event = Event::Insert {
                     position: pos,
-                    text: text.clone(),
+                    text: text.clone().into(),
                     cursor_id: cursors.primary_id(),
                 };
                 state.apply(cursors, &event);
@@ -145,7 +141,7 @@ impl SingleEditOp {
                     // Can't delete from empty buffer — insert instead
                     let event = Event::Insert {
                         position: 0,
-                        text: "x".to_string(),
+                        text: "x".to_string().into(),
                         cursor_id: cursors.primary_id(),
                     };
                     state.apply(cursors, &event);
@@ -161,7 +157,7 @@ impl SingleEditOp {
                     if start == end {
                         let event = Event::Insert {
                             position: 0,
-                            text: "x".to_string(),
+                            text: "x".to_string().into(),
                             cursor_id: cursors.primary_id(),
                         };
                         state.apply(cursors, &event);
@@ -170,7 +166,7 @@ impl SingleEditOp {
                     let deleted_text = state.buffer.to_string().unwrap()[start..end].to_string();
                     let event = Event::Delete {
                         range: start..end,
-                        deleted_text,
+                        deleted_text: deleted_text.into(),
                         cursor_id: cursors.primary_id(),
                     };
                     state.apply(cursors, &event);
@@ -179,7 +175,7 @@ impl SingleEditOp {
                     let deleted_text = state.buffer.to_string().unwrap()[start..end].to_string();
                     let event = Event::Delete {
                         range: start..end,
-                        deleted_text,
+                        deleted_text: deleted_text.into(),
                         cursor_id: cursors.primary_id(),
                     };
                     state.apply(cursors, &event);
@@ -284,7 +280,7 @@ fn test_each_single_edit_type_marker_roundtrip() {
 
         let event = Event::Insert {
             position: 4,
-            text: "X".to_string(),
+            text: "X".to_string().into(),
             cursor_id,
         };
         state.apply(&mut cursors, &event);
@@ -309,7 +305,7 @@ fn test_each_single_edit_type_marker_roundtrip() {
 
         let event = Event::Insert {
             position: 1,
-            text: "XX".to_string(),
+            text: "XX".to_string().into(),
             cursor_id,
         };
         state.apply(&mut cursors, &event);
@@ -335,7 +331,7 @@ fn test_each_single_edit_type_marker_roundtrip() {
 
         let event = Event::Delete {
             range: 5..11,
-            deleted_text: " world".to_string(),
+            deleted_text: " world".to_string().into(),
             cursor_id,
         };
         state.apply(&mut cursors, &event);
@@ -361,7 +357,7 @@ fn test_each_single_edit_type_marker_roundtrip() {
 
         let event = Event::Delete {
             range: 0..6,
-            deleted_text: "hello ".to_string(),
+            deleted_text: "hello ".to_string().into(),
             cursor_id,
         };
         state.apply(&mut cursors, &event);
@@ -387,7 +383,7 @@ fn test_each_single_edit_type_marker_roundtrip() {
 
         let event = Event::Insert {
             position: 2,
-            text: "\n".to_string(),
+            text: "\n".to_string().into(),
             cursor_id,
         };
         state.apply(&mut cursors, &event);
@@ -420,7 +416,7 @@ fn test_delete_containing_marker_restores_exact_position_on_undo() {
     // Delete range 5..10 (" worl") — marker at 7 is inside this range
     let event = Event::Delete {
         range: 5..10,
-        deleted_text: " worl".to_string(),
+        deleted_text: " worl".to_string().into(),
         cursor_id: cursors.primary_id(),
     };
     log.append(event.clone());
@@ -476,7 +472,7 @@ fn test_delete_containing_multiple_markers_restores_all_on_undo() {
     // Delete range 2..8 ("cdefgh") — all three markers inside
     let event = Event::Delete {
         range: 2..8,
-        deleted_text: "cdefgh".to_string(),
+        deleted_text: "cdefgh".to_string().into(),
         cursor_id: cursors.primary_id(),
     };
     // Manually set displaced markers (simulating log_and_apply_event)
@@ -529,7 +525,7 @@ fn test_insert_after_markers_roundtrip() {
     // Insert at end (after all markers)
     let event = Event::Insert {
         position: 5,
-        text: "X".to_string(),
+        text: "X".to_string().into(),
         cursor_id: cursors.primary_id(),
     };
     state.apply(&mut cursors, &event);
@@ -564,7 +560,7 @@ fn test_insert_before_markers_roundtrip() {
     // Insert "XX" at position 1 (before both markers)
     let event = Event::Insert {
         position: 1,
-        text: "XX".to_string(),
+        text: "XX".to_string().into(),
         cursor_id: cursors.primary_id(),
     };
     state.apply(&mut cursors, &event);
@@ -599,7 +595,7 @@ fn test_delete_before_markers_roundtrip() {
     // Delete "hello " (0..6)
     let event = Event::Delete {
         range: 0..6,
-        deleted_text: "hello ".to_string(),
+        deleted_text: "hello ".to_string().into(),
         cursor_id: cursors.primary_id(),
     };
     state.apply(&mut cursors, &event);
@@ -636,7 +632,7 @@ fn test_multi_edit_marker_roundtrip() {
     // Marker at 0 is before the insert, so stays at 0
     let e1 = Event::Insert {
         position: 1,
-        text: "XX".to_string(),
+        text: "XX".to_string().into(),
         cursor_id: cursors.primary_id(),
     };
     state.apply(&mut cursors, &e1);
@@ -648,7 +644,7 @@ fn test_multi_edit_marker_roundtrip() {
     // Marker at 0 is before the delete, stays at 0
     let e2 = Event::Delete {
         range: 5..7,
-        deleted_text: "de".to_string(),
+        deleted_text: "de".to_string().into(),
         cursor_id: cursors.primary_id(),
     };
     state.apply(&mut cursors, &e2);

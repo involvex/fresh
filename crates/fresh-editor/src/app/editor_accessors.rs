@@ -119,11 +119,6 @@ impl Editor {
     // `take_pending_semantic_token_range_request` live on `impl Window`
     // — call them via `self.active_window_mut()`.
 
-    /// Get all keybindings as (key, action) pairs
-    pub fn get_all_keybindings(&self) -> Vec<(String, String)> {
-        self.keybindings.read().unwrap().get_all_bindings()
-    }
-
     /// Get the formatted keybinding for a specific action (for display in messages)
     /// Returns None if no keybinding is found for the action
     pub fn get_keybinding_for_action(&self, action_name: &str) -> Option<String> {
@@ -131,27 +126,6 @@ impl Editor {
             .read()
             .unwrap()
             .find_keybinding_for_action(action_name, self.active_window().key_context.clone())
-    }
-
-    /// Raw-event counterpart: return the `(KeyCode, KeyModifiers)` currently
-    /// bound to `action` in `context`. Intended for callers that need to
-    /// simulate the user pressing the bound key (e2e tests, some hotkey-
-    /// chaining code) without hardcoding a default that a user's rebind
-    /// would invalidate.
-    pub fn keybinding_event_for_action(
-        &self,
-        action: &crate::input::keybindings::Action,
-        context: crate::input::keybindings::KeyContext,
-    ) -> Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)> {
-        self.keybindings
-            .read()
-            .unwrap()
-            .get_keybinding_event_for_action(action, context)
-    }
-
-    /// Get mutable access to the mode registry
-    pub fn mode_registry_mut(&mut self) -> &mut ModeRegistry {
-        &mut self.mode_registry
     }
 
     /// Get immutable access to the mode registry
@@ -165,7 +139,7 @@ impl Editor {
     /// The editor always has at least one buffer, so this never fails.
     ///
     /// When the active split has a buffer-group tab as its active target
-    /// (i.e., `active_group_tab.is_some()`), this returns the buffer of the
+    /// (`Shown::Group`), this returns the buffer of the
     /// currently-focused inner panel — so that input routing, command palette
     /// context, buffer mode, and other "what is the user looking at" queries
     /// resolve to the panel the user is actually interacting with rather than
@@ -196,18 +170,14 @@ impl Editor {
     /// target. This is the single source of truth — both `active_buffer` and
     /// `effective_active_split` derive from it so they can never disagree.
     ///
-    /// Returned invariant: `split_view_states[split]` exists, its
-    /// `active_buffer` equals the returned buffer id, `self.buffers`
-    /// contains the returned buffer id, and `split.keyed_states` contains
-    /// an entry for the returned buffer id. Consequently the mutation path
-    /// in `apply_event_to_active_buffer` (which indexes into
-    /// `keyed_states[buffer]`) is always well-defined for the returned pair.
+    /// Returned invariant: `split_view_states[split]` exists, it shows the
+    /// returned buffer id, `self.buffers` contains the returned buffer id,
+    /// and the split keeps a view state for it. Consequently the mutation
+    /// path in `apply_event_to_active_buffer` (which reads the split's state
+    /// for that buffer) is always well-defined for the returned pair.
     ///
-    /// If a buffer-group panel is focused but any of the invariants above
-    /// is not satisfied for the inner leaf (for example because the panel
-    /// buffer was freed without clearing `focused_group_leaf`), the helper
-    /// falls back to the outer split's own leaf. The fallback is also
-    /// validated before being returned.
+    /// While the active pane shows a group the pair is one of its panels,
+    /// never the buffer behind the group (`Window::effective_active_pair`).
     #[inline]
     fn effective_active_pair(&self) -> (crate::model::event::LeafId, BufferId) {
         self.active_window().effective_active_pair()
@@ -223,7 +193,12 @@ impl Editor {
     ///      buffer or a file-backed one — `openFileStreaming` produces
     ///      the latter for streaming detail panels).
     pub fn active_buffer_mode(&self) -> Option<&str> {
-        let buffer_id = self.active_buffer();
+        self.buffer_mode(self.active_buffer())
+    }
+
+    /// The plugin mode a buffer of the active window resolves its keys
+    /// against: its own virtual mode, else its buffer group's.
+    pub fn buffer_mode(&self, buffer_id: fresh_core::BufferId) -> Option<&str> {
         let win = self.active_window();
         if let Some(mode) = win
             .buffer_metadata
@@ -259,24 +234,25 @@ impl Editor {
 
     /// Get the effective mode for the active buffer.
     ///
-    /// Buffer-local mode (virtual buffers) takes precedence over the global
-    /// editor mode, so that e.g. a search-replace panel isn't hijacked by
-    /// a markdown-source or vi-mode global mode.
+    /// The first of, in order: the buffer's own mode (virtual buffers), the
+    /// active window's editor mode, and the editor-wide input mode. So a
+    /// search-replace panel isn't hijacked by markdown-source or vi, a
+    /// window-scoped mode (flash's labels) outranks vi in its own window
+    /// only, and vi holds wherever nothing more specific does.
+    ///
+    /// A mounted panel's keymap is not in this answer: a dock or floating
+    /// panel names its own (`panel_keymap`), and never borrows this one.
     pub fn effective_mode(&self) -> Option<&str> {
-        // When a floating widget panel is mounted, its plugin-defined
-        // mode (`editor.setEditorMode(...)`) takes precedence over the
-        // underlying buffer's virtual mode. Without this, opening the
-        // Orchestrator picker from a python3 terminal session would
-        // resolve mode-keybindings against `"terminal"` instead of
-        // `"orchestrator-open"`, so picker-specific shortcuts like
-        // `Alt+N` never reached their handlers.
-        if self.floating_widget_panel.is_some() {
-            if let Some(mode) = self.active_window().editor_mode.as_deref() {
-                return Some(mode);
-            }
-        }
-        self.active_buffer_mode()
-            .or(self.active_window().editor_mode.as_deref())
+        self.active_buffer_mode().or(self.window_or_input_mode())
+    }
+
+    /// The mode beneath the buffer's: the active window's editor mode, else
+    /// the editor-wide input mode.
+    pub(crate) fn window_or_input_mode(&self) -> Option<&str> {
+        self.active_window()
+            .editor_mode
+            .as_deref()
+            .or(self.input_mode.as_deref())
     }
 
     // `has_active_lsp_progress`, `get_lsp_progress`, and
@@ -328,10 +304,50 @@ impl Editor {
         // (~16ms) for smooth animation, which would turn the ~1s title poll
         // into a 60Hz busy loop. The loop's existing 50ms idle poll is fine
         // granularity to notice `terminal_titles_need_poll` going true.
-        [lsp_progress_deadline, anim_deadline, paste_deadline]
-            .into_iter()
-            .flatten()
-            .min()
+        // A wheel gesture walking its remaining lines needs a frame per
+        // line; without this the walk would stall on an idle loop.
+        let wheel_deadline = self.pending_wheel_scroll_deadline();
+        // A drag held past a list's edge scrolls it a step at a time, and
+        // held still it produces no input to wake the loop.
+        let drag_deadline = self.drag_autoscroll_deadline();
+        // The occurrence highlight's debounce. It is applied inside a render
+        // and only once its delay has elapsed, so like the spinner above it
+        // needs the loop to come back for it: with the editor idle after a
+        // cursor move there is no next frame, and the highlight stayed armed
+        // until an unrelated event forced one — which is why it appeared to
+        // jump on the next keystroke. Across every buffer in the window, not
+        // just the active one: each rendered split runs its own update.
+        let highlight_deadline = self
+            .active_window()
+            .buffers
+            .iter()
+            .filter_map(|(_, state)| state.reference_highlight_overlay.next_deadline())
+            .min();
+        // A drop's move preview types a character at a time, and what it was
+        // holding back (a confirmation, a plugin's filing) is due when it ends.
+        let move_preview_deadline = [
+            self.explorer_move_preview_deadline(),
+            self.tree_move_previews_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        // A macro replay parked on a plugin step resumes from the loop, so the
+        // loop has to come straight back rather than sleep its idle poll.
+        let macro_replay_deadline = self.macro_replay_parked().then(std::time::Instant::now);
+        [
+            lsp_progress_deadline,
+            anim_deadline,
+            macro_replay_deadline,
+            move_preview_deadline,
+            paste_deadline,
+            wheel_deadline,
+            drag_deadline,
+            highlight_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Earliest time a terminal tab needs its foreground-process title
@@ -434,70 +450,49 @@ impl Editor {
         self.warning_log = Some((receiver, path));
     }
 
-    /// Take the warning-log receiver+path out of this editor.
-    ///
-    /// The receiver is single-consumer and lives for the process's
-    /// lifetime; on a destructive editor restart (e.g. authority swap)
-    /// `main.rs` lifts it from the old editor and re-installs it on the
-    /// new one so warnings keep flowing post-restart instead of vanishing
-    /// with the dropped editor.
-    pub fn take_warning_log(&mut self) -> Option<(std::sync::mpsc::Receiver<()>, PathBuf)> {
-        self.warning_log.take()
-    }
-
     /// Set the status message log path
     pub fn set_status_log_path(&mut self, path: PathBuf) {
         self.status_log_path = Some(path);
     }
 
-    /// Queue a new authority and restart the editor.
+    /// Attach `authority` to the project the active window is showing.
     ///
-    /// Per the design decision in `docs/internal/AUTHORITY_DESIGN.md`,
-    /// authority transitions piggy-back on the existing
-    /// `change_working_dir` restart path. The caller never sees an
-    /// editor that is half-transitioned: the current `Editor` is
-    /// dropped, `main.rs` rebuilds a fresh one with the queued
-    /// authority, and session restore reopens buffers against the new
-    /// backend. This is slower than an in-place pointer swap but is
-    /// far more robust — every cached `Arc<dyn FileSystem>`, LSP
-    /// handle, terminal PTY, plugin state, and in-flight task is
-    /// dropped cleanly by the existing restart machinery.
-    pub fn install_authority(&mut self, authority: crate::services::authority::Authority) {
-        self.pending_authority = Some(authority);
-        // Re-open the same working directory; `main.rs` picks up the
-        // pending authority from the old editor just before dropping it.
-        self.request_restart(self.working_dir().to_path_buf());
+    /// The window already showing that project is re-pointed in place, or a
+    /// new one opens; every other window keeps its machine. Nothing is torn
+    /// down, so the plugin that asked is not reloaded. Returns the window the
+    /// backend landed on.
+    pub fn install_authority(
+        &mut self,
+        authority: crate::services::authority::Authority,
+    ) -> fresh_core::WindowId {
+        let root = self.working_dir().to_path_buf();
+        let connection =
+            self.open_connection(crate::services::authority::Connection::plain(authority));
+        self.attach_connection_at(connection, root)
     }
 
-    /// Install a new authority that owns a live connection, parking its
-    /// keepalive bundle so the connection survives the restart.
+    /// Attach an authority that owns a live connection, at `working_dir`.
     ///
-    /// Remote-agent backends (SSH-style, K8s) hold carrier processes,
-    /// reconnect/heartbeat tasks, and a Tokio handle that must outlive
-    /// the `Editor` rebuild — exactly the role of the daemon's
-    /// `session_keepalive` slot. The restart loop pairs
-    /// `take_pending_authority` with `take_pending_keepalive` and moves
-    /// the bundle into the process-/server-level keepalive, dropping the
-    /// previous one (tearing down the prior connection). Opaque
-    /// `Box<dyn Any + Send>` so core/main need not name the backend.
+    /// The keepalive rides inside the connection, so the transport closes when
+    /// the last window using it does. Unlike [`Self::install_authority`] this
+    /// re-roots at the remote workspace, since the local path does not exist
+    /// there. Returns the window the backend landed on, usually a new one.
     pub fn install_authority_with_keepalive(
         &mut self,
         authority: crate::services::authority::Authority,
         keepalive: Box<dyn std::any::Any + Send>,
         working_dir: std::path::PathBuf,
-    ) {
-        // Unlike `install_authority` (which re-opens the *current* working
-        // dir), a remote-agent attach must re-root the editor at the pod-side
-        // workspace — otherwise the explorer, quick-open, and open-file all
-        // operate on the local host path, which doesn't exist in the pod.
-        self.pending_keepalive = Some(keepalive);
-        self.pending_authority = Some(authority);
-        self.request_restart(working_dir);
+    ) -> fresh_core::WindowId {
+        let connection = self.open_connection(crate::services::authority::Connection {
+            authority,
+            keepalive: std::sync::Mutex::new(Some(keepalive)),
+        });
+        self.attach_connection_at(connection, working_dir)
     }
 
-    /// Restore the default local authority. Same destructive-restart
-    /// semantics as `install_authority` — the caller never observes a
-    /// half-transitioned editor.
+    /// Detach: put the active window back on a plain local backend, in place.
+    /// Going through [`Self::install_authority`] could re-home onto another
+    /// window sharing the root and lose the session the user is looking at.
     pub fn clear_authority(&mut self) {
         // Reuse the editor's live trust handle so the restored local authority
         // is gated by the same workspace-trust state.
@@ -508,21 +503,14 @@ impl Editor {
         // backend the user explicitly left.
         self.active_window_mut().authority_spec =
             crate::services::authority::SessionAuthoritySpec::Local;
-        self.install_authority(crate::services::authority::Authority::local(trust, env));
-    }
-
-    /// Take the queued authority (if any). Called by `main.rs` on
-    /// restart to move the queued authority into the fresh editor.
-    pub fn take_pending_authority(&mut self) -> Option<crate::services::authority::Authority> {
-        self.pending_authority.take()
-    }
-
-    /// Take the keepalive bundle queued alongside a pending authority by
-    /// [`Self::install_authority_with_keepalive`]. Called by the restart
-    /// loop right beside `take_pending_authority` so the new connection's
-    /// carrier/tasks are parked before the old `Editor` is dropped.
-    pub fn take_pending_keepalive(&mut self) -> Option<Box<dyn std::any::Any + Send>> {
-        self.pending_keepalive.take()
+        let active = self.active_window;
+        let connection = self.open_connection(crate::services::authority::Connection::plain(
+            crate::services::authority::Authority::local(trust, env),
+        ));
+        self.set_session_connection(active, connection);
+        // The terminals are still shells inside the container just left; move them.
+        self.move_window_terminals_to_its_authority(active);
+        self.prune_connections();
     }
 
     /// Directly replace the active authority without triggering a
@@ -536,7 +524,10 @@ impl Editor {
     /// after `set_boot_authority`) see the real `authority_label` instead
     /// of the empty string the temporary `Authority::local()` carried
     /// during construction.
-    pub fn set_boot_authority(&mut self, authority: crate::services::authority::Authority) {
+    pub fn set_boot_authority(
+        &mut self,
+        connection: std::sync::Arc<crate::services::authority::Connection>,
+    ) {
         // The installed authority belongs to the *active/owning* session only
         // — the backend for the working-dir project the attach (or
         // `fresh user@host` launch) re-rooted at. Background windows are
@@ -552,35 +543,35 @@ impl Editor {
             .filter(|(id, _)| **id != active_id)
             .map(|(id, w)| (*id, w.root.clone()))
             .collect();
-        // (root → fresh local authority) for every background window.
-        let mut installs: Vec<(fresh_core::WindowId, crate::services::authority::Authority)> =
-            bg_roots
-                .into_iter()
-                .map(|(id, root)| {
-                    (
-                        id,
-                        crate::services::authority::Authority::local_scoped(
-                            self.session_scope_for(&root),
-                        ),
-                    )
-                })
-                .collect();
-        installs.push((active_id, authority));
-        // Re-point each window's LSP backend, then **move** the authority into
-        // the window (single owner — never cloned).
-        for (id, a) in installs {
+        // (root → its own fresh local connection) for every background window.
+        let mut installs: Vec<(
+            fresh_core::WindowId,
+            std::sync::Arc<crate::services::authority::Connection>,
+        )> = Vec::with_capacity(bg_roots.len() + 1);
+        for (id, root) in bg_roots {
+            let scope = self.session_scope_for(&root);
+            let connection = self.open_connection(crate::services::authority::Connection::plain(
+                crate::services::authority::Authority::local_scoped(scope),
+            ));
+            installs.push((id, connection));
+        }
+        installs.push((active_id, self.adopt_connection(connection)));
+        // Re-point each window's LSP backend, then give the window its connection.
+        for (id, connection) in installs {
             if let Some(w) = self.windows.get_mut(&id) {
+                let a = &connection.authority;
                 w.lsp
                     .set_long_running_spawner(a.long_running_spawner.clone());
                 w.lsp.set_path_translation(a.path_translation.clone());
+                w.lsp.set_filesystem(a.filesystem.clone());
                 w.lsp.set_workspace_trust(a.workspace_trust.clone());
-                w.authority = a;
+                w.connection = std::sync::Arc::clone(&connection);
             }
         }
         // Re-point quick-open's file provider at the now-active backend (the
         // provider captured the previous authority's filesystem + spawner).
         let (fs, sp) = {
-            let a = &self.active_window().authority;
+            let a = &self.active_window().authority();
             (a.filesystem.clone(), a.process_spawner.clone())
         };
         self.quick_open_registry.set_file_backends(fs, sp);
@@ -589,7 +580,7 @@ impl Editor {
             self.update_plugin_state_snapshot();
             // Notify plugins so they can re-register state-gated commands
             // (e.g. devcontainer `Attach` only when not attached).
-            let label = self.active_window().authority.display_label.clone();
+            let label = self.active_window().authority().display_label.clone();
             self.plugin_manager.read().unwrap().run_hook(
                 "authority_changed",
                 crate::services::plugins::hooks::HookArgs::AuthorityChanged { label },
@@ -641,39 +632,125 @@ impl Editor {
         }
     }
 
+    /// Re-point a window at a plain (local or container) authority.
     pub fn set_session_authority(
         &mut self,
         window_id: fresh_core::WindowId,
         authority: crate::services::authority::Authority,
     ) {
+        self.set_session_connection(
+            window_id,
+            std::sync::Arc::new(crate::services::authority::Connection::plain(authority)),
+        );
+    }
+
+    /// Re-point a window at `connection`. The connection carries its own
+    /// keepalive, so a reconnect installs backend and carrier in one move.
+    pub fn set_session_connection(
+        &mut self,
+        window_id: fresh_core::WindowId,
+        connection: std::sync::Arc<crate::services::authority::Connection>,
+    ) {
+        let connection = self.adopt_connection(connection);
         let is_active = self.active_window == window_id;
         if let Some(w) = self.windows.get_mut(&window_id) {
-            // Re-point this window's LSP backend, then **move** the authority
-            // into the window it owns (single owner — never cloned).
+            // Re-point this window's LSP backend, then hand it the connection.
+            let authority = &connection.authority;
             let lsp = &mut w.lsp;
             lsp.set_long_running_spawner(authority.long_running_spawner.clone());
             lsp.set_path_translation(authority.path_translation.clone());
+            lsp.set_filesystem(authority.filesystem.clone());
             lsp.set_workspace_trust(authority.workspace_trust.clone());
-            w.authority = authority;
+            w.connection = connection;
         }
+        // Close what the window let go of, here so no call site can forget.
+        self.prune_connections();
         if is_active {
             // The active backend *is* this window's authority now — re-point
             // quick-open's file provider at it (same stale-capture fix).
             let (fs, sp) = {
-                let a = &self.active_window().authority;
+                let a = &self.active_window().authority();
                 (a.filesystem.clone(), a.process_spawner.clone())
             };
             self.quick_open_registry.set_file_backends(fs, sp);
             #[cfg(feature = "plugins")]
             {
                 self.update_plugin_state_snapshot();
-                let label = self.active_window().authority.display_label.clone();
+                let label = self.active_window().authority().display_label.clone();
                 self.plugin_manager.read().unwrap().run_hook(
                     "authority_changed",
                     crate::services::plugins::hooks::HookArgs::AuthorityChanged { label },
                 );
             }
         }
+    }
+
+    /// How many connections this editor has open, shared ones counted once.
+    pub fn open_connection_count(&self) -> usize {
+        self.connections.len()
+    }
+
+    /// The display label of every open connection, sorted; `local` for the unlabelled one.
+    pub fn open_connection_labels(&self) -> Vec<String> {
+        let mut labels: Vec<String> = self
+            .connections
+            .iter()
+            .map(|(_, c)| {
+                let label = c.authority.display_label.clone();
+                if label.is_empty() {
+                    "local".to_string()
+                } else {
+                    label
+                }
+            })
+            .collect();
+        labels.sort();
+        labels
+    }
+
+    /// Open a connection: register it and hand back the `Arc` to store.
+    pub(crate) fn open_connection(
+        &mut self,
+        connection: crate::services::authority::Connection,
+    ) -> std::sync::Arc<crate::services::authority::Connection> {
+        self.connections.register(connection).1
+    }
+
+    /// Register a connection built elsewhere. The same `Arc` twice is a no-op.
+    pub(crate) fn adopt_connection(
+        &mut self,
+        connection: std::sync::Arc<crate::services::authority::Connection>,
+    ) -> std::sync::Arc<crate::services::authority::Connection> {
+        self.connections.share(connection).1
+    }
+
+    /// Register the connections of windows built before the registry existed.
+    pub(crate) fn adopt_existing_window_connections(&mut self) {
+        let held: Vec<_> = self
+            .windows
+            .values()
+            .map(|w| std::sync::Arc::clone(&w.connection))
+            .collect();
+        for connection in held {
+            self.connections.share(connection);
+        }
+    }
+
+    /// Close the connections nothing refers to any more.
+    pub(crate) fn prune_connections(&mut self) {
+        let closed = self.connections.prune();
+        if closed > 0 {
+            tracing::debug!("closed {closed} connection(s) nothing was using");
+        }
+    }
+
+    /// Whether `window_id` holds a live connection with a keepalive, rather than
+    /// a plain local backend or a dormant session's shell.
+    #[cfg(feature = "plugins")]
+    pub(crate) fn window_connection_is_live(&self, window_id: fresh_core::WindowId) -> bool {
+        self.windows
+            .get(&window_id)
+            .is_some_and(|w| w.connection.keepalive.lock().is_ok_and(|k| k.is_some()))
     }
 
     /// Adopt the now-active window's authority into the editor-wide caches,
@@ -691,10 +768,10 @@ impl Editor {
     /// cheap and the status bar doesn't flicker.
     pub(crate) fn adopt_active_window_authority(&mut self, previous_label: &str) {
         // No editor-wide copy to update — the active backend *is*
-        // `active_window().authority`. Re-point quick-open at it and fire the
+        // `active_window().authority()`. Re-point quick-open at it and fire the
         // hook when the label actually changed.
         let (label_changed, fs, sp) = {
-            let a = &self.active_window().authority;
+            let a = &self.active_window().authority();
             (
                 a.display_label != previous_label,
                 a.filesystem.clone(),
@@ -702,11 +779,14 @@ impl Editor {
             )
         };
         self.quick_open_registry.set_file_backends(fs, sp);
+        // Every switch of active window comes through here, so this is where
+        // Quick Open picks up the incoming window's explorer visibility.
+        self.sync_quick_open_file_visibility();
         if label_changed {
             #[cfg(feature = "plugins")]
             {
                 self.update_plugin_state_snapshot();
-                let label = self.active_window().authority.display_label.clone();
+                let label = self.active_window().authority().display_label.clone();
                 self.plugin_manager.read().unwrap().run_hook(
                     "authority_changed",
                     crate::services::plugins::hooks::HookArgs::AuthorityChanged { label },
@@ -721,20 +801,20 @@ impl Editor {
         // there is no separate editor-wide copy. Each window owns its
         // authority outright (no `Clone`), so a session's backend/trust/env
         // can never be shared into another window (issue #2280).
-        &self.active_window().authority
+        self.active_window().authority()
     }
 
-    /// Move the active window's `Authority` out, leaving a local placeholder.
-    /// Used by the restart loops to carry the active session's backend into
-    /// the rebuilt editor across a *non-transition* restart — `Authority` is
-    /// non-`Clone`, so it must be moved. The editor is being torn down
-    /// immediately after, so the placeholder left behind is never observed.
-    pub fn take_active_authority(&mut self) -> crate::services::authority::Authority {
-        let placeholder = crate::services::authority::Authority::local(
-            std::sync::Arc::new(crate::services::workspace_trust::WorkspaceTrust::permissive()),
-            std::sync::Arc::new(crate::services::env_provider::EnvProvider::inactive()),
-        );
-        std::mem::replace(&mut self.active_window_mut().authority, placeholder)
+    /// Move the active window's connection out, leaving a local placeholder.
+    pub fn take_active_authority(
+        &mut self,
+    ) -> std::sync::Arc<crate::services::authority::Connection> {
+        let placeholder = self.open_connection(crate::services::authority::Connection::plain(
+            crate::services::authority::Authority::local(
+                std::sync::Arc::new(crate::services::workspace_trust::WorkspaceTrust::permissive()),
+                std::sync::Arc::new(crate::services::env_provider::EnvProvider::inactive()),
+            ),
+        ));
+        std::mem::replace(&mut self.active_window_mut().connection, placeholder)
     }
 
     /// Run a blocking effect (filesystem writes/deletes, teardown I/O) off
@@ -831,8 +911,20 @@ impl Editor {
     /// without that readiness check, keys can race into the editor
     /// during the gap and the test silently waits for a dock response
     /// that never comes.
+    ///
+    /// **Asked of the tree.** A focused dock keeps its keyboard layer under a
+    /// centred panel, which holds the keyboard while it is up; whether the
+    /// keys go to the dock is where the tree's focus is — inside the dock's
+    /// interior (or its sink, for a dock with nothing described).
     pub fn is_dock_focused(&self) -> bool {
+        use crate::view::shell::{panel, widgets::Slot};
         self.dock.as_ref().is_some_and(|d| d.focused)
+            && self.shell_ui.as_ref().is_some_and(|ui| {
+                [panel::interior_key(Slot::Dock), panel::sink_key(Slot::Dock)]
+                    .iter()
+                    .filter_map(|k| ui.find_by_key(k))
+                    .any(|el| ui.has_focus_within(el))
+            })
     }
 
     /// Allocate the next globally-unique `BufferId`. Use this in
@@ -962,6 +1054,9 @@ impl Editor {
         match slot {
             crate::app::PanelSlot::Floating => self.floating_widget_panel.as_ref(),
             crate::app::PanelSlot::Dock => self.dock.as_ref(),
+            crate::app::PanelSlot::Sidebar(i) => {
+                self.sidebar_sections.get(i).and_then(|s| s.panel.as_ref())
+            }
         }
     }
 
@@ -973,22 +1068,40 @@ impl Editor {
         match slot {
             crate::app::PanelSlot::Floating => self.floating_widget_panel.as_mut(),
             crate::app::PanelSlot::Dock => self.dock.as_mut(),
+            crate::app::PanelSlot::Sidebar(i) => self
+                .sidebar_sections
+                .get_mut(i)
+                .and_then(|s| s.panel.as_mut()),
         }
     }
 
     /// Mutable handle to the slot *option* itself (for take/assign).
+    ///
+    /// `None` only for a sidebar index with no section — the two fixed
+    /// slots always exist. Emptying a sidebar slot leaves its section as a
+    /// header over a placeholder; dropping the section is
+    /// `Editor::close_sidebar_section`.
     pub(crate) fn panel_opt_mut(
         &mut self,
         slot: crate::app::PanelSlot,
-    ) -> &mut Option<crate::app::FloatingWidgetState> {
+    ) -> Option<&mut Option<crate::app::FloatingWidgetState>> {
         match slot {
-            crate::app::PanelSlot::Floating => &mut self.floating_widget_panel,
-            crate::app::PanelSlot::Dock => &mut self.dock,
+            crate::app::PanelSlot::Floating => Some(&mut self.floating_widget_panel),
+            crate::app::PanelSlot::Dock => Some(&mut self.dock),
+            crate::app::PanelSlot::Sidebar(i) => {
+                self.sidebar_sections.get_mut(i).map(|s| &mut s.panel)
+            }
         }
     }
 
     /// Which slot currently holds the panel with this identity, if any.
-    #[cfg(feature = "plugins")]
+    ///
+    /// **Not `plugins`-gated, though its first caller was.** The panel slots
+    /// and `PanelKey` are ungated, and S6 gave this a second caller in
+    /// `advance_panel_focus_in_tree`, which the focus ring reaches on every
+    /// host-driven advance whether or not plugins are compiled in. The gate was
+    /// inherited from the one caller it used to have, and `--no-default-features
+    /// --features runtime` is where that showed.
     pub(crate) fn slot_of_panel(
         &self,
         panel_key: &crate::widgets::PanelKey,
@@ -1006,33 +1119,27 @@ impl Editor {
         {
             Some(crate::app::PanelSlot::Dock)
         } else {
-            None
-        }
-    }
-
-    /// Map a panel sentinel buffer-id back to its slot.
-    pub(crate) fn slot_for_panel_buffer(buffer_id: BufferId) -> Option<crate::app::PanelSlot> {
-        if buffer_id == crate::app::FLOATING_PANEL_BUFFER_ID {
-            Some(crate::app::PanelSlot::Floating)
-        } else if buffer_id == crate::app::DOCK_PANEL_BUFFER_ID {
-            Some(crate::app::PanelSlot::Dock)
-        } else {
-            None
+            self.sidebar_sections
+                .iter()
+                .position(|s| s.panel.as_ref().is_some_and(|f| &f.panel_key == panel_key))
+                .map(crate::app::PanelSlot::Sidebar)
         }
     }
 
     /// The active window's layout-cache (split-leaf rects, tab rects,
     /// file-explorer rect, view-line mappings). Mouse hit-testing and
     /// visual-line motion read from here.
-    pub(crate) fn active_layout(&self) -> &crate::app::types::WindowLayoutCache {
-        &self.active_window().layout_cache
-    }
-
-    /// Mutable handle to the active window's layout cache. Renderer
-    /// writes split / tab / file-explorer hit-test rects here at the
-    /// end of each frame.
-    pub(crate) fn active_layout_mut(&mut self) -> &mut crate::app::types::WindowLayoutCache {
-        &mut self.active_window_mut().layout_cache
+    /// What the pointer is on.
+    ///
+    /// One answer, from one walk. There were two: the tree wrote `shell_hover`
+    /// and a box walk wrote `mouse_state.hover_target`, and because the walk
+    /// ran *after* the tree on the same event it could erase a migrated
+    /// surface's hover — which is what happened to the split dividers when
+    /// they became nodes, the walk finding nothing under that cell and storing
+    /// `None` over the tree's answer. The walk is gone; the field it wrote is
+    /// gone with it.
+    pub fn hovered(&self) -> Option<crate::app::types::HoverTarget> {
+        self.shell_hover.clone()
     }
 
     /// The active window's editor-chrome layout cache (status bar,
@@ -1050,14 +1157,6 @@ impl Editor {
     }
 
     // --- semantic accessors for the web/GUI chrome (read-only projections) ---
-
-    /// Read access to the shared keybinding resolver, for view projections
-    /// that surface shortcut hints (e.g. the search-options toggles).
-    pub(crate) fn keybinding_resolver(
-        &self,
-    ) -> std::sync::RwLockReadGuard<'_, crate::input::keybindings::KeybindingResolver> {
-        self.keybindings.read().unwrap()
-    }
 
     /// The menu-bar state (which menu is open, highlighted item, condition
     /// context for `when`/checkbox evaluation).
@@ -1132,6 +1231,44 @@ impl Editor {
         &self.active_window().buffers
     }
 
+    /// Every open window's id, ascending. `windows` is a `HashMap`, so
+    /// shutdown work that touches every workspace needs an order of its own to
+    /// be reproducible.
+    pub(crate) fn window_ids_sorted(&self) -> Vec<fresh_core::WindowId> {
+        let mut ids: Vec<_> = self.windows.keys().copied().collect();
+        ids.sort_by_key(|id| id.0);
+        ids
+    }
+
+    /// Run `f` with the active-window pointer temporarily retargeted.
+    ///
+    /// Lets work that spans every workspace (shutdown; reloading a file
+    /// restored behind its buffers' back) reuse the many per-window helpers
+    /// written against `active_window` instead of growing a
+    /// window-parameterized twin of each (issue #3189). Deliberately not
+    /// [`Editor::set_active_window`]: no checkpoint, materialization, hooks
+    /// or layout — none of which such work wants.
+    ///
+    /// Only safe for synchronous, non-rendering work: nothing here may yield
+    /// to the event loop or paint, or the user sees the wrong workspace. A
+    /// panic in `f` leaves the pointer retargeted, tolerable only because a
+    /// panic ends the editor anyway.
+    pub(crate) fn with_window_retargeted<R>(
+        &mut self,
+        window_id: fresh_core::WindowId,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        if !self.windows.contains_key(&window_id) {
+            tracing::warn!("with_window_retargeted: unknown window id {window_id}");
+            return f(self);
+        }
+        let previous = self.active_window;
+        self.active_window = window_id;
+        let out = f(self);
+        self.active_window = previous;
+        out
+    }
+
     /// Mutable handle to the active window's buffer storage.
     /// Holds `&mut self` for the call's lifetime — at sites that
     /// need a concurrent mutable borrow on another Window field
@@ -1156,59 +1293,6 @@ impl Editor {
     /// `self.windows.get_mut(&self.active_window).map(|w| &mut w.lsp)`.
     pub(crate) fn lsp_mut(&mut self) -> Option<&mut crate::services::lsp::manager::LspManager> {
         Some(&mut self.active_window_mut().lsp)
-    }
-
-    /// Active window's split tree. Panics if the window has no
-    /// layout yet — the invariant is "the active window always has
-    /// `splits` populated", upheld by `set_active_window` (which
-    /// seeds the layout on first dive) and by editor init (which
-    /// hands the initial layout to the base window).
-    pub(crate) fn split_manager(&self) -> &crate::view::split::SplitManager {
-        &self
-            .active_window()
-            .buffers
-            .splits()
-            .expect("active window must have a populated split layout")
-            .0
-    }
-
-    /// Mutable handle to the active window's split tree.
-    pub(crate) fn split_manager_mut(&mut self) -> &mut crate::view::split::SplitManager {
-        &mut self
-            .active_window_mut()
-            .buffers
-            .splits_mut()
-            .expect("active window must have a populated split layout")
-            .0
-    }
-
-    /// Active window's per-leaf view state map.
-    #[cfg(test)]
-    pub(crate) fn split_view_states(
-        &self,
-    ) -> &std::collections::HashMap<crate::model::event::LeafId, crate::view::split::SplitViewState>
-    {
-        &self
-            .active_window()
-            .buffers
-            .splits()
-            .expect("active window must have a populated split layout")
-            .1
-    }
-
-    /// Mutable handle to the active window's per-leaf view state map.
-    pub(crate) fn split_view_states_mut(
-        &mut self,
-    ) -> &mut std::collections::HashMap<
-        crate::model::event::LeafId,
-        crate::view::split::SplitViewState,
-    > {
-        &mut self
-            .active_window_mut()
-            .buffers
-            .splits_mut()
-            .expect("active window must have a populated split layout")
-            .1
     }
 
     /// Return buffer ids whose on-disk path sits at or under `root`.
@@ -1256,11 +1340,6 @@ impl Editor {
                 format!("{} (Disconnected)", conn)
             }
         })
-    }
-
-    /// Get the status log path
-    pub fn get_status_log_path(&self) -> Option<&PathBuf> {
-        self.status_log_path.as_ref()
     }
 
     /// Open the status log file (user clicked on status message)
@@ -1324,6 +1403,7 @@ impl Editor {
                 .is_some_and(|w| w.buffers.get(&buffer).is_some());
             if exists {
                 self.active_window = window;
+                self.sync_quick_open_file_visibility();
                 self.active_window_mut().set_active_buffer(buffer);
                 return;
             }
@@ -1422,6 +1502,11 @@ impl Editor {
     pub fn check_mouse_hover_timer(&mut self) -> bool {
         // Check if mouse hover is enabled
         if !self.config.editor.mouse_hover_enabled {
+            return false;
+        }
+
+        // Nothing armed: skip the overlay checks below, which run every tick.
+        if self.active_window().mouse_state.lsp_hover_state.is_none() {
             return false;
         }
 

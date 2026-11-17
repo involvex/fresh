@@ -1,7 +1,7 @@
 //! Undo and redo action handlers.
 
 use super::Editor;
-use rust_i18n::t;
+use fresh_i18n::t;
 
 impl Editor {
     /// Handle Undo action - revert the last edit operation.
@@ -28,7 +28,6 @@ impl Editor {
         // Apply all inverse events collected during undo.
         // Each event may carry displaced markers that need restoration after apply.
         for (event, displaced_markers) in &events {
-            tracing::debug!("Undo applying event: {:?}", event);
             self.apply_event_to_active_buffer(event);
 
             // Restore displaced markers from LogEntry (for single Delete events).

@@ -1,7 +1,7 @@
 # Plugin Configuration
 
 Plugins can expose user-configurable settings that appear in the editor's
-Settings UI under their own "Plugin: \<name\>" category. The values are
+Settings UI under their own "\<name\>" category, nested under "Plugins". The values are
 saved alongside the rest of the user config and respect the same
 User/Project/Session layering as built-in settings.
 
@@ -88,15 +88,67 @@ the change on the next read.
 | `defineConfigString`            | `string`           | Text input         |
 | `defineConfigEnum`              | one of `values`    | Dropdown           |
 | `defineConfigStringArray`       | `string[]`         | List editor        |
+| `defineConfigMap`               | `Record<string, Record<string, unknown>>` | Map editor: a row per entry, a dialog per entry |
 
 All methods accept `description` (string). Numeric methods accept
 `minimum` / `maximum`. Each method's `options` parameter is strictly
 typed — unknown keys (`defualt` → "Did you mean 'default'?"), wrong
 default types, and out-of-range defaults are all compile-time errors.
 
-The Settings UI renders one **Plugin: \<name\>** top-level category per
-enabled plugin that has registered at least one field, sorted alongside
-the built-in categories.
+## Map settings
+
+`defineConfigMap` declares a setting made of named entries, each a small
+record of typed fields: a command per language, a colour per tag, and so on.
+
+```ts
+editor.defineConfigMap("renderers", {
+  default: {
+    mermaid: { command: "termaid", args: ["{file}", "--width", "{width}"] },
+    math: { command: "utftex", args: ["--line-width", "{width}", "--", "{source}"] },
+  },
+  value: {
+    command: { type: "string", description: "The program to run." },
+    args: { type: "string[]", description: "Its arguments. {file} is the input file." },
+  },
+  displayField: "command",
+  description: "Programs that draw a preview of a code block, by its language.",
+});
+```
+
+- `value` names each entry's fields. A field's type is `"string"`,
+  `"string[]"`, `"boolean"`, `"integer"` or `"number"`, given on its own or
+  as `{ type, description }`.
+- `displayField` names the field each row shows next to its key.
+- `default` is checked against `value`: an entry with a field `value` does not
+  name, or of the wrong type, throws.
+
+In the Settings UI the map is a list of rows, the key and the `displayField`
+of each, with **[+] Add new** at the end. A row opens a dialog holding the
+entry's fields:
+
+- the fields come in the order `value` declares them;
+- the focused field's `description` is shown under the fields as its help,
+  wrapped to the dialog's width — the place to explain what a field takes,
+  such as the placeholders an argument list understands.
+
+In `config.json` the map is a plain object, and a map set there replaces the
+declared default as a whole:
+
+```json
+"plugins": {
+  "my_plugin": {
+    "settings": {
+      "renderers": {
+        "mermaid": { "command": "mmaid", "args": ["{file}"] }
+      }
+    }
+  }
+}
+```
+
+The Settings UI renders one **\<name\>** category per enabled plugin
+that has registered at least one field, nested under the **Plugins**
+category in the left panel (expanded when Settings opens).
 
 ## What's not supported
 

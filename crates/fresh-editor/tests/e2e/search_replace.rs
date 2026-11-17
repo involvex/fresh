@@ -1,5 +1,6 @@
 //! E2E tests for the Search & Replace plugin (multi-file project-wide search/replace)
 
+use crate::common::git_test_helper::GitTestRepo;
 use crate::common::harness::{copy_plugin, copy_plugin_lib, EditorTestHarness, HarnessOptions};
 use crate::common::tracing::init_tracing_from_env;
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -79,17 +80,105 @@ fn enter_search_and_replace(harness: &mut EditorTestHarness, search: &str, repla
     harness.render().unwrap();
 }
 
-/// Trigger Replace All (Alt+Enter), accept the confirmation prompt, and wait
+/// Wait until the panel's streaming search has *finished*, not merely
+/// produced its first results.
+///
+/// The match count is not that gate. `buildMatchStatsEntries` prints
+/// "(N matches / M files)" from `panel.searchResults` as the pump appends to
+/// it, while `panel.busy` is still true — and `doReplaceAll` refuses to run
+/// while it is: it sets "Search still running — please wait, then try again."
+/// and *drops* the keystroke rather than queueing it. So a Replace All fired
+/// on the count alone can be swallowed, and the wait for the confirmation
+/// prompt that follows then never resolves — a 180s nextest timeout with no
+/// failed assertion to point at, which is how
+/// `test_search_replace_current_file_unnamed_buffer` failed on CI.
+///
+/// The end of the search is visible on the status line: `performSearch` sets
+/// "Found N matches" (or "No matches found for …") as its last act, and the
+/// caller flips `busy` in the same JS turn, before the host renders either.
+fn wait_for_search_finished(harness: &mut EditorTestHarness) {
+    harness
+        .wait_until(|h| {
+            h.screen_to_string().lines().any(|line| {
+                (line.contains("Found ") && line.contains(" matches"))
+                    || line.contains("No matches found for")
+            })
+        })
+        .unwrap();
+}
+
+/// Wait until the "hello" search over `create_test_files` shows its rows
+/// where they will stay: alpha.txt's group first, beta.txt's below it.
+///
+/// Results stream in file-arrival order and are re-sorted into path order
+/// once the search finishes (#2435), which re-numbers the rows. A test that
+/// reads a row off a frame drawn before that — two identical frames are easy
+/// to get while the producer is still walking the project — clicks or
+/// navigates a row that means something else to the plugin by the time the
+/// input lands, and the wait that follows never resolves. The only other
+/// match in the project is the copied `plugins/lib/fresh.d.ts`, which sorts
+/// after both, and late arrivals are appended below; so once alpha.txt leads
+/// with beta.txt under it, no later frame moves their rows.
+fn wait_for_sorted_hello_results(harness: &mut EditorTestHarness) {
+    harness
+        .wait_until_stable(|h| {
+            let s = h.screen_to_string();
+            let first = |needle: &str| s.lines().position(|l| l.contains(needle));
+            match (first("alpha.txt:1"), first("beta.txt"), first("fresh.d.ts")) {
+                (Some(alpha), Some(beta), other) => {
+                    alpha < beta && other.is_none_or(|other| other > alpha)
+                }
+                _ => false,
+            }
+        })
+        .unwrap();
+}
+
+/// Text only the Replace confirmation dialog shows (its undo caveat).
+const CONFIRM_DIALOG_TEXT: &str = "Undo only covers";
+
+/// Wait for the Replace confirmation dialog to open.
+fn wait_for_confirm_dialog(harness: &mut EditorTestHarness) {
+    harness
+        .wait_until(|h| h.screen_to_string().contains(CONFIRM_DIALOG_TEXT))
+        .unwrap();
+}
+
+/// Wait for the Replace confirmation dialog to close.
+fn wait_for_confirm_dialog_closed(harness: &mut EditorTestHarness) {
+    harness
+        .wait_until(|h| !h.screen_to_string().contains(CONFIRM_DIALOG_TEXT))
+        .unwrap();
+}
+
+/// Trigger Replace All (Alt+Enter), accept the confirmation dialog, and wait
 /// for the "Replaced" status. Used by every test that exercises a successful
-/// replacement — the confirmation prompt was added to guard against the
+/// replacement — the confirmation was added to guard against the
 /// accidental-replace-you-can't-undo case described in bug #1.
 fn confirm_replace_all(harness: &mut EditorTestHarness) {
+    // Alt+Enter is dropped outright while the search is still streaming, so
+    // the replace has to wait for the search to land (see
+    // `wait_for_search_finished`).
+    wait_for_search_finished(harness);
     harness.send_key(KeyCode::Enter, KeyModifiers::ALT).unwrap();
-    harness.wait_for_prompt().unwrap();
+    // If the replace was refused after all, say so here instead of waiting
+    // out the external timeout on a dialog that will never open.
+    harness
+        .wait_until(|h| {
+            let screen = h.screen_to_string();
+            if screen.contains("Search still running") {
+                panic!(
+                    "Replace All was dropped: the search was still streaming. Screen:\n{screen}"
+                );
+            }
+            screen.contains(CONFIRM_DIALOG_TEXT)
+        })
+        .unwrap();
+    // Focus starts on the dialog's Replace button, so Enter confirms.
     harness
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
-    harness.wait_for_prompt_closed().unwrap();
+    wait_for_confirm_dialog_closed(harness);
     harness
         .wait_until(|h| h.screen_to_string().contains("Replaced"))
         .unwrap();
@@ -554,12 +643,19 @@ fn test_search_replace_current_file_unnamed_buffer() {
     enter_search_and_replace(&mut harness, "hello", "goodbye");
 
     // The three in-buffer matches must be found (this is the regression:
-    // it used to read "No matches found").
-    harness
-        .wait_until(|h| h.screen_to_string().contains("3 matches"))
-        .unwrap();
+    // it used to read "No matches found"). Gate on the search *finishing*
+    // rather than on the count appearing: a wait for "3 matches" can only
+    // ever resolve when the test passes, so the regression it guards would
+    // show up as an unexplained 180s timeout instead of this assertion.
+    wait_for_search_finished(&mut harness);
 
     let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("3 matches"),
+        "The unnamed buffer holds three \"hello\"s, so the finished search \
+         must report three matches. Got:\n{}",
+        screen
+    );
     assert!(
         !screen.contains("No matches"),
         "Unnamed-buffer search must find the in-memory matches, not report \
@@ -665,6 +761,152 @@ fn test_search_replace_current_file_outside_workspace() {
         screen.contains("Matches (1 in 1 files)"),
         "Out-of-root current-file search must find the on-disk match, not \
          report 'No matches'. Got:\n{}",
+        screen
+    );
+}
+
+/// "Search and Replace in Current File" must work on a hidden file such as
+/// `.fresh-tour.json`. The project walk skips dotfiles, and current-file scope
+/// only filters the walk's results, so it used to report "No matches found"
+/// for a file that was open and plainly contained the pattern. The replace
+/// must also land exactly once: the file is searched directly and the walk
+/// must not add it a second time.
+#[test]
+fn test_search_replace_current_file_hidden() {
+    init_tracing_from_env();
+    let (_temp_dir, project_root) = setup_search_replace_project();
+    create_test_files(&project_root);
+
+    let hidden_file = project_root.join(".hidden-notes.txt");
+    fs::write(&hidden_file, "Line 1: testing the search\nplain line\n").unwrap();
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        160,
+        30,
+        Default::default(),
+        project_root.clone(),
+    )
+    .unwrap();
+    harness.open_file(&hidden_file).unwrap();
+    harness.render().unwrap();
+
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.wait_for_prompt().unwrap();
+    harness
+        .type_text("Search and Replace in Current File")
+        .unwrap();
+    harness
+        .wait_until(|h| {
+            h.screen_to_string()
+                .contains("Search and Replace in Current File")
+        })
+        .unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+
+    enter_search_and_replace(&mut harness, "testing", "done");
+    wait_for_search_finished(&mut harness);
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("Matches (1 in 1 files)"),
+        "Current-file search must find the match in the open hidden file. \
+         Got:\n{}",
+        screen
+    );
+
+    confirm_replace_all(&mut harness);
+
+    let content = fs::read_to_string(&hidden_file).unwrap();
+    assert_eq!(content, "Line 1: done the search\nplain line\n");
+}
+
+/// The project search covers the files Quick Open lists, so what
+/// `file_explorer.custom_ignore_patterns` matches is not searched — whether
+/// the pattern names a directory or a glob over files.
+#[test]
+fn test_search_replace_skips_custom_ignored_files() {
+    init_tracing_from_env();
+    let (_temp_dir, project_root) = setup_search_replace_project();
+    create_test_files(&project_root);
+    fs::write(project_root.join("kept.txt"), "zebra_marker kept\n").unwrap();
+    fs::create_dir(project_root.join("generated")).unwrap();
+    fs::write(
+        project_root.join("generated").join("out.txt"),
+        "zebra_marker generated\n",
+    )
+    .unwrap();
+    fs::write(project_root.join("debug.log"), "zebra_marker log\n").unwrap();
+
+    let mut config = Config::default();
+    config.file_explorer.custom_ignore_patterns =
+        vec!["generated/".to_string(), "*.log".to_string()];
+
+    let start_file = project_root.join("alpha.txt");
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(160, 30, config, project_root).unwrap();
+    harness.open_file(&start_file).unwrap();
+    harness.render().unwrap();
+
+    open_search_replace_via_palette(&mut harness);
+    harness.type_text("zebra_marker").unwrap();
+    wait_for_search_finished(&mut harness);
+
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("Matches (1 in 1 files)") && screen.contains("kept.txt"),
+        "Only kept.txt should match; custom-ignored files must not be \
+         searched. Got:\n{}",
+        screen
+    );
+}
+
+/// In a git repository the project search lists files with `git ls-files`,
+/// as Quick Open does: `.gitignore`d files are not searched, while untracked
+/// files that are not ignored are.
+#[test]
+fn test_search_replace_respects_gitignore() {
+    init_tracing_from_env();
+    let repo = GitTestRepo::new();
+    let plugins_dir = repo.path.join("plugins");
+    fs::create_dir(&plugins_dir).unwrap();
+    copy_plugin_lib(&plugins_dir);
+    copy_plugin(&plugins_dir, "search_replace");
+
+    repo.create_file(".gitignore", "build/\n*.tmp\n");
+    let start_file = repo.create_file("tracked.txt", "zebra_marker tracked\n");
+    repo.create_file("untracked.txt", "zebra_marker untracked\n");
+    repo.create_file("build/out.txt", "zebra_marker built\n");
+    repo.create_file("scratch.tmp", "zebra_marker scratch\n");
+    repo.git_add(&[".gitignore", "tracked.txt"]);
+    repo.git_commit("initial");
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        160,
+        30,
+        Default::default(),
+        repo.path.clone(),
+    )
+    .unwrap();
+    harness.open_file(&start_file).unwrap();
+    harness.render().unwrap();
+
+    open_search_replace_via_palette(&mut harness);
+    harness.type_text("zebra_marker").unwrap();
+    wait_for_search_finished(&mut harness);
+
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("Matches (2 in 2 files)"),
+        "tracked.txt and untracked.txt should match; gitignored files must \
+         not be searched. Got:\n{}",
+        screen
+    );
+    assert!(
+        !screen.contains("out.txt") && !screen.contains("scratch.tmp"),
+        "gitignored files must not appear in the results. Got:\n{}",
         screen
     );
 }
@@ -954,6 +1196,102 @@ fn test_search_replace_delete_pattern() {
     );
 }
 
+/// With Regex on, the replacement is a template: `$1` expands to the
+/// match's first capture group, in the open file and in one on disk alike.
+/// It used to be written as the literal text `$1ent`. (`qxz` rather than
+/// the reported `est`, which the copied plugin sources are full of.)
+#[test]
+fn test_search_replace_regex_expands_capture_groups() {
+    init_tracing_from_env();
+    let (_temp_dir, project_root) = setup_search_replace_project();
+
+    fs::write(project_root.join("open.txt"), "tqxz rqxz lqxz\n").unwrap();
+    fs::write(project_root.join("closed.txt"), "bqxz\n").unwrap();
+
+    let start_file = project_root.join("open.txt");
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        30,
+        Default::default(),
+        project_root.clone(),
+    )
+    .unwrap();
+    harness.open_file(&start_file).unwrap();
+    harness.render().unwrap();
+
+    open_search_replace_via_palette(&mut harness);
+    harness
+        .send_key(KeyCode::Char('r'), KeyModifiers::ALT)
+        .unwrap();
+    harness.render().unwrap();
+    enter_search_and_replace(&mut harness, "(.)qxz", "$1ent");
+    harness
+        .wait_until_stable(|h| h.screen_to_string().contains("(4 matches / 2 files)"))
+        .unwrap();
+
+    confirm_replace_all(&mut harness);
+
+    let open = fs::read_to_string(project_root.join("open.txt")).unwrap();
+    assert_eq!(open, "tent rent lent\n");
+    let closed = fs::read_to_string(project_root.join("closed.txt")).unwrap();
+    assert_eq!(closed, "bent\n");
+}
+
+/// Undoing a replace in the edited file puts the matches back, and the
+/// panel shows them again without the user re-running the search. The
+/// replace and its undo are one bulk edit each, which fire no
+/// `after_insert` / `after_delete`, so the panel listens for
+/// `buffer_modified`. It used to keep reading "No matches found".
+#[test]
+fn test_search_replace_undo_in_file_shows_matches_again() {
+    init_tracing_from_env();
+    let (_temp_dir, project_root) = setup_search_replace_project();
+
+    // `qxzv`, not a word the copied plugin sources contain.
+    let file = project_root.join("undo_refresh.txt");
+    fs::write(&file, "qxzv one\nqxzv two\n").unwrap();
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        160,
+        40,
+        Default::default(),
+        project_root.clone(),
+    )
+    .unwrap();
+    harness.open_file(&file).unwrap();
+    harness.render().unwrap();
+
+    open_search_replace_via_palette(&mut harness);
+    enter_search_and_replace(&mut harness, "qxzv", "done");
+    harness
+        .wait_until_stable(|h| h.screen_to_string().contains("(2 matches / 1 files)"))
+        .unwrap();
+    confirm_replace_all(&mut harness);
+    harness
+        .wait_until(|h| {
+            let s = h.screen_to_string();
+            s.contains("done one") && s.contains("No matches found")
+        })
+        .unwrap();
+
+    // Focus the edited file (the panel stays open) and undo there.
+    let (col, row) = harness
+        .find_text_on_screen("done one")
+        .expect("the edited file is on screen");
+    harness.mouse_click(col, row).unwrap();
+    harness.render().unwrap();
+    harness
+        .send_key(KeyCode::Char('z'), KeyModifiers::CONTROL)
+        .unwrap();
+
+    harness
+        .wait_until(|h| {
+            let s = h.screen_to_string();
+            s.contains("qxzv one") && s.contains("(2 matches / 1 files)")
+        })
+        .unwrap();
+}
+
 /// Multiple matches on the same line — all occurrences on the line get replaced.
 #[test]
 fn test_search_replace_multiple_matches_same_line() {
@@ -1032,7 +1370,7 @@ fn test_search_replace_multiple_matches_same_line() {
         harness
             .wait_until(|h| {
                 wait_iters += 1;
-                if wait_iters % 20 == 0 {
+                if wait_iters.is_multiple_of(20) {
                     eprintln!(
                         "[DEBUG wait_until Search:] iteration {}, screen:\n{}",
                         wait_iters,
@@ -1097,14 +1435,14 @@ fn test_search_replace_multiple_matches_same_line() {
         harness.screen_to_string()
     );
 
-    // Alt+Enter to execute Replace All (confirms via prompt).
+    // Alt+Enter to execute Replace All (confirms via the dialog).
     eprintln!("[DEBUG {}] pressing Alt+Enter to Replace All", elapsed());
     harness.send_key(KeyCode::Enter, KeyModifiers::ALT).unwrap();
-    harness.wait_for_prompt().unwrap();
+    wait_for_confirm_dialog(&mut harness);
     harness
         .send_key(KeyCode::Enter, KeyModifiers::NONE)
         .unwrap();
-    harness.wait_for_prompt_closed().unwrap();
+    wait_for_confirm_dialog_closed(&mut harness);
     eprintln!(
         "[DEBUG {}] Alt+Enter sent and confirmation accepted",
         elapsed()
@@ -1116,7 +1454,7 @@ fn test_search_replace_multiple_matches_same_line() {
         harness
             .wait_until(|h| {
                 wait_iters += 1;
-                if wait_iters % 20 == 0 {
+                if wait_iters.is_multiple_of(20) {
                     eprintln!(
                         "[DEBUG wait_until Replaced] iteration {}, screen:\n{}",
                         wait_iters,
@@ -1543,11 +1881,11 @@ fn test_search_replace_panel_not_duplicated_in_tabs() {
     );
 }
 
-/// Bug 1 (upstream) companion: pressing Alt+Enter opens a confirmation
-/// prompt explaining that the replace is not restore-safe.  Cancelling the
-/// prompt must leave the file unchanged.
+/// Bug 1 (upstream) companion: pressing Alt+Enter opens a modal
+/// confirmation dialog explaining that the replace is not restore-safe.
+/// Cancelling it must leave the file unchanged.
 #[test]
-fn test_search_replace_confirmation_prompt_cancel_leaves_files_untouched() {
+fn test_search_replace_confirmation_dialog_cancel_leaves_files_untouched() {
     init_tracing_from_env();
     let (_temp_dir, project_root) = setup_search_replace_project();
 
@@ -1575,21 +1913,39 @@ fn test_search_replace_confirmation_prompt_cancel_leaves_files_untouched() {
         })
         .unwrap();
 
-    // Trigger Replace All — expect the confirmation prompt to open.
+    // Trigger Replace All — expect the confirmation dialog to open. It is
+    // a modal dialog, not the prompt line at the bottom of the screen.
     harness.send_key(KeyCode::Enter, KeyModifiers::ALT).unwrap();
-    harness.wait_for_prompt().unwrap();
-
-    // Prompt text should warn about the undo caveat.
-    let prompt_screen = harness.screen_to_string();
+    wait_for_confirm_dialog(&mut harness);
+    let dialog_screen = harness.screen_to_string();
     assert!(
-        prompt_screen.contains("Undo only covers"),
-        "Confirmation prompt should warn about undo scope.  Screen:\n{}",
-        prompt_screen
+        dialog_screen.contains("match(es) in")
+            && dialog_screen.contains("[ Cancel ]")
+            && dialog_screen.contains("[ Replace ]"),
+        "Confirmation dialog should state the counts and offer Cancel / \
+         Replace.  Screen:\n{}",
+        dialog_screen
+    );
+    assert!(
+        !harness.editor().is_prompting(),
+        "Confirmation must not use the bottom prompt line"
     );
 
-    // Cancel the prompt with Escape.
+    // Keys the Search/Replace panel would act on stay in the modal dialog:
+    // Alt+R must not flip the panel's Regex toggle behind it.
+    harness
+        .send_key(KeyCode::Char('r'), KeyModifiers::ALT)
+        .unwrap();
+    harness.render().unwrap();
+    assert!(
+        harness.screen_to_string().contains("[ ] Regex"),
+        "Alt+R reached the panel behind the modal dialog. Screen:\n{}",
+        harness.screen_to_string()
+    );
+
+    // Cancel the dialog with Escape.
     harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
-    harness.wait_for_prompt_closed().unwrap();
+    wait_for_confirm_dialog_closed(&mut harness);
     harness
         .wait_until(|h| h.screen_to_string().contains("Replacement cancelled"))
         .unwrap();
@@ -2468,12 +2824,7 @@ fn test_search_replace_click_opens_match() {
         .wait_until(|h| h.screen_to_string().contains("Search:"))
         .unwrap();
     harness.type_text("hello").unwrap();
-    harness
-        .wait_until_stable(|h| {
-            let s = h.screen_to_string();
-            s.contains("alpha.txt:1") && s.contains("beta.txt")
-        })
-        .unwrap();
+    wait_for_sorted_hello_results(&mut harness);
 
     // Sanity: the source pane (top rows) shows gamma.txt, not any match.
     let before = harness.screen_to_string();
@@ -2523,12 +2874,7 @@ fn test_search_replace_nav_highlights_selection() {
         .wait_until(|h| h.screen_to_string().contains("Search:"))
         .unwrap();
     harness.type_text("hello").unwrap();
-    harness
-        .wait_until_stable(|h| {
-            let s = h.screen_to_string();
-            s.contains("alpha.txt:1") && s.contains("beta.txt")
-        })
-        .unwrap();
+    wait_for_sorted_hello_results(&mut harness);
 
     // Screen rows of the match leaf rows (they render "…:<line> - hello…").
     let screen = harness.screen_to_string();
@@ -2661,7 +3007,7 @@ fn cursor_sits_on(h: &EditorTestHarness, needle: &str) -> bool {
     match h.get_buffer_content() {
         Some(content) => content
             .get(h.cursor_position()..)
-            .map_or(false, |tail| tail.starts_with(needle)),
+            .is_some_and(|tail| tail.starts_with(needle)),
         None => false,
     }
 }
@@ -2805,6 +3151,67 @@ fn test_search_replace_positions_track_column_edits() {
         .unwrap();
 }
 
+/// An edit to a file with results re-runs the search, so the panel lists what
+/// the file holds now. That re-search must not lose the user's place: stepping
+/// on after it goes to the match after the one they edited, not back to the
+/// first. It used to reset the selection to the top of the list, so stepping
+/// through and editing each match restarted after every edit that outlived the
+/// debounce — and the `positions_track_*` tests above passed only while their
+/// next step beat it.
+#[test]
+fn test_search_replace_stepping_continues_after_an_edit_re_runs_the_search() {
+    init_tracing_from_env();
+    let (_temp_dir, project_root) = setup_search_replace_project();
+
+    fs::write(
+        project_root.join("alpha.txt"),
+        "ZZNEEDLE one\nZZNEEDLE two\nZZNEEDLE three\n",
+    )
+    .unwrap();
+
+    let start_file = project_root.join("alpha.txt");
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(120, 30, Default::default(), project_root)
+            .unwrap();
+    harness.open_file(&start_file).unwrap();
+    harness.render().unwrap();
+
+    open_search_replace_via_palette(&mut harness);
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Search:"))
+        .unwrap();
+    harness.type_text("ZZNEEDLE").unwrap();
+    harness
+        .wait_until_stable(|h| h.screen_to_string().contains("alpha.txt:3"))
+        .unwrap();
+
+    // Step onto the first match and edit in front of it.
+    harness
+        .send_key(KeyCode::Right, KeyModifiers::CONTROL | KeyModifiers::ALT)
+        .unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Ln 1, Col 1"))
+        .unwrap();
+    harness.type_text("xx").unwrap();
+
+    // The re-search has landed: its row shows the edited line, and it has
+    // replaced the step's "Match 1/3" with its own count.
+    harness
+        .wait_until(|h| {
+            let s = h.screen_to_string();
+            s.contains("alpha.txt:1 - xxZZNEEDLE one") && s.contains("Found 3 matches")
+        })
+        .unwrap();
+
+    // The next step goes on to the second match.
+    harness
+        .send_key(KeyCode::Right, KeyModifiers::CONTROL | KeyModifiers::ALT)
+        .unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Ln 2, Col 1"))
+        .unwrap();
+}
+
 /// Issue #2583, the case the event-hook approach could not cover: **bulk**
 /// edits — multi-cursor typing, paste-over, type-over-selection,
 /// query-replace, LSP code-action rewrites — apply as a single `BulkEdit`
@@ -2914,9 +3321,11 @@ fn test_search_results_grow_with_the_panel_on_resize() {
     open_search_replace_via_palette(&mut harness);
     harness.type_text("NEEDLE_MARKER").unwrap();
 
-    // The tree is windowing (40 matches, a panel that fits a handful).
+    // The tree is windowing (40 matches, a panel that fits a handful). Wait
+    // for the whole search: the open file is searched first, so its single
+    // match can be on screen while the other 39 are still streaming in.
     harness
-        .wait_until(|h| h.screen_to_string().matches("NEEDLE_MARKER here").count() >= 2)
+        .wait_until(|h| h.screen_to_string().contains("(40 matches"))
         .unwrap();
     let before = harness
         .screen_to_string()
@@ -2934,4 +3343,1215 @@ fn test_search_results_grow_with_the_panel_on_resize() {
          blank while 40 of them wait to be shown: {before} match rows \
          before the resize, {after} after. Screen:\n{screen}"
     );
+}
+
+/// Issue #1960: a terminal-initiated bracketed paste (right-click /
+/// middle-click / Ctrl+Shift+V) must land in the panel's focused field.
+///
+/// It arrives as a single `Event::Paste`, not as key events, so it never
+/// passes through the widget key routing that makes `Ctrl+V` work here.
+/// Before the fix it fell through to `paste_text`, which targeted the
+/// panel's own read-only widget buffer and refused with "Editing disabled
+/// in this buffer" — nothing reached the field.
+#[test]
+fn test_search_replace_bracketed_paste_reaches_fields() {
+    init_tracing_from_env();
+    let (_temp_dir, project_root) = setup_search_replace_project();
+    create_test_files(&project_root);
+
+    let start_file = project_root.join("gamma.txt");
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        30,
+        Config::default(),
+        project_root.clone(),
+    )
+    .unwrap();
+    harness.open_file(&start_file).unwrap();
+    harness.render().unwrap();
+
+    open_search_replace_via_palette(&mut harness);
+
+    // Search field is focused on open: the paste is the whole pattern.
+    // Wait on either outcome — the text landing, or the refusal the bug
+    // produced — so a regression fails with the screen rather than
+    // hanging on a condition that will never come true.
+    harness.send_paste("hello").unwrap();
+    harness
+        .wait_until(|h| {
+            let s = h.screen_to_string();
+            s.contains("Search: [hello") || s.contains("Editing disabled")
+        })
+        .unwrap();
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("Search: [hello") && !screen.contains("Editing disabled"),
+        "the bracketed paste did not reach the focused search field. \
+         Screen:\n{screen}"
+    );
+    // And it is a real pattern, not just glyphs in a box: the search runs.
+    harness
+        .wait_until_stable(|h| h.screen_to_string().contains("alpha.txt:1"))
+        .unwrap();
+
+    // Same for the Replace field, one Tab away.
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+    harness.send_paste("goodbye").unwrap();
+    harness
+        .wait_until(|h| {
+            let s = h.screen_to_string();
+            s.contains("Replace: [goodbye") || s.contains("Editing disabled")
+        })
+        .unwrap();
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("Replace: [goodbye") && !screen.contains("Editing disabled"),
+        "the bracketed paste did not reach the focused replace field. \
+         Screen:\n{screen}"
+    );
+}
+
+/// The other half of #1960's routing: a bracketed paste belongs to
+/// whatever owns the keyboard, so a panel mounted into a buffer must NOT
+/// take one while a menu (or any other layer) is open over it.
+///
+/// Routing the paste to the panel without asking who owns the keyboard
+/// reintroduces, in mirror image, the bug
+/// `paste_bracketed_into_focused_panel` exists to prevent: text landing
+/// in a field the user cannot see.
+#[test]
+fn test_search_replace_bracketed_paste_declines_under_an_open_menu() {
+    init_tracing_from_env();
+    let (_temp_dir, project_root) = setup_search_replace_project();
+    create_test_files(&project_root);
+
+    let start_file = project_root.join("gamma.txt");
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        30,
+        Config::default(),
+        project_root.clone(),
+    )
+    .unwrap();
+    harness.open_file(&start_file).unwrap();
+    harness.render().unwrap();
+
+    open_search_replace_via_palette(&mut harness);
+    harness.type_text("hello").unwrap();
+    harness
+        .wait_until_stable(|h| h.screen_to_string().contains("Search: [hello"))
+        .unwrap();
+
+    // Alt+F opens the File menu over the panel.
+    harness
+        .send_key(KeyCode::Char('f'), KeyModifiers::ALT)
+        .unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("New File"))
+        .unwrap();
+
+    harness.send_paste("LEAKED").unwrap();
+    // Give the paste every chance to land in the field before asserting
+    // it didn't: drive the plugin round trip the accepting path needs.
+    for _ in 0..8 {
+        harness.tick_and_render().unwrap();
+    }
+    let screen = harness.screen_to_string();
+    assert!(
+        !screen.contains("LEAKED"),
+        "the paste reached the search field behind an open menu. \
+         Screen:\n{screen}"
+    );
+}
+
+/// Issue #1580: a match far along a long line must still be visible in
+/// its result row.
+///
+/// The row used to render the head of the line and truncate, so a match
+/// past the panel's width was never shown — and there is no horizontal
+/// scroll in the results tree to go find it. The window now slides to
+/// bring the match in, marking the elided head with a leading ellipsis.
+#[test]
+fn test_search_replace_long_line_match_is_visible() {
+    init_tracing_from_env();
+    let (_temp_dir, project_root) = setup_search_replace_project();
+
+    // The match sits at column 257 of a 290-column line — well past
+    // anything a 120-column panel can show from the start of the line.
+    let long_line = format!("{}NEEDLE_MARKER{}", "x".repeat(256), "y".repeat(21));
+    assert_eq!(long_line.chars().count(), 290);
+    fs::write(
+        project_root.join("long.txt"),
+        format!("start {long_line}\n"),
+    )
+    .unwrap();
+    // And one past the 512-char cap the plugin applies before any
+    // per-codepoint work: that cap used to be anchored at the start of
+    // the line, so a match beyond it was discarded before the row was
+    // even laid out.
+    let huge_line = format!("{}NEEDLE_MARKER{}", "x".repeat(2000), "y".repeat(1000));
+    fs::write(project_root.join("huge.txt"), format!("{huge_line}\n")).unwrap();
+    // Two matches far apart on one long line: each gets its own row, and
+    // each row must window onto *its own* match rather than both landing
+    // on the first one.
+    let multi_line = format!(
+        "{}NEEDLE_MARKER{}NEEDLE_MARKER{}",
+        "a".repeat(40),
+        "b".repeat(300),
+        "c".repeat(40),
+    );
+    fs::write(project_root.join("multi.txt"), format!("{multi_line}\n")).unwrap();
+    // A short match too, so the ordinary (unwindowed) row is covered by
+    // the same assertion pass.
+    fs::write(project_root.join("short.txt"), "a NEEDLE_MARKER here\n").unwrap();
+
+    let start_file = project_root.join("short.txt");
+    // Tall enough that every file's rows are on screen at once — this
+    // test reads the rows, so none of them may be scrolled off.
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        44,
+        Config::default(),
+        project_root.clone(),
+    )
+    .unwrap();
+    harness.open_file(&start_file).unwrap();
+    harness.render().unwrap();
+
+    open_search_replace_via_palette(&mut harness);
+    harness.type_text("NEEDLE_MARKER").unwrap();
+    wait_for_search_finished(&mut harness);
+    harness
+        .wait_until_stable(|h| h.screen_to_string().contains("long.txt:1"))
+        .unwrap();
+
+    let screen = harness.screen_to_string();
+    let long_row = screen
+        .lines()
+        .find(|l| l.contains("long.txt:1"))
+        .unwrap_or_else(|| panic!("no row for the long-line match. Screen:\n{screen}"))
+        .to_string();
+    assert!(
+        long_row.contains("NEEDLE_MARKER"),
+        "the matched text is not in its own result row — the row shows \
+         the head of the line and truncates before reaching the match, \
+         and nothing scrolls the row horizontally. Row:\n{long_row}\n\
+         Screen:\n{screen}"
+    );
+    let huge_row = screen
+        .lines()
+        .find(|l| l.contains("huge.txt:1"))
+        .unwrap_or_else(|| panic!("no row for the past-the-cap match. Screen:\n{screen}"))
+        .to_string();
+    assert!(
+        huge_row.contains("NEEDLE_MARKER"),
+        "a match past the 512-char context cap is still not shown — the \
+         cap must be anchored on the match, not on the start of the \
+         line. Row:\n{huge_row}\nScreen:\n{screen}"
+    );
+    let multi_rows: Vec<String> = screen
+        .lines()
+        .filter(|l| l.contains("multi.txt:1"))
+        .map(|l| l.to_string())
+        .collect();
+    assert_eq!(
+        multi_rows.len(),
+        2,
+        "expected one row per match on the shared line. Screen:\n{screen}"
+    );
+    assert!(
+        multi_rows.iter().all(|r| r.contains("NEEDLE_MARKER")),
+        "both rows on the shared line must show their match. \
+         Rows:\n{multi_rows:#?}"
+    );
+    assert_ne!(
+        multi_rows[0].trim(),
+        multi_rows[1].trim(),
+        "the two matches on one line must window onto different parts of \
+         it, not both onto the first hit. Rows:\n{multi_rows:#?}"
+    );
+
+    // The short match still renders from the start of its line: the
+    // window only slides when it has to.
+    let short_row = screen
+        .lines()
+        .find(|l| l.contains("short.txt:1"))
+        .unwrap_or_else(|| panic!("no row for the short match. Screen:\n{screen}"))
+        .to_string();
+    assert!(
+        short_row.contains("a NEEDLE_MARKER here"),
+        "a match that already fits must render its line unwindowed. \
+         Row:\n{short_row}"
+    );
+}
+
+/// The same windowing, on lines whose prefix is not ASCII.
+///
+/// `SearchMatch.column` is a UTF-8 *byte* column while the plugin slices
+/// its context in UTF-16 units. On an ASCII line the two coincide, so a
+/// test built only from ASCII fixtures passes while the feature is broken
+/// for a whole class of real files: a CJK prefix inflates the column 3x
+/// and a non-BMP one 2x, sliding the window past the match. The row then
+/// renders the region *after* the match — strictly worse than the
+/// head-truncation the windowing replaced. The column is now a hint that
+/// bounds a search, never a position that is trusted.
+#[test]
+fn test_search_replace_multibyte_prefix_match_is_visible() {
+    init_tracing_from_env();
+    let (_temp_dir, project_root) = setup_search_replace_project();
+
+    // Both lines run past the 512-char context cap, so the match-anchored
+    // cap slice is exercised as well as the display window.
+    for (name, lead) in [("cjk.txt", "漢"), ("emoji.txt", "😀")] {
+        let line = format!(
+            "{}{}NEEDLE_MARKER{}",
+            lead.repeat(200),
+            "x".repeat(900),
+            "y".repeat(900)
+        );
+        fs::write(project_root.join(name), format!("{line}\n")).unwrap();
+    }
+    fs::write(project_root.join("plain.txt"), "a NEEDLE_MARKER here\n").unwrap();
+
+    let start_file = project_root.join("plain.txt");
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        44,
+        Config::default(),
+        project_root.clone(),
+    )
+    .unwrap();
+    harness.open_file(&start_file).unwrap();
+    harness.render().unwrap();
+
+    open_search_replace_via_palette(&mut harness);
+    harness.type_text("NEEDLE_MARKER").unwrap();
+    wait_for_search_finished(&mut harness);
+    harness
+        .wait_until_stable(|h| h.screen_to_string().contains("emoji.txt:1"))
+        .unwrap();
+
+    let screen = harness.screen_to_string();
+    for name in ["cjk.txt", "emoji.txt"] {
+        let row = screen
+            .lines()
+            .find(|l| l.contains(&format!("{name}:1")))
+            .unwrap_or_else(|| panic!("no row for the {name} match. Screen:\n{screen}"))
+            .to_string();
+        assert!(
+            row.contains("NEEDLE_MARKER"),
+            "the match is not shown on a line with a multibyte prefix — \
+             the window must anchor on a hit located in the line itself, \
+             not on arithmetic over a byte column the slicing does not \
+             count in. Row:\n{row}\nScreen:\n{screen}"
+        );
+    }
+}
+
+/// A row shows its own match even when the pattern is regex syntax only
+/// the editor's engine accepts.
+///
+/// The row used to find its match again with JavaScript's `RegExp`, which
+/// throws on Rust-only syntax such as an inline `(?i)`; with no hit to
+/// anchor on, a match far along a long line was cut out of the row. The
+/// row now carries where the search found it, so the window rests on the
+/// match and marks the text cut on its left.
+#[test]
+fn test_search_replace_rust_only_regex_row_shows_its_match() {
+    init_tracing_from_env();
+    let (_temp_dir, project_root) = setup_search_replace_project();
+
+    // Past the 512-char context cap, with the match far along it. The
+    // head carries a distinctive marker: filler alone cannot tell "the
+    // head of the line" apart from "a slice of the filler", which is
+    // exactly how this test first passed against the bug it targets.
+    let long_line = format!(
+        "HEAD_MARKER{}NEEDLE_MARKER{}",
+        "a".repeat(1700),
+        "b".repeat(1700)
+    );
+    fs::write(project_root.join("long.txt"), format!("{long_line}\n")).unwrap();
+
+    let start_file = project_root.join("long.txt");
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        30,
+        Config::default(),
+        project_root.clone(),
+    )
+    .unwrap();
+    harness.open_file(&start_file).unwrap();
+    harness.render().unwrap();
+
+    open_search_replace_via_palette(&mut harness);
+    // Alt+R turns on Regex; the inline `(?i)` flag is valid in the Rust
+    // regex crate and a SyntaxError in JavaScript.
+    harness
+        .send_key(KeyCode::Char('r'), KeyModifiers::ALT)
+        .unwrap();
+    harness.render().unwrap();
+    harness.type_text("(?i)NEEDLE_MARKER").unwrap();
+    wait_for_search_finished(&mut harness);
+    harness
+        .wait_until_stable(|h| h.screen_to_string().contains("long.txt:1"))
+        .unwrap();
+
+    let screen = harness.screen_to_string();
+    let row = screen
+        .lines()
+        .find(|l| l.contains("long.txt:1"))
+        .unwrap_or_else(|| panic!("no row for the long-line match. Screen:\n{screen}"))
+        .to_string();
+    let body = row.split(" - ").nth(1).unwrap_or("").trim();
+    assert!(
+        body.contains("NEEDLE_MARKER"),
+        "the row must show its match, found by a regex JavaScript can't \
+         parse. Row:\n{row}"
+    );
+    assert!(
+        body.starts_with('\u{2026}') && !body.contains("HEAD_MARKER"),
+        "a window resting on a match far along the line must mark the \
+         text cut on its left. Row:\n{row}"
+    );
+}
+
+/// Drive the panel to a state where the results tree has focus and the
+/// selection sits on a match row (not the file row above it).
+///
+/// The panel puts focus on the matches tree once a search settles; `Down`
+/// then moves off the file node onto its first child. Every panning test
+/// starts here, because a pan is addressed to the focused widget.
+fn focus_first_match_row(harness: &mut EditorTestHarness, pattern: &str) {
+    open_search_replace_via_palette(harness);
+    harness.type_text(pattern).unwrap();
+    wait_for_search_finished(harness);
+    harness
+        .wait_until_stable(|h| h.screen_to_string().contains("long.txt:1"))
+        .unwrap();
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+}
+
+/// Press Shift+`code` `n` times, rendering after each — one press is one
+/// pan step, and the steps accumulate.
+fn press_shift(harness: &mut EditorTestHarness, code: KeyCode, n: usize) {
+    for _ in 0..n {
+        harness.send_key(code, KeyModifiers::SHIFT).unwrap();
+        harness.render().unwrap();
+    }
+}
+
+fn row_containing(harness: &EditorTestHarness, needle: &str) -> String {
+    let screen = harness.screen_to_string();
+    screen
+        .lines()
+        .find(|l| l.contains(needle))
+        .unwrap_or_else(|| panic!("no row containing {needle:?}. Screen:\n{screen}"))
+        .to_string()
+}
+
+/// A long line with a distinct marker at each end and the match far along
+/// it, so "which part of the line is on screen" is answerable from the
+/// rendered row alone.
+///
+/// Filler alone cannot distinguish the head of a line from a slice of the
+/// filler — that is how a test on #3154 passed against the bug it targeted —
+/// so each end carries a marker that appears nowhere else.
+fn write_panning_fixture(project_root: &std::path::Path) {
+    let line = format!(
+        "HEADMARK {}NEEDLE_MARKER{}TAILMARK{}",
+        "x".repeat(250),
+        "y".repeat(100),
+        "z".repeat(30),
+    );
+    fs::write(project_root.join("long.txt"), format!("{line}\n")).unwrap();
+    // A short row, to hold the "a row that fits never moves" half.
+    fs::write(project_root.join("short.txt"), "a NEEDLE_MARKER here\n").unwrap();
+}
+
+fn panning_harness(project_root: &std::path::Path) -> EditorTestHarness {
+    // Tall enough that every fixture's rows are on screen at once: these
+    // tests read the rows, so none of them may be scrolled off.
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        44,
+        Config::default(),
+        project_root.to_path_buf(),
+    )
+    .unwrap();
+    harness.open_file(&project_root.join("short.txt")).unwrap();
+    harness.render().unwrap();
+    harness
+}
+
+/// Shift+Left walks back through the head of a long line — the part that no
+/// key could reach before, because the row the host received had already been
+/// cut to the panel's width around the match.
+#[test]
+fn test_search_replace_pan_left_reaches_the_line_head() {
+    init_tracing_from_env();
+    let (_temp_dir, project_root) = setup_search_replace_project();
+    write_panning_fixture(&project_root);
+    let mut harness = panning_harness(&project_root);
+
+    focus_first_match_row(&mut harness, "NEEDLE_MARKER");
+
+    // The premise: at rest the row is windowed onto its match, so the head of
+    // the line is NOT on screen. Without this the test could pass vacuously
+    // on a build that never windowed at all.
+    let rested = row_containing(&harness, "long.txt:1");
+    assert!(
+        rested.contains("NEEDLE_MARKER"),
+        "the row should rest on its own match. Row:\n{rested}"
+    );
+    assert!(
+        !rested.contains("HEADMARK"),
+        "the head of the line should be off screen at rest, or this test \
+         cannot tell panning from doing nothing. Row:\n{rested}"
+    );
+
+    press_shift(&mut harness, KeyCode::Left, 30);
+
+    let panned = row_containing(&harness, "long.txt:1");
+    assert!(
+        panned.contains("HEADMARK"),
+        "Shift+Left did not reach the head of the line. Row:\n{panned}\n\
+         Screen:\n{}",
+        harness.screen_to_string()
+    );
+}
+
+/// Shift+Right runs to the tail, past everything the resting window showed.
+#[test]
+fn test_search_replace_pan_right_reaches_the_line_tail() {
+    init_tracing_from_env();
+    let (_temp_dir, project_root) = setup_search_replace_project();
+    write_panning_fixture(&project_root);
+    let mut harness = panning_harness(&project_root);
+
+    focus_first_match_row(&mut harness, "NEEDLE_MARKER");
+    let rested = row_containing(&harness, "long.txt:1");
+    assert!(
+        !rested.contains("TAILMARK"),
+        "the tail should be off screen at rest. Row:\n{rested}"
+    );
+
+    press_shift(&mut harness, KeyCode::Right, 12);
+
+    let panned = row_containing(&harness, "long.txt:1");
+    assert!(
+        panned.contains("TAILMARK"),
+        "Shift+Right did not reach the tail of the line. Row:\n{panned}\n\
+         Screen:\n{}",
+        harness.screen_to_string()
+    );
+}
+
+/// Shift+Home returns every row to the window its own content asks for, and
+/// Shift+End takes them to their tails.
+#[test]
+fn test_search_replace_pan_home_and_end() {
+    init_tracing_from_env();
+    let (_temp_dir, project_root) = setup_search_replace_project();
+    write_panning_fixture(&project_root);
+    let mut harness = panning_harness(&project_root);
+
+    focus_first_match_row(&mut harness, "NEEDLE_MARKER");
+
+    press_shift(&mut harness, KeyCode::Left, 30);
+    assert!(
+        row_containing(&harness, "long.txt:1").contains("HEADMARK"),
+        "precondition: panned to the head"
+    );
+
+    harness
+        .send_key(KeyCode::Home, KeyModifiers::SHIFT)
+        .unwrap();
+    harness.render().unwrap();
+    let homed = row_containing(&harness, "long.txt:1");
+    assert!(
+        homed.contains("NEEDLE_MARKER") && !homed.contains("HEADMARK"),
+        "Shift+Home should rest the row back on its own match, not on \
+         column zero. Row:\n{homed}"
+    );
+
+    harness.send_key(KeyCode::End, KeyModifiers::SHIFT).unwrap();
+    harness.render().unwrap();
+    let ended = row_containing(&harness, "long.txt:1");
+    assert!(
+        ended.contains("TAILMARK"),
+        "Shift+End should reach the tail. Row:\n{ended}"
+    );
+}
+
+/// Shift+End is walkable back with Shift+Left, in a number of presses the
+/// line's own length explains.
+///
+/// The stored pan is what the *next* keystroke moves from, so "jump to the
+/// end" cannot leave a number no row can reach: it did — `i32::MAX / 4` — and
+/// eight columns a press put the head of the line sixty-seven million presses
+/// away, with `Shift+Home` the only way out.
+#[test]
+fn test_search_replace_pan_end_is_walkable_back() {
+    init_tracing_from_env();
+    let (_temp_dir, project_root) = setup_search_replace_project();
+    write_panning_fixture(&project_root);
+    let mut harness = panning_harness(&project_root);
+
+    focus_first_match_row(&mut harness, "NEEDLE_MARKER");
+    harness.send_key(KeyCode::End, KeyModifiers::SHIFT).unwrap();
+    harness.render().unwrap();
+    assert!(
+        row_containing(&harness, "long.txt:1").contains("TAILMARK"),
+        "precondition: panned to the tail"
+    );
+
+    // **One press, not sixty.** The stored pan is held to what the paint can
+    // honour, so `Shift+End` lands *on* the tail rather than past it and the
+    // very next `Shift+Left` moves the row. Asserting on the first press is
+    // what makes this a test of the bound rather than of arithmetic: an
+    // over-estimate of any size fails here, and the earlier one was 8 presses
+    // wide on this fixture.
+    let ended = row_containing(&harness, "long.txt:1");
+    press_shift(&mut harness, KeyCode::Left, 1);
+    assert_ne!(
+        row_containing(&harness, "long.txt:1"),
+        ended,
+        "the first Shift+Left after Shift+End must move the row; the pan \
+         stored by Shift+End is past anything the row can show. Row:\n{ended}"
+    );
+
+    // And the head is still reachable: the bound is a clamp on the stored
+    // value, not a shorter leash.
+    press_shift(&mut harness, KeyCode::Left, 60);
+    let panned = row_containing(&harness, "long.txt:1");
+    assert!(
+        panned.contains("HEADMARK"),
+        "Shift+Left no longer reaches the head of the line. Row:\n{panned}\n\
+         Screen:\n{}",
+        harness.screen_to_string()
+    );
+}
+
+/// The row's `path:line` is pinned: it is which match the row *is*, and rows
+/// that panned it away could not be told apart.
+///
+/// A row that fits the panel is untouched by the same keystrokes.
+#[test]
+fn test_search_replace_pan_pins_the_location_and_leaves_short_rows_alone() {
+    init_tracing_from_env();
+    let (_temp_dir, project_root) = setup_search_replace_project();
+    write_panning_fixture(&project_root);
+    let mut harness = panning_harness(&project_root);
+
+    focus_first_match_row(&mut harness, "NEEDLE_MARKER");
+    let short_before = row_containing(&harness, "short.txt:1");
+
+    press_shift(&mut harness, KeyCode::Right, 12);
+
+    let long_row = row_containing(&harness, "long.txt:1");
+    assert!(
+        long_row.contains("TAILMARK"),
+        "precondition: the long row panned. Row:\n{long_row}"
+    );
+    // `long.txt:1` is still there — `row_containing` found the row by it —
+    // and it is still at the head of the row rather than somewhere in the
+    // middle of the panned content.
+    let body = long_row.trim_start().trim_start_matches("[v] ");
+    assert!(
+        body.starts_with("long.txt:1"),
+        "the row's location should stay pinned at the head while the \
+         context slides under it. Row:\n{long_row}"
+    );
+
+    assert_eq!(
+        row_containing(&harness, "short.txt:1"),
+        short_before,
+        "a row that fits the panel must not move when the tree pans"
+    );
+}
+
+/// A wide-character row shows its match and stays inside the panel.
+///
+/// This is the case an ASCII-only fixture cannot catch: the width accounting
+/// counted codepoints on both sides while the screen counts columns, so 100
+/// CJK characters measured as 100 and drew as 200 — the row overflowed the
+/// panel and the terminal cut it, taking the match off the right edge. That
+/// is the #1580 symptom, and it survived the row-windowing fix.
+#[test]
+fn test_search_replace_wide_char_row_is_fitted_to_the_panel() {
+    init_tracing_from_env();
+    let (_temp_dir, project_root) = setup_search_replace_project();
+    write_panning_fixture(&project_root);
+    // 60 wide characters are 60 codepoints and **120 columns**. That gap is
+    // the whole test: a budget counted in codepoints sees a match ending at
+    // codepoint 73 and concludes the head of the line fits, so it head-
+    // truncates — putting the match at column 142 of a 120-column panel,
+    // where nothing can be read and nothing could scroll to it. Counted in
+    // columns the row does not fit, so the window slides onto the match.
+    let wide = format!("{}NEEDLE_MARKER{}", "漢".repeat(60), "y".repeat(200));
+    fs::write(project_root.join("wide.txt"), format!("{wide}\n")).unwrap();
+
+    let mut harness = panning_harness(&project_root);
+    focus_first_match_row(&mut harness, "NEEDLE_MARKER");
+
+    let row = row_containing(&harness, "wide.txt:1");
+    assert!(
+        row.contains("NEEDLE_MARKER"),
+        "a match behind a wide-character prefix is not on screen — the row \
+         was measured in codepoints and drawn in columns, so it was built \
+         wider than the panel and cut. Row:\n{row}"
+    );
+    // And the ASCII row beside it is unaffected, so a failure above is about
+    // width accounting rather than about the search.
+    assert!(
+        row_containing(&harness, "long.txt:1").contains("NEEDLE_MARKER"),
+        "control: the ASCII long-line row still shows its match"
+    );
+}
+
+/// Shift+arrows still extend the selection in the panel's own text fields.
+///
+/// This is the reason the pan chord is routed on the focused widget rather
+/// than bound in the panel's mode: mode bindings resolve ahead of the arm
+/// that extends a widget text selection, so a `S-Left` binding would have
+/// taken the chord from the Search field too. Must pass before *and* after.
+#[test]
+fn test_search_replace_shift_arrow_still_selects_in_the_search_field() {
+    init_tracing_from_env();
+    let (_temp_dir, project_root) = setup_search_replace_project();
+    write_panning_fixture(&project_root);
+    let mut harness = panning_harness(&project_root);
+
+    open_search_replace_via_palette(&mut harness);
+    harness.type_text("NEEDLE_MARKER").unwrap();
+    wait_for_search_finished(&mut harness);
+    harness
+        .wait_until_stable(|h| h.screen_to_string().contains("long.txt:1"))
+        .unwrap();
+
+    // Focus is on the Search field: Shift+Left selects, and then typing
+    // replaces the selection — which is what makes the selection observable
+    // on screen without inspecting widget state.
+    let rows_before = row_containing(&harness, "long.txt:1");
+    press_shift(&mut harness, KeyCode::Left, 6);
+    harness.type_text("Z").unwrap();
+    harness.render().unwrap();
+
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("NEEDLE_Z"),
+        "Shift+Left in the Search field should have selected the last six \
+         characters, so typing replaced them. Screen:\n{screen}"
+    );
+    // And the keystrokes went to the field alone: the results tree did not
+    // pan under them. (The rows are re-read from the pre-retype screen, so
+    // this compares like with like.)
+    assert!(
+        !rows_before.contains("TAILMARK"),
+        "precondition: the row was at its resting window. Row:\n{rows_before}"
+    );
+}
+
+/// A pan does not survive a change of subject: a fresh search opens at each
+/// row's resting window rather than wherever the last one was left.
+#[test]
+fn test_search_replace_pan_homes_on_a_new_search() {
+    init_tracing_from_env();
+    let (_temp_dir, project_root) = setup_search_replace_project();
+    write_panning_fixture(&project_root);
+    // A second pattern that also hits the long line, so the row survives the
+    // re-search and the only thing that can differ is where its window rests.
+    let mut harness = panning_harness(&project_root);
+
+    focus_first_match_row(&mut harness, "NEEDLE_MARKER");
+    press_shift(&mut harness, KeyCode::Right, 12);
+    assert!(
+        row_containing(&harness, "long.txt:1").contains("TAILMARK"),
+        "precondition: panned to the tail"
+    );
+
+    // Back to the Search field — the focus ring wraps from the tree to it —
+    // and retype, which replaces the tree's rows.
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+    for _ in 0.."NEEDLE_MARKER".len() {
+        harness
+            .send_key(KeyCode::Backspace, KeyModifiers::NONE)
+            .unwrap();
+    }
+    harness.render().unwrap();
+    harness.type_text("HEADMARK").unwrap();
+    // The status line still carries the *previous* search's "Found N
+    // matches", so waiting on that alone would return before this search has
+    // run. Wait for the field to hold the new pattern, then for its results.
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Search: [HEADMARK"))
+        .unwrap();
+    harness
+        .wait_until_stable(|h| {
+            let s = h.screen_to_string();
+            s.contains("long.txt:1") && !s.contains("short.txt:1")
+        })
+        .unwrap();
+
+    let row = row_containing(&harness, "long.txt:1");
+    assert!(
+        row.contains("HEADMARK") && !row.contains("TAILMARK"),
+        "a new search should open at the new match's resting window, not \
+         where the last search was panned to. Row:\n{row}"
+    );
+}
+
+/// Each window has its own Search/Replace panel (#3704). Opening it in a
+/// second window opens a panel there — before the fix, Alt+A silently
+/// re-ran the search in the first window's panel and drew nothing — and each
+/// window keeps its own query and results across switches.
+#[test]
+fn test_search_replace_panel_is_per_window() {
+    let (temp_dir, project_root) = setup_search_replace_project();
+    create_test_files(&project_root);
+    // A second workspace in a directory of its own (one window per root).
+    let other_root = temp_dir.path().join("other_root");
+    fs::create_dir(&other_root).unwrap();
+    // Canonical, like the harness's own root: on macOS the temp dir is behind
+    // a symlink (/var → /private/var), and a window rooted at the symlinked
+    // path lists an open buffer (canonical path) and its file twice.
+    let other_root = other_root.canonicalize().unwrap();
+    fs::write(
+        other_root.join("other.txt"),
+        "hello from the other window\nsecond line\n",
+    )
+    .unwrap();
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        30,
+        Default::default(),
+        project_root.clone(),
+    )
+    .unwrap();
+    harness.open_file(&project_root.join("alpha.txt")).unwrap();
+    harness.render().unwrap();
+    let window_a = harness.editor().active_window_id();
+
+    // Window A: search for "hello".
+    open_search_replace_via_palette(&mut harness);
+    harness.type_text("hello").unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("4 matches / 3 files"))
+        .unwrap();
+
+    let window_b = harness
+        .editor_mut()
+        .create_window_at(other_root.clone(), "other".to_string());
+    assert_ne!(window_a, window_b);
+    harness.editor_mut().set_active_window(window_b);
+    harness.open_file(&other_root.join("other.txt")).unwrap();
+    harness.render().unwrap();
+    assert!(
+        !harness.screen_to_string().contains("*Search/Replace*"),
+        "window B starts without a panel:\n{}",
+        harness.screen_to_string()
+    );
+
+    // Window B: Alt+A opens B's own panel, and a search runs in B's files.
+    harness
+        .send_key(KeyCode::Char('a'), KeyModifiers::ALT)
+        .unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("*Search/Replace*"))
+        .unwrap();
+    harness.type_text("second").unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("other.txt:2 - second line"))
+        .unwrap();
+
+    // Back in A: A's panel is as it was left, with its own query and results.
+    harness.editor_mut().set_active_window(window_a);
+    harness
+        .wait_until(|h| {
+            let s = h.screen_to_string();
+            s.contains("Search: [hello") && s.contains("4 matches / 3 files")
+        })
+        .unwrap();
+    harness.assert_screen_not_contains("second line");
+
+    // Edit A's query and leave before its search has run: it runs for A, not
+    // for the window the user went to, and A shows it on return.
+    harness.type_text(" again").unwrap();
+    harness.editor_mut().set_active_window(window_b);
+    harness
+        .wait_until(|h| {
+            let s = h.screen_to_string();
+            s.contains("Search: [second") && s.contains("other.txt:2 - second line")
+        })
+        .unwrap();
+    harness.editor_mut().set_active_window(window_a);
+    harness
+        .wait_until(|h| {
+            let s = h.screen_to_string();
+            s.contains("Search: [hello again") && s.contains("1 matches / 1 files")
+        })
+        .unwrap();
+}
+
+/// A search keeps running for its own window's panel while the user works in
+/// another window, and what it finds meanwhile belongs to its window: paths
+/// relative to that window's root, not to the window the user is in (#3704).
+#[test]
+fn test_search_replace_search_continues_in_the_background() {
+    const FILES: usize = 5000;
+    // Result rows show paths with the platform's separator.
+    let sep = std::path::MAIN_SEPARATOR;
+    let (temp_dir, project_root) = setup_search_replace_project();
+    // Enough files that the streaming search spans many pump ticks.
+    let big = project_root.join("big");
+    fs::create_dir(&big).unwrap();
+    for i in 0..FILES {
+        fs::write(big.join(format!("f{i}.txt")), format!("zqxneedle {i}\n")).unwrap();
+    }
+    // Window B's project: as large, so B's own search keeps frames coming
+    // for a good while — the time A's search spends in the background.
+    let other_root = temp_dir.path().join("other_root");
+    fs::create_dir_all(other_root.join("many")).unwrap();
+    // Canonical, like the harness's own root: on macOS the temp dir is behind
+    // a symlink (/var → /private/var), and a window rooted at the symlinked
+    // path lists an open buffer (canonical path) and its file twice.
+    let other_root = other_root.canonicalize().unwrap();
+    let many = other_root.join("many");
+    for i in 0..FILES {
+        fs::write(many.join(format!("g{i}.txt")), format!("zqxneedle {i}\n")).unwrap();
+    }
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        30,
+        Default::default(),
+        project_root.clone(),
+    )
+    .unwrap();
+    harness.open_file(&big.join("f0.txt")).unwrap();
+    harness.render().unwrap();
+    let window_a = harness.editor().active_window_id();
+
+    open_search_replace_via_palette(&mut harness);
+    harness.type_text("zqxneedle").unwrap();
+    // Leave as soon as the search has results but before it has all of them.
+    let total = format!("({FILES} matches / {FILES} files)");
+    harness
+        .wait_until(|h| {
+            let s = h.screen_to_string();
+            s.contains(" matches / ") && !s.contains(&total)
+        })
+        .unwrap();
+
+    let window_b = harness
+        .editor_mut()
+        .create_window_at(other_root.clone(), "other".to_string());
+    harness.editor_mut().set_active_window(window_b);
+    harness.open_file(&many.join("g0.txt")).unwrap();
+    harness
+        .send_key(KeyCode::Char('a'), KeyModifiers::ALT)
+        .unwrap();
+    harness.type_text("zqxneedle").unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains(&total))
+        .unwrap();
+    let screen_b = harness.screen_to_string();
+    assert!(
+        !screen_b.contains(&format!("big{sep}")),
+        "B's panel shows only B's files:\n{screen_b}"
+    );
+
+    // Back in A: every match, under paths relative to A's root.
+    harness.editor_mut().set_active_window(window_a);
+    harness
+        .wait_until(|h| h.screen_to_string().contains(&total))
+        .unwrap();
+    let screen = harness.screen_to_string();
+    let abs_prefix = project_root.to_string_lossy().to_string();
+    assert!(
+        !screen.contains(&abs_prefix) && !screen.contains(&format!("many{sep}")),
+        "A's results should be A's files, relative to A's root:\n{screen}"
+    );
+    harness.assert_screen_contains(&format!("big{sep}f0.txt:1 - zqxneedle 0"));
+}
+
+/// In a window whose root is reached through a symlink, a file open in the
+/// editor is searched once, and Replace All rewrites it once (#3720). Open
+/// buffers carry their canonical path while the project walk spells files
+/// under the root as given; before the fix the two never matched, the open
+/// file was listed twice, and Replace All applied its edits twice, the second
+/// time at offsets the first had moved, corrupting the file.
+#[cfg(unix)]
+#[test]
+fn test_search_replace_window_root_through_a_symlink() {
+    let (temp_dir, project_root) = setup_search_replace_project();
+    let real = temp_dir.path().join("real");
+    fs::create_dir(&real).unwrap();
+    fs::write(real.join("a.txt"), "needle here\n").unwrap();
+    fs::write(real.join("b.txt"), "needle too\n").unwrap();
+    let link = temp_dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(120, 30, Default::default(), project_root)
+            .unwrap();
+    // A window at the symlinked path, as `createWindow` makes one.
+    let window = harness
+        .editor_mut()
+        .create_window_at(link.clone(), "link".to_string());
+    harness.editor_mut().set_active_window(window);
+    harness.open_file(&link.join("a.txt")).unwrap();
+    harness.render().unwrap();
+
+    open_search_replace_via_palette(&mut harness);
+    harness.type_text("needle").unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("(2 matches / 2 files)"))
+        .unwrap();
+    // The open file under its project-relative name, not its canonical path.
+    harness.assert_screen_contains("a.txt:1 - needle here");
+    harness.assert_screen_not_contains(&real.to_string_lossy());
+
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+    harness.type_text("PIN").unwrap();
+    harness.send_key(KeyCode::Enter, KeyModifiers::ALT).unwrap();
+    harness
+        .wait_until(|h| {
+            h.screen_to_string()
+                .contains("Replace 2 match(es) in 2 file(s)?")
+        })
+        .unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .wait_until(|h| {
+            h.screen_to_string()
+                .contains("Replaced 2 occurrences in 2 files")
+        })
+        .unwrap();
+    assert_eq!(fs::read_to_string(real.join("b.txt")).unwrap(), "PIN too\n");
+    // a.txt is open: the replace lands in its buffer and is saved.
+    harness
+        .wait_until(|_| fs::read_to_string(real.join("a.txt")).unwrap() == "PIN here\n")
+        .unwrap();
+}
+
+/// An open file with unsaved changes, in a window rooted through a symlink,
+/// is searched once, as it is in the buffer, and listed under its
+/// project-relative name like every other file (#3720).
+#[cfg(unix)]
+#[test]
+fn test_search_replace_modified_buffer_under_a_symlinked_root() {
+    let (temp_dir, project_root) = setup_search_replace_project();
+    let real = temp_dir.path().join("real");
+    fs::create_dir(&real).unwrap();
+    fs::write(real.join("a.txt"), "needle here\n").unwrap();
+    fs::write(real.join("b.txt"), "needle too\n").unwrap();
+    let link = temp_dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(120, 30, Default::default(), project_root)
+            .unwrap();
+    let window = harness
+        .editor_mut()
+        .create_window_at(link.clone(), "link".to_string());
+    harness.editor_mut().set_active_window(window);
+    harness.open_file(&link.join("a.txt")).unwrap();
+    // An unsaved second match: only the buffer has it.
+    harness
+        .send_key(KeyCode::End, KeyModifiers::CONTROL)
+        .unwrap();
+    harness.type_text("needle unsaved").unwrap();
+    harness.render().unwrap();
+
+    open_search_replace_via_palette(&mut harness);
+    harness.type_text("needle").unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("(3 matches / 2 files)"))
+        .unwrap();
+    harness.assert_screen_contains("a.txt:2 - needle unsaved");
+    harness.assert_screen_not_contains(&real.to_string_lossy());
+}
+
+/// "Search and Replace in Current File" names its matches as the project
+/// search does in a window rooted through a symlink: by the file's
+/// project-relative name, not its canonical path.
+#[cfg(unix)]
+#[test]
+fn test_search_replace_in_current_file_under_a_symlinked_root() {
+    let (temp_dir, project_root) = setup_search_replace_project();
+    let real = temp_dir.path().join("real");
+    fs::create_dir(&real).unwrap();
+    fs::write(real.join("a.txt"), "needle here\n").unwrap();
+    let link = temp_dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let mut harness =
+        EditorTestHarness::with_config_and_working_dir(120, 30, Default::default(), project_root)
+            .unwrap();
+    let window = harness
+        .editor_mut()
+        .create_window_at(link.clone(), "link".to_string());
+    harness.editor_mut().set_active_window(window);
+    harness.open_file(&link.join("a.txt")).unwrap();
+    harness.render().unwrap();
+
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.wait_for_prompt().unwrap();
+    harness
+        .type_text("Search and Replace in Current File")
+        .unwrap();
+    harness
+        .wait_until(|h| {
+            h.screen_to_string()
+                .contains("Search and Replace in Current File")
+        })
+        .unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("Search:"))
+        .unwrap();
+    harness.type_text("needle").unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("(1 matches / 1 files)"))
+        .unwrap();
+    // The match row, not the canonical `…/real/a.txt:1`.
+    harness.assert_screen_contains("[v] a.txt:1 - needle here");
+}
+
+/// A symlink git tracks is a second name for its target. The project search
+/// lists the file once, under its own name — through two links to a file
+/// outside the project, once too; through a link to a gitignored file,
+/// still — and a tracked link since replaced by a file is searched as that
+/// file. Replace All rewrites each file once,
+/// leaving the links links. Searched under both names, Replace All rewrote
+/// the file twice at offsets the first rewrite had moved.
+#[cfg(unix)]
+#[test]
+fn test_search_replace_tracked_symlinks_are_searched_once() {
+    let (temp_dir, project_root) = setup_search_replace_project();
+    fs::write(
+        project_root.join("real.txt"),
+        "zqxneedle here\nmore zqxneedle\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("real.txt", project_root.join("link.txt")).unwrap();
+    let outside = temp_dir.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("o.txt"), "zqxneedle outside\n").unwrap();
+    for name in ["out1.txt", "out2.txt"] {
+        std::os::unix::fs::symlink(outside.join("o.txt"), project_root.join(name)).unwrap();
+    }
+    // A link to a file the listing leaves out (gitignored): the link is
+    // the only way the search reaches it.
+    fs::write(project_root.join(".gitignore"), "*.log\n").unwrap();
+    fs::write(project_root.join("secret.log"), "zqxneedle ignored\n").unwrap();
+    std::os::unix::fs::symlink("secret.log", project_root.join("to_ignored.txt")).unwrap();
+    // A tracked link replaced by a file, not yet staged: the index still
+    // says link.
+    std::os::unix::fs::symlink("real.txt", project_root.join("was_link.txt")).unwrap();
+    for args in [&["init", "-q"][..], &["add", "-A"][..]] {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(&project_root)
+            .status()
+            .unwrap()
+            .success());
+    }
+    fs::remove_file(project_root.join("was_link.txt")).unwrap();
+    fs::write(project_root.join("was_link.txt"), "zqxneedle now a file\n").unwrap();
+
+    // Tall enough for all four result groups at once: the negative assertion
+    // below is about the whole result set, and a window that can only show
+    // part of it makes "not on screen" mean "not scrolled into view yet".
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        44,
+        Default::default(),
+        project_root.clone(),
+    )
+    .unwrap();
+    harness.render().unwrap();
+
+    open_search_replace_via_palette(&mut harness);
+    harness.type_text("zqxneedle").unwrap();
+    // The count reaches "5 / 4" while the list is still arriving group by
+    // group, so wait for the rows to stop changing as well: the negative
+    // assertion below is about the whole result set, and asserting it
+    // against a half-drawn list is a race (CONTRIBUTING.md Testing §3).
+    //
+    // Stability rather than naming each expected row, because one of the
+    // four files lies outside the project and is listed by absolute path.
+    // That path is as long as the temp dir holding it, so on a 120-column
+    // screen it truncates — and matching its text would quietly make this
+    // wait depend on `$TMPDIR`, which is short on Linux and
+    // `/var/folders/...` on macOS.
+    harness
+        .wait_until_stable(|h| h.screen_to_string().contains("(5 matches / 4 files)"))
+        .unwrap();
+    // Not vacuous: the results really did render, so the absence asserted
+    // below is an absence from a drawn list.
+    harness
+        .wait_until(|h| h.screen_to_string().contains("real.txt:1 - zqxneedle here"))
+        .unwrap();
+    // `link.txt` points at `real.txt`, which is listed, so the link is never
+    // a result of its own. Anchored on the space that precedes every file
+    // name the list renders: a bare `contains("link.txt")` also matches the
+    // legitimate `was_link.txt` rows, which is what made this assertion pass
+    // or fail depending on how much of the list had been drawn.
+    let screen = harness.screen_to_string();
+    assert!(
+        !screen.contains(" link.txt"),
+        "link.txt is the tracked symlink to real.txt and must not be listed \
+         as a result of its own.\nScreen:\n{screen}"
+    );
+
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+    harness.type_text("PIN").unwrap();
+    harness.send_key(KeyCode::Enter, KeyModifiers::ALT).unwrap();
+    harness
+        .wait_until(|h| {
+            h.screen_to_string()
+                .contains("Replace 5 match(es) in 4 file(s)?")
+        })
+        .unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .wait_until(|h| {
+            h.screen_to_string()
+                .contains("Replaced 5 occurrences in 4 files")
+        })
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(project_root.join("real.txt")).unwrap(),
+        "PIN here\nmore PIN\n"
+    );
+    assert_eq!(
+        fs::read_to_string(outside.join("o.txt")).unwrap(),
+        "PIN outside\n"
+    );
+    assert_eq!(
+        fs::read_to_string(project_root.join("secret.log")).unwrap(),
+        "PIN ignored\n"
+    );
+    assert_eq!(
+        fs::read_to_string(project_root.join("was_link.txt")).unwrap(),
+        "PIN now a file\n"
+    );
+    for name in ["link.txt", "out1.txt", "out2.txt", "to_ignored.txt"] {
+        let meta = fs::symlink_metadata(project_root.join(name)).unwrap();
+        assert!(meta.file_type().is_symlink(), "{name} is still a link");
+    }
 }

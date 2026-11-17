@@ -4,7 +4,7 @@
 // Two blog posts: "editing" (text editing features) and "productivity" (broader features).
 //
 // Usage:
-//   cargo test --package fresh-editor --test e2e_tests blog_showcase_ -- --ignored --nocapture
+//   cargo test --package fresh-editor --test all_tests blog_showcase_ -- --ignored --nocapture
 //   # Then for each generated showcase:
 //   scripts/frames-to-gif.sh docs/blog/editing/multi-cursor
 //   scripts/frames-to-gif.sh docs/blog/editing/search-replace
@@ -12,8 +12,10 @@
 
 use crate::common::blog_showcase::BlogShowcase;
 use crate::common::fixtures::TestFixture;
-use crate::common::git_test_helper::{git_command, DirGuard, GitTestRepo};
+use crate::common::git_test_helper::{git_command, GitTestRepo};
 use crate::common::harness::{copy_plugin, copy_plugin_lib, EditorTestHarness, HarnessOptions};
+#[cfg(feature = "plugins")]
+use crate::common::launch_form::FORM_TITLE;
 use crossterm::event::{KeyCode, KeyModifiers};
 use lsp_types::FoldingRange;
 use std::fs;
@@ -627,9 +629,7 @@ fn blog_showcase_productivity_flash_jump() {
     })
     .unwrap();
     // Two extra renders so the status bar's cursor snapshot catches
-    // up before capture.  (Pre-existing Fresh quirk: the status's
-    // `Ln` value reads from a cached `primary_cursor_line_number`
-    // that lags one tick behind `setBufferCursor`.)
+    // up before capture.
     h.render().unwrap();
     h.render().unwrap();
     snap(&mut h, &mut s, Some("m"), 700);
@@ -1494,10 +1494,10 @@ fn blog_showcase_fresh_0_2_9_large_file_scanning() {
     snap(&mut h, &mut s, Some("Ctrl+G"), 500);
     hold(&mut h, &mut s, 3, 200);
 
-    // Type "y" to accept the scan
-    h.send_key(KeyCode::Char('y'), KeyModifiers::NONE).unwrap();
+    // Press the Scan button's letter to accept the scan
+    h.send_key(KeyCode::Char('s'), KeyModifiers::NONE).unwrap();
     h.render().unwrap();
-    snap(&mut h, &mut s, Some("y"), 300);
+    snap(&mut h, &mut s, Some("s"), 300);
     h.send_key(KeyCode::Enter, KeyModifiers::NONE).unwrap();
     h.render().unwrap();
     snap(&mut h, &mut s, Some("Enter"), 400);
@@ -3330,7 +3330,7 @@ fn blog_showcase_fresh_0_4_0_ssh_session() {
         "fresh-0.4.0/ssh-session",
         "New SSH Session",
         "Start a remote SSH session from the Orchestrator's New Workspace dialog: \
-         pick the SSH backend and point it at a host. Fresh attaches its \
+         add the host as a machine and launch on it. Fresh attaches its \
          filesystem, terminal, and LSP over the connection, so you can open \
          remote files in buffers — then hop back to a local session through \
          the dock.",
@@ -3355,31 +3355,32 @@ fn blog_showcase_fresh_0_4_0_ssh_session() {
     hold(&mut h, &mut s, 2, 60);
 
     h.send_key(KeyCode::Enter, KeyModifiers::NONE).unwrap();
-    h.wait_until(|h| {
-        h.screen_to_string()
-            .contains("ORCHESTRATOR :: New Workspace")
-    })
-    .unwrap();
+    h.wait_until(|h| h.screen_to_string().contains(FORM_TITLE))
+        .unwrap();
+    crate::common::launch_form::choose_terminal_agent(&mut h);
     snap(&mut h, &mut s, Some("Enter"), 110);
     hold(&mut h, &mut s, 4, 75);
 
-    // --- Switch to the SSH backend by clicking the "Run in: … SSH" tab. -----
-    let (ssh_col, ssh_row) = h
-        .find_text_on_screen("SSH")
-        .expect("the 'Run in:' tab row should offer an SSH backend");
-    snap_mouse(&mut h, &mut s, None, (ssh_col, ssh_row), 100);
-    h.mouse_click(ssh_col, ssh_row).unwrap();
-    h.wait_until(|h| h.screen_to_string().contains("Remote Path"))
+    // --- Add the demo host as a machine: a remote workspace runs only on a
+    //     saved machine, and `+ Add machine…` under the Machine control opens
+    //     Add Machine over the form. -------------------------------------------
+    while !h
+        .screen_to_string()
+        .lines()
+        .any(|l| l.contains("▸ [ + Add machine"))
+    {
+        h.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+        h.render().unwrap();
+        snap(&mut h, &mut s, Some("Tab"), 45);
+    }
+    h.send_key(KeyCode::Enter, KeyModifiers::NONE).unwrap();
+    h.wait_until(|h| h.screen_to_string().contains("┌ Add Machine"))
         .unwrap();
-    snap_mouse(&mut h, &mut s, Some("Click"), (ssh_col, ssh_row), 90);
+    snap(&mut h, &mut s, Some("Enter"), 90);
     hold(&mut h, &mut s, 2, 55);
 
-    // Enter on the already-active SSH tab dives into the first field (Host).
-    h.send_key(KeyCode::Enter, KeyModifiers::NONE).unwrap();
-    h.render().unwrap();
-    snap(&mut h, &mut s, Some("Enter"), 65);
-
-    // --- Host: the fake hostname + the throwaway sshd's port. ---------------
+    // Host (focus starts here; the machine is named by it): the fake
+    // hostname + the throwaway sshd's port.
     let host_value = format!("{}:{}", sup::DEMO_HOST, server.port);
     for ch in host_value.chars() {
         h.send_key(KeyCode::Char(ch), KeyModifiers::NONE).unwrap();
@@ -3390,14 +3391,6 @@ fn blog_showcase_fresh_0_4_0_ssh_session() {
 
     // --- The remaining fields fill in quickly (they're the "plumbing"; the
     //     host is the star). Each lands its whole value in one go. -----------
-    // Remote Path: where the session is rooted on the remote.
-    h.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
-    h.render().unwrap();
-    snap(&mut h, &mut s, Some("Tab"), 45);
-    h.type_text(&server.work.to_string_lossy()).unwrap();
-    h.render().unwrap();
-    snap(&mut h, &mut s, None, 60);
-
     // Identity file: the keypair authorized on the demo sshd.
     h.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
     h.render().unwrap();
@@ -3405,6 +3398,9 @@ fn blog_showcase_fresh_0_4_0_ssh_session() {
     h.type_text(&server.identity.to_string_lossy()).unwrap();
     h.render().unwrap();
     snap(&mut h, &mut s, None, 60);
+    // Past Browse…, beside it.
+    h.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+    h.render().unwrap();
 
     // SSH options: a throwaway known_hosts so the demo leaves no trace in the
     // user's ~/.ssh (and to show the free-form options field).
@@ -3419,19 +3415,30 @@ fn blog_showcase_fresh_0_4_0_ssh_session() {
     h.render().unwrap();
     snap(&mut h, &mut s, None, 60);
 
-    // Session name.
+    // Default path: where a workspace on this machine is rooted.
     h.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
     h.render().unwrap();
     snap(&mut h, &mut s, Some("Tab"), 45);
-    h.type_text("deploy-box").unwrap();
+    h.type_text(&server.work.to_string_lossy()).unwrap();
     h.render().unwrap();
-    snap(&mut h, &mut s, None, 75);
+    snap(&mut h, &mut s, None, 60);
     hold(&mut h, &mut s, 2, 60);
 
-    // --- Submit: click "Create Workspace" (focus follows into the remote). ----
+    // Save: back to the form, on the new machine.
+    h.send_key(KeyCode::Enter, KeyModifiers::CONTROL).unwrap();
+    h.wait_until(|h| {
+        let screen = h.screen_to_string();
+        screen.contains(FORM_TITLE) && screen.contains("[demo-box")
+    })
+    .unwrap();
+    snap(&mut h, &mut s, Some("Ctrl+Enter"), 90);
+    hold(&mut h, &mut s, 2, 60);
+
+    // --- Submit: click "Launch" (focus follows into the remote). -------------
     let (create_col, create_row) = h
-        .find_text_on_screen("Create Workspace")
-        .expect("the form should offer a 'Create Workspace' button");
+        .find_text_on_screen("[ Launch ]")
+        .map(|(c, r)| (c + 3, r))
+        .expect("the form should offer a 'Launch' button");
     snap_mouse(&mut h, &mut s, None, (create_col, create_row), 80);
     h.mouse_click(create_col, create_row).unwrap();
     h.render().unwrap();
@@ -3447,7 +3454,7 @@ fn blog_showcase_fresh_0_4_0_ssh_session() {
     //     wait robust. -------------------------------------------------------
     h.wait_until(|h| {
         let screen = h.screen_to_string();
-        !screen.contains("ORCHESTRATOR :: New Workspace") || screen.contains("Error:")
+        !screen.contains(FORM_TITLE) || screen.contains("Error:")
     })
     .unwrap();
     let screen = h.screen_to_string();
@@ -3702,8 +3709,8 @@ fn blog_showcase_fresh_0_4_0_universal_search() {
         .unwrap();
     snap(&mut h, &mut s, None, 80);
     h.send_key(KeyCode::Enter, KeyModifiers::NONE).unwrap();
-    // The overlay's scope toolbar paints "Search in:".
-    h.wait_until(|h| h.screen_to_string().contains("Search in:"))
+    // The overlay's scope toolbar paints "Scope".
+    h.wait_until(|h| h.screen_to_string().contains("Scope "))
         .unwrap();
     snap(&mut h, &mut s, Some("Enter"), 110);
     hold(&mut h, &mut s, 3, 75);
@@ -4184,8 +4191,7 @@ fn blog_showcase_fresh_0_4_0_live_diff() {
     repo.git_commit("initial");
     repo.setup_live_diff_plugin();
 
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     let mut h = EditorTestHarness::with_config_and_working_dir(
         100,
@@ -4348,7 +4354,7 @@ fn blog_showcase_fresh_0_4_0_review_diff() {
         "Review Diff, Reimagined",
         "A real review workflow: a file sidebar grouped by directory, a true \
          side-by-side OLD/NEW view, and comments anywhere — collected in a \
-         dedicated panel. (Plus Review Stash and a watch mode that auto-reloads \
+         dedicated panel. (Plus Review Diff: Stash and a watch mode that auto-reloads \
          on save.)",
     );
 
@@ -4593,9 +4599,7 @@ fn blog_showcase_fresh_0_4_0_workspace_trust() {
     // build.rs) starts Restricted and raises the full-screen trust prompt.
     let store_path = {
         let editor = h.editor();
-        editor
-            .dir_context()
-            .project_state_dir(&editor.working_dir().to_path_buf())
+        editor.dir_context().project_state_dir(editor.working_dir())
     };
     let store = fresh::services::workspace_trust::TrustStore::for_project_dir(&store_path);
     h.editor()

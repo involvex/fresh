@@ -62,13 +62,17 @@ jobs:
     needs: plan
     if: ${{ needs.plan.outputs.publishing == 'true' }}
     runs-on: ubuntu-22.04
+    # Narrower than the workflow default: this job only builds, so it does not
+    # get the release-publishing grants the jobs below it need.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
 
       - name: Install Nix
-        uses: cachix/install-nix-action@v31
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
         with:
           nix_path: nixpkgs=channel:nixos-unstable
 
@@ -120,7 +124,7 @@ jobs:
           submodules: recursive
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
         with:
           targets: ${{ matrix.target }}
 
@@ -158,7 +162,11 @@ jobs:
           fi
           # Default features include embed-plugins; plugins (and themes via build.rs)
           # are compiled into the binary, so we ship a single self-contained executable.
-          cargo build --release --target ${{ matrix.target }}
+          # `web` is NOT default (it embeds the browser UI and the sha1
+          # WebSocket-handshake dep), so name it: these archives are what the
+          # AUR -bin package, the Homebrew formula and the npm package install,
+          # and without it every one of them rejects `--web` (#3316).
+          cargo build --release --features web --target ${{ matrix.target }}
 
       # Checks the artifact rather than trusting the build flag above: a
       # released binary must load nothing but the OS's own libraries, or it
@@ -278,6 +286,17 @@ jobs:
     uses: ./.github/workflows/linux-packages.yml
     secrets: inherit
 
+  # The Debian-archive build (packaging/debian): built on debian:testing from
+  # Debian's own crates, QuickJS and esbuild, so it installs on Debian
+  # testing/unstable only. Attached under its own names beside the main .deb;
+  # a failure here does not stop the release (see `release`).
+  build-debian-testing:
+    needs: [plan]
+    if: ${{ needs.plan.outputs.publishing == 'true' }}
+    uses: ./.github/workflows/debian-package.yml
+    with:
+      release: true
+
   # Build Flatpak bundle
   build-flatpak:
     needs: [plan, build]
@@ -295,6 +314,21 @@ jobs:
     with:
       version: ${{ needs.plan.outputs.version }}
     secrets: inherit
+
+  # Build Fresh Desktop (the web UI as a standalone Electron app with the
+  # editor bundled) from the release binaries above.
+  build-desktop:
+    needs: [plan, build]
+    if: ${{ needs.plan.outputs.publishing == 'true' }}
+    # actions: read lets desktop-builds.yml's job declare it (a called
+    # workflow can only narrow its caller's token); it uses it only when run
+    # by hand against another run's binaries.
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/desktop-builds.yml
+    with:
+      version: ${{ needs.plan.outputs.version }}
 
   # Build AppImage
   build-appimage:
@@ -384,7 +418,7 @@ jobs:
             desc "A modern terminal-based text editor with plugin support"
             homepage "https://github.com/sinelaw/fresh"
             version "${VERSION}"
-            license "Apache-2.0"
+            license "GPL-3.0-or-later"
 
             on_macos do
               on_intel do
@@ -445,11 +479,32 @@ jobs:
           path: fresh.rb
 
   # Create GitHub Release
-  # Only runs if ALL needed jobs succeed - uses !cancelled() to run after all jobs complete,
-  # then !failure() ensures none failed
+  # Runs after all needed jobs complete (!cancelled()), and only if none of them
+  # failed, except build-debian-testing: its packages are attached when it
+  # builds, but it builds against Debian testing as it is that day, so a
+  # transition there must not hold up the release.
+  #
+  # Every job downstream of this one gates on its direct needs' results, never
+  # on the bare status functions: `failure()` (and the implicit `success()`)
+  # look at all ancestors, so a build-debian-testing failure would otherwise
+  # skip verification, promotion and publishing even though the release ran.
   release:
-    needs: [plan, build, build-freebsd, build-musl, build-min-size, build-linux-packages, build-flatpak, build-appimage, build-gui, build-npm-package, build-homebrew-formula, test-nix-build]
-    if: ${{ !cancelled() && !failure() && needs.plan.outputs.publishing == 'true' }}
+    needs: [plan, build, build-freebsd, build-musl, build-min-size, build-linux-packages, build-debian-testing, build-flatpak, build-appimage, build-gui, build-desktop, build-npm-package, build-homebrew-formula, test-nix-build]
+    if: >-
+      ${{ !cancelled() && needs.plan.outputs.publishing == 'true'
+      && needs.plan.result != 'failure'
+      && needs.build.result != 'failure'
+      && needs.build-freebsd.result != 'failure'
+      && needs.build-musl.result != 'failure'
+      && needs.build-min-size.result != 'failure'
+      && needs.build-linux-packages.result != 'failure'
+      && needs.build-flatpak.result != 'failure'
+      && needs.build-appimage.result != 'failure'
+      && needs.build-gui.result != 'failure'
+      && needs.build-desktop.result != 'failure'
+      && needs.build-npm-package.result != 'failure'
+      && needs.build-homebrew-formula.result != 'failure'
+      && needs.test-nix-build.result != 'failure' }}
     runs-on: ubuntu-22.04
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -537,6 +592,8 @@ jobs:
             artifacts/*.AppImage artifacts/*.AppImage.sha256
             artifacts/*.pkg artifacts/*.pkg.sha256
             artifacts/fresh-gui-*.exe artifacts/fresh-gui-*.exe.sha256
+            artifacts/fresh-desktop-*.exe artifacts/fresh-desktop-*.exe.sha256
+            artifacts/*.dmg artifacts/*.dmg.sha256
             artifacts/fresh.rb
           )
           [ "${#assets[@]}" -gt 0 ] || { echo "no artifacts to upload"; exit 1; }
@@ -587,7 +644,7 @@ jobs:
   # otherwise surface as a broken update on a user's machine.
   verify-release:
     needs: [plan, release]
-    if: ${{ !cancelled() && !failure() && needs.plan.outputs.publishing == 'true' }}
+    if: ${{ !cancelled() && needs.release.result == 'success' && needs.plan.outputs.publishing == 'true' }}
     runs-on: ubuntu-22.04
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -605,7 +662,7 @@ jobs:
   # attestation gate live. A release that fails here is never promoted.
   rehearse-update:
     needs: [plan, release]
-    if: ${{ !cancelled() && !failure() && needs.plan.outputs.publishing == 'true' }}
+    if: ${{ !cancelled() && needs.release.result == 'success' && needs.plan.outputs.publishing == 'true' }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
@@ -627,7 +684,7 @@ jobs:
   # the swap runs downwards, which exercises the same path.
   verify-shipped-updater:
     needs: [plan, release]
-    if: ${{ !cancelled() && !failure() && needs.plan.outputs.publishing == 'true' }}
+    if: ${{ !cancelled() && needs.release.result == 'success' && needs.plan.outputs.publishing == 'true' }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
@@ -650,7 +707,13 @@ jobs:
   # prevent.
   promote:
     needs: [plan, release, verify-release, rehearse-update, verify-shipped-updater]
-    if: ${{ needs.plan.outputs.publishing == 'true' && needs.plan.outputs.is_prerelease != 'true' }}
+    if: >-
+      ${{ !cancelled() && needs.plan.outputs.publishing == 'true'
+      && needs.plan.outputs.is_prerelease != 'true'
+      && needs.release.result == 'success'
+      && needs.verify-release.result == 'success'
+      && needs.rehearse-update.result == 'success'
+      && needs.verify-shipped-updater.result == 'success' }}
     runs-on: ubuntu-22.04
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -674,6 +737,12 @@ jobs:
           }
           echo "$TAG is now the latest release."
 
+      # An earlier attempt of this run may have failed and marked the release
+      # "do not install". This one passed, so that has to come off with the
+      # promotion rather than by hand -- v0.5.1 shipped still wearing it.
+      - name: Take back a failed-validation notice
+        run: python3 scripts/validation-notice.py strip "$TAG"
+
   # A release that fails validation cannot be withdrawn: immutable releases lock
   # the tag and freeze the assets, so there is nothing to delete and nothing to
   # fix in place. What is left is to say so, on the release itself, rather than
@@ -693,30 +762,17 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAG: ${{ needs.plan.outputs.tag }}
-      VERSION: ${{ needs.plan.outputs.version }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - uses: actions/checkout@v6
 
       - name: Say on the release that it failed validation
-        run: |
-          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          gh release view "$TAG" --json body -q .body > body.md
-          {
-            echo "> [!CAUTION]"
-            echo "> **This release failed its own validation and must not be installed.**"
-            echo "> It remains a pre-release: \`fresh\` will not offer it, and the latest"
-            echo "> release is unchanged. See [the run that rejected it]($run_url)."
-            echo
-            cat body.md
-          } > annotated.md
-          gh release edit "$TAG" \
-            --title "fresh-editor ${VERSION} — FAILED VALIDATION, do not install" \
-            --notes-file annotated.md
+        run: python3 scripts/validation-notice.py add "$TAG" "$RUN_URL"
 
   # Publish to Homebrew tap
   publish-homebrew:
     needs: [plan, promote]
-    if: ${{ needs.plan.outputs.publishing == 'true' }}
+    if: ${{ !cancelled() && needs.promote.result == 'success' && needs.plan.outputs.publishing == 'true' }}
     runs-on: ubuntu-22.04
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -745,69 +801,49 @@ jobs:
           git push
 
   # Publish to npm
+  # npm only accepts a trusted (OIDC) publish from the workflow file named in
+  # the package's trusted-publisher settings on npmjs.com: release-npm.yml.
+  # Publishing from a job here fails with ENEEDAUTH, so this starts that
+  # workflow on the release tag, as a run of its own, and waits for it.
   publish-npm:
     needs: [plan, promote]
-    if: ${{ needs.plan.outputs.publishing == 'true' }}
+    if: ${{ !cancelled() && needs.promote.result == 'success' && needs.plan.outputs.publishing == 'true' }}
     runs-on: ubuntu-22.04
     permissions:
+      actions: write
       contents: read
-      id-token: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Determine version
-        id: version
+      - name: Run release-npm.yml on the release tag
         run: |
-          if [ -n "${{ needs.plan.outputs.version }}" ]; then
-            VERSION="${{ needs.plan.outputs.version }}"
-          else
-            VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          # A little early, in case the runner's clock is ahead of GitHub's.
+          since=$(date -u -d '-30 seconds' +%Y-%m-%dT%H:%M:%SZ)
+          gh workflow run release-npm.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG" -f version="$VERSION"
+          # `gh workflow run` does not say which run it started: take the
+          # first dispatch of this workflow on the tag since then.
+          run_id=
+          for _ in $(seq 30); do
+            sleep 10
+            run_id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow release-npm.yml \
+              --event workflow_dispatch --branch "$TAG" --limit 10 \
+              --json databaseId,createdAt \
+              --jq "[.[] | select(.createdAt >= \"$since\")] | sort_by(.createdAt) | first | .databaseId // empty")
+            [ -n "$run_id" ] && break
+          done
+          if [ -z "$run_id" ]; then
+            echo "::error::release-npm.yml did not start"
+            exit 1
           fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Publishing npm package for version: $VERSION"
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: '24'
-
-      - name: Update npm
-        run: npm install -g npm@latest
-
-      - name: Create npm package
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          # Copy JS files from npm-package template
-          mkdir -p dist-npm
-          cp crates/fresh-editor/npm-package/*.js dist-npm/
-
-          # Create package.json from template with version
-          sed "s/VERSION_PLACEHOLDER/${VERSION}/g" crates/fresh-editor/npm-package/package.json.template > dist-npm/package.json
-
-          # Copy supporting files. Plugins/themes are embedded in the binary.
-          cp README.md LICENSE CHANGELOG.md dist-npm/
-
-          # Create the tarball
-          cd dist-npm
-          npm pack
-          mv *.tgz ../fresh-editor-npm-package.tar.gz
-          cd ..
-
-          echo "Created npm package:"
-          ls -la fresh-editor-npm-package.tar.gz
-
-      - name: Publish to npm with provenance (OIDC)
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          echo "Publishing npm package for version ${VERSION}"
-          npm publish --access public --provenance ./fresh-editor-npm-package.tar.gz
+          echo "release-npm.yml run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run_id"
+          gh run watch "$run_id" --repo "$GITHUB_REPOSITORY" --exit-status --interval 15
 
   # Publish to AUR
   publish-aur:
     needs: [plan, promote]
-    if: ${{ needs.plan.outputs.publishing == 'true' }}
+    if: ${{ !cancelled() && needs.promote.result == 'success' && needs.plan.outputs.publishing == 'true' }}
     uses: ./.github/workflows/aur-publish.yml
     with:
       version: ${{ needs.plan.outputs.version }}
@@ -816,14 +852,14 @@ jobs:
   # Publish to crates.io
   publish-cargo:
     needs: [plan, promote]
-    if: ${{ needs.plan.outputs.publishing == 'true' }}
+    if: ${{ !cancelled() && needs.promote.result == 'success' && needs.plan.outputs.publishing == 'true' }}
     uses: ./.github/workflows/cargo-publish.yml
     secrets: inherit
 
   # Publish to winget-pkgs
   publish-winget:
     needs: [plan, promote]
-    if: ${{ needs.plan.outputs.publishing == 'true' }}
+    if: ${{ !cancelled() && needs.promote.result == 'success' && needs.plan.outputs.publishing == 'true' }}
     uses: ./.github/workflows/winget-publish.yml
     with:
       version: ${{ needs.plan.outputs.version }}

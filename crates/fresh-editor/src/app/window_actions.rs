@@ -58,6 +58,7 @@ impl crate::app::Editor {
             )),
             local_filesystem: std::sync::Arc::clone(&self.local_filesystem),
             buffer_id_alloc: self.buffer_id_alloc.clone(),
+            terminal_id_alloc: self.terminal_id_alloc.clone(),
             time_source: std::sync::Arc::clone(&self.time_source),
             dir_context: self.dir_context.clone(),
             tokio_runtime: self.tokio_runtime.clone(),
@@ -89,6 +90,48 @@ impl crate::app::Editor {
             .map(|(id, _)| *id)
     }
 
+    /// Attach `connection` to the project at `root` and make it the active
+    /// window. A window already at `root` is re-pointed in place and keeps its
+    /// buffers and layout; otherwise a new window opens. Other windows keep
+    /// the machines they were on.
+    pub(crate) fn attach_connection_at(
+        &mut self,
+        connection: std::sync::Arc<crate::services::authority::Connection>,
+        root: PathBuf,
+    ) -> WindowId {
+        let root = root.canonicalize().unwrap_or(root);
+        // Prefer the active window: several windows can share a root, and
+        // `find_window_by_root` would pick whichever comes first.
+        let here = self.active_window;
+        let at_root = |editor: &Self, id: fresh_core::WindowId| {
+            editor.windows.get(&id).is_some_and(|w| {
+                crate::app::orchestrator_persistence::canonical_key(&w.root)
+                    == crate::app::orchestrator_persistence::canonical_key(&root)
+            })
+        };
+        let target = if at_root(self, here) {
+            Some(here)
+        } else {
+            self.find_window_by_root(&root)
+        };
+        let Some(existing) = target else {
+            let label = root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| root.to_string_lossy().into_owned());
+            let id = self.create_window_with_authority(root, label, connection);
+            self.set_active_window(id);
+            return id;
+        };
+        self.set_session_connection(existing, connection);
+        // Its terminals are still on the machine it just left; move them.
+        self.move_window_terminals_to_its_authority(existing);
+        if self.active_window != existing {
+            self.set_active_window(existing);
+        }
+        existing
+    }
+
     /// Open the window for `root`, creating it if absent. Enforces
     /// one-session-per-directory: if a window already exists at the
     /// same canonical root it is returned as-is and `label` is
@@ -102,6 +145,10 @@ impl crate::app::Editor {
     /// cross-window render (e.g. the Orchestrator preview pane's
     /// `WindowEmbed`) draws blank.
     pub fn create_window_at(&mut self, root: PathBuf, label: String) -> WindowId {
+        self.mark_plugin_snapshot_dirty();
+        // The dedup below has to see a persisted workspace for `root` even
+        // when the registry has not been read yet.
+        self.ensure_all_workspaces_loaded();
         // One session per directory: reuse an existing window at this
         // root instead of spawning a colliding duplicate.
         if let Some(existing) = self.find_window_by_root(&root) {
@@ -112,7 +159,13 @@ impl crate::app::Editor {
         // session's authority/trust (which would leak a trust decision across
         // projects). Its `fs_manager` rides the same (host) filesystem.
         let local_authority = self.local_session_authority(&root);
-        self.create_window_with_authority(root, label, local_authority)
+        self.create_window_with_authority(
+            root,
+            label,
+            std::sync::Arc::new(crate::services::authority::Connection::plain(
+                local_authority,
+            )),
+        )
     }
 
     /// Number of live windows whose canonical root matches `root` — the size
@@ -162,7 +215,11 @@ impl crate::app::Editor {
         // per-session trust/env). For a local source that IS the final backend;
         // for a remote source it is a placeholder the reconnect re-points.
         let authority = self.local_session_authority(&root);
-        let id = self.create_window_with_authority(root, label, authority);
+        let id = self.create_window_with_authority(
+            root,
+            label,
+            std::sync::Arc::new(crate::services::authority::Connection::plain(authority)),
+        );
         if let Some(w) = self.windows.get_mut(&id) {
             w.authority_spec = spec;
         }
@@ -215,16 +272,20 @@ impl crate::app::Editor {
         &mut self,
         root: PathBuf,
         label: String,
-        authority: crate::services::authority::Authority,
+        connection: std::sync::Arc<crate::services::authority::Connection>,
     ) -> WindowId {
+        // Window ids are allocated past every workspace, and a new window's
+        // root may already have one on disk: read the registry first.
+        self.ensure_all_workspaces_loaded();
+        let connection = self.adopt_connection(connection);
         let id = WindowId(self.next_window_id);
         self.next_window_id += 1;
 
         let mut resources = self.window_resources();
         resources.fs_manager = std::sync::Arc::new(crate::services::fs::FsManager::new(
-            std::sync::Arc::clone(&authority.filesystem),
+            std::sync::Arc::clone(&connection.authority.filesystem),
         ));
-        let mut session = Window::new(id, label, root.clone(), authority, resources);
+        let mut session = Window::new(id, label, root.clone(), connection, resources);
         session.terminal_width = self.terminal_width;
         session.terminal_height = self.terminal_height;
         let resolved_label = session.label.clone();
@@ -355,7 +416,7 @@ impl crate::app::Editor {
         cwd: Option<PathBuf>,
         command: Option<Vec<String>>,
         title: Option<String>,
-        window_authority: crate::services::authority::Authority,
+        connection: std::sync::Arc<crate::services::authority::Connection>,
         resume: Option<Vec<String>>,
         env: Option<HashMap<String, String>>,
         allow_script: bool,
@@ -379,15 +440,16 @@ impl crate::app::Editor {
         // whether the active authority actually changed and skip the
         // hook/snapshot churn when it didn't.
         let previous_authority_label = self.authority().display_label.clone();
+        let connection = self.adopt_connection(connection);
 
         let mut resources = self.window_resources();
         // Re-derive the window's `fs_manager` from *its* backend's filesystem
         // so the file explorer rides this session's backend, then build the
         // window owning `window_authority` outright.
         resources.fs_manager = std::sync::Arc::new(crate::services::fs::FsManager::new(
-            std::sync::Arc::clone(&window_authority.filesystem),
+            std::sync::Arc::clone(&connection.authority.filesystem),
         ));
-        let mut session = Window::new(id, label, root.clone(), window_authority, resources);
+        let mut session = Window::new(id, label, root.clone(), connection, resources);
         session.terminal_width = self.terminal_width;
         session.terminal_height = self.terminal_height;
         // Drop the placeholder now — everything above that reads through the
@@ -395,6 +457,9 @@ impl crate::app::Editor {
         // breath, so `active_window` is never left pointing at nothing.
         let adopted = adopt_id.and_then(|id| {
             self.preparing_windows.remove(&id);
+            // The placeholder's id stops existing here — the real window takes
+            // a new one — so the placeholder's scope is dead, not dormant.
+            self.forget_window_ui_state(id);
             self.windows.remove(&id).map(|w| (id, w))
         });
         if let Some((_, placeholder)) = &adopted {
@@ -487,6 +552,9 @@ impl crate::app::Editor {
                 // message — rather than vanishing out from under the user
                 // who is sitting in it.
                 self.windows.remove(&id);
+                // The half-built window's id is dead too — nothing will ever
+                // be described under it again.
+                self.forget_window_ui_state(id);
                 if let Some((placeholder_id, placeholder)) = adopted {
                     self.windows.insert(placeholder_id, placeholder);
                     self.preparing_windows.insert(
@@ -517,16 +585,6 @@ impl crate::app::Editor {
             // to drive the editor.
             target.record_terminal_script_token(terminal_id, &terminal_env);
         }
-
-        // The switch has now committed (the spawn succeeded and the active
-        // pointer stays on the new window). This path wrote `active_window`
-        // directly above, bypassing `set_active_window` — so mirror its
-        // guard here, or a panel-scoped mode set on the window we switched
-        // away from (e.g. the New-Session form's `orchestrator-new-form`,
-        // still mounted during a born-attached SSH/K8s attach) is left
-        // stranded and silently swallows all of that window's buffer input.
-        // See #2237 / #2234 item 4.
-        self.clear_panel_scoped_mode_on_switch_away(previous_id);
 
         // Adopt the new active window's authority into the editor-wide
         // caches (`self.authority`, quick-open, the `authority_changed`
@@ -581,22 +639,9 @@ impl crate::app::Editor {
                 root: root.to_string_lossy().into_owned(),
             },
         );
-        if previous_id != id {
-            self.plugin_manager.read().unwrap().run_hook(
-                "active_window_changed",
-                HookArgs::ActiveWindowChanged {
-                    previous_id: Some(previous_id.0),
-                    active_id: id.0,
-                },
-            );
-        }
-        #[cfg(feature = "plugins")]
-        self.update_plugin_state_snapshot();
-        #[cfg(feature = "plugins")]
-        self.plugin_manager.read().unwrap().run_hook(
-            "buffer_activated",
-            crate::services::plugins::hooks::HookArgs::BufferActivated { buffer_id },
-        );
+        // `active_window_changed` (when the dive changed windows) and
+        // `buffer_activated` for the seed buffer, from the announcer.
+        self.announce_focus();
 
         // Seeding the terminal dives into the new window. For an *adopted*
         // one that dive is only mechanical: focus was already settled when
@@ -610,40 +655,6 @@ impl crate::app::Editor {
         }
 
         Ok((id, terminal_id, buffer_id))
-    }
-
-    /// Clear a floating-panel-scoped editor mode on the window we are
-    /// switching *away* from.
-    ///
-    /// A plugin-defined editor mode (`editor.setEditorMode`) tied to a mounted
-    /// floating widget panel — the Orchestrator picker (`orchestrator-open`) or
-    /// new-session form (`orchestrator-new-form`) — is transient UI state that
-    /// belongs to the *panel*, not to the window it was opened over.
-    /// `setEditorMode` writes to whatever window is active when the plugin
-    /// calls it, so a plugin that switches the active window while its panel is
-    /// still mounted (the orchestrator "dive": `setActiveWindow(target)` first,
-    /// then `closeOpenDialog()` / `closeForm()` which runs
-    /// `setEditorMode(null)`) lands the clear on the *incoming* window and
-    /// leaves the *outgoing* one stuck in the panel's mode. That stuck mode
-    /// stays masked while the window sits in terminal mode, then silently
-    /// swallows every printable key the moment the user leaves terminal mode
-    /// (e.g. opens a file via quick-open) — the buffer ignores all keyboard
-    /// input until the user switches sessions.
-    ///
-    /// Both window-switch paths must call this before moving the active
-    /// pointer: the ordinary `set_active_window` dive *and* the born-attached
-    /// remote session creation (`create_window_with_terminal`), which writes
-    /// the active pointer directly and so never reaches `set_active_window`'s
-    /// own guard. See #2237 / #2234 item 4.
-    ///
-    /// vi-mode and other persistent per-window modes are unaffected: they never
-    /// have a floating panel mounted during a window switch.
-    fn clear_panel_scoped_mode_on_switch_away(&mut self, previous_id: WindowId) {
-        if self.floating_widget_panel.is_some() {
-            if let Some(win) = self.windows.get_mut(&previous_id) {
-                win.editor_mode = None;
-            }
-        }
     }
 
     /// Switch the active window to `id`.
@@ -660,6 +671,7 @@ impl crate::app::Editor {
     /// bug (caller verifies with `listWindows`), not a recoverable
     /// error worth surfacing through the channel.
     pub fn set_active_window(&mut self, id: WindowId) {
+        self.mark_plugin_snapshot_dirty();
         if self.active_window == id {
             return;
         }
@@ -684,10 +696,12 @@ impl crate::app::Editor {
         // the `authority_changed` hook.
         let previous_authority_label = self.authority().display_label.clone();
 
-        // Clear any panel-scoped editor mode on the window we're leaving so
-        // it can never outlive the switch (see
-        // `clear_panel_scoped_mode_on_switch_away`).
-        self.clear_panel_scoped_mode_on_switch_away(previous_id);
+        // The outgoing window keeps its editor mode, floating panel or not:
+        // that slot is its buffer's (a window-scoped plugin mode; vi's is the
+        // editor-wide input mode and never lives here), and a
+        // mounted panel's keymap is the mode it was mounted with
+        // (`FloatingWidgetState::mode`), which is editor-wide and goes
+        // wherever the panel does.
 
         // Lazy materialization: if this window's saved workspace hasn't
         // been restored yet, restore it now (before seeding) so the
@@ -705,6 +719,13 @@ impl crate::app::Editor {
         // derives from the active window's root, so moving the pointer
         // is all it takes (no separate working_dir to sync).
         self.active_window = id;
+        // ...and the one thing about the switch worth remembering past
+        // this process: which workspace you were last in. With
+        // `open_last_workspace` the next bare `fresh` reopens it, whatever
+        // directory that `fresh` is typed in.
+        if let Some(window) = self.windows.get_mut(&id) {
+            window.last_focused_at = crate::workspace::now_millis();
+        }
 
         // For a never-activated incoming window, install the freshly
         // built layout into the window's `splits` field and attach
@@ -731,6 +752,28 @@ impl crate::app::Editor {
         // skipped.
         self.adopt_active_window_authority(&previous_authority_label);
 
+        // Let this workspace claim its own unsaved work from the recovery
+        // store — crash leftovers the workspace snapshot doesn't cover. Per
+        // workspace, on activation, so each buffer returns to where it was
+        // edited; a workspace never visited is never touched (issue #3189).
+        //
+        // What comes back here opens as a tab, but the tab the user left in
+        // this workspace stays the one in front: they switched to their work,
+        // not to a crash leftover, and restoring an unnamed buffer used to
+        // make it the active one (#3633, B11). A startup restore still brings
+        // the restored work forward.
+        // The pane counts as well as the tab: opening a restored file moves
+        // the focus out of a utility-dock pane (a terminal there) into an
+        // editor pane, so the tab goes back into the pane it was in.
+        let focused_split = self.effective_active_split();
+        let focused = self.active_buffer();
+        self.adopt_recovery_for_window(id, None, super::recovery_actions::AdoptScope::Workspace);
+        if (self.effective_active_split() != focused_split || self.active_buffer() != focused)
+            && self.buffers().contains_key(&focused)
+        {
+            self.focus_split(focused_split, focused);
+        }
+
         // If we just switched to a remote session that came back from disk
         // dormant (backend spec known, live authority still the local
         // placeholder), start reconnecting its backend now — the per-window
@@ -745,16 +788,11 @@ impl crate::app::Editor {
         // this, plugins that read `editor.getCwd()` — Live Grep, file
         // finders, etc. — keep targeting the previous window's project
         // after a dive, surfacing the wrong project's files.
-        #[cfg(feature = "plugins")]
-        self.update_plugin_state_snapshot();
-
-        self.plugin_manager.read().unwrap().run_hook(
-            "active_window_changed",
-            HookArgs::ActiveWindowChanged {
-                previous_id: Some(previous_id.0),
-                active_id: id.0,
-            },
-        );
+        // The announcer fires `active_window_changed` and — the part this
+        // path used to forget (sinelaw/fresh#3326) — `buffer_deactivated` /
+        // `buffer_activated` for the incoming window's buffer, so plugins
+        // tracking "the active buffer" follow a dive like a tab switch.
+        self.announce_focus();
 
         // Bring `terminal_mode` in line with the incoming window's active
         // buffer, exactly as the tab-switch path (`set_active_buffer`) does.
@@ -868,6 +906,9 @@ impl crate::app::Editor {
     /// `prev_window` so both directions stay in sync if the
     /// underlying ordering changes (e.g. user-controlled reorder).
     fn cycle_active_window(&mut self, delta: isize) {
+        // Cycling walks the saved workspaces too, so it is a use of the
+        // registry: read the rest of it first.
+        self.ensure_all_workspaces_loaded();
         // A plugin (the orchestrator dock) may constrain cycling to a
         // specific ordered subset — the windows currently visible in its
         // session list — so Next/Prev Window walks exactly that list rather
@@ -936,21 +977,25 @@ impl crate::app::Editor {
             self.config.editor.large_file_threshold_bytes as usize,
             std::sync::Arc::clone(&self.authority().filesystem),
         );
-        state
-            .margins
-            .configure_for_line_numbers(self.config.editor.line_numbers);
-        state
-            .buffer
-            .set_default_line_ending(self.config.editor.default_line_ending.to_line_ending());
+        state.apply_unnamed_buffer_config(&self.config);
         let metadata = crate::app::types::BufferMetadata::new();
         let event_log = crate::model::event::EventLog::new();
         let manager = SplitManager::new(buf);
         let active_leaf = manager.active_split();
         let mut view_states = HashMap::new();
-        view_states.insert(
-            active_leaf,
-            SplitViewState::with_buffer(self.terminal_width, self.terminal_height, buf),
+        let mut view_state =
+            SplitViewState::with_buffer(self.terminal_width, self.terminal_height, buf);
+        // `with_buffer` goes through `BufferViewState::new`, whose display
+        // flags are hard-coded rather than read from `editor.*`, so the scratch
+        // buffer ignores the user's settings until something stamps them —
+        // the same miss as the restore path in #3426. The boot-time seed in
+        // `Editor::new` stamps here too; this is its per-window counterpart,
+        // and the buffer is empty and unnamed, so the global wrap values are
+        // the resolved ones.
+        view_state.buffer_tab_state_mut().apply_config_defaults(
+            crate::view::split::ViewConfigDefaults::from_editor_config(&self.config.editor),
         );
+        view_states.insert(active_leaf, view_state);
         Some((buf, state, metadata, event_log, manager, view_states))
     }
 
@@ -1003,7 +1048,7 @@ impl crate::app::Editor {
     /// The live `EditorState` moves — unsaved modifications and undo history
     /// travel with the tab rather than being re-read from disk.
     pub fn extract_tab_to_new_workspace(&mut self, buffer_id: fresh_core::BufferId) {
-        use rust_i18n::t;
+        use fresh_i18n::t;
 
         if self.active_window().is_terminal_buffer(buffer_id) {
             self.extract_terminal_tab_to_new_workspace(buffer_id);
@@ -1062,7 +1107,7 @@ impl crate::app::Editor {
     /// shell's own cwd is irrelevant to the workspace root now — the co-tenant
     /// is rooted at the source project, same as the file path.
     fn extract_terminal_tab_to_new_workspace(&mut self, buffer_id: fresh_core::BufferId) {
-        use rust_i18n::t;
+        use fresh_i18n::t;
 
         let win = self.active_window();
         let Some(terminal_id) = win
@@ -1104,7 +1149,7 @@ impl crate::app::Editor {
         // Focus changes that bypass the usual tab-click path must restore
         // terminal mode themselves, and the PTY must match its new split.
         self.sync_terminal_mode_to_active_buffer();
-        self.active_window_mut().resize_visible_terminals();
+        self.resize_visible_terminals();
 
         self.set_status_message(
             t!("workspace.extracted_tab", name = name, label = target_label).to_string(),
@@ -1113,7 +1158,7 @@ impl crate::app::Editor {
 
     /// Move every piece of per-terminal state for `buffer_id`'s terminal
     /// from the active window to `target`: the PTY handle (adopted under a
-    /// fresh id, since terminal ids are per-window), the backing/log file
+    /// fresh editor-wide id and re-tagged with its new window), the backing/log file
     /// bindings, launch/resume argv, the ephemeral flag, title/fg-name
     /// caches, and the process-group registration. Mirrors the remap loop
     /// in `respawn_terminals_through_authority`, which is the same
@@ -1199,6 +1244,11 @@ impl crate::app::Editor {
         buffer_id: fresh_core::BufferId,
         target: WindowId,
     ) {
+        // A group in the window the buffer leaves, showing it in a panel it
+        // borrowed, closes first: its panels would otherwise show a buffer
+        // the window no longer has.
+        self.close_groups_borrowing(buffer_id);
+
         // Re-target buffer storage: move the state to the target window's
         // map. Step 0c: each window owns its EditorState outright.
         if let Some(state) = self.detach_buffer_from_all_windows(buffer_id) {
@@ -1231,20 +1281,15 @@ impl crate::app::Editor {
         // so it doesn't surface as a stray tab — the target
         // session owns it.
         let leaf_ids: Vec<_> = self
-            .windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .map(|(_, vs)| vs)
-            .expect("active window must have a populated split layout")
+            .active_window()
+            .split_view_states()
             .keys()
             .copied()
             .collect();
         for leaf_id in leaf_ids {
             if let Some(view_state) = self
-                .windows
-                .get_mut(&self.active_window)
-                .and_then(|w| w.split_view_states_mut())
-                .expect("active window must have a populated split layout")
+                .active_window_mut()
+                .split_view_states_mut()
                 .get_mut(&leaf_id)
             {
                 view_state.remove_buffer(buffer_id);
@@ -1294,15 +1339,16 @@ impl crate::app::Editor {
         // replacement candidates in focus-history (LRU) order — most-recently
         // focused first, then any other open tab — mirroring the real
         // close-tab path (`resolve_close_replacement`) rather than raw tab
-        // order. The rect is a probe; only ids matter here. Owned Vecs so the
-        // `self.windows` borrow is released before the mutating loop.
-        let probe = ratatui::layout::Rect::new(0, 0, 1, 1);
+        // order. Every leaf of the tree, maximized or not: a leaf hidden
+        // behind a maximized sibling still shows the buffer and still needs
+        // retargeting. Owned Vecs so the `self.windows` borrow is released
+        // before the mutating loop.
         let showing: Vec<(crate::model::event::LeafId, Vec<fresh_core::BufferId>)> = mgr
             .root()
-            .get_leaves_with_rects(probe)
+            .visible_leaves()
             .into_iter()
-            .filter(|(_, displayed, _)| *displayed == buffer_id)
-            .map(|(leaf_id, _, _)| {
+            .filter(|(_, displayed)| *displayed == buffer_id)
+            .map(|(leaf_id, _)| {
                 let candidates = view_states
                     .get(&leaf_id)
                     .map(|vs| {
@@ -1371,6 +1417,25 @@ impl crate::app::Editor {
         }
     }
 
+    /// Drop the shell tree's `Persisted` values for a window that is gone.
+    ///
+    /// The tree cannot make this call. What it sees when a window is switched
+    /// away from and when a window is closed is the same thing — a subtree it
+    /// is no longer describing — and in the first case the values must be
+    /// kept, which is the entire point of scoping them. Only the host knows
+    /// which of the two happened, so the host says.
+    ///
+    /// Two consequences if this is not called: the map grows for the life of
+    /// the process, and a later window that reuses a freed id inherits the
+    /// dead one's scroll offsets and expansions.
+    ///
+    /// The scope name is `frame_tree`'s, and the two must agree — the pairing
+    /// is pinned by `a_closed_windows_scope_is_forgotten`.
+    pub(crate) fn forget_window_ui_state(&self, id: WindowId) {
+        self.shell_store
+            .forget_scope(&crate::view::shell::frame::window_scope(id.0));
+    }
+
     /// Close a session and drop its `Session` entry. Refuses to
     /// close the currently active session — the caller must switch
     /// to a different session first. Refuses to close the *last*
@@ -1409,10 +1474,48 @@ impl crate::app::Editor {
             );
             return false;
         }
-        if self.windows.remove(&id).is_none() {
+        // Last chance to keep this workspace's unsaved work: its buffers go
+        // with the window below, and nothing here asks the user (issue #3189).
+        match self.flush_window_recovery(id) {
+            Ok(n) if n > 0 => {
+                tracing::info!(
+                    "close_window: flushed {n} unsaved buffer(s) of window {id} to recovery"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("close_window: recovery flush for window {id} failed: {e}"),
+        }
+        let Some(closed) = self.windows.remove(&id) else {
             tracing::warn!("close_window: unknown session id {id}");
             return false;
+        };
+        // Its buffers go with it. A plugin that keyed state on one of them
+        // (an outline, a diagnostics panel) learns that the way it learns of
+        // any other close — before `window_closed`, so the buffer-level
+        // cleanup runs while the window id still means something.
+        {
+            let plugins = self.plugin_manager.read().unwrap();
+            for buffer_id in closed.buffers.ids() {
+                plugins.run_hook(
+                    "buffer_closed",
+                    HookArgs::BufferClosed {
+                        buffer_id,
+                        window_id: id.0,
+                    },
+                );
+            }
         }
+        // The sections and diff baselines about its buffers go with the
+        // buffers, the ones about the window with the window.
+        for buffer_id in closed.buffers.ids() {
+            self.drop_sidebar_sections_for_buffer(buffer_id);
+            #[cfg(feature = "plugins")]
+            self.diff_baselines.drop_for_buffer(buffer_id);
+        }
+        drop(closed);
+        self.drop_sidebar_sections_for_window(id);
+        // The window is gone, so its half of the shell tree is gone with it.
+        self.forget_window_ui_state(id);
         // Closing a dormant session's disconnected shell drops the whole
         // session: the descriptor must leave the dock with the window.
         self.dormant_remote.remove(&id);
@@ -1420,16 +1523,16 @@ impl crate::app::Editor {
         // nothing left to describe, and a stale entry would make a later
         // window that reuses the id render as "still being created".
         self.preparing_windows.remove(&id);
-        // Tear down a born-attached remote session's connection (carrier +
-        // reconnect/heartbeat + runtime) when its window closes. No-op for
-        // local windows, which never have an entry.
-        if self.session_keepalives.remove(&id).is_some() {
-            tracing::info!("close_window: dropped remote session keepalive for window {id}");
-        }
         self.plugin_manager
             .read()
             .unwrap()
             .run_hook("window_closed", HookArgs::WindowClosed { id: id.0 });
+
+        // The window's reference is gone; close its connection if nothing else shares it.
+        self.prune_connections();
+
+        // Its files' locks, for an editor waiting on one of them
+        self.sync_file_locks();
 
         true
     }
@@ -1452,12 +1555,12 @@ impl crate::app::Editor {
     /// into the editor-wide caches before returning.
     pub(crate) fn create_remote_session_window(
         &mut self,
-        authority: crate::services::authority::Authority,
-        keepalive: Box<dyn std::any::Any + Send>,
+        connection: std::sync::Arc<crate::services::authority::Connection>,
         root: PathBuf,
         label: String,
         command: Option<Vec<String>>,
         spec: crate::services::authority::SessionAuthoritySpec,
+        adopt: Option<WindowId>,
     ) -> Result<WindowId, String> {
         match self.create_window_with_terminal(
             root.clone(),
@@ -1465,16 +1568,18 @@ impl crate::app::Editor {
             Some(root),
             command,
             None,
-            authority,
+            connection,
             None,
             None,
             false,
-            // Remote sessions are born attached to their connected backend
-            // rather than growing out of a local placeholder.
-            None,
+            // A remote session is born attached to its connected backend, but
+            // it can still grow out of the placeholder the user has been
+            // sitting in since they asked for it — the same adoption the local
+            // path uses, which is what keeps the window id, the durable
+            // workspace id and the dock slot across the connect.
+            adopt,
         ) {
             Ok((window_id, _terminal, _buffer)) => {
-                self.session_keepalives.insert(window_id, keepalive);
                 // Persist how to reconnect this backend on the new session so
                 // a restart / relaunch can bring it back rather than degrade
                 // it to local.
@@ -1489,9 +1594,8 @@ impl crate::app::Editor {
                 // `create_window_with_terminal` already rolled the active
                 // pointer back to the previous window and left the
                 // editor-wide authority untouched (it never installed the
-                // remote one), so just drop the keepalive (tears down the
-                // carrier).
-                drop(keepalive);
+                // remote one). No window holds the connection, so prune closes it.
+                self.prune_connections();
                 Err(e)
             }
         }
@@ -1504,6 +1608,7 @@ impl crate::app::Editor {
     /// only a `dormant_remote` descriptor (no authority). The active window is
     /// left unchanged until the connection lands, so the editor never shows a
     /// window without its real backend.
+    #[cfg(feature = "plugins")]
     pub(crate) fn bring_dormant_remote_online(&mut self, id: WindowId) {
         let Some(descriptor) = self.dormant_remote.get(&id) else {
             return;
@@ -1530,7 +1635,7 @@ impl crate::app::Editor {
         // created through the orchestrator plugin); without it there is nothing
         // to connect through, so diving into one is a no-op.
         #[cfg(feature = "plugins")]
-        self.start_remote_connect(spec, Some(id), request_id);
+        self.start_remote_connect(spec, Some(id), request_id, false);
         #[cfg(not(feature = "plugins"))]
         let _ = (spec, request_id);
     }
@@ -1545,13 +1650,12 @@ impl crate::app::Editor {
     pub(crate) fn promote_dormant_remote(
         &mut self,
         id: WindowId,
-        authority: crate::services::authority::Authority,
-        keepalive: Box<dyn std::any::Any + Send>,
+        connection: std::sync::Arc<crate::services::authority::Connection>,
     ) {
+        let connection = self.adopt_connection(connection);
         let Some(descriptor) = self.dormant_remote.remove(&id) else {
-            // Raced with a close / a second connect — nothing to promote.
-            drop(authority);
-            drop(keepalive);
+            // Raced with a close / a second connect: nothing to promote.
+            drop(connection);
             return;
         };
         let root = descriptor.root.clone();
@@ -1560,13 +1664,12 @@ impl crate::app::Editor {
         // so its file explorer / quick-open ride the session's backend.
         let mut resources = self.window_resources();
         resources.fs_manager = std::sync::Arc::new(crate::services::fs::FsManager::new(
-            std::sync::Arc::clone(&authority.filesystem),
+            std::sync::Arc::clone(&connection.authority.filesystem),
         ));
 
         // Restore the persisted workspace through the connected authority (its
         // terminals spawn over SSH/kube), or seed an empty layout when there is
-        // no saved workspace. Either constructor takes the authority by value —
-        // the window is born owning its real backend.
+        // no saved workspace. Either constructor takes the connection.
         // One store, whatever launched this editor — see `save_workspace_for`.
         let workspace = crate::workspace::Workspace::load(&root).ok().flatten();
         let mut window = match workspace {
@@ -1574,7 +1677,7 @@ impl crate::app::Editor {
                 id,
                 descriptor.label.clone(),
                 root.clone(),
-                authority,
+                connection,
                 resources,
                 &ws,
             ),
@@ -1583,7 +1686,7 @@ impl crate::app::Editor {
                     id,
                     descriptor.label.clone(),
                     root.clone(),
-                    authority,
+                    connection,
                     resources,
                 );
                 w.seed_initial_layout();
@@ -1601,7 +1704,6 @@ impl crate::app::Editor {
         let previous_authority_label = self.authority().display_label.clone();
         let already_active = self.active_window == id;
         self.windows.insert(id, window);
-        self.session_keepalives.insert(id, keepalive);
 
         if already_active {
             // The restored window replaced this session's disconnected shell
@@ -1649,7 +1751,10 @@ impl crate::app::Editor {
         let id = WindowId(self.next_window_id);
         self.next_window_id += 1;
         let authority = self.local_session_authority(&root);
-        let mut window = Window::new(id, label, root, authority, self.window_resources());
+        let connection =
+            self.open_connection(crate::services::authority::Connection::plain(authority));
+        let resources = self.window_resources();
+        let mut window = Window::new(id, label, root, connection, resources);
         window.terminal_width = self.terminal_width;
         window.terminal_height = self.terminal_height;
         // Seed a layout so the renderer has a populated `splits` to paint
@@ -1659,6 +1764,12 @@ impl crate::app::Editor {
         window.seed_initial_layout();
         let seed_buffer = window.active_buffer();
         window.mark_buffer_read_only(seed_buffer, true);
+        // The page stands in for the workspace, so the buffer under it is
+        // bookkeeping — an untitled tab for a workspace that does not exist
+        // yet is one the user can neither use nor meaningfully close.
+        if let Some(meta) = window.buffer_metadata.get_mut(&seed_buffer) {
+            meta.hidden_from_tabs = true;
+        }
         self.windows.insert(id, window);
         self.preparing_windows.insert(
             id,
@@ -1698,26 +1809,27 @@ impl crate::app::Editor {
         let Some(descriptor) = self.dormant_remote.get(&id) else {
             return;
         };
+        // Copied out before `open_connection` borrows `self` mutably.
         let root = descriptor.root.clone();
+        let label = descriptor.label.clone();
+        let plugin_state = descriptor.plugin_state.clone();
+        let authority_spec = descriptor.authority_spec.clone();
         // Same per-session local scope a boot-discovered local shell gets:
         // its own trust + env handles, never a clone of the previous
         // window's. Routed through the blessed factory so this shell inherits
         // the worktree→repo trust keying too.
         let authority = self.local_session_authority(&root);
-        let mut window = Window::new(
-            id,
-            descriptor.label.clone(),
-            root,
-            authority,
-            self.window_resources(),
-        );
+        let connection =
+            self.open_connection(crate::services::authority::Connection::plain(authority));
+        let resources = self.window_resources();
+        let mut window = Window::new(id, label, root, connection, resources);
         window.terminal_width = self.terminal_width;
         window.terminal_height = self.terminal_height;
-        window.plugin_state = descriptor.plugin_state.clone();
+        window.plugin_state = plugin_state;
         // Keep the backend identity so the status bar / dock present the
         // session as its real (not-yet-connected) backend and a retry knows
         // what to reconnect to — never downgraded to local.
-        window.authority_spec = descriptor.authority_spec.clone();
+        window.authority_spec = authority_spec;
         // The shell renders as a placeholder page (see
         // `render_dormant_shell_page`), not as an editable buffer — nothing
         // can be meaningfully edited before the backend connects. Seed the

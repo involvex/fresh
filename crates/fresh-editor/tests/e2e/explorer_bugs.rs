@@ -26,9 +26,10 @@ use fresh::config::Config;
 use fresh::model::filesystem::{
     DirEntry, FileMetadata, FilePermissions, FileReader, FileSystem, FileWriter, StdFileSystem,
 };
+use fresh_editor_core::model::host_path::{AsHostPath, HostPath, HostPathBuf};
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -96,7 +97,14 @@ impl FaultInjectingFileSystem {
 }
 
 impl FileSystem for FaultInjectingFileSystem {
-    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+    /// This fake injects faults, not path semantics: the filesystem it
+    /// wraps decides how paths read.
+    fn style(&self) -> fresh_editor_core::model::host_path::PathStyle {
+        self.inner.style()
+    }
+    fn rename(&self, from: &HostPath, to: &HostPath) -> io::Result<()> {
+        let from = from.as_path();
+        let to = to.as_path();
         if self.fail_rename_with_eacces.load(Ordering::SeqCst) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -109,119 +117,149 @@ impl FileSystem for FaultInjectingFileSystem {
                 "fault-injected: rename across filesystems (EXDEV)",
             ));
         }
-        self.inner.rename(from, to)
+        self.inner.rename(from.as_host(), to.as_host())
     }
 
-    fn copy(&self, from: &Path, to: &Path) -> io::Result<u64> {
+    fn copy(&self, from: &HostPath, to: &HostPath) -> io::Result<u64> {
+        let from = from.as_path();
+        let to = to.as_path();
         if self.poison_match(to) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "fault-injected: copy of poisoned name refused",
             ));
         }
-        self.inner.copy(from, to)
+        self.inner.copy(from.as_host(), to.as_host())
     }
 
     // ---- boilerplate delegation to the inner filesystem ----
-    fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
-        self.inner.read_file(path)
+    fn read_file(&self, path: &HostPath) -> io::Result<Vec<u8>> {
+        let path = path.as_path();
+        self.inner.read_file(path.as_host())
     }
-    fn read_range(&self, path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        self.inner.read_range(path, offset, len)
+    fn read_range(&self, path: &HostPath, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        let path = path.as_path();
+        self.inner.read_range(path.as_host(), offset, len)
     }
-    fn write_file(&self, path: &Path, data: &[u8]) -> io::Result<()> {
-        self.inner.write_file(path, data)
+    fn write_file(&self, path: &HostPath, data: &[u8]) -> io::Result<()> {
+        let path = path.as_path();
+        self.inner.write_file(path.as_host(), data)
     }
-    fn create_file(&self, path: &Path) -> io::Result<Box<dyn FileWriter>> {
-        self.inner.create_file(path)
+    fn create_file(&self, path: &HostPath) -> io::Result<Box<dyn FileWriter>> {
+        let path = path.as_path();
+        self.inner.create_file(path.as_host())
     }
-    fn open_file(&self, path: &Path) -> io::Result<Box<dyn FileReader>> {
-        self.inner.open_file(path)
+    fn create_new_file(&self, path: &HostPath) -> io::Result<Box<dyn FileWriter>> {
+        let path = path.as_path();
+        self.inner.create_new_file(path.as_host())
     }
-    fn open_file_for_write(&self, path: &Path) -> io::Result<Box<dyn FileWriter>> {
-        self.inner.open_file_for_write(path)
+    fn create_new_private_file(&self, path: &HostPath) -> io::Result<Box<dyn FileWriter>> {
+        let path = path.as_path();
+        self.inner.create_new_private_file(path.as_host())
     }
-    fn open_file_for_append(&self, path: &Path) -> io::Result<Box<dyn FileWriter>> {
-        self.inner.open_file_for_append(path)
+    fn open_file(&self, path: &HostPath) -> io::Result<Box<dyn FileReader>> {
+        let path = path.as_path();
+        self.inner.open_file(path.as_host())
     }
-    fn set_file_length(&self, path: &Path, len: u64) -> io::Result<()> {
-        self.inner.set_file_length(path, len)
+    fn open_file_for_write(&self, path: &HostPath) -> io::Result<Box<dyn FileWriter>> {
+        let path = path.as_path();
+        self.inner.open_file_for_write(path.as_host())
     }
-    fn remove_file(&self, path: &Path) -> io::Result<()> {
+    fn open_file_for_append(&self, path: &HostPath) -> io::Result<Box<dyn FileWriter>> {
+        let path = path.as_path();
+        self.inner.open_file_for_append(path.as_host())
+    }
+    fn set_file_length(&self, path: &HostPath, len: u64) -> io::Result<()> {
+        let path = path.as_path();
+        self.inner.set_file_length(path.as_host(), len)
+    }
+    fn remove_file(&self, path: &HostPath) -> io::Result<()> {
+        let path = path.as_path();
         if self.fail_remove_with_eacces.load(Ordering::SeqCst) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "fault-injected: remove_file not permitted",
             ));
         }
-        self.inner.remove_file(path)
+        self.inner.remove_file(path.as_host())
     }
-    fn remove_dir(&self, path: &Path) -> io::Result<()> {
+    fn remove_dir(&self, path: &HostPath) -> io::Result<()> {
+        let path = path.as_path();
         if self.fail_remove_with_eacces.load(Ordering::SeqCst) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "fault-injected: remove_dir not permitted",
             ));
         }
-        self.inner.remove_dir(path)
+        self.inner.remove_dir(path.as_host())
     }
-    fn metadata(&self, path: &Path) -> io::Result<FileMetadata> {
-        self.inner.metadata(path)
+    fn metadata(&self, path: &HostPath) -> io::Result<FileMetadata> {
+        let path = path.as_path();
+        self.inner.metadata(path.as_host())
     }
-    fn symlink_metadata(&self, path: &Path) -> io::Result<FileMetadata> {
-        self.inner.symlink_metadata(path)
+    fn symlink_metadata(&self, path: &HostPath) -> io::Result<FileMetadata> {
+        let path = path.as_path();
+        self.inner.symlink_metadata(path.as_host())
     }
-    fn is_dir(&self, path: &Path) -> io::Result<bool> {
-        self.inner.is_dir(path)
+    fn is_dir(&self, path: &HostPath) -> io::Result<bool> {
+        let path = path.as_path();
+        self.inner.is_dir(path.as_host())
     }
-    fn is_file(&self, path: &Path) -> io::Result<bool> {
-        self.inner.is_file(path)
+    fn is_file(&self, path: &HostPath) -> io::Result<bool> {
+        let path = path.as_path();
+        self.inner.is_file(path.as_host())
     }
-    fn set_permissions(&self, path: &Path, permissions: &FilePermissions) -> io::Result<()> {
-        self.inner.set_permissions(path, permissions)
+    fn set_permissions(&self, path: &HostPath, permissions: &FilePermissions) -> io::Result<()> {
+        let path = path.as_path();
+        self.inner.set_permissions(path.as_host(), permissions)
     }
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
-        self.inner.read_dir(path)
+    fn read_dir(&self, path: &HostPath) -> io::Result<Vec<DirEntry>> {
+        let path = path.as_path();
+        self.inner.read_dir(path.as_host())
     }
-    fn create_dir(&self, path: &Path) -> io::Result<()> {
-        self.inner.create_dir(path)
+    fn create_dir(&self, path: &HostPath) -> io::Result<()> {
+        let path = path.as_path();
+        self.inner.create_dir(path.as_host())
     }
-    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
-        self.inner.create_dir_all(path)
+    fn create_dir_all(&self, path: &HostPath) -> io::Result<()> {
+        let path = path.as_path();
+        self.inner.create_dir_all(path.as_host())
     }
-    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
-        self.inner.canonicalize(path)
+    fn canonicalize(&self, path: &HostPath) -> io::Result<HostPathBuf> {
+        let path = path.as_path();
+        self.inner.canonicalize(path.as_host())
     }
     fn current_uid(&self) -> u32 {
         self.inner.current_uid()
     }
     fn sudo_write(
         &self,
-        path: &Path,
+        path: &HostPath,
         data: &[u8],
-        mode: u32,
-        uid: u32,
-        gid: u32,
+        mode: Option<u32>,
+        owner: Option<(u32, u32)>,
     ) -> io::Result<()> {
-        self.inner.sudo_write(path, data, mode, uid, gid)
+        let path = path.as_path();
+        self.inner.sudo_write(path.as_host(), data, mode, owner)
     }
     fn search_file(
         &self,
-        path: &Path,
+        path: &HostPath,
         pattern: &str,
         opts: &fresh::model::filesystem::FileSearchOptions,
-        cursor: &mut fresh::model::filesystem::FileSearchCursor,
     ) -> io::Result<Vec<fresh::model::filesystem::SearchMatch>> {
-        fresh::model::filesystem::default_search_file(&*self.inner, path, pattern, opts, cursor)
+        let path = path.as_path();
+        fresh::model::filesystem::default_search_file(&*self.inner, path.as_host(), pattern, opts)
     }
-    fn walk_files(
+    fn walk(
         &self,
-        root: &Path,
-        skip_dirs: &[&str],
+        root: &HostPath,
+        opts: &fresh_editor_core::model::filesystem::WalkOptions<'_>,
         cancel: &std::sync::atomic::AtomicBool,
-        on_file: &mut dyn FnMut(&Path, &str) -> bool,
-    ) -> io::Result<()> {
-        self.inner.walk_files(root, skip_dirs, cancel, on_file)
+        on_entry: &mut dyn FnMut(fresh_editor_core::model::filesystem::WalkEntry<'_>) -> bool,
+    ) -> std::io::Result<()> {
+        let root = root.as_path();
+        self.inner.walk(root.as_host(), opts, cancel, on_entry)
     }
 }
 
@@ -535,10 +573,7 @@ fn test_delete_preserves_sibling_expansion_state() {
         .unwrap();
     harness.wait_for_prompt().unwrap();
     harness
-        .send_key(KeyCode::Char('y'), KeyModifiers::NONE)
-        .unwrap();
-    harness
-        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .send_key(KeyCode::Char('d'), KeyModifiers::NONE)
         .unwrap();
     harness.render().unwrap();
 
@@ -643,17 +678,16 @@ fn test_paste_success_status_is_distinct_from_clipboard_set() {
     assert!(project_root.join("dst/thing.txt").exists());
 }
 
-/// The multi-delete prompt used to say only "Delete 2 items? (y)es, (N)o" —
-/// no names. That's safer with: "Delete 2 items ('foo', 'bar')? ..." so
-/// the user can eyeball what they're actually about to drop. Check the
-/// minibuffer row specifically (the tree pane separately lists file names).
+/// The multi-delete confirmation used to say only "Delete 2 items?" — no
+/// names. That's safer with: "Delete 2 items ('foo', 'bar')?" so the user can
+/// eyeball what they're actually about to drop. Asserted on the dialog's own
+/// body row (the tree pane separately lists file names).
 #[test]
 fn test_multi_delete_prompt_names_the_items() {
     let mut harness = EditorTestHarness::with_temp_project(100, 30).unwrap();
     let project_root = harness.project_dir().unwrap();
-    // Use distinctive names that the tree cannot display alongside each other
-    // on the minibuffer row (bottom of screen) — we'll assert the prompt row
-    // mentions them.
+    // Use distinctive names, so the row of the dialog that names them cannot
+    // be confused with the tree's own listing of the same files.
     fs::write(project_root.join("tomato.md"), "a").unwrap();
     fs::write(project_root.join("zucchini.md"), "b").unwrap();
 
@@ -670,37 +704,29 @@ fn test_multi_delete_prompt_names_the_items() {
         .unwrap();
     harness.wait_for_prompt().unwrap();
 
-    // The minibuffer (last non-empty row of the rendered screen) shows the
-    // prompt text. Without the fix it reads "Delete 2 items? (y)es, (N)o"
-    // with no names. With the fix it should mention the names.
+    // Without the fix the question read "Delete 2 items?" with no names. One
+    // row of the dialog must carry the count and both names.
     let screen = harness.screen_to_string();
-    let prompt_row = screen
+    let question = screen
         .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
+        .find(|l| l.contains("Delete") && l.contains("tomato"))
         .unwrap_or("");
     assert!(
-        prompt_row.contains("Delete")
-            && prompt_row.contains("tomato")
-            && prompt_row.contains("zucchini"),
-        "Multi-delete prompt should name the items being deleted. Prompt:\n{}",
-        prompt_row
+        question.contains("zucchini"),
+        "Multi-delete dialog should name the items being deleted. Screen:\n{screen}"
     );
 
     // Cancel.
     harness
-        .send_key(KeyCode::Char('n'), KeyModifiers::NONE)
-        .unwrap();
-    harness
-        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .send_key(KeyCode::Char('c'), KeyModifiers::NONE)
         .unwrap();
 }
 
-/// The conflict prompt advertises `(c)ancel` but used to accept *any*
-/// unrecognized input as a cancel — including typos. A typo loses the
-/// clipboard and the whole paste queue with no recovery. The prompt
-/// should re-prompt on unknown input and only cancel on the explicit
-/// `c` / Escape keys.
+/// The conflict prompt used to accept *any* unrecognized input as a cancel —
+/// including typos, which lose the clipboard and the whole paste queue with
+/// no recovery. As a modal dialog there is no unrecognized input to mistake
+/// for consent: a key that is nobody's accelerator does nothing at all, and
+/// only Escape or the Cancel button backs out.
 #[test]
 fn test_conflict_prompt_typo_re_prompts_does_not_cancel() {
     let mut harness = EditorTestHarness::with_temp_project(100, 30).unwrap();
@@ -726,21 +752,17 @@ fn test_conflict_prompt_typo_re_prompts_does_not_cancel() {
     harness.wait_for_prompt().unwrap();
     harness.assert_screen_contains("exists");
 
-    // Type a typo (not o / r / c) and submit. The prompt should stay
-    // open and re-prompt, rather than silently cancel.
-    if let Some(prompt) = harness.editor_mut().prompt_mut() {
-        prompt.clear();
-        prompt.insert_str("z");
-    }
+    // A key that is nobody's accelerator here (not o / r / c). The dialog
+    // must stay up rather than read it as a cancel.
     harness
-        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .send_key(KeyCode::Char('z'), KeyModifiers::NONE)
         .unwrap();
     harness.render().unwrap();
     let screen = harness.screen_to_string();
     assert!(
         screen.contains("exists"),
-        "Unknown input should not cancel the paste — the conflict prompt \
-         should re-ask. Screen:\n{}",
+        "Unknown input should not cancel the paste — the conflict dialog \
+         should stay up. Screen:\n{}",
         screen
     );
 
@@ -925,7 +947,8 @@ fn test_shift_up_at_top_seeds_selection_before_escape_unfocuses() {
     harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
     harness.render().unwrap();
 
-    harness.assert_screen_not_contains("File Explorer (Ctrl+E)");
+    // The hint's start: in a narrow column the title elides after it.
+    harness.assert_screen_not_contains("File Explorer (Ctrl");
     harness.assert_screen_contains("File Explorer");
 }
 
@@ -1380,10 +1403,7 @@ fn test_delete_closes_open_buffer_for_deleted_file() {
         .unwrap();
     harness.wait_for_prompt().unwrap();
     harness
-        .send_key(KeyCode::Char('y'), KeyModifiers::NONE)
-        .unwrap();
-    harness
-        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .send_key(KeyCode::Char('d'), KeyModifiers::NONE)
         .unwrap();
     harness.wait_for_prompt_closed().unwrap();
     harness.render().unwrap();

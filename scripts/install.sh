@@ -95,6 +95,56 @@ log_error()   { printf "${RED}[ERROR]${NC} %s\n" "$1" >&2; exit 1; }
 
 check_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+# Refuse to `rm -rf` anything that is not ours.
+#
+# Installing replaces INSTALL_DIR wholesale, and INSTALL_DIR comes from
+# $FRESH_INSTALL_DIR. Rejecting only "", "/" and $HOME was not enough: a
+# plausible typo or a habit like FRESH_INSTALL_DIR=$HOME/.local wiped a
+# directory full of unrelated software, without a prompt and with nothing in
+# the trash. An existing directory now has to look like a previous Fresh
+# install before it is removed -- it must hold the binary, the install
+# receipt, or the file manifest this script writes. Anything else is a path
+# the user did not mean, and the install stops instead of clearing it.
+assert_safe_install_dir() {
+    # A trailing slash names the same directory, so normalise rather than
+    # refuse: failing here would break a FRESH_INSTALL_DIR that had been
+    # working for someone, in the middle of an upgrade. `/` itself survives
+    # the strip and is caught below.
+    while :; do
+        case "$INSTALL_DIR" in
+            /) break ;;
+            */) INSTALL_DIR="${INSTALL_DIR%/}" ;;
+            *) break ;;
+        esac
+    done
+
+    case "$INSTALL_DIR" in
+        ""|"/"|"$HOME") log_error "refusing to install into '$INSTALL_DIR'." ;;
+        /*) ;;
+        *) log_error "refusing to install into '$INSTALL_DIR': an absolute path is required." ;;
+    esac
+
+    # A path that does not exist yet is created fresh -- nothing to destroy.
+    [ -e "$INSTALL_DIR" ] || return 0
+
+    [ -d "$INSTALL_DIR" ] || log_error "refusing to install into '$INSTALL_DIR': not a directory."
+
+    if [ -x "$INSTALL_DIR/$REPO_NAME" ] ||
+       [ -f "$INSTALL_DIR/$MANIFEST_NAME" ] ||
+       [ -f "$INSTALL_DIR/install-receipt.toml" ] ||
+       [ -f "$INSTALL_DIR/usr/bin/install-receipt.toml" ] ||
+       [ -x "$INSTALL_DIR/usr/bin/$REPO_NAME" ]; then
+        return 0
+    fi
+
+    # An empty directory is safe to replace: there is nothing in it to lose.
+    if [ -z "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]; then
+        return 0
+    fi
+
+    log_error "refusing to replace '$INSTALL_DIR': it is not empty and does not look like a Fresh install. Set FRESH_INSTALL_DIR to a dedicated directory, or remove that one yourself first."
+}
+
 usage() {
     cat <<EOF
 Fresh Editor installer
@@ -227,8 +277,24 @@ download_verified() {
         *)       log_warn "Download of $(basename "$1") failed (HTTP $_dl)."; return 1 ;;
     esac
 
-    sums=$(curl -fsSL "$1.sha256" 2>/dev/null || true)
-    [ -n "$sums" ] || log_error "no .sha256 published for $(basename "$1"); refusing to install unverified bytes."
+    # The sidecar is metered exactly like the artifact above, so it gets the same
+    # status handling. Collapsing every failure into "not published" was both
+    # wrong and fatal: a throttled request killed the install outright, skipping
+    # the fallback chain, and told the user the release was unsigned. Only a 404
+    # is that claim; everything else returns and lets a fallback method run.
+    # -s here where the artifact above has a progress meter: 112 bytes of
+    # checksum render one, which reads as a second download failing to start.
+    _sum_code=$(curl -sSL -w '%{http_code}' "$1.sha256" -o "$2.sha256") || _sum_code=000
+    case "$_sum_code" in
+        2??) ;;
+        403|429) log_warn "GitHub is rate limiting downloads from this network (HTTP $_sum_code); retry shortly."; rm -f "$2.sha256"; return 1 ;;
+        404)     log_error "no .sha256 published for $(basename "$1"); refusing to install unverified bytes." ;;
+        000)     log_warn "Could not reach GitHub for the checksum of $(basename "$1")."; rm -f "$2.sha256"; return 1 ;;
+        *)       log_warn "Checksum fetch for $(basename "$1") failed (HTTP $_sum_code)."; rm -f "$2.sha256"; return 1 ;;
+    esac
+    sums=$(cat "$2.sha256")
+    rm -f "$2.sha256"
+    [ -n "$sums" ] || log_error "the .sha256 for $(basename "$1") is empty; refusing to install unverified bytes."
 
     expected=$(printf '%s\n' "$sums" | awk 'NR==1 {print $1}')
     actual=$(sha256_of "$2") || log_error "need sha256sum or shasum to verify the download; install coreutils and retry."
@@ -463,9 +529,7 @@ asset = "$ASSET"
 EOF
     fi
 
-    case "$INSTALL_DIR" in
-        ""|"/"|"$HOME") log_error "refusing to install into '$INSTALL_DIR'." ;;
-    esac
+    assert_safe_install_dir
 
     log_info "Finalizing installation..."
     mkdir -p "$(dirname "$INSTALL_DIR")" "$BIN_DIR"
@@ -613,9 +677,7 @@ do_install_appimage() {
         log_error "Extraction completed but source files are missing."
     fi
 
-    case "$INSTALL_DIR" in
-        ""|"/"|"$HOME") log_error "refusing to install into '$INSTALL_DIR'." ;;
-    esac
+    assert_safe_install_dir
 
     log_info "Finalizing installation..."
     mkdir -p "$(dirname "$INSTALL_DIR")" "$BIN_DIR"

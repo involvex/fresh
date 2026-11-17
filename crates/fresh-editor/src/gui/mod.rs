@@ -12,6 +12,7 @@ use anyhow::{Context, Result as AnyhowResult};
 use crossterm::event::{
     KeyEvent as CtKeyEvent, KeyEventKind, KeyEventState, MouseEvent as CtMouseEvent,
 };
+use fresh_input_parser::Event;
 
 use crate::app::Editor;
 use crate::config;
@@ -40,7 +41,7 @@ pub fn run_gui(
     log_file: Option<&PathBuf>,
 ) -> AnyhowResult<()> {
     if let Some(loc) = locale {
-        rust_i18n::set_locale(loc);
+        crate::i18n::set_locale(loc);
     }
 
     // Set up tracing subscriber (same as terminal path)
@@ -79,13 +80,18 @@ pub fn run_gui(
         files.iter().map(|f| parse_file_location(f)).collect();
 
     let show_file_explorer = file_locations.is_empty();
+    let explorer = if show_file_explorer {
+        crate::app::workspace::ExplorerOnEntry::Enter
+    } else {
+        crate::app::workspace::ExplorerOnEntry::Keep
+    };
     let no_session_flag = no_session;
 
     // Configure wgpu reset colors and ANSI color table based on theme.
     // Load the theme to check its editor_bg luminance rather than relying
     // on the theme name — this works for custom themes too.
-    let is_light = crate::view::theme::Theme::load_builtin(&loaded_config.theme)
-        .map_or(false, |t| t.is_light());
+    let is_light =
+        crate::view::theme::Theme::load_builtin(&loaded_config.theme).is_some_and(|t| t.is_light());
     let gui_config = {
         let mut cfg = GuiConfig::default();
         if is_light {
@@ -154,7 +160,7 @@ pub fn run_gui(
             // persisted explorer visibility, and only a brand-new
             // directory defaults to the tree — so a closed explorer is
             // not re-opened on every relaunch.
-            match editor.restore_active_window_on_launch(!show_file_explorer) {
+            match editor.restore_active_window_on_launch(explorer) {
                 Ok(true) => tracing::info!("Workspace restored"),
                 Ok(false) => tracing::debug!("No previous workspace"),
                 Err(e) => tracing::warn!("Failed to restore workspace: {}", e),
@@ -162,7 +168,7 @@ pub fn run_gui(
         } else if show_file_explorer {
             // No session restore (e.g. --no-session) but a bare directory:
             // still default to showing the tree.
-            editor.apply_active_window_explorer_default(!show_file_explorer, false);
+            editor.apply_active_window_explorer_default(explorer, false);
         }
 
         if let Err(e) = editor.start_recovery_session() {
@@ -198,6 +204,19 @@ impl GuiApplication for EditorApp {
             key_event.modifiers
         );
 
+        // The interactive wave animation runs until the reader does something:
+        // the first key press dismisses it and is CONSUMED (it only stops the
+        // show, it doesn't also act on the editor). Parity with the TUI loops
+        // in `main.rs` and the daemon server, and with the web bridge — this
+        // window used to be the one frontend where the wave could not be
+        // stopped at all, so it ran to its 600-second safety cap.
+        if self
+            .editor
+            .maybe_dismiss_wave_animation(&Event::key(key_event))
+        {
+            return Ok(());
+        }
+
         // Event debug dialog intercepts ALL key events before normal processing.
         if self.editor.active_window().is_event_debug_active() {
             let raw_event = crossterm::event::KeyEvent {
@@ -218,6 +237,17 @@ impl GuiApplication for EditorApp {
     }
 
     fn on_mouse(&mut self, mouse: CtMouseEvent) -> AnyhowResult<bool> {
+        // Same rule as the key path above: any mouse activity — a move, a
+        // click, a wheel notch — ends the wave and is consumed. The window
+        // reports pointer motion the moment the pointer is over it, so this
+        // is the dismissal a reader coming back to the screensaver reaches
+        // for first.
+        if self
+            .editor
+            .maybe_dismiss_wave_animation(&Event::Mouse(mouse))
+        {
+            return Ok(true);
+        }
         self.editor.handle_mouse(mouse)
     }
 
@@ -248,15 +278,10 @@ impl GuiApplication for EditorApp {
     }
 
     fn on_close(&mut self) {
-        // End recovery session first (flushes dirty buffers + assigns recovery IDs),
-        // then save workspace (captures those IDs for next session restore).
-        if let Err(e) = self.editor.end_recovery_session() {
-            tracing::warn!("Failed to end recovery session: {}", e);
-        }
-        if self.workspace_enabled {
-            if let Err(e) = self.editor.save_all_windows_workspaces() {
-                tracing::warn!("Failed to save workspaces: {}", e);
-            }
+        // The same quit-time persistence as the terminal and daemon exits.
+        // Each failure is logged inside; none blocks closing.
+        if let Err(e) = self.editor.persist_on_exit(self.workspace_enabled) {
+            tracing::debug!("Close-time persistence incomplete: {e}");
         }
     }
 

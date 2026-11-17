@@ -65,7 +65,7 @@ Quick install:
 
 On Linux this installs the **universal build**: one statically linked binary
 that runs on every distro, unpacked under `~/.local`, owned by you. It needs no
-root, and it updates itself — `fresh --cmd update`, or the update prompt in the
+root, and it updates itself — `fresh --update`, or the update prompt in the
 editor. On macOS it uses Homebrew.
 
 Prefer your distro's package manager? Ask for it explicitly:
@@ -94,7 +94,9 @@ Or, pick your preferred method:
 | OpenSUSE | [.rpm](#opensuse-rpm) |
 | FreeBSD | [ports / pkg](https://www.freshports.org/editors/fresh) |
 | Gentoo | [GURU](#gentoo-guru) |
+| Solus | [eopkg](#solus-eopkg) |
 | Linux (sandboxed / portable) | [AppImage](#appimage), [Flatpak](#flatpak) |
+| Desktop app (Windows, macOS, Linux) | [Fresh Desktop](#fresh-desktop) |
 | All platforms | [Pre-built binaries](#pre-built-binaries) |
 | npm | [npm / npx](#npm) |
 | Rust users (Fast) | [cargo-binstall](#using-cargo-binstall) |
@@ -114,7 +116,7 @@ symlinks `~/.local/bin/fresh`; set `FRESH_INSTALL_DIR` / `FRESH_BIN_DIR` to put
 them elsewhere. Ensure `~/.local/bin` is in your `PATH`.
 
 Because nothing else owns these files, this is the one Linux install that can
-replace itself: `fresh --cmd update` downloads the next release, verifies it
+replace itself: `fresh --update` downloads the next release, verifies it
 against both its published checksum and GitHub's release attestation, and swaps
 the binary in place.
 
@@ -220,6 +222,15 @@ Enable the repository as read in [Project:GURU/Information for End Users](https:
 emerge --ask app-editors/fresh
 ```
 
+### Solus (eopkg)
+
+Fresh is the official repository. Run eopkg to install:
+
+
+```bash
+sudo eopkg it fresh
+```
+
 ### AppImage
 
 > On most systems the [universal build](#universal-build-linux) is the better
@@ -255,6 +266,35 @@ flatpak run io.github.sinelaw.fresh
 ```
 
 See [flatpak/README.md](flatpak/README.md) for building from source.
+
+### Fresh Desktop
+
+A standalone desktop application: Fresh in its own window, with the editor
+bundled inside, so there is nothing else to install and no browser or terminal
+to open. Download it from the [releases page](https://github.com/sinelaw/fresh/releases):
+
+| Platform | File |
+|----------|------|
+| Windows (x64) | `fresh-desktop-VERSION-windows-x64-setup.exe` |
+| macOS (Intel and Apple Silicon) | `fresh-desktop-VERSION-macos-universal.dmg` |
+| Linux (x86_64) | `fresh-desktop-VERSION-linux-x86_64.AppImage` |
+
+It opens your home directory, or the folder or files you open it with, and
+remembers each project's session like the terminal edition does. The builds
+are not signed with a developer certificate yet. On macOS, the first launch is
+refused; allow it under **System Settings → Privacy & Security → Open Anyway**
+(or run `xattr -dr com.apple.quarantine "/Applications/Fresh Desktop.app"`).
+On Windows, choose **More info → Run anyway** in the SmartScreen prompt.
+Update by installing a newer release.
+To build it from source instead (needs Rust and Node.js), run this from a
+checkout. It builds this platform's package (an AppImage on Linux, a `.dmg` on
+macOS, an installer on Windows) into `desktop/dist/`:
+
+```bash
+node desktop/scripts/package.js
+```
+
+See [desktop/README.md](desktop/README.md) for details.
 
 ### Pre-built binaries
 
@@ -301,7 +341,19 @@ cargo binstall fresh-editor
 
 ### Nix flakes
 
-Run without installing:
+The latest release is packaged in
+[nixpkgs unstable](https://search.nixos.org/packages?channel=unstable&query=fresh-editor)
+as `fresh-editor`:
+```bash
+nix profile add nixpkgs#fresh-editor
+```
+
+For declarative management, add `pkgs.fresh-editor` to your
+[NixOS](https://nixos.org/manual/nixos/stable/#sec-declarative-package-mgmt),
+[Home Manager](https://nix-community.github.io/home-manager/), or
+[nix-darwin](https://github.com/LnL/nix-darwin) configuration.
+
+To follow `master` instead, use this repository's flake. Run without installing:
 ```bash
 nix run github:sinelaw/fresh
 ```
@@ -346,4 +398,14 @@ To disable both upgrade checks and telemetry, use `--no-upgrade-check` or set `c
 
 Copyright (c) Noam Lewis
 
-This project is licensed under the GNU General Public License v2.0 (GPL-2.0).
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version (GPL-3.0-or-later).
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the [GNU General Public License](LICENSE) for more
+details.
+
+SPDX-License-Identifier: GPL-3.0-or-later

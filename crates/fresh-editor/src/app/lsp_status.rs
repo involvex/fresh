@@ -49,17 +49,20 @@ fn centered(s: &str) -> String {
 /// Compose the LSP segment of the status bar for a given buffer language.
 ///
 /// Returns (text, indicator-state).  The state drives the indicator's color
-/// in `status_bar::element_style`; the text is what's rendered inside the
+/// in `view::ui::status_bar::lsp_look`; the text is what's rendered inside the
 /// segment.  Priority:
 ///
-///     0. Buffer-level skip (large file, binary, per-buffer toggle)
-///                       — "LSP (n/a)",              state = OffDismissed
-///     1. Progress       — detailed progress string, state = On
-///     2. Error          — "LSP (error)",            state = Error
-///     3. Running        — "LSP (on)",               state = On
-///     4. Configured-but-not-running (either auto_start or opt-in dormant)
-///                       — "LSP (off)",              state = Off / OffDismissed
-///     5. Nothing        — empty,                    state = None
+/// ```text
+/// 0. Buffer-level skip (large file, binary, per-buffer toggle)
+///                   — "LSP (n/a)",              state = OffDismissed
+/// 1. Progress       — detailed progress string, state = On
+/// 2. Error          — "LSP (error)",            state = Error
+/// 2b. Unresponsive  — "LSP (stuck)",            state = Warning
+/// 3. Running        — "LSP (on)",               state = On
+/// 4. Configured-but-not-running (either auto_start or opt-in dormant)
+///                   — "LSP (off)",              state = Off / OffDismissed
+/// 5. Nothing        — empty,                    state = None
+/// ```
 ///
 /// The buffer-level skip only wins over running language state: showing
 /// "LSP (on)" while LSP is actively skipping this buffer (e.g. rust-
@@ -130,6 +133,16 @@ pub(crate) fn compose_lsp_status(
         return (centered("LSP (error)"), LspIndicatorState::Error);
     }
 
+    // 2b. A server that is alive but not answering: "ready" would be a
+    //     lie while every request expires after 30s (issue #2197), so the
+    //     indicator says so and takes a warning colour.
+    let has_unresponsive = lsp_server_statuses.iter().any(|((lang, _), status)| {
+        lang == current_language && *status == LspServerStatus::Unresponsive
+    });
+    if has_unresponsive {
+        return (centered("LSP (stuck)"), LspIndicatorState::Warning);
+    }
+
     // 3. At least one running (non-Shutdown) server for this language.
     //    Starting/Initializing also counts as "on" — the user has opted in
     //    and it's making progress.
@@ -158,7 +171,7 @@ pub(crate) fn compose_lsp_status(
         .unwrap_or(0);
     if configured_count > 0 {
         // User-dismissed languages keep the same `LSP (off)` text — only
-        // the style changes (handled by `element_style` via the
+        // the style changes (handled by `lsp_look` via the
         // `OffDismissed` variant). `enabled = false` on every configured
         // server is the persistent flavour of the same idea, so render
         // it the same way: pill stays visible but dimmed, so the user
@@ -214,9 +227,11 @@ mod tests {
 
     fn configured_for(lang: &str, command: &str) -> HashMap<String, LspLanguageConfig> {
         let mut m = HashMap::new();
-        let mut server = LspServerConfig::default();
-        server.command = command.to_string();
-        server.enabled = true;
+        let server = LspServerConfig {
+            command: command.to_string(),
+            enabled: true,
+            ..Default::default()
+        };
         m.insert(
             lang.to_string(),
             LspLanguageConfig::Single(Box::new(server)),
@@ -254,6 +269,77 @@ mod tests {
         assert_eq!(state, LspIndicatorState::Off);
     }
 
+    /// Issue #2197: a server that stopped answering requests must not keep
+    /// claiming to be on. Requests expire after 30s and are cancelled; the
+    /// status bar used to keep reading "ready" throughout.
+    #[test]
+    fn stuck_when_server_is_unresponsive() {
+        let (text, state) = compose_lsp_status(
+            "python",
+            None,
+            &HashMap::new(),
+            &status(
+                "python",
+                "pyright-langserver",
+                LspServerStatus::Unresponsive,
+            ),
+            &configured_for("python", "pyright-langserver"),
+            &HashSet::new(),
+            true,
+        );
+        assert!(text.contains("LSP (stuck)"), "got {text:?}");
+        assert_eq!(state, LspIndicatorState::Warning);
+    }
+
+    /// An outright error still wins over "not answering" — a dead server is
+    /// the more urgent of the two.
+    #[test]
+    fn error_outranks_unresponsive() {
+        let mut statuses = status(
+            "python",
+            "pyright-langserver",
+            LspServerStatus::Unresponsive,
+        );
+        statuses.insert(
+            ("python".to_string(), "ruff".to_string()),
+            LspServerStatus::Error,
+        );
+        let (text, state) = compose_lsp_status(
+            "python",
+            None,
+            &HashMap::new(),
+            &statuses,
+            &configured_for("python", "pyright-langserver"),
+            &HashSet::new(),
+            true,
+        );
+        assert!(text.contains("LSP (error)"), "got {text:?}");
+        assert_eq!(state, LspIndicatorState::Error);
+    }
+
+    /// The pill is a fixed width so nothing else on the status bar shifts
+    /// when the LSP state changes.
+    #[test]
+    fn stuck_pill_matches_the_indicator_width() {
+        let (text, _) = compose_lsp_status(
+            "python",
+            None,
+            &HashMap::new(),
+            &status(
+                "python",
+                "pyright-langserver",
+                LspServerStatus::Unresponsive,
+            ),
+            &configured_for("python", "pyright-langserver"),
+            &HashSet::new(),
+            true,
+        );
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(text.as_str()),
+            INDICATOR_WIDTH,
+        );
+    }
+
     #[test]
     fn off_dismissed_when_user_dismissed_language() {
         let mut dismissed = HashSet::new();
@@ -278,9 +364,11 @@ mod tests {
     #[test]
     fn off_dismissed_when_all_servers_disabled_in_config() {
         let mut config = HashMap::new();
-        let mut server = LspServerConfig::default();
-        server.command = "rust-analyzer".to_string();
-        server.enabled = false;
+        let server = LspServerConfig {
+            command: "rust-analyzer".to_string(),
+            enabled: false,
+            ..Default::default()
+        };
         config.insert(
             "rust".to_string(),
             LspLanguageConfig::Single(Box::new(server)),

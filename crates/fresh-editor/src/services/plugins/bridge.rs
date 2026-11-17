@@ -2,10 +2,12 @@ use crate::config_io::DirectoryContext;
 use crate::i18n;
 use crate::input::command_registry::CommandRegistry;
 use crate::model::filesystem::FileSystem;
+use crate::services::plugins::owned_store::OwnedStore;
 use crate::services::signal_handler;
 use crate::view::theme;
 use fresh_core::api::DirEntry as PluginDirEntry;
 use fresh_core::services::{PluginFileStat, PluginFilesystem, PluginServiceBridge};
+use fresh_editor_core::model::host_path::AsHostPath;
 use std::any::Any;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -96,8 +98,8 @@ impl RoutedFilesystem {
     fn ensure_parent(fs: &dyn FileSystem, path: &Path) -> bool {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty()
-                && !fs.exists(parent)
-                && fs.create_dir_all(parent).is_err()
+                && !fs.exists(parent.as_host())
+                && fs.create_dir_all(parent.as_host()).is_err()
             {
                 return false;
             }
@@ -108,25 +110,40 @@ impl RoutedFilesystem {
 
 impl PluginFilesystem for RoutedFilesystem {
     fn read_file(&self, path: &Path) -> Option<Vec<u8>> {
-        (self.resolve)()?.read_file(path).ok()
+        (self.resolve)()?.read_file(path.as_host()).ok()
     }
 
     fn write_file(&self, path: &Path, contents: &[u8]) -> bool {
         let Some(fs) = (self.resolve)() else {
             return false;
         };
-        Self::ensure_parent(fs.as_ref(), path) && fs.write_file(path, contents).is_ok()
+        // Create-only, as this has always claimed to be. The underlying
+        // `write_file` replaces its target, so without this check a plugin
+        // aiming at an existing path destroyed it.
+        if fs.exists(path.as_host()) {
+            return false;
+        }
+        Self::ensure_parent(fs.as_ref(), path) && fs.write_file(path.as_host(), contents).is_ok()
+    }
+
+    fn replace_file(&self, path: &Path, contents: &[u8]) -> bool {
+        let Some(fs) = (self.resolve)() else {
+            return false;
+        };
+        Self::ensure_parent(fs.as_ref(), path) && fs.write_file(path.as_host(), contents).is_ok()
     }
 
     fn exists(&self, path: &Path) -> bool {
-        (self.resolve)().map(|fs| fs.exists(path)).unwrap_or(false)
+        (self.resolve)()
+            .map(|fs| fs.exists(path.as_host()))
+            .unwrap_or(false)
     }
 
     fn read_dir(&self, path: &Path) -> Vec<PluginDirEntry> {
         let Some(fs) = (self.resolve)() else {
             return Vec::new();
         };
-        match fs.read_dir(path) {
+        match fs.read_dir(path.as_host()) {
             Ok(entries) => entries
                 .into_iter()
                 .map(|e| PluginDirEntry {
@@ -143,68 +160,25 @@ impl PluginFilesystem for RoutedFilesystem {
         let Some(fs) = (self.resolve)() else {
             return false;
         };
-        fs.is_dir(path).unwrap_or(false) || fs.create_dir_all(path).is_ok()
-    }
-
-    fn remove_path(&self, path: &Path) -> bool {
-        let Some(fs) = (self.resolve)() else {
-            return false;
-        };
-        if fs.is_dir(path).unwrap_or(false) {
-            fs.remove_dir_all(path).is_ok()
-        } else {
-            fs.remove_file(path).is_ok()
-        }
-    }
-
-    fn rename(&self, from: &Path, to: &Path) -> bool {
-        let Some(fs) = (self.resolve)() else {
-            return false;
-        };
-        if fs.rename(from, to).is_ok() {
-            return true;
-        }
-        // Same-backend cross-device fallback: copy then remove the source.
-        let is_dir = fs.is_dir(from).unwrap_or(false);
-        let copied = if is_dir {
-            fs.copy_dir_all(from, to).is_ok()
-        } else {
-            fs.copy(from, to).is_ok()
-        };
-        if !copied {
-            return false;
-        }
-        if is_dir {
-            fs.remove_dir_all(from).is_ok()
-        } else {
-            fs.remove_file(from).is_ok()
-        }
-    }
-
-    fn copy(&self, from: &Path, to: &Path) -> bool {
-        let Some(fs) = (self.resolve)() else {
-            return false;
-        };
-        if fs.is_dir(from).unwrap_or(false) {
-            fs.copy_dir_all(from, to).is_ok()
-        } else {
-            Self::ensure_parent(fs.as_ref(), to) && fs.copy(from, to).is_ok()
-        }
+        fs.is_dir(path.as_host()).unwrap_or(false) || fs.create_dir_all(path.as_host()).is_ok()
     }
 
     fn stat(&self, path: &Path) -> Option<PluginFileStat> {
         let fs = (self.resolve)()?;
-        let md = fs.metadata(path).ok()?;
+        let md = fs.metadata(path.as_host()).ok()?;
         Some(PluginFileStat {
-            is_file: fs.is_file(path).unwrap_or(false),
-            is_dir: fs.is_dir(path).unwrap_or(false),
+            is_file: fs.is_file(path.as_host()).unwrap_or(false),
+            is_dir: fs.is_dir(path.as_host()).unwrap_or(false),
             size: md.size,
             readonly: md.is_readonly,
         })
     }
 
     fn canonicalize(&self, path: &Path) -> Option<PathBuf> {
-        (self.resolve)()?.canonicalize(path).ok()
+        (self.resolve)()?
+            .canonicalize(path.as_host())
+            .ok()
+            .map(Into::into)
     }
 }
 
@@ -219,6 +193,10 @@ pub struct EditorServiceBridge {
     /// refresh. Backs bare-string paths (active window) and `WindowPath` values
     /// (a specific window).
     pub window_registry: Arc<WindowFsRegistry>,
+    /// Editor-owned removal and replacement, keyed by name rather than path.
+    /// Plugins have no path-taking delete; everything that removes something
+    /// resolves the path here instead. See `owned_store`.
+    pub owned_store: Arc<OwnedStore>,
 }
 
 impl PluginServiceBridge for EditorServiceBridge {
@@ -330,12 +308,69 @@ impl PluginServiceBridge for EditorServiceBridge {
         self.dir_context.data_dir.clone()
     }
 
+    // Editor-owned mutation. Each of these takes a name, never a path: the
+    // store resolves it, so a plugin cannot aim a removal at a path of its
+    // own choosing. See `owned_store` for why that distinction is the whole
+    // point.
+
+    fn scratch_create(&self, label: &str) -> Option<String> {
+        self.owned_store.scratch_create(label)
+    }
+
+    fn scratch_path(&self, token: &str) -> Option<PathBuf> {
+        self.owned_store.scratch_path(token)
+    }
+
+    fn scratch_discard(&self, token: &str) -> bool {
+        self.owned_store.scratch_discard(token)
+    }
+
+    fn install_scratch(&self, token: &str, kind: &str, name: &str, subpath: &str) -> bool {
+        self.owned_store.install_scratch(token, kind, name, subpath)
+    }
+
+    fn scratch_from_directory(&self, from: &Path) -> Option<String> {
+        self.owned_store.scratch_from_directory(from)
+    }
+
+    fn uninstall_package(&self, kind: &str, name: &str) -> bool {
+        self.owned_store.uninstall_package(kind, name)
+    }
+
+    fn trash_theme(&self, name: &str) -> bool {
+        self.owned_store.trash_theme(name)
+    }
+
+    fn state_set(&self, namespace: &str, key: &str, value: &str) -> bool {
+        self.owned_store.state_set(namespace, key, value)
+    }
+
+    fn state_get(&self, namespace: &str, key: &str) -> Option<String> {
+        self.owned_store.state_get(namespace, key)
+    }
+
+    fn state_keys(&self, namespace: &str) -> Vec<String> {
+        self.owned_store.state_keys(namespace)
+    }
+
+    fn state_delete(&self, namespace: &str, key: &str) -> bool {
+        self.owned_store.state_delete(namespace, key)
+    }
+
+    fn home_dir(&self) -> Option<PathBuf> {
+        self.dir_context.home_dir.clone()
+    }
+
     fn terminal_dir(&self, working_dir: &std::path::Path) -> PathBuf {
         self.dir_context.terminal_dir_for(working_dir)
     }
 
     fn working_data_dir(&self, working_dir: &std::path::Path) -> PathBuf {
         self.dir_context.working_data_dir_for(working_dir)
+    }
+
+    fn builtin_file_icons(&self) -> serde_json::Value {
+        crate::view::file_icons::builtin_json()
     }
 
     fn get_theme_data(&self, key_or_name: &str) -> Option<serde_json::Value> {

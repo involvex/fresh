@@ -56,7 +56,7 @@ pub(crate) fn screen_to_buffer_position(
     row: u16,
     content_rect: Rect,
     gutter_width: u16,
-    cached_mappings: &Option<Vec<ViewLineMapping>>,
+    cached_mappings: Option<&[ViewLineMapping]>,
     fallback_position: usize,
     allow_gutter_click: bool,
     compose_width: Option<u16>,
@@ -108,7 +108,7 @@ pub(crate) fn screen_to_buffer_position_with_overshoot(
     row: u16,
     content_rect: Rect,
     gutter_width: u16,
-    cached_mappings: &Option<Vec<ViewLineMapping>>,
+    cached_mappings: Option<&[ViewLineMapping]>,
     fallback_position: usize,
     allow_gutter_click: bool,
     compose_width: Option<u16>,
@@ -144,7 +144,7 @@ pub(crate) fn screen_to_buffer_position_with_overshoot(
         gutter_width,
         content_col,
         content_row,
-        num_mappings = cached_mappings.as_ref().map(|m| m.len()),
+        num_mappings = cached_mappings.map(|m| m.len()),
         "screen_to_buffer_position"
     );
 
@@ -164,24 +164,10 @@ pub(crate) fn screen_to_buffer_position_with_overshoot(
     // Helper to get position (and cells past the rendered content) from a
     // line mapping at a given visual column.
     let position_from_mapping = |line_mapping: &ViewLineMapping, col: usize| -> (usize, usize) {
-        // Column of the cell just past the last *content* cell: the last
-        // source-backed cell whose byte is before `line_end_byte` (the
-        // newline cell and trailing decoration-only cells don't count).
-        // A click at or beyond this column is a click past the line's
-        // content; the difference is the virtual-space overshoot.
-        let content_end_col = line_mapping
-            .visual_to_char
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, &char_idx)| {
-                line_mapping
-                    .char_source_bytes
-                    .get(char_idx)
-                    .is_some_and(|b| b.is_some_and(|b| b < line_mapping.line_end_byte))
-            })
-            .map(|(visual_col, _)| visual_col + 1)
-            .unwrap_or(0);
+        // A click at or beyond the column just past the last content cell
+        // is a click past the line's content; the difference is the
+        // virtual-space overshoot.
+        let content_end_col = line_mapping.content_end_col();
 
         if col < content_end_col {
             // Use O(1) lookup: visual column -> char index -> source byte
@@ -198,9 +184,12 @@ pub(crate) fn screen_to_buffer_position_with_overshoot(
         } else {
             // Click is past end of visible content.
             let overshoot = col - content_end_col;
-            // For empty lines (only a newline), return the line start position
-            // to keep cursor on this line rather than jumping to the next line.
-            if line_mapping.visual_to_char.len() <= 1 {
+            // For empty lines (no content cells, at most a newline cell),
+            // return the line start position to keep cursor on this line
+            // rather than jumping to the next line. The cell count can't
+            // tell: the newline usually draws no cell, so a one-character
+            // line has exactly one (issue #3351).
+            if content_end_col == 0 {
                 if let Some(Some(first_byte)) = line_mapping.char_source_bytes.first() {
                     return (*first_byte, overshoot);
                 }
@@ -294,7 +283,9 @@ pub(crate) fn fold_toggle_byte_from_position(
     }
 
     use crate::view::folding::indent_folding;
-    let line_start = indent_folding::find_line_start_byte(&state.buffer, target_position);
+    // No line start within reach: the click is inside a line too long to have
+    // foldable indentation structure, so there is no fold to toggle.
+    let line_start = indent_folding::find_line_start_byte(&state.buffer, target_position)?;
 
     // Already collapsed → allow toggling (unfold). This stays available even
     // with the indicators hidden: the collapsed line still renders its "..."
@@ -392,7 +383,7 @@ mod tests {
         let r = Rect::new(0, 0, 100, 20);
         let pos = screen_to_buffer_position(
             /* col */ 5, /* row */ 5, /* content_rect */ r,
-            /* gutter_width */ 3, /* cached_mappings */ &None,
+            /* gutter_width */ 3, /* cached_mappings */ None,
             /* fallback_position */ 42, /* allow_gutter_click */ true,
             /* compose_width */ None,
         );
@@ -403,7 +394,7 @@ mod tests {
     fn screen_to_buffer_position_rejects_gutter_click_when_not_allowed() {
         let r = Rect::new(0, 0, 100, 20);
         // col 1 is inside the 3-wide gutter.
-        let pos = screen_to_buffer_position(1, 2, r, 3, &None, 0, false, None);
+        let pos = screen_to_buffer_position(1, 2, r, 3, None, 0, false, None);
         assert_eq!(pos, None);
     }
 }

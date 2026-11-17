@@ -9,6 +9,7 @@
 use crate::services::async_bridge::AsyncBridge;
 use crate::services::lsp::async_handler::LspHandle;
 use crate::types::{FeatureFilter, LspFeature, LspServerConfig};
+use fresh_editor_core::model::host_path::{AsHostPath, PathStyle};
 use lsp_types::{SemanticTokensLegend, Uri};
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -110,77 +111,72 @@ enum SpawnDecision {
     CooledDown,
 }
 
-/// Convert a directory path to an LSP `file://` URI without the `url` crate.
-fn path_to_uri(path: &Path) -> Option<Uri> {
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().ok()?.join(path)
-    };
-    // Percent-encode each path component for RFC 3986 compliance
-    let encoded: String = abs
-        .components()
-        .filter_map(|c| match c {
-            std::path::Component::RootDir => None, // handled by leading '/' in Normal
-            std::path::Component::Normal(s) => {
-                let s = s.to_str()?;
-                let mut out = String::with_capacity(s.len() + 1);
-                out.push('/');
-                for b in s.bytes() {
-                    if b.is_ascii_alphanumeric()
-                        || matches!(
-                            b,
-                            b'-' | b'.'
-                                | b'_'
-                                | b'~'
-                                | b'@'
-                                | b'!'
-                                | b'$'
-                                | b'&'
-                                | b'\''
-                                | b'('
-                                | b')'
-                                | b'+'
-                                | b','
-                                | b';'
-                                | b'='
-                        )
-                    {
-                        out.push(b as char);
-                    } else {
-                        out.push_str(&format!("%{:02X}", b));
-                    }
-                }
-                Some(out)
-            }
-            _ => None,
-        })
-        .collect();
-    format!("file://{}", encoded).parse().ok()
+/// Convert a directory path to an LSP `file://` URI.
+///
+/// This routes through the shared, platform-aware converter in
+/// `fresh_core::file_uri`, the same one that builds the per-document
+/// `didOpen` URIs, so the workspace `root_uri` is encoded the same way.
+/// The old hand-rolled encoder here only handled `RootDir` and `Normal`
+/// components and dropped `Component::Prefix`, so it stripped the Windows
+/// drive letter (producing `file:///Users/...` instead of
+/// `file:///C:/Users/...`) and broke root-dependent LSP operations with
+/// "os error 3" (issue #3067).
+pub fn path_to_uri(style: PathStyle, path: &Path) -> Option<Uri> {
+    // The shared converter returns `None` for a path with no root, so keep the
+    // long-standing behavior of resolving those against the working directory
+    // before encoding. Rooted-ness is asked of the path itself, not of
+    // `Path::is_absolute`: on Windows that wants a drive letter, so a remote
+    // host's `/home/user/proj` took the `current_dir` branch and came back as
+    // `C:/home/user/proj` — a root the host does not have.
+    if path.as_host().under(style).is_absolute() {
+        return fresh_core::file_uri::path_to_lsp_uri(path);
+    }
+    let abs = std::env::current_dir().ok()?.join(path);
+    fresh_core::file_uri::path_to_lsp_uri(&abs)
 }
 
 /// Detect workspace root by walking upward from a file looking for marker files/directories.
 ///
 /// Returns the first directory containing any of the markers, or the file's parent
 /// directory if no marker is found.
-pub fn detect_workspace_root(file_path: &Path, root_markers: &[String]) -> std::path::PathBuf {
-    let file_dir = file_path.parent().unwrap_or(file_path).to_path_buf();
+///
+/// The markers are looked for through `fs`, the filesystem the file is on.
+/// `Path::exists` would ask the *client's* filesystem, which for a remote
+/// workspace answers no to everything, so the root silently collapsed to the
+/// file's own directory and the language server was handed the wrong project.
+pub fn detect_workspace_root(
+    fs: &dyn crate::model::filesystem::FileSystem,
+    file_path: &Path,
+    root_markers: &[String],
+) -> std::path::PathBuf {
+    // The whole climb splits under the path's own rules; using
+    // `Path::parent` for the first step and `HostPath::parent` for the rest
+    // would mix the client's rules into a host path.
+    let file_dir = fs
+        .at(file_path.as_host())
+        .parent()
+        .unwrap_or(file_path.as_host())
+        .to_host_path_buf();
 
     if root_markers.is_empty() {
-        return file_dir;
+        return file_dir.into_path_buf();
     }
 
-    let mut dir = Some(file_dir.as_path());
+    let mut dir = Some(file_dir.as_host_path());
     while let Some(d) = dir {
         for marker in root_markers {
-            if d.join(marker).exists() {
-                return d.to_path_buf();
+            if fs.exists(
+                fs.at(d)
+                    .join_name(std::ffi::OsStr::new(marker))
+                    .as_host_path(),
+            ) {
+                return d.as_path().to_path_buf();
             }
         }
-        dir = d.parent();
+        dir = fs.at(d).parent();
     }
 
-    file_dir
+    file_dir.into_path_buf()
 }
 
 /// Summary of capabilities reported by an LSP server during initialization.
@@ -204,6 +200,10 @@ pub struct ServerCapabilitySummary {
     pub document_formatting: bool,
     pub document_range_formatting: bool,
     pub rename: bool,
+    /// `renameProvider.prepareProvider`: the server answers
+    /// `textDocument/prepareRename`. A bare `renameProvider: true` (e.g.
+    /// pylsp) supports rename but not prepareRename.
+    pub rename_prepare: bool,
     pub signature_help: bool,
     pub inlay_hints: bool,
     pub folding_ranges: bool,
@@ -217,6 +217,9 @@ pub struct ServerCapabilitySummary {
     pub document_symbols: bool,
     pub workspace_symbols: bool,
     pub diagnostics: bool,
+    /// How the server asked to be told about edits (`textDocumentSync`):
+    /// range edits, the whole document, or nothing (#3436).
+    pub text_document_sync: crate::services::lsp::sync_policy::ServerSync,
 }
 
 impl ServerCapabilitySummary {
@@ -273,7 +276,14 @@ impl ServerCapabilitySummary {
             "textDocument/references" => self.references = register,
             "textDocument/formatting" => self.document_formatting = register,
             "textDocument/rangeFormatting" => self.document_range_formatting = register,
-            "textDocument/rename" => self.rename = register,
+            "textDocument/rename" => {
+                self.rename = register;
+                self.rename_prepare = register
+                    && register_options
+                        .and_then(|opts| opts.get("prepareProvider"))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+            }
             "textDocument/signatureHelp" => self.signature_help = register,
             "textDocument/inlayHint" => self.inlay_hints = register,
             "textDocument/foldingRange" => self.folding_ranges = register,
@@ -294,6 +304,20 @@ impl ServerCapabilitySummary {
             "textDocument/documentSymbol" => self.document_symbols = register,
             "workspace/symbol" => self.workspace_symbols = register,
             "textDocument/diagnostic" => self.diagnostics = register,
+            "textDocument/didChange" => {
+                use crate::services::lsp::sync_policy::ServerSync;
+                // Unregistering leaves the server without a didChange
+                // registration at all; registering without a kind keeps
+                // what it declared statically.
+                self.text_document_sync = if register {
+                    ServerSync::from_registration(register_options)
+                        .unwrap_or(self.text_document_sync)
+                } else {
+                    ServerSync::None
+                };
+                // Not a feature gate: nothing to re-request.
+                return false;
+            }
             "textDocument/semanticTokens" => {
                 if register {
                     // Registration options carry the legend and full/range
@@ -419,7 +443,7 @@ pub struct LspManager {
     per_language_root_uris: HashMap<String, Uri>,
 
     /// Tokio runtime reference
-    runtime: Option<tokio::runtime::Handle>,
+    runtime: Option<crate::services::runtime::LiveRuntime>,
 
     /// Async bridge for communication
     async_bridge: Option<AsyncBridge>,
@@ -430,6 +454,8 @@ pub struct LspManager {
     /// by `set_long_running_spawner` from `Editor::set_boot_authority`
     /// before any LSP spawn can happen.
     long_running_spawner: Option<std::sync::Arc<dyn crate::services::remote::LongRunningSpawner>>,
+    /// The active authority's filesystem; see [`Self::set_filesystem`].
+    filesystem: Option<std::sync::Arc<dyn crate::model::filesystem::FileSystem>>,
 
     /// Active authority's Workspace Trust handle. LSP servers load and execute
     /// project-controlled code at startup (analyzers/source-generators for C#,
@@ -487,6 +513,7 @@ impl LspManager {
             runtime: None,
             async_bridge: None,
             long_running_spawner: None,
+            filesystem: None,
             workspace_trust: None,
             path_translation: None,
             restart_attempts: HashMap::new(),
@@ -551,6 +578,20 @@ impl LspManager {
         self.path_translation = translation;
     }
 
+    /// Install the active authority's filesystem, so root detection looks for
+    /// marker files where the workspace actually is. Set from
+    /// `Editor::set_boot_authority` alongside the spawner and the translation.
+    pub fn set_filesystem(&mut self, fs: std::sync::Arc<dyn crate::model::filesystem::FileSystem>) {
+        self.filesystem = Some(fs);
+    }
+
+    /// The authority's filesystem, or the local one before any is wired.
+    fn filesystem(&self) -> std::sync::Arc<dyn crate::model::filesystem::FileSystem> {
+        self.filesystem
+            .clone()
+            .unwrap_or_else(|| std::sync::Arc::new(crate::model::filesystem::StdFileSystem))
+    }
+
     /// Blocking variant of the authority-routed command probe used by
     /// the LSP status popup (which runs on the main thread and needs a
     /// synchronous answer). Blocks on the tokio runtime to drive the
@@ -574,11 +615,6 @@ impl LspManager {
             return crate::services::lsp::command_exists(command);
         };
         runtime.block_on(spawner.command_exists(command))
-    }
-
-    /// Check if a language has been manually enabled (allowing spawn even if auto_start=false)
-    pub fn is_language_allowed(&self, language: &str) -> bool {
-        self.allowed_languages.contains(language)
     }
 
     /// Allow a language to spawn LSP server (used by manual start command)
@@ -664,14 +700,6 @@ impl LspManager {
         self.get_handles(language).iter().any(|sh| {
             sh.feature_filter.allows(LspFeature::SemanticTokens)
                 && sh.capabilities.semantic_tokens_full
-        })
-    }
-
-    /// Check if any eligible server for the language supports full semantic token deltas.
-    pub fn semantic_tokens_full_delta_supported(&self, language: &str) -> bool {
-        self.get_handles(language).iter().any(|sh| {
-            sh.feature_filter.allows(LspFeature::SemanticTokens)
-                && sh.capabilities.semantic_tokens_full_delta
         })
     }
 
@@ -821,7 +849,11 @@ impl LspManager {
     /// Set the Tokio runtime and async bridge
     ///
     /// Must be called before spawning any servers
-    pub fn set_runtime(&mut self, runtime: tokio::runtime::Handle, async_bridge: AsyncBridge) {
+    pub fn set_runtime(
+        &mut self,
+        runtime: crate::services::runtime::LiveRuntime,
+        async_bridge: AsyncBridge,
+    ) {
         self.runtime = Some(runtime);
         self.async_bridge = Some(async_bridge);
     }
@@ -836,30 +868,12 @@ impl LspManager {
         self.config.insert(language, configs);
     }
 
-    /// Append additional server configs to an existing language entry.
-    pub fn append_language_configs(&mut self, language: String, configs: Vec<LspServerConfig>) {
-        self.config.entry(language).or_default().extend(configs);
-    }
-
     /// Set universal (global) LSP server configs.
     ///
     /// Universal servers are spawned once per project and shared across all
     /// languages, rather than being duplicated into each language's config list.
     pub fn set_universal_configs(&mut self, configs: Vec<LspServerConfig>) {
         self.universal_configs = configs;
-    }
-
-    /// Return the list of currently configured language keys.
-    pub fn configured_languages(&self) -> Vec<String> {
-        self.config.keys().cloned().collect()
-    }
-
-    /// Set a new root URI for the workspace
-    ///
-    /// This should be called after shutting down all servers when switching projects.
-    /// Servers spawned after this will use the new root URI.
-    pub fn set_root_uri(&mut self, root_uri: Option<Uri>) {
-        self.root_uri = root_uri;
     }
 
     /// Set a language-specific root URI
@@ -913,51 +927,19 @@ impl LspManager {
                 .and_then(|configs| configs.first())
                 .map(|c| c.root_markers.as_slice())
                 .unwrap_or(&[]);
-            let root = detect_workspace_root(path, markers);
+            let root = detect_workspace_root(&*self.filesystem(), path, markers);
             let mapped = self
                 .path_translation
                 .as_ref()
                 .and_then(|t| t.host_to_remote(&root))
                 .unwrap_or(root);
-            if let Some(uri) = path_to_uri(&mapped) {
+            if let Some(uri) = path_to_uri(self.filesystem().style(), &mapped) {
                 return Some(uri);
             }
         }
 
         // 3. No file path available — use the global root_uri
         self.root_uri.clone()
-    }
-
-    /// Get the effective root URI for a language (legacy, without file-based detection)
-    ///
-    /// Returns the language-specific root if set, otherwise the default root.
-    pub fn get_effective_root_uri(&self, language: &str) -> Option<Uri> {
-        self.resolve_root_uri(language, None)
-    }
-
-    /// Reset the manager for a new project
-    ///
-    /// This shuts down all servers and clears state, preparing for a fresh start.
-    /// The configuration is preserved but servers will need to be respawned.
-    pub fn reset_for_new_project(&mut self, new_root_uri: Option<Uri>) {
-        // Shutdown all servers
-        self.shutdown_all();
-
-        // Update root URI
-        self.root_uri = new_root_uri;
-
-        // Clear restart tracking state (fresh start)
-        self.restart_attempts.clear();
-        self.restart_cooldown.clear();
-        self.pending_restarts.clear();
-
-        // Keep allowed_languages and disabled_languages as user preferences
-        // Keep config as it's not project-specific
-
-        tracing::info!(
-            "LSP manager reset for new project: {:?}",
-            self.root_uri.as_ref().map(|u| u.as_str())
-        );
     }
 
     /// Get the primary (first) existing LSP handle for a language (no spawning).
@@ -984,6 +966,16 @@ impl LspManager {
             .iter()
             .filter(|sh| sh.handle.scope().accepts(language))
             .collect()
+    }
+
+    /// Every running server handle, regardless of the language it serves.
+    pub fn all_handles(&self) -> &[ServerHandle] {
+        &self.handles
+    }
+
+    /// Every running server handle, mutably.
+    pub fn all_handles_mut(&mut self) -> Vec<&mut ServerHandle> {
+        self.handles.iter_mut().collect()
     }
 
     /// Get all mutable handles that accept a language (both language-specific and universal).
@@ -1074,6 +1066,19 @@ impl LspManager {
             .filter(|sh| sh.handle.scope().accepts(language))
             .filter(|sh| sh.feature_filter.allows(feature) && sh.has_capability(feature))
             .collect()
+    }
+
+    /// Whether a server that would take `feature` for `language` is still
+    /// starting: spawned, but its `initialize` answer not yet handled, so
+    /// [`Self::handles_for_feature_mut`] leaves it out for now. A request
+    /// that found no server because of this can be re-issued once
+    /// `LspInitialized` arrives.
+    pub fn has_initializing_handle(&self, language: &str, feature: LspFeature) -> bool {
+        self.handles.iter().any(|sh| {
+            sh.handle.scope().accepts(language)
+                && sh.feature_filter.allows(feature)
+                && !sh.capabilities.initialized
+        })
     }
 
     /// Consult the spawn throttle for `language` and, on `Allow`, record
@@ -1423,8 +1428,9 @@ impl LspManager {
                 Ok(handle) => {
                     let effective_root = file_path
                         .and_then(|p| {
-                            let root = detect_workspace_root(p, &config.root_markers);
-                            path_to_uri(&root)
+                            let root =
+                                detect_workspace_root(&*self.filesystem(), p, &config.root_markers);
+                            path_to_uri(self.filesystem().style(), &root)
                         })
                         .or_else(|| self.root_uri.clone());
                     if let Err(e) =
@@ -1592,11 +1598,6 @@ impl LspManager {
         results
     }
 
-    /// Check if a language server is in restart cooldown
-    pub fn is_in_cooldown(&self, language: &str) -> bool {
-        self.restart_cooldown.contains(language)
-    }
-
     /// Check if a language server has a pending restart
     pub fn has_pending_restart(&self, language: &str) -> bool {
         self.pending_restarts.contains_key(language)
@@ -1751,8 +1752,9 @@ impl LspManager {
                 let effective_root = if is_universal {
                     file_path
                         .and_then(|p| {
-                            let root = detect_workspace_root(p, &config.root_markers);
-                            path_to_uri(&root)
+                            let root =
+                                detect_workspace_root(&*self.filesystem(), p, &config.root_markers);
+                            path_to_uri(self.filesystem().style(), &root)
                         })
                         .or_else(|| self.root_uri.clone())
                 } else {
@@ -1791,21 +1793,6 @@ impl LspManager {
                 (false, message)
             }
         }
-    }
-
-    /// Get the number of recent restart attempts for a language
-    pub fn restart_attempt_count(&self, language: &str) -> usize {
-        let now = Instant::now();
-        let window = Duration::from_secs(RESTART_WINDOW_SECS);
-        self.restart_attempts
-            .get(language)
-            .map(|attempts| {
-                attempts
-                    .iter()
-                    .filter(|t| now.duration_since(**t) < window)
-                    .count()
-            })
-            .unwrap_or(0)
     }
 
     /// Get a list of currently running LSP server language labels (deduplicated).
@@ -1930,189 +1917,16 @@ impl Drop for LspManager {
     }
 }
 
-/// Helper function to detect language from file path using the config's languages section.
-///
-/// Priority order matches `GrammarRegistry::find_by_path`:
-/// 1. Exact filename match against `filenames` (highest priority)
-/// 2. Glob pattern match against `filenames` entries containing wildcards
-/// 3. File extension match against `extensions` (lowest config-based priority)
-///
-/// Kept separate from `find_by_path` because this returns the user's
-/// config **key** (`[languages.mylang]` → `"mylang"`) rather than the
-/// catalog entry's `language_id`, which is needed for LSP routing when a
-/// user aliases an existing grammar.
-pub fn detect_language(
-    path: &std::path::Path,
-    languages: &std::collections::HashMap<String, crate::config::LanguageConfig>,
-) -> Option<String> {
-    let detected = detect_language_by_config(path, languages);
-
-    // `.h` headers: the default config maps the extension to C, but in C++
-    // projects the header is still C++ and must route to clangd in C++ mode.
-    // If the detected language is `c`, the file is `.h`, and the surrounding
-    // tree smells like C++ (sibling C++ sources or an ancestor
-    // `compile_commands.json`), promote to `cpp` so the LSP binding is right.
-    if detected.as_deref() == Some("c")
-        && path.extension().and_then(|e| e.to_str()) == Some("h")
-        && languages.contains_key("cpp")
-        && header_in_cpp_tree(path)
-    {
-        return Some("cpp".to_string());
-    }
-
-    detected
-}
-
-/// Pure config/path-based language detection without filesystem probing.
-fn detect_language_by_config(
-    path: &std::path::Path,
-    languages: &std::collections::HashMap<String, crate::config::LanguageConfig>,
-) -> Option<String> {
-    use crate::primitives::glob_match::{glob_entry_matches, literal_entry_matches};
-
-    if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
-        // 1. Exact filename match (highest priority)
-        for (language_name, lang_config) in languages {
-            if lang_config
-                .filenames
-                .iter()
-                .any(|f| literal_entry_matches(f, filename))
-            {
-                return Some(language_name.clone());
-            }
-        }
-
-        // 2. Glob pattern match
-        let path_str = path.to_str().unwrap_or("");
-        for (language_name, lang_config) in languages {
-            if lang_config
-                .filenames
-                .iter()
-                .any(|f| glob_entry_matches(f, path_str, filename))
-            {
-                return Some(language_name.clone());
-            }
-        }
-    }
-
-    // 3. Extension match (lowest priority among config-based detection)
-    if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
-        for (language_name, lang_config) in languages {
-            if lang_config.extensions.iter().any(|ext| ext == extension) {
-                return Some(language_name.clone());
-            }
-        }
-    }
-
-    None
-}
-
-/// Filesystem probe: does this header sit inside something that looks like
-/// a C++ project? Two signals, both conservative:
-///
-///   * The file's own directory contains any C++ source or C++-specific
-///     header (`.cc`, `.cpp`, `.cxx`, `.C`, `.c++`, `.hpp`, `.hh`, `.hxx`).
-///     Decisive — if the siblings are C++, the header is too.
-///   * An ancestor up to 10 levels deep contains a `compile_commands.json`
-///     whose content carries a C++ marker. The mere presence of the file
-///     is not enough: CMake emits `compile_commands.json` for pure-C
-///     builds as well, so we peek inside and only promote when the
-///     payload mentions a C++-specific compiler, flag, or source
-///     extension (`c++`, `.cpp`, `.cc`, `.cxx`, `.C` ). This still covers
-///     the fmt / Chromium / LLVM / Qt-style layouts where the header
-///     lives deep under `include/` while sources sit in `src/` at the
-///     project root.
-///
-/// Bounded by depth (10), by a single shallow `read_dir` at the start,
-/// and by a capped 1 MiB read of `compile_commands.json`, so the cost is
-/// a handful of `stat`s plus at most one bounded read on file open.
-/// Silent on any I/O error — if we can't see the filesystem we fall back
-/// to the default config answer (C), which is the pre-fix behavior.
-///
-/// NOTE(remote-fs): Uses `std::fs` directly, matching the pre-existing
-/// `detect_workspace_root` in this module. On SSH sessions the probe
-/// sees the local filesystem, so the promotion silently becomes a no-op
-/// (returns `false`, falls back to `c`). Fixing this requires threading
-/// `&dyn FileSystem` through `detect_language` and
-/// `DetectedLanguage::from_path` — a cross-cutting refactor that should
-/// be done alongside the same fix for `detect_workspace_root`.
-fn header_in_cpp_tree(path: &std::path::Path) -> bool {
-    let Some(start_dir) = path.parent() else {
-        return false;
-    };
-
-    // 1. Sibling scan in the header's own directory.
-    if let Ok(entries) = std::fs::read_dir(start_dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            let Some(ext) = p.extension().and_then(|e| e.to_str()) else {
-                continue;
-            };
-            if matches!(
-                ext,
-                "cc" | "cpp" | "cxx" | "C" | "c++" | "hpp" | "hh" | "hxx"
-            ) {
-                return true;
-            }
-        }
-    }
-
-    // 2. Walk ancestors for compile_commands.json, and only promote if
-    //    the file actually carries a C++ marker — CMake emits it for
-    //    pure-C builds too.
-    let mut current = Some(start_dir);
-    let mut depth = 0u32;
-    while let Some(dir) = current {
-        let cc = dir.join("compile_commands.json");
-        if cc.is_file() && compile_commands_has_cpp_marker(&cc) {
-            return true;
-        }
-        if depth >= 10 {
-            break;
-        }
-        depth += 1;
-        current = dir.parent();
-    }
-
-    false
-}
-
-/// Returns true when `compile_commands.json` contains a C++ marker —
-/// either the literal substring `c++` (covers `-std=c++17`, `clang++`,
-/// `g++`, the `c++` compiler name) or a C++ source extension in a
-/// context where it cannot be confused with an adjacent header path
-/// (`.cpp`, `.cc`, `.cxx`). Reads at most 1 MiB so multi-megabyte
-/// compile DBs from large monorepos don't block file open; a valid CMake
-/// entry fits comfortably in that window.
-fn compile_commands_has_cpp_marker(path: &std::path::Path) -> bool {
-    use std::io::Read;
-    const MAX_READ: u64 = 1_048_576;
-
-    let Ok(file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut buf = Vec::with_capacity(64 * 1024);
-    if file.take(MAX_READ).read_to_end(&mut buf).is_err() {
-        return false;
-    }
-    let Ok(text) = std::str::from_utf8(&buf) else {
-        return false;
-    };
-
-    // Strongest single marker: literal "c++" appears in -std=c++NN,
-    // clang++, g++, and the "c++" compiler name — never in a pure-C
-    // compilation invocation.
-    if text.contains("c++") {
-        return true;
-    }
-    // Secondary markers: any mention of a C++ source extension in the
-    // compile DB implies at least one C++ translation unit in the tree.
-    text.contains(".cpp") || text.contains(".cxx") || text.contains(".cc\"")
-}
+// Language detection by config lives in `fresh-editor-core`: the routing
+// rules read `config::LanguageConfig` and `primitives::detected_language`
+// needs them too, so they sit below both callers. Re-exported here so
+// `services::lsp::manager::detect_language` keeps resolving.
+pub use fresh_editor_core::language_detect::detect_language;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::filesystem::StdFileSystem;
     use std::path::Path;
 
     #[test]
@@ -2184,11 +1998,11 @@ mod tests {
 
     #[test]
     fn test_lsp_manager_force_spawn_no_config() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = crate::services::runtime::LiveRuntime::multi_thread("lsp-test", 1).unwrap();
         let mut manager = LspManager::new(fresh_core::WindowId(1), None);
         let async_bridge = AsyncBridge::new();
 
-        manager.set_runtime(rt.handle().clone(), async_bridge);
+        manager.set_runtime(rt.clone(), async_bridge);
 
         // force_spawn should return None for unconfigured language
         let result = manager.force_spawn("rust", None);
@@ -2197,11 +2011,11 @@ mod tests {
 
     #[test]
     fn test_lsp_manager_force_spawn_disabled_language() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = crate::services::runtime::LiveRuntime::multi_thread("lsp-test", 1).unwrap();
         let mut manager = LspManager::new(fresh_core::WindowId(1), None);
         let async_bridge = AsyncBridge::new();
 
-        manager.set_runtime(rt.handle().clone(), async_bridge);
+        manager.set_runtime(rt.clone(), async_bridge);
 
         // Add disabled config (command is optional when disabled)
         manager.set_language_config(
@@ -2234,10 +2048,10 @@ mod tests {
     // every file open.
     #[test]
     fn test_lsp_manager_try_spawn_returns_disabled_when_all_configs_disabled() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = crate::services::runtime::LiveRuntime::multi_thread("lsp-test", 1).unwrap();
         let mut manager = LspManager::new(fresh_core::WindowId(1), None);
         let async_bridge = AsyncBridge::new();
-        manager.set_runtime(rt.handle().clone(), async_bridge);
+        manager.set_runtime(rt.clone(), async_bridge);
 
         manager.set_language_config(
             "rust".to_string(),
@@ -2266,10 +2080,10 @@ mod tests {
     // `Disabled` (callers stay silent), not `Failed`.
     #[test]
     fn test_lsp_manager_try_spawn_returns_disabled_when_globally_disabled() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = crate::services::runtime::LiveRuntime::multi_thread("lsp-test", 1).unwrap();
         let mut manager = LspManager::new(fresh_core::WindowId(1), None);
         let async_bridge = AsyncBridge::new();
-        manager.set_runtime(rt.handle().clone(), async_bridge);
+        manager.set_runtime(rt.clone(), async_bridge);
 
         manager.set_language_config(
             "rust".to_string(),
@@ -2397,33 +2211,48 @@ mod tests {
 
         // Test configured languages
         assert_eq!(
-            detect_language(Path::new("main.rs"), &languages),
+            detect_language(Path::new("main.rs"), &languages, &StdFileSystem),
             Some("rust".to_string())
         );
         assert_eq!(
-            detect_language(Path::new("index.js"), &languages),
+            detect_language(Path::new("index.js"), &languages, &StdFileSystem),
             Some("javascript".to_string())
         );
         assert_eq!(
-            detect_language(Path::new("App.jsx"), &languages),
+            detect_language(Path::new("App.jsx"), &languages, &StdFileSystem),
             Some("javascript".to_string())
         );
         assert_eq!(
-            detect_language(Path::new("Program.cs"), &languages),
+            detect_language(Path::new("Program.cs"), &languages, &StdFileSystem),
             Some("csharp".to_string())
         );
 
         // Test unconfigured extensions return None
-        assert_eq!(detect_language(Path::new("main.py"), &languages), None);
-        assert_eq!(detect_language(Path::new("file.xyz"), &languages), None);
-        assert_eq!(detect_language(Path::new("file"), &languages), None);
+        assert_eq!(
+            detect_language(Path::new("main.py"), &languages, &StdFileSystem),
+            None
+        );
+        assert_eq!(
+            detect_language(Path::new("file.xyz"), &languages, &StdFileSystem),
+            None
+        );
+        assert_eq!(
+            detect_language(Path::new("file"), &languages, &StdFileSystem),
+            None
+        );
     }
 
     #[test]
     fn test_detect_language_no_extension() {
         let languages = test_languages();
-        assert_eq!(detect_language(Path::new("README"), &languages), None);
-        assert_eq!(detect_language(Path::new("Makefile"), &languages), None);
+        assert_eq!(
+            detect_language(Path::new("README"), &languages, &StdFileSystem),
+            None
+        );
+        assert_eq!(
+            detect_language(Path::new("Makefile"), &languages, &StdFileSystem),
+            None
+        );
     }
 
     #[test]
@@ -2458,20 +2287,189 @@ mod tests {
 
         // Path glob: /etc/**/rc.* should match
         assert_eq!(
-            detect_language(Path::new("/etc/rc.conf"), &languages),
+            detect_language(Path::new("/etc/rc.conf"), &languages, &StdFileSystem),
             Some("shell".to_string())
         );
         assert_eq!(
-            detect_language(Path::new("/etc/init/rc.local"), &languages),
+            detect_language(Path::new("/etc/init/rc.local"), &languages, &StdFileSystem),
             Some("shell".to_string())
         );
         // Path glob should NOT match different root
-        assert_eq!(detect_language(Path::new("/var/rc.conf"), &languages), None);
+        assert_eq!(
+            detect_language(Path::new("/var/rc.conf"), &languages, &StdFileSystem),
+            None
+        );
 
         // Filename glob: *rc should still work
         assert_eq!(
-            detect_language(Path::new("lfrc"), &languages),
+            detect_language(Path::new("lfrc"), &languages, &StdFileSystem),
             Some("shell".to_string())
+        );
+    }
+
+    /// `detect_workspace_root` used to look for its markers with
+    /// `Path::exists`, i.e. on the *client*. For a remote workspace that
+    /// answers no to everything, so the root silently collapsed to the file's
+    /// own directory and the language server was handed the wrong project.
+    ///
+    /// This filesystem exists only on its own terms — no path it reports is on
+    /// the machine running the test — so it fails against the `std::fs`
+    /// version and passes only when the climb goes through the trait.
+    #[test]
+    fn detect_workspace_root_asks_the_workspaces_filesystem_not_the_clients() {
+        use crate::model::filesystem::{FileMetadata, FileSystem, NoopFileSystem};
+        use fresh_editor_core::model::host_path::HostPath;
+
+        struct OnlyTheMarker;
+        impl FileSystem for OnlyTheMarker {
+            /// It answers for `/srv/proj/...`, i.e. it is standing in for a
+            /// POSIX host.
+            fn style(&self) -> fresh_editor_core::model::host_path::PathStyle {
+                fresh_editor_core::model::host_path::PathStyle::Posix
+            }
+
+            fn metadata(&self, path: &HostPath) -> std::io::Result<FileMetadata> {
+                if path.to_str() == Some("/srv/proj/Cargo.toml") {
+                    Ok(FileMetadata::new(0))
+                } else {
+                    Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+                }
+            }
+            fn read_file(&self, p: &HostPath) -> std::io::Result<Vec<u8>> {
+                NoopFileSystem.read_file(p)
+            }
+            fn read_range(&self, p: &HostPath, o: u64, l: usize) -> std::io::Result<Vec<u8>> {
+                NoopFileSystem.read_range(p, o, l)
+            }
+            fn write_file(&self, p: &HostPath, d: &[u8]) -> std::io::Result<()> {
+                NoopFileSystem.write_file(p, d)
+            }
+            fn create_file(
+                &self,
+                p: &HostPath,
+            ) -> std::io::Result<Box<dyn crate::model::filesystem::FileWriter>> {
+                NoopFileSystem.create_file(p)
+            }
+            fn create_new_file(
+                &self,
+                p: &HostPath,
+            ) -> std::io::Result<Box<dyn crate::model::filesystem::FileWriter>> {
+                NoopFileSystem.create_new_file(p)
+            }
+            fn create_new_private_file(
+                &self,
+                p: &HostPath,
+            ) -> std::io::Result<Box<dyn crate::model::filesystem::FileWriter>> {
+                NoopFileSystem.create_new_private_file(p)
+            }
+            fn open_file(
+                &self,
+                p: &HostPath,
+            ) -> std::io::Result<Box<dyn crate::model::filesystem::FileReader>> {
+                NoopFileSystem.open_file(p)
+            }
+            fn open_file_for_write(
+                &self,
+                p: &HostPath,
+            ) -> std::io::Result<Box<dyn crate::model::filesystem::FileWriter>> {
+                NoopFileSystem.open_file_for_write(p)
+            }
+            fn open_file_for_append(
+                &self,
+                p: &HostPath,
+            ) -> std::io::Result<Box<dyn crate::model::filesystem::FileWriter>> {
+                NoopFileSystem.open_file_for_append(p)
+            }
+            fn set_file_length(&self, p: &HostPath, l: u64) -> std::io::Result<()> {
+                NoopFileSystem.set_file_length(p, l)
+            }
+            fn rename(&self, f: &HostPath, t: &HostPath) -> std::io::Result<()> {
+                NoopFileSystem.rename(f, t)
+            }
+            fn copy(&self, f: &HostPath, t: &HostPath) -> std::io::Result<u64> {
+                NoopFileSystem.copy(f, t)
+            }
+            fn remove_file(&self, p: &HostPath) -> std::io::Result<()> {
+                NoopFileSystem.remove_file(p)
+            }
+            fn remove_dir(&self, p: &HostPath) -> std::io::Result<()> {
+                NoopFileSystem.remove_dir(p)
+            }
+            fn symlink_metadata(&self, p: &HostPath) -> std::io::Result<FileMetadata> {
+                self.metadata(p)
+            }
+            fn is_dir(&self, p: &HostPath) -> std::io::Result<bool> {
+                NoopFileSystem.is_dir(p)
+            }
+            fn is_file(&self, p: &HostPath) -> std::io::Result<bool> {
+                NoopFileSystem.is_file(p)
+            }
+            fn set_permissions(
+                &self,
+                p: &HostPath,
+                m: &crate::model::filesystem::FilePermissions,
+            ) -> std::io::Result<()> {
+                NoopFileSystem.set_permissions(p, m)
+            }
+            fn read_dir(
+                &self,
+                p: &HostPath,
+            ) -> std::io::Result<Vec<crate::model::filesystem::DirEntry>> {
+                NoopFileSystem.read_dir(p)
+            }
+            fn create_dir(&self, p: &HostPath) -> std::io::Result<()> {
+                NoopFileSystem.create_dir(p)
+            }
+            fn create_dir_all(&self, p: &HostPath) -> std::io::Result<()> {
+                NoopFileSystem.create_dir_all(p)
+            }
+            fn canonicalize(
+                &self,
+                p: &HostPath,
+            ) -> std::io::Result<fresh_editor_core::model::host_path::HostPathBuf> {
+                NoopFileSystem.canonicalize(p)
+            }
+            fn current_uid(&self) -> u32 {
+                0
+            }
+            fn search_file(
+                &self,
+                p: &HostPath,
+                pat: &str,
+                o: &crate::model::filesystem::FileSearchOptions,
+            ) -> std::io::Result<Vec<crate::model::filesystem::SearchMatch>> {
+                NoopFileSystem.search_file(p, pat, o)
+            }
+            fn sudo_write(
+                &self,
+                p: &HostPath,
+                d: &[u8],
+                m: Option<u32>,
+                o: Option<(u32, u32)>,
+            ) -> std::io::Result<()> {
+                NoopFileSystem.sudo_write(p, d, m, o)
+            }
+            fn walk(
+                &self,
+                r: &HostPath,
+                o: &crate::model::filesystem::WalkOptions<'_>,
+                c: &std::sync::atomic::AtomicBool,
+                e: &mut dyn FnMut(crate::model::filesystem::WalkEntry<'_>) -> bool,
+            ) -> std::io::Result<()> {
+                NoopFileSystem.walk(r, o, c, e)
+            }
+        }
+
+        let root = detect_workspace_root(
+            &OnlyTheMarker,
+            Path::new("/srv/proj/src/deep/main.rs"),
+            &["Cargo.toml".to_string()],
+        );
+        assert_eq!(
+            root,
+            std::path::PathBuf::from("/srv/proj"),
+            "the climb must ask the workspace's filesystem; against the client's \
+             it finds nothing and collapses to the file's own directory"
         );
     }
 
@@ -2485,7 +2483,11 @@ mod tests {
         let file = src.join("main.rs");
         std::fs::write(&file, "").unwrap();
 
-        let root = detect_workspace_root(&file, &["Cargo.toml".to_string(), ".git".to_string()]);
+        let root = detect_workspace_root(
+            &StdFileSystem,
+            &file,
+            &["Cargo.toml".to_string(), ".git".to_string()],
+        );
         assert_eq!(root, project);
     }
 
@@ -2499,7 +2501,7 @@ mod tests {
         let file = deep.join("lib.rs");
         std::fs::write(&file, "").unwrap();
 
-        let root = detect_workspace_root(&file, &["Cargo.toml".to_string()]);
+        let root = detect_workspace_root(&StdFileSystem, &file, &["Cargo.toml".to_string()]);
         assert_eq!(root, project);
     }
 
@@ -2511,7 +2513,8 @@ mod tests {
         let file = dir.join("file.txt");
         std::fs::write(&file, "").unwrap();
 
-        let root = detect_workspace_root(&file, &["nonexistent_marker".to_string()]);
+        let root =
+            detect_workspace_root(&StdFileSystem, &file, &["nonexistent_marker".to_string()]);
         assert_eq!(root, dir);
     }
 
@@ -2523,7 +2526,7 @@ mod tests {
         let file = dir.join("file.txt");
         std::fs::write(&file, "").unwrap();
 
-        let root = detect_workspace_root(&file, &[]);
+        let root = detect_workspace_root(&StdFileSystem, &file, &[]);
         assert_eq!(root, dir);
     }
 
@@ -2537,7 +2540,7 @@ mod tests {
         let file = src.join("main.rs");
         std::fs::write(&file, "").unwrap();
 
-        let root = detect_workspace_root(&file, &[".git".to_string()]);
+        let root = detect_workspace_root(&StdFileSystem, &file, &[".git".to_string()]);
         assert_eq!(root, project);
     }
 
@@ -2604,7 +2607,7 @@ mod tests {
         // default-config answer (`c`) survives.
         let languages = c_cpp_languages();
         assert_eq!(
-            detect_language(Path::new("foo.h"), &languages),
+            detect_language(Path::new("foo.h"), &languages, &StdFileSystem),
             Some("c".to_string())
         );
     }
@@ -2621,7 +2624,7 @@ mod tests {
 
         let languages = c_cpp_languages();
         assert_eq!(
-            detect_language(&header, &languages),
+            detect_language(&header, &languages, &StdFileSystem),
             Some("cpp".to_string())
         );
     }
@@ -2638,7 +2641,7 @@ mod tests {
 
         let languages = c_cpp_languages();
         assert_eq!(
-            detect_language(&header, &languages),
+            detect_language(&header, &languages, &StdFileSystem),
             Some("cpp".to_string())
         );
     }
@@ -2661,7 +2664,7 @@ mod tests {
 
         let languages = c_cpp_languages();
         assert_eq!(
-            detect_language(&header, &languages),
+            detect_language(&header, &languages, &StdFileSystem),
             Some("cpp".to_string())
         );
     }
@@ -2683,7 +2686,10 @@ mod tests {
         std::fs::write(&header, "").unwrap();
 
         let languages = c_cpp_languages();
-        assert_eq!(detect_language(&header, &languages), Some("c".to_string()));
+        assert_eq!(
+            detect_language(&header, &languages, &StdFileSystem),
+            Some("c".to_string())
+        );
     }
 
     #[test]
@@ -2697,7 +2703,10 @@ mod tests {
         std::fs::write(project.join("lib.c"), "").unwrap();
 
         let languages = c_cpp_languages();
-        assert_eq!(detect_language(&header, &languages), Some("c".to_string()));
+        assert_eq!(
+            detect_language(&header, &languages, &StdFileSystem),
+            Some("c".to_string())
+        );
     }
 
     #[test]
@@ -2712,7 +2721,10 @@ mod tests {
         std::fs::write(&header, "").unwrap();
 
         let languages = c_cpp_languages();
-        assert_eq!(detect_language(&header, &languages), Some("c".to_string()));
+        assert_eq!(
+            detect_language(&header, &languages, &StdFileSystem),
+            Some("c".to_string())
+        );
     }
 
     #[test]
@@ -2735,7 +2747,7 @@ mod tests {
 
         let languages = c_cpp_languages();
         assert_eq!(
-            detect_language(&header, &languages),
+            detect_language(&header, &languages, &StdFileSystem),
             Some("cpp".to_string())
         );
     }
@@ -2751,7 +2763,10 @@ mod tests {
         std::fs::write(project.join("main.cpp"), "").unwrap();
 
         let languages = c_cpp_languages();
-        assert_eq!(detect_language(&source, &languages), Some("c".to_string()));
+        assert_eq!(
+            detect_language(&source, &languages, &StdFileSystem),
+            Some("c".to_string())
+        );
     }
 
     #[test]
@@ -2767,19 +2782,87 @@ mod tests {
 
         let mut languages = c_cpp_languages();
         languages.remove("cpp");
-        assert_eq!(detect_language(&header, &languages), Some("c".to_string()));
+        assert_eq!(
+            detect_language(&header, &languages, &StdFileSystem),
+            Some("c".to_string())
+        );
     }
 
+    // These two use POSIX-absolute inputs (`/tmp/...`). On Windows such a path
+    // has no drive, so `path_to_uri` resolves it against the current directory
+    // and the encoded URI carries that drive (`file:///D:/tmp/...`). That is a
+    // correct result, but not the literal the assertions below expect, so gate
+    // them to Unix. The Windows drive and space behavior is covered by the
+    // `#[cfg(windows)]` test that follows.
+    #[cfg(unix)]
     #[test]
     fn test_path_to_uri_basic() {
-        let uri = path_to_uri(Path::new("/tmp/test")).unwrap();
+        let uri = path_to_uri(PathStyle::Posix, Path::new("/tmp/test")).unwrap();
         assert_eq!(uri.as_str(), "file:///tmp/test");
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_path_to_uri_with_spaces() {
-        let uri = path_to_uri(Path::new("/tmp/my project/src")).unwrap();
+        let uri = path_to_uri(PathStyle::Posix, Path::new("/tmp/my project/src")).unwrap();
         assert_eq!(uri.as_str(), "file:///tmp/my%20project/src");
+    }
+
+    /// Regression test for issue #3067: on Windows the workspace `root_uri`
+    /// dropped the drive letter (`file:///Users/...` instead of
+    /// `file:///C:/Users/...`), breaking root-dependent LSP operations with
+    /// "os error 3". The old hand-rolled encoder ignored `Component::Prefix`,
+    /// and routing through the shared converter preserves the drive. Runs on
+    /// the Windows CI runner, where a `C:\...` path parses to a `Prefix`
+    /// component.
+    #[cfg(windows)]
+    #[test]
+    fn test_path_to_uri_preserves_windows_drive_letter() {
+        let uri = path_to_uri(
+            PathStyle::Windows,
+            Path::new(r"C:\Users\Lance\.config\opencode"),
+        )
+        .unwrap();
+        assert_eq!(
+            uri.as_str(),
+            "file:///C:/Users/Lance/.config/opencode",
+            "root_uri must keep the Windows drive letter (issue #3067)"
+        );
+
+        // Spaces are still percent-encoded on Windows (the encoding coverage the
+        // Unix `test_path_to_uri_with_spaces` provides on that platform).
+        let spaced = path_to_uri(PathStyle::Windows, Path::new(r"C:\my project\src")).unwrap();
+        assert_eq!(spaced.as_str(), "file:///C:/my%20project/src");
+    }
+
+    /// Regression test for issue #3280: after session restore on Windows the
+    /// first spawn resolves its root from the restored buffer's path, which
+    /// carries the `\\?\` verbatim prefix. That path goes through
+    /// `resolve_root_uri` -> `path_to_uri` (the auto-restart instead passes no
+    /// file and falls back to the global `root_uri`, which is why the retry
+    /// always got the drive right). The verbatim drive must survive.
+    #[cfg(windows)]
+    #[test]
+    fn resolve_root_uri_keeps_drive_of_verbatim_file_path() {
+        let manager = LspManager::new(fresh_core::WindowId(1), None);
+        let file = Path::new(r"\\?\D:\Code\temp\test_fresh\main.py");
+        let uri = manager.resolve_root_uri("python", Some(file)).unwrap();
+        assert_eq!(uri.as_str(), "file:///D:/Code/temp/test_fresh");
+    }
+
+    /// The file-path branch of `resolve_root_uri` (the one the first spawn
+    /// after restore takes) must produce the same URI as the global-root
+    /// fallback the auto-restart takes, for the same directory (#3280).
+    #[test]
+    fn resolve_root_uri_from_file_matches_global_root_fallback() {
+        let dir = std::env::current_dir().unwrap().join("some project");
+        let global = path_to_uri(PathStyle::host(), &dir).unwrap();
+        let manager = LspManager::new(fresh_core::WindowId(1), Some(global.clone()));
+        let from_file = manager
+            .resolve_root_uri("python", Some(&dir.join("main.py")))
+            .unwrap();
+        assert_eq!(from_file, global);
+        assert_eq!(manager.resolve_root_uri("python", None), Some(global));
     }
 
     #[test]
@@ -2835,6 +2918,26 @@ mod tests {
         assert!(!caps.completion);
         assert!(!caps.completion_resolve);
         assert!(caps.completion_trigger_characters.is_empty());
+    }
+
+    #[test]
+    fn dynamic_registration_parses_rename_prepare_provider() {
+        let mut caps = ServerCapabilitySummary::default();
+
+        // No options: rename only, no prepareRename.
+        caps.apply_dynamic_registration("textDocument/rename", None, true);
+        assert!(caps.rename);
+        assert!(!caps.rename_prepare);
+
+        let opts = serde_json::json!({ "prepareProvider": true });
+        caps.apply_dynamic_registration("textDocument/rename", Some(&opts), true);
+        assert!(caps.rename);
+        assert!(caps.rename_prepare);
+
+        // Unregister clears both.
+        caps.apply_dynamic_registration("textDocument/rename", None, false);
+        assert!(!caps.rename);
+        assert!(!caps.rename_prepare);
     }
 
     #[test]

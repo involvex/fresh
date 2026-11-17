@@ -28,7 +28,12 @@ pub(crate) struct Carry {
     parent: Option<RenderId>,
     w: Sizing,
     h: Sizing,
+    min_w: u16,
+    min_h: u16,
+    priority: u8,
+    pointer: Option<crate::desc::PointerMode>,
     theme: Option<Rc<str>>,
+    classes: Option<Rc<str>>,
     key: Option<crate::key::Key>,
     focus_parent: Option<crate::focus::FocusId>,
 }
@@ -59,6 +64,15 @@ impl<M: 'static> LayoutCx for UiLayoutCx<'_, M> {
         (n.w, n.h)
     }
 
+    fn floor(&self, child: RenderId) -> (u16, u16) {
+        let n = &self.ui.render[child];
+        (n.min_w, n.min_h)
+    }
+
+    fn priority(&self, child: RenderId) -> u8 {
+        self.ui.render[child].priority
+    }
+
     fn measure(&mut self, child: RenderId, c: Constraints) -> Size {
         self.ui.measure(child, c)
     }
@@ -75,6 +89,8 @@ impl<M: 'static> LayoutCx for UiLayoutCx<'_, M> {
             let n = &self.ui.render[r];
             if let Some(w) = n.data.window {
                 info.scroll_window = Some(w);
+                info.band = n.data.band;
+                info.pinned = n.data.pinned;
                 return info;
             }
             cur = n.parent;
@@ -97,10 +113,22 @@ impl<M: 'static> LayoutCx for UiLayoutCx<'_, M> {
             let Some(n) = self.ui.render.get_mut(self.node) else {
                 return;
             };
-            let moved = n.data.window != Some(info.window);
+            // The band travels with the window because a builder reads them
+            // together, and a change to either one changes what it would
+            // build: asking an item-scrolled window for a band and then
+            // telling it the answer is two publications at the same
+            // constraints, and only this tells the reader below them apart.
+            let moved = n.data.window != Some(info.window)
+                || n.data.band != info.band
+                || n.data.pinned != info.pinned;
             n.data.window = Some(info.window);
+            n.data.band = info.band;
+            n.data.pinned = info.pinned;
             n.data.content = info.content;
             n.data.scroll_max = info.max;
+            n.data.scroll_axis = info.axis;
+            n.data.scroll_step = info.step;
+            n.data.scroll_cap = info.cap;
             n.data.translate = info.translate;
             moved
         };
@@ -124,6 +152,23 @@ impl<M: 'static> LayoutCx for UiLayoutCx<'_, M> {
 // ---------------------------------------------------------------------------
 // The pass
 // ---------------------------------------------------------------------------
+
+/// The component of `p` along `axis` — the one a window's offset counts.
+fn main(axis: crate::event::Axis, p: Point) -> i32 {
+    match axis {
+        crate::event::Axis::Vertical => p.y,
+        crate::event::Axis::Horizontal => p.x,
+    }
+}
+
+/// `p` with its `axis` component replaced, leaving the other where it was: a
+/// command moves the window one way and must not disturb the other.
+fn along(axis: crate::event::Axis, p: Point, v: i32) -> Point {
+    match axis {
+        crate::event::Axis::Vertical => Point::new(p.x, v),
+        crate::event::Axis::Horizontal => Point::new(v, p.y),
+    }
+}
 
 impl<M: 'static> Ui<M> {
     /// A node whose geometry is stale. The mark travels up only as far as the
@@ -215,6 +260,27 @@ impl<M: 'static> Ui<M> {
         self.focus_roots = focus_roots;
     }
 
+    /// Relink one subtree a builder has just replaced, from a render parent
+    /// rather than from the root.
+    ///
+    /// **The focus parent's child list is recomputed, not overwritten with
+    /// what this subtree contributed.** A `layout_reader`'s nearest focus
+    /// ancestor is rarely its own: it is whatever focusable encloses it, and
+    /// that focusable's other descendants — the widgets *beside* this reader,
+    /// and every other reader under the same ancestor — are its children too.
+    /// Assigning this subtree's contribution took them all away, and the last
+    /// reader to rebuild decided the whole list: a plugin panel whose
+    /// interior held two readers ended every frame with a focus scope
+    /// containing whichever of them ran last, which for the orchestrator's
+    /// picker was one holding no focusables at all. The scope was then empty,
+    /// `apply_autofocus` fell back to focusing the scope element itself, and
+    /// Tab moved nothing — while the same panel's *nine* focusables sat in
+    /// the tree with their focus parent correctly pointing at it.
+    ///
+    /// So the parent is asked for its children again, over the element tree
+    /// that has just been made current. `relink_from` above is still what
+    /// sets each registration's `parent` and the render links; this settles
+    /// the one list it cannot see the whole of.
     pub(crate) fn relink_from_pub(
         &mut self,
         e: ElementId,
@@ -237,9 +303,47 @@ impl<M: 'static> Ui<M> {
             out,
             &mut fout,
         );
-        if let Some(fp) = focus_parent {
-            if let Some(n) = self.focus_tree.get_mut(fp) {
-                n.children = fout;
+        match focus_parent {
+            Some(fp) => {
+                let Some(fe) = self.focus_tree.get(fp).map(|n| n.element) else {
+                    return;
+                };
+                let mut kids = Vec::new();
+                self.collect_focus_children(fe, &mut kids);
+                if let Some(n) = self.focus_tree.get_mut(fp) {
+                    n.children = kids;
+                }
+            }
+            // **No focusable encloses this reader: its registrations are
+            // focus roots.** The root scope's list is recomputed the same
+            // way, over the whole element tree, or what the reader built
+            // is invisible to the settle until the next full `relink` — a
+            // split grid's panes are built by the grid's reader, so a
+            // two-pane frame's first settle found no pane content in the
+            // root scope, followed the active pane's mark a frame late, and
+            // the first key into a restored session had no focus holder.
+            None => {
+                if let Some(root) = self.root {
+                    let mut roots = Vec::new();
+                    self.collect_focus_children(root, &mut roots);
+                    self.focus_roots = roots;
+                }
+            }
+        }
+    }
+
+    /// The focus registrations directly under `e`: the first one on each
+    /// branch of its element subtree, in element order.
+    ///
+    /// The same set and the same order [`Self::relink_node`] accumulates on a
+    /// full walk — it descends until it meets a registration and stops there,
+    /// because anything below that one is *its* child.
+    fn collect_focus_children(&self, e: ElementId, out: &mut Vec<crate::focus::FocusId>) {
+        let Some(el) = self.arena.get(e) else { return };
+        for c in el.children.clone() {
+            match self.arena.get(c).and_then(|x| x.focus) {
+                Some(f) => out.push(f),
+                None => self.collect_focus_children(c, out),
             }
         }
     }
@@ -295,12 +399,29 @@ impl<M: 'static> Ui<M> {
         let (nw, nh) = node_sizing(&el.desc);
         let w = if carry.w != Sizing::Auto { carry.w } else { nw };
         let h = if carry.h != Sizing::Auto { carry.h } else { nh };
+        // Floors and pointer mode travel the same way sizing does: down from a
+        // description that has no geometry of its own, onto the first node that
+        // has. The outer one wins, because it is the one the caller wrote on
+        // the wrapper it handed over.
+        let min_w = carry.min_w.max(el.desc.min_w);
+        let min_h = carry.min_h.max(el.desc.min_h);
+        let priority = carry.priority.max(el.desc.priority);
+        let pointer = carry.pointer.or(el.desc.pointer);
         let theme = el
             .desc
             .theme
             .clone()
             .or_else(|| resolve(&el.desc).theme.clone())
             .or(carry.theme);
+        // Inherited exactly as provenance is: a node that names no class wears
+        // the nearest enclosing one, so a button's label run is still part of
+        // the button.
+        let classes = el
+            .desc
+            .classes
+            .clone()
+            .or_else(|| resolve(&el.desc).classes.clone())
+            .or(carry.classes);
         let key = el.key.clone().or(carry.key);
         let render = el.render;
         let focus = el.focus;
@@ -326,10 +447,16 @@ impl<M: 'static> Ui<M> {
                     n.parent = carry.parent;
                     n.w = w;
                     n.h = h;
+                    n.min_w = min_w;
+                    n.min_h = min_h;
+                    n.priority = priority;
+                    n.pointer = pointer;
                     n.theme = theme;
+                    n.classes = classes;
                     n.key = key;
                 }
                 let carried = self.render[r].theme.clone();
+                let carried_classes = self.render[r].classes.clone();
                 let mut inner = Vec::new();
                 let mut finner = Vec::new();
                 for k in kids {
@@ -341,6 +468,7 @@ impl<M: 'static> Ui<M> {
                         Carry {
                             parent: Some(r),
                             theme: carried.clone(),
+                            classes: carried_classes.clone(),
                             focus_parent,
                             ..Carry::default()
                         },
@@ -370,7 +498,12 @@ impl<M: 'static> Ui<M> {
                             parent: carry.parent,
                             w,
                             h,
+                            min_w,
+                            min_h,
+                            priority,
+                            pointer,
                             theme: theme.clone(),
+                            classes: classes.clone(),
                             key: key.clone(),
                             focus_parent,
                         },
@@ -495,7 +628,15 @@ impl<M: 'static> Ui<M> {
         let root_c = self.root_constraints(root, frame);
         let full = self.frame_size != frame || self.render[root].data.cached.is_none();
         if full {
-            self.layout_dirty.clear();
+            // The dirty list is deliberately *not* cleared here. A root
+            // measure is not a whole-tree measure: path-marking stops at the
+            // nearest relayout boundary, so the root walk short-circuits above
+            // every boundary that was marked from below and leaves it holding
+            // last frame's measurement — which for text is the shaped rows
+            // paint reads. Dropping the list here painted a stale status bar
+            // for the whole frame in which a layer was open, because the layer
+            // dirtied the root. Re-entering the root from the drain afterwards
+            // is a cache hit.
             self.measure(root, root_c);
         }
 
@@ -506,24 +647,40 @@ impl<M: 'static> Ui<M> {
         // A constraint-dependent builder may have replaced part of its subtree.
         self.process_disposals();
 
+        self.replace_layers(frame);
+
+        // Commands an owner queued through a handle, applied once geometry
+        // exists and before anything reads it.
+        //
+        // A geometry pass leaves them queued. "Put this band in the window" is
+        // a statement about a frame somebody will see, and a query is not one;
+        // draining it here would move a viewport because the host asked where
+        // something was. The queue already waits for the frame that can answer
+        // it (see `apply_anchors`) — this is one more pass it waits through.
+        if !self.geometry_pass && self.apply_anchors() {
+            // The layers found by the first walk are stale the moment anything
+            // moves: re-arranging without clearing them would resolve, paint
+            // and dismiss every one of them twice.
+            self.replace_layers(frame);
+        }
+
+        self.refresh_geometry();
+    }
+
+    /// Arrange the tree and place every layer against the anchors as they
+    /// stand.
+    ///
+    /// Re-runnable by construction, and run more than once already: a scroll
+    /// command applied after the first walk moves content, which moves anything
+    /// anchored to it. The layer list is rebuilt rather than reused because
+    /// `arrange` appends to it — resolving the accumulated list would place,
+    /// paint and dismiss every layer twice.
+    pub(crate) fn replace_layers(&mut self, frame: Size) {
+        let Some(root) = self.render_root else { return };
         self.pending_layers.clear();
         self.arrange(root, Point::ZERO, Rect::from_size(frame));
         self.resolve_layers(frame);
         self.process_disposals();
-
-        // Commands an owner queued through a handle, applied once geometry
-        // exists and before anything reads it.
-        if self.apply_anchors() {
-            // The layers found by the first walk are stale the moment anything
-            // moves: re-arranging without clearing them would resolve, paint
-            // and dismiss every one of them twice.
-            self.pending_layers.clear();
-            self.arrange(root, Point::ZERO, Rect::from_size(frame));
-            self.resolve_layers(frame);
-            self.process_disposals();
-        }
-
-        self.refresh_geometry();
     }
 
     /// Update the geometry of every element somebody holds a handle to. The
@@ -540,10 +697,215 @@ impl<M: 'static> Ui<M> {
                     clip: n.data.clip,
                     scroll: n.data.scroll,
                     content: n.data.content,
+                    // The band travels with the window here for the same
+                    // reason it travels with it into a builder: the window is
+                    // in the unit the offset counts, and the band is the only
+                    // thing that says which unit that is.
+                    window: n.data.window,
+                    band: n.data.band,
                 })
                 .unwrap_or_default();
             store.borrow_mut().entries.insert(id, g);
         }
+    }
+
+    /// The first element carrying `key` inside `root`'s subtree, in tree
+    /// order — `find_by_key` starting somewhere other than the root.
+    ///
+    /// A key is only unique where its owner says it is: a list of cards keys
+    /// each card by index, and so does the list beside it. Searching within
+    /// the subtree that owns the keys is what makes the answer the right one,
+    /// and it is also what keeps a per-item lookup from walking the whole
+    /// frame each time.
+    pub fn find_by_key_in(&self, root: ElementId, key: &crate::key::Key) -> Option<ElementId> {
+        match self
+            .arena
+            .get(root)
+            .is_some_and(|e| e.key.as_ref() == Some(key))
+        {
+            true => Some(root),
+            false => self.keyed_descendant(root, key),
+        }
+    }
+
+    /// The first descendant of `root` carrying `key`, not counting `root`
+    /// itself — the element a `RevealKey` names.
+    fn keyed_descendant(&self, root: ElementId, key: &crate::key::Key) -> Option<ElementId> {
+        let el = self.arena.get(root)?;
+        for c in &el.children {
+            if self
+                .arena
+                .get(*c)
+                .is_some_and(|e| e.key.as_ref() == Some(key))
+            {
+                return Some(*c);
+            }
+        }
+        el.children
+            .iter()
+            .find_map(|c| self.keyed_descendant(*c, key))
+    }
+
+    /// Where a keyed descendant sits in its scrolling ancestor's *content*
+    /// space, as `(top, rows)`.
+    ///
+    /// A child's laid-out rectangle is already scrolled — the window's offset
+    /// has been taken off it — so putting it back is what turns "where it is
+    /// on screen" into "where it is in the column", which is the space a
+    /// scroll offset is in.
+    /// Where the keyed descendant sits inside the window's content, along the
+    /// axis the window scrolls: `(start, extent)`.
+    ///
+    /// **One reading, both axes.** The band is the child's rectangle relative
+    /// to the window's, put back into content space; which of its two
+    /// dimensions that is depends only on which way the window scrolls, and
+    /// the window is what knows.
+    fn keyed_band(
+        &self,
+        vp_el: ElementId,
+        vp_r: RenderId,
+        key: &crate::key::Key,
+        arranged_at: Point,
+        axis: crate::event::Axis,
+    ) -> Option<(i32, i32)> {
+        let el = self.keyed_descendant(vp_el, key)?;
+        let child = self.render_for(el).and_then(|r| self.render.get(r))?;
+        let vp = self.render.get(vp_r)?;
+        // `arranged_at`, not the window's *current* offset: an earlier command
+        // in the same batch may already have moved it, and nothing is
+        // re-arranged between commands — so the children's rectangles are
+        // still the ones the last arrange produced, and it is that offset they
+        // have to be read against.
+        // **Past the caps, not past the box.** A horizontal window reserves a
+        // cap's width at each end and places its content past the leading one,
+        // so the content's origin is inside the node's rectangle, not on it —
+        // while `here` and `ceiling` in the command loop count from the
+        // content's own zero. Measuring from `rect.x` put every band a cap
+        // further along than it is, and every `reveal_key` that many columns
+        // off (`a_horizontal_window_reveals_by_key_across`). The reservation is
+        // whatever the window did not keep for its view, halved: it is
+        // symmetric by construction, and reading it back this way asks the
+        // layout that made it rather than re-deriving the condition it made it
+        // under.
+        let inset = match axis {
+            crate::event::Axis::Vertical => 0,
+            crate::event::Axis::Horizontal => {
+                let view = vp.data.window.map_or(vp.data.rect.w, |w| w.w);
+                (vp.data.rect.w.saturating_sub(view) / 2) as i32
+            }
+        };
+        Some(match axis {
+            crate::event::Axis::Vertical => (
+                child.data.rect.y - vp.data.rect.y + arranged_at.y,
+                child.data.rect.h as i32,
+            ),
+            crate::event::Axis::Horizontal => (
+                child.data.rect.x - vp.data.rect.x - inset + arranged_at.x,
+                child.data.rect.w as i32,
+            ),
+        })
+    }
+
+    /// Which row of the keyed descendant's wrapped text holds `byte`.
+    ///
+    /// `None` when the key names nothing under this element, or names
+    /// something that is not a text run — the same "then nothing moves" a
+    /// `keyed_band` miss produces.
+    fn byte_row(&mut self, vp_el: ElementId, key: &crate::key::Key, byte: usize) -> Option<usize> {
+        let el = self.keyed_descendant(vp_el, key)?;
+        let r = self.render_for(el)?;
+        // The object is taken out to be asked and put straight back: a render
+        // object is owned by its node, and `layout` takes it the same way.
+        let mut obj = self.render.get_mut(r)?.obj.take()?;
+        let row = obj
+            .as_any_mut()
+            .downcast_ref::<crate::render::prim::TextRender>()
+            .map(|t| t.row_of_byte(byte));
+        self.render.get_mut(r).expect("live render node").obj = Some(obj);
+        row
+    }
+
+    /// The keyed children of a paged window's content and the bands the
+    /// last arrange gave them, with the window's extent — what
+    /// [`Anchor::page_key`](crate::behavior::Anchor::page_key) answers from.
+    ///
+    /// The content's children are the first level under the window at which
+    /// children carry keys: a window over a `col` of keyed cards records the
+    /// cards, however many unkeyed wrappers stand between.
+    fn bands_of(
+        &self,
+        vp_el: ElementId,
+        arranged_at: Point,
+    ) -> Option<crate::behavior::anchor::Bands> {
+        let r = self.render_for(vp_el)?;
+        let vp = self.render.get(r)?;
+        let axis = vp.data.scroll_axis;
+        let window = match axis {
+            crate::event::Axis::Vertical => vp.data.window.map_or(vp.data.size.h, |w| w.h),
+            crate::event::Axis::Horizontal => vp.data.window.map_or(vp.data.size.w, |w| w.w),
+        } as i32;
+        // Where the window is now: the commands before this have moved it
+        // already, and the bands are in content coordinates either way.
+        let offset = main(axis, vp.data.scroll);
+        let inset = match axis {
+            crate::event::Axis::Vertical => 0,
+            crate::event::Axis::Horizontal => {
+                (vp.data.rect.w.saturating_sub(window as u16) / 2) as i32
+            }
+        };
+        // Down through the unkeyed wrappers to the first keyed run.
+        let mut at = vp_el;
+        let children = loop {
+            let el = self.arena.get(at)?;
+            if el
+                .children
+                .iter()
+                .any(|c| self.arena.get(*c).is_some_and(|e| e.key.is_some()))
+            {
+                break el.children.clone();
+            }
+            match el.children.as_slice() {
+                [only] => at = *only,
+                _ => return None,
+            }
+        };
+        let run = children
+            .iter()
+            .filter_map(|c| {
+                let key = self.arena.get(*c)?.key.clone()?;
+                let n = self.render_for(*c).and_then(|cr| self.render.get(cr))?;
+                Some(match axis {
+                    crate::event::Axis::Vertical => (
+                        key,
+                        n.data.rect.y - vp.data.rect.y + arranged_at.y,
+                        n.data.rect.h as i32,
+                    ),
+                    // Past the leading cap, as `keyed_band` reads it.
+                    crate::event::Axis::Horizontal => (
+                        key,
+                        n.data.rect.x - vp.data.rect.x - inset + arranged_at.x,
+                        n.data.rect.w as i32,
+                    ),
+                })
+            })
+            .collect::<Vec<_>>();
+        (!run.is_empty()).then_some(crate::behavior::anchor::Bands {
+            window,
+            offset,
+            run,
+        })
+    }
+
+    /// The run an index-scrolled window would show at offset `y`. See
+    /// [`ViewportRender::run_at`](crate::render::prim::ViewportRender::run_at).
+    fn run_at(&mut self, r: RenderId, y: u32) -> Option<u32> {
+        self.render
+            .get_mut(r)?
+            .obj
+            .as_mut()?
+            .as_any_mut()
+            .downcast_mut::<crate::render::prim::ViewportRender>()?
+            .run_at(y)
     }
 
     /// Returns whether anything moved.
@@ -555,28 +917,157 @@ impl<M: 'static> Ui<M> {
             let Some(a) = self.arena.get(id).and_then(|e| e.desc.anchor.clone()) else {
                 continue;
             };
-            for cmd in a.take() {
+            // **A command waits for the frame that measures its target.** An
+            // element created while a layer was being resolved has no
+            // geometry until the next pass over the tree, and every command
+            // here is a statement *about* geometry — "put this band in the
+            // window" against an unmeasured window is not a smaller move, it
+            // is a meaningless one. Draining the queue then would answer it
+            // wrongly and lose it; leaving it queued answers it on the frame
+            // that can.
+            let measured = self
+                .render_for(id)
+                .and_then(|r| self.render.get(r))
+                .is_some_and(|n| n.data.size.h > 0 || n.data.size.w > 0);
+            if !measured {
+                continue;
+            }
+            // Where the window was when the children were last placed. Every
+            // command in this batch reads their rectangles, and none of them
+            // triggers a re-arrange, so this is the offset those rectangles
+            // are relative to however many times the window moves below.
+            let arranged_at = self
+                .render_for(id)
+                .and_then(|r| self.render.get(r))
+                .map(|n| n.data.scroll)
+                .unwrap_or_default();
+            // A standing follow is a reveal asked again on every layout, after
+            // whatever this frame's commands did.
+            let mut cmds = a.take();
+            if let Some(i) = a.following() {
+                cmds.push(Command::Reveal(i));
+            }
+            for cmd in cmds {
                 let Some(r) = self.render_for(id) else {
                     continue;
                 };
-                let (scroll, max, rows) = {
+                // **The window in whatever unit the offset counts.** A
+                // cell-scrolled window's offset is a row, and its window is
+                // its own height; an index-scrolled one's offset is an item,
+                // and its window is however many items fit — which is not its
+                // height in cells unless the items are one cell tall. Reading
+                // the height for both put a list of three-row cards eleven
+                // items down inside a "fifteen-row" window and left it where
+                // it was.
+                let (scroll, max, rows, axis) = {
                     let n = &self.render[r];
-                    (n.data.scroll, n.data.scroll_max, n.data.size.h as i32)
+                    let axis = n.data.scroll_axis;
+                    // The window along the axis the offset counts. For a
+                    // horizontal window that is its width in cells; a
+                    // horizontal window is never index-scrolled, so there is
+                    // no band to divide by.
+                    let rows = match axis {
+                        crate::event::Axis::Vertical => {
+                            n.data.window.map_or(n.data.size.h, |w| w.h) as i32
+                        }
+                        crate::event::Axis::Horizontal => {
+                            n.data.window.map_or(n.data.size.w, |w| w.w) as i32
+                        }
+                    };
+                    (n.data.scroll, n.data.scroll_max, rows, axis)
                 };
+                // The offset, and the point that carries it back — every
+                // command below reasons in one dimension, and these are what
+                // say which. The other axis is left exactly where it was.
+                let here = main(axis, scroll);
+                let at = |v: i32| along(axis, scroll, v);
                 let next = match cmd {
                     Command::ScrollTo(p) => p,
+                    Command::ScrollBy(dy) => at(here + dy),
+                    Command::ScrollByPages(n) => at(here + n * rows.max(1)),
                     Command::Reveal(i) => {
                         let i = i as i32;
                         // The shortest move that puts the index inside the
-                        // window; nothing at all if it already is.
-                        let y = if i < scroll.y {
+                        // window; nothing at all if it already is. Moving
+                        // down, the run is the one under the pins of the
+                        // offset the window lands on, which can be shorter
+                        // than the run it has here: step on until the index
+                        // is in it. Each step pins at most one more row, so
+                        // this is as long as the deepest pin stack.
+                        at(if i < here {
                             i
-                        } else if i >= scroll.y + rows {
-                            i - rows + 1
+                        } else if i >= here + rows {
+                            let mut y = i - rows + 1;
+                            while y < i {
+                                match self.run_at(r, y as u32) {
+                                    Some(run) if i >= y + run as i32 => y += 1,
+                                    _ => break,
+                                }
+                            }
+                            y
                         } else {
-                            scroll.y
+                            here
+                        })
+                    }
+                    // The same, for a band the framework measured rather than
+                    // a row the caller counted. A key that names nothing under
+                    // this element leaves the window where it is.
+                    // "Take me there", rather than "keep it in sight".
+                    Command::TopKey(k) => {
+                        let Some((top, _)) = self.keyed_band(id, r, &k, arranged_at, axis) else {
+                            continue;
                         };
-                        Point::new(scroll.x, y)
+                        at(top)
+                    }
+                    // A row inside the band, which is one cell tall wherever
+                    // the band starts.
+                    Command::RevealKeyAt(k, row) => {
+                        let Some((top, h)) = self.keyed_band(id, r, &k, arranged_at, axis) else {
+                            continue;
+                        };
+                        let want = top + (row as i32).min(h.saturating_sub(1).max(0));
+                        at(if want < here {
+                            want
+                        } else if want >= here + rows {
+                            want - rows + 1
+                        } else {
+                            here
+                        })
+                    }
+                    // A byte of a keyed wrapped run, whose row only the
+                    // shaping knows (L5). The band gives where the run starts
+                    // in content space; the run gives how far into itself the
+                    // byte fell, and the two add.
+                    Command::RevealByte(k, byte) => {
+                        let Some((top, h)) = self.keyed_band(id, r, &k, arranged_at, axis) else {
+                            continue;
+                        };
+                        let Some(row) = self.byte_row(id, &k, byte) else {
+                            continue;
+                        };
+                        let want = top + (row as i32).min(h.saturating_sub(1).max(0));
+                        at(if want < here {
+                            want
+                        } else if want >= here + rows {
+                            want - rows + 1
+                        } else {
+                            here
+                        })
+                    }
+                    Command::RevealKey(k) => {
+                        let Some((top, h)) = self.keyed_band(id, r, &k, arranged_at, axis) else {
+                            continue;
+                        };
+                        at(if top < here {
+                            top
+                        } else if top + h > here + rows {
+                            // A band longer than the window shows its start:
+                            // flushing its far edge would scroll past the
+                            // thing that was asked for.
+                            (top + h - rows).min(top)
+                        } else {
+                            here
+                        })
                     }
                 };
                 let next = Point::new(next.x.clamp(0, max.x.max(0)), next.y.clamp(0, max.y.max(0)));
@@ -586,6 +1077,21 @@ impl<M: 'static> Ui<M> {
                     }
                     self.mark_render_dirty(r);
                     moved = true;
+                    // A window whose offset the owner holds snaps back to
+                    // the owner's value in the pass below; the report is
+                    // how the command reaches the owner at all.
+                    // Along the axis the window counts on. The generalisation
+                    // stopped here: a horizontal window reported its `y`, which
+                    // is always `0`, so an owner holding the offset was told
+                    // the window had gone back to the start and put it there.
+                    let mut told = Vec::new();
+                    self.report_scroll(r, main(axis, next), &mut told);
+                    self.pending_messages.extend(told);
+                }
+            }
+            if a.wants_bands() {
+                if let Some(b) = self.bands_of(id, arranged_at) {
+                    a.record_bands(b);
                 }
             }
         }
@@ -621,8 +1127,16 @@ impl<M: 'static> Ui<M> {
                     continue;
                 }
                 let Some((c, _)) = self.render[b].data.cached else {
+                    // No cache means no constraints to re-enter this boundary
+                    // on, so the pass starts again from the root. That does
+                    // *not* stand in for the rest of the list: path-marking
+                    // stops at a boundary, so the root walk short-circuits
+                    // above every other dirty boundary and leaves it stale.
+                    // Each one is still visited — by then the root pass has
+                    // usually refilled its cache, and if it has not, this
+                    // measure is a cache hit that costs nothing.
                     self.measure(root, root_c);
-                    break;
+                    continue;
                 };
                 self.measure(b, c);
             }
@@ -669,11 +1183,12 @@ impl<M: 'static> Ui<M> {
     // -- positioning ---------------------------------------------------------
 
     pub(crate) fn arrange(&mut self, r: RenderId, origin: Point, clip: Rect) {
-        let (size, clips, translate, scroll, kids, dirty, was, cached) = {
+        let (size, clips, clip_inset, translate, scroll, kids, dirty, was, cached) = {
             let Some(n) = self.render.get(r) else { return };
             (
                 n.data.size,
                 n.clips,
+                n.clip_inset,
                 n.data.translate,
                 n.data.scroll,
                 n.children.clone(),
@@ -699,7 +1214,14 @@ impl<M: 'static> Ui<M> {
             n.data.child_arrange_dirty = false;
         }
         let start = self.pending_layers.len();
-        let child_clip = if clips { clip.intersect(rect) } else { clip };
+        // A clipping node bounds its descendants at its *content* rect, not at
+        // its outer edge: a bordered box owns the ring it drew, so content that
+        // reaches it has escaped rather than arrived.
+        let child_clip = if clips {
+            clip.intersect(rect.deflate(clip_inset.0, clip_inset.1))
+        } else {
+            clip
+        };
         let sc = if clips && translate {
             scroll
         } else {
@@ -734,24 +1256,85 @@ impl<M: 'static> Ui<M> {
             let Some(props) = self.layer_geom(lr) else {
                 continue;
             };
+            // Where this layer may go. The frame unless it named a region —
+            // resolved the same way an `Anchor::Node` is, so a region the tree
+            // does not contain yet can still be named.
+            let bounds = props
+                .within
+                .as_ref()
+                .and_then(|k| {
+                    self.find_by_key(k)
+                        .and_then(|e| self.render_for(e))
+                        .map(|r| self.render[r].data.rect)
+                        .or_else(|| self.host_anchors.get(k).copied())
+                })
+                .unwrap_or(Rect::from_size(frame));
             let anchor = match &props.anchor {
                 Anchor::Parent => self.render[parent].data.rect,
+                // An element carrying the key first; then a rectangle the
+                // host published for it, for a thing that lives inside a host
+                // leaf and has no element of its own; then the parent, which is
+                // what a name nobody answers has always fallen back to.
                 Anchor::Node(k) => self
                     .find_by_key(k)
                     .and_then(|e| self.render_for(e))
                     .map(|r| self.render[r].data.rect)
+                    .or_else(|| self.host_anchors.get(k).copied())
                     .unwrap_or(self.render[parent].data.rect),
-                Anchor::Point(x, y) => Rect::new(*x as i32, *y as i32, 0, 0),
-                Anchor::Screen(_) => Rect::from_size(frame),
+                // In `bounds`' space, origin included — the frame when the
+                // layer named no region. A region "moves the origin as well as
+                // the limit" for a screen anchor already; a point was the one
+                // that did not, so a caller holding coordinates inside a panel
+                // had to add the panel's origin itself, and that addition is
+                // the second source of geometry naming a region removes.
+                Anchor::Point(x, y) => Rect::new(bounds.x + *x as i32, bounds.y + *y as i32, 0, 0),
+                // One cell, which is the whole difference: `Place::Below` a
+                // cell is the row after it, while below a point is the point's
+                // own row.
+                Anchor::Cell(x, y) => Rect::new(bounds.x + *x as i32, bounds.y + *y as i32, 1, 1),
+                Anchor::Screen(_) => bounds,
+            };
+            // Where the layer's real anchor is, when it is inside a leaf the
+            // tree cannot name — a button inside a row a widget runtime laid
+            // out, a row of a sub-render with no node of its own. Applied to
+            // the anchor rather than to the result, so the placement, the
+            // cross-axis alignment and the fit all work against the real one:
+            // a dropdown that flips above clears the button it hangs off.
+            // `Anchor::Screen` has no anchor rectangle and is left alone.
+            let anchor = match props.anchor {
+                Anchor::Screen(_) => anchor,
+                _ => anchor.translate(props.offset.0 as i32, props.offset.1 as i32),
             };
             let c = if props.place == Place::Fill {
                 Constraints::tight(anchor.size())
+            } else if props.align == Some(Align::Stretch) {
+                // Free axis pinned to the anchor, the other still free. What
+                // makes a dropdown the width of its button without the caller
+                // measuring the button.
+                let a = anchor.size();
+                match props.place {
+                    Place::Above | Place::Below => Constraints::new(a.w, a.w, 0, bounds.h),
+                    Place::LeftOf | Place::RightOf => Constraints::new(0, bounds.w, a.h, a.h),
+                    Place::Over | Place::Fill => Constraints::loose(bounds.size()),
+                }
             } else {
-                Constraints::loose(frame)
+                Constraints::loose(bounds.size())
+            };
+            let c = match props.fit.shrink {
+                true => shrink_to_room(c, props.place, anchor, bounds),
+                false => c,
             };
             self.render.get_mut(lr).expect("live").data.needs_layout = true;
             let size = self.measure(lr, c);
-            let origin = place(&props.anchor, props.place, props.fit, anchor, size, frame);
+            let origin = place(
+                &props.anchor,
+                props.place,
+                props.fit,
+                props.align,
+                anchor,
+                size,
+                bounds,
+            );
             self.arrange(lr, origin, Rect::from_size(frame));
         }
     }
@@ -777,24 +1360,52 @@ impl<M: 'static> Ui<M> {
     }
 }
 
-fn place(anchor_kind: &Anchor, p: Place, fit: Fit, anchor: Rect, size: Size, frame: Size) -> Point {
-    let fw = frame.w as i32;
-    let fh = frame.h as i32;
+/// `Fit::shrink`: cap the placed axis at the room between the anchor and the
+/// edge of `bounds` on the placed side. A box of fixed height then gives up
+/// rows rather than being clamped back over its anchor.
+fn shrink_to_room(c: Constraints, p: Place, anchor: Rect, bounds: Rect) -> Constraints {
+    let room = |n: i32| n.clamp(0, u16::MAX as i32) as u16;
+    let cap_h = |h: u16| Constraints::new(c.min_w, c.max_w, c.min_h.min(h), c.max_h.min(h));
+    let cap_w = |w: u16| Constraints::new(c.min_w.min(w), c.max_w.min(w), c.min_h, c.max_h);
+    match p {
+        Place::Above => cap_h(room(anchor.y - bounds.y)),
+        Place::Below => cap_h(room(bounds.bottom() - anchor.bottom())),
+        Place::LeftOf => cap_w(room(anchor.x - bounds.x)),
+        Place::RightOf => cap_w(room(bounds.right() - anchor.right())),
+        Place::Over | Place::Fill => c,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn place(
+    anchor_kind: &Anchor,
+    p: Place,
+    fit: Fit,
+    align: Option<Align>,
+    anchor: Rect,
+    size: Size,
+    // Where the layer may go: the frame, or the region it named. Every edge
+    // below is this rectangle's, not the screen's.
+    bounds: Rect,
+) -> Point {
+    let (left, top) = (bounds.x, bounds.y);
+    let right = bounds.right();
+    let bottom = bounds.bottom();
     let sw = size.w as i32;
     let sh = size.h as i32;
 
     if let Anchor::Screen(a) = anchor_kind {
         let x = match a {
-            Align::Stretch | Align::Start => 0,
-            Align::Center => (fw - sw) / 2,
-            Align::End => fw - sw,
+            Align::Stretch | Align::Start => left,
+            Align::Center => left + (bounds.w as i32 - sw) / 2,
+            Align::End => right - sw,
         };
         let y = match a {
-            Align::Stretch | Align::Start => 0,
-            Align::Center => (fh - sh) / 2,
-            Align::End => fh - sh,
+            Align::Stretch | Align::Start => top,
+            Align::Center => top + (bounds.h as i32 - sh) / 2,
+            Align::End => bottom - sh,
         };
-        return Point::new(x.max(0), y.max(0));
+        return Point::new(x.max(left), y.max(top));
     }
 
     let (mut x, mut y) = match p {
@@ -805,20 +1416,41 @@ fn place(anchor_kind: &Anchor, p: Place, fit: Fit, anchor: Rect, size: Size, fra
         Place::Over | Place::Fill => (anchor.x, anchor.y),
     };
 
+    // Where the layer sits against the anchor on the axis the placement did
+    // not use. `Stretch` was already applied as a constraint and needs no
+    // origin of its own; the rest slide within the anchor's extent.
+    match (align, p) {
+        (Some(a), Place::Above | Place::Below) => {
+            x = match a {
+                Align::Stretch | Align::Start => anchor.x,
+                Align::Center => anchor.x + (anchor.w as i32 - sw) / 2,
+                Align::End => anchor.right() - sw,
+            }
+        }
+        (Some(a), Place::LeftOf | Place::RightOf) => {
+            y = match a {
+                Align::Stretch | Align::Start => anchor.y,
+                Align::Center => anchor.y + (anchor.h as i32 - sh) / 2,
+                Align::End => anchor.bottom() - sh,
+            }
+        }
+        _ => {}
+    }
+
     if fit.flip {
         match p {
-            Place::Below if y + sh > fh && anchor.y - sh >= 0 => y = anchor.y - sh,
-            Place::Above if y < 0 && anchor.bottom() + sh <= fh => y = anchor.bottom(),
-            Place::RightOf if x + sw > fw && anchor.x - sw >= 0 => x = anchor.x - sw,
-            Place::LeftOf if x < 0 && anchor.right() + sw <= fw => x = anchor.right(),
+            Place::Below if y + sh > bottom && anchor.y - sh >= top => y = anchor.y - sh,
+            Place::Above if y < top && anchor.bottom() + sh <= bottom => y = anchor.bottom(),
+            Place::RightOf if x + sw > right && anchor.x - sw >= left => x = anchor.x - sw,
+            Place::LeftOf if x < left && anchor.right() + sw <= right => x = anchor.right(),
             _ => {}
         }
     }
     if fit.shift || fit.clamp {
-        x = x.min(fw - sw).max(0);
+        x = x.min(right - sw).max(left);
     }
     if fit.clamp {
-        y = y.min(fh - sh).max(0);
+        y = y.min(bottom - sh).max(top);
     }
     Point::new(x, y)
 }

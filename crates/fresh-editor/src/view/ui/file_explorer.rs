@@ -1,726 +1,363 @@
-use crate::app::types::CellThemeRecorder;
 use crate::input::fuzzy::FuzzyMatch;
 use crate::primitives::display_width::str_width;
-use crate::view::file_tree::{
-    ExplorerSlotContext, ExplorerSlotResolution, ExplorerSlotResolver, FileExplorerDecorationCache,
-    FileExplorerSlotOverrideCache, FileTreeView, NodeId,
-};
+use crate::view::file_tree::view::VisibleRow;
+use crate::view::file_tree::ExplorerSlotContext;
 use crate::view::theme::Theme;
-use ratatui::{
-    layout::Rect,
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState},
-    Frame,
-};
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-/// The plugin-driven decoration inputs for the file explorer: the slot
-/// resolver plus the decoration and slot-override caches. These three always
-/// travel together through the render pipeline, so they're bundled rather
-/// than threaded as three parallel parameters. `Copy` (the resolver is two
-/// `&dyn` pointers, the caches are shared refs), so it passes by value into
-/// the per-row closure without cloning.
-#[derive(Clone, Copy)]
-pub struct ExplorerDecorations<'a> {
-    pub slot_resolver: ExplorerSlotResolver<'a>,
-    pub decorations: &'a FileExplorerDecorationCache,
-    pub slot_overrides: &'a FileExplorerSlotOverrideCache,
+/// Whether anything unsaved lives under this folder.
+///
+/// All that is left of `FileExplorerRenderer`, whose `render`,
+/// `render_loading`, `panel_title`, `panel_chrome_styles`,
+/// `render_close_button`, `build_node_line` and `trailing_slot_screen_bounds`
+/// went when the panel became a native region in the shell's tree. The type
+/// outlived them as a namespace around this one predicate, which is a
+/// function about paths and belongs beside the row that asks it.
+fn folder_has_modified_files(
+    folder_path: &PathBuf,
+    files_with_unsaved_changes: &HashSet<PathBuf>,
+) -> bool {
+    for modified_file in files_with_unsaved_changes {
+        if modified_file.starts_with(folder_path) {
+            return true;
+        }
+    }
+    false
 }
 
-pub struct FileExplorerRenderer;
-
-/// Inputs to [`FileExplorerRenderer::trailing_slot_screen_bounds`], grouped
-/// so the call takes one argument instead of eight.
-pub(crate) struct TrailingSlotBoundsCtx<'a> {
-    pub view: &'a FileTreeView,
-    pub node_id: NodeId,
-    pub indent: usize,
-    pub content_width: usize,
-    pub slot_resolution: &'a ExplorerSlotResolution,
-    pub tree_indicator_collapsed: &'a str,
-    pub tree_indicator_expanded: &'a str,
-    pub explorer_area: Rect,
+/// Everything one row needs to describe itself.
+pub struct RowDesc<'a> {
+    /// The node, as the tree's projection saw it.
+    pub node: &'a VisibleRow,
+    /// The row's index in the tree's display order — its key, what
+    /// hit-testing answers with, and the unit the window counts in.
+    pub row: usize,
+    pub is_cursor: bool,
+    pub is_multi: bool,
+    pub focused: bool,
+    pub unsaved: &'a HashSet<PathBuf>,
+    pub cut: &'a [PathBuf],
+    /// The directory a held drag would drop into, if the pointer is over one.
+    pub drop_target: Option<&'a std::path::Path>,
+    pub fuzzy: Option<&'a FuzzyMatch>,
+    pub decorations: &'a crate::view::file_tree::FileExplorerDecorationCache,
+    pub slot_overrides: &'a crate::view::file_tree::FileExplorerSlotOverrideCache,
+    pub slot_resolver: &'a crate::view::file_tree::ExplorerSlotResolver<'static>,
+    pub theme: &'a Theme,
+    pub collapsed: &'a str,
+    pub expanded: &'a str,
+    /// A drop's preview is moving this entry: how many characters of its
+    /// name have ghosted out (`view::move_preview`).
+    pub ghost: Option<usize>,
+    /// A drop's preview is opening a row under this directory, so it is drawn
+    /// open whatever its state.
+    pub opening: bool,
+    /// The row is one of the sticky rows the list holds above the run: the
+    /// fold's own decision, told to the row at the moment it is built (a
+    /// model-side copy would always be a frame behind the wheel). The row
+    /// draws on `ui.file_explorer_pinned_bg`, so the band reads as a distinct
+    /// strip — "there is more of your tree above this folder" — and not as
+    /// the tree itself.
+    pub pinned: bool,
 }
 
-impl FileExplorerRenderer {
-    /// The explorer panel's title in its non-search state: `" File Explorer (kb) "`
-    /// locally, `" [host] (kb) "` on a remote connection. Shared by the
-    /// materialised panel and the loading placeholder
-    /// ([`Self::render_loading`]) so the chrome can't drift between the two
-    /// build phases — the tree landing must change nothing but the list body.
-    fn panel_title(remote_connection: Option<&str>, keybinding_suffix: &str) -> String {
-        if let Some(host) = remote_connection {
-            // Extract just the hostname from "user@host" or "user@host:port"
-            let hostname = host
-                .split('@')
-                .next_back()
-                .unwrap_or(host)
-                .split(':')
-                .next()
-                .unwrap_or(host);
-            format!(" [{}]{} ", hostname, keybinding_suffix)
-        } else {
-            format!(" File Explorer{} ", keybinding_suffix)
-        }
+/// One row of the tree, as the shell describes it.
+///
+/// This is [`FileExplorerRenderer::build_node_line`] with the arithmetic taken
+/// out. It still decides *what the row says* — the indicator glyph and its
+/// padding, the leading slot and its padding, the compacted ancestor chain,
+/// the name and its fuzzy-match highlights, the trailing status slot and the
+/// error marker — and it still decides what each piece looks like, but now as
+/// a theme *name* rather than a resolved `Color`.
+///
+/// What it no longer decides is where anything sits. `content_width`,
+/// `left_side_width`, `total_right_width` and the `padding` rule are gone: the
+/// gap between the name and the status slot is a flex spacer with a floor, and
+/// the tree measures it. So is `trailing_slot_screen_bounds`, the 45-line
+/// second derivation that existed only so a hover could find the slot the
+/// painter had already placed.
+pub fn describe_row(d: RowDesc<'_>) -> crate::view::shell::file_explorer::Row {
+    use crate::app::shell_host::shell_theme::{literal, pair, Paint};
+    use crate::view::shell::file_explorer as fe;
+
+    // A slot color as a name: the theme key it came from, so the key's text
+    // attributes apply too, over the resolved color for a key the theme does
+    // not know; or the color itself when no key named it.
+    let slot_paint = |fg: ratatui::style::Color, key: &Option<String>| match key {
+        Some(k) => Paint::asked(k.clone(), Paint::Lit(fg)).to_string(),
+        None => literal(fg),
+    };
+
+    let node = d.node;
+    let is_hidden = node
+        .entry
+        .metadata
+        .as_ref()
+        .map(|m| m.is_hidden)
+        .unwrap_or(false);
+    let neutral = fe::neutral_key(is_hidden, node.entry.is_symlink(), node.is_dir());
+    // An entry an ignore rule matched, but which the tree shows anyway
+    // (`respect_gitignore` off, or `show_gitignored` on): it recedes like a
+    // cut file, VS Code-style, so "show everything" stays scannable
+    // (issue #3283). The projection settled this when it was made; the row
+    // does not re-ask the rules per frame.
+    let is_ignored = node.ignored;
+    // Three ways to wear the selected ground: the keyboard is on this row, the
+    // row is in the reader's set, or a held drag would land here. The drop
+    // target comes first because it outranks a cursor sitting elsewhere — it
+    // is the only one of the three that is about the pointer.
+    let selected = d.drop_target == Some(node.entry.path.as_path())
+        || (d.focused && (d.is_cursor || d.is_multi));
+    // The pinned band has a ground of its own: one shade above the panel, but
+    // not the unfocused cursor's — a cursor on a pinned row must stay legible
+    // as a cursor. The band yields to both the selection and the cursor.
+    let ground = if selected {
+        "editor.selection_bg"
+    } else if d.is_cursor {
+        "editor.current_line_bg"
+    } else if d.pinned {
+        "ui.file_explorer_pinned_bg"
+    } else {
+        "ui.file_explorer_bg"
+    };
+
+    let has_unsaved = if node.is_dir() {
+        folder_has_modified_files(&node.entry.path.clone().into_path_buf(), d.unsaved)
+    } else {
+        d.unsaved.contains(node.entry.path.as_path())
+    };
+    let slots = d.slot_resolver.resolve(&ExplorerSlotContext {
+        path: node.entry.path.as_path(),
+        is_dir: node.is_dir(),
+        is_expanded: node.state == crate::view::file_tree::NodeState::Expanded || d.opening,
+        has_unsaved,
+        is_symlink: node.entry.is_symlink(),
+        is_hidden,
+        decorations: d.decorations,
+        slot_overrides: d.slot_overrides,
+        theme: d.theme,
+        // The neutral colour the slot providers fall back to. They still work
+        // in `Color`; only the description speaks in names.
+        neutral_fg: d
+            .theme
+            .resolve_theme_key(neutral)
+            .unwrap_or(d.theme.editor_fg),
+    });
+
+    let is_cut = d
+        .cut
+        .iter()
+        .any(|p| p.as_path() == node.entry.path.as_path());
+    let name_fg = if is_cut || is_ignored {
+        "editor.line_number_fg".to_string()
+    } else if let Some(c) = slots.name_color_hint {
+        slot_paint(c, &slots.name_color_key)
+    } else if (d.is_cursor || d.is_multi) && d.focused {
+        "editor.fg".to_string()
+    } else {
+        neutral.to_string()
+    };
+
+    let mut left: fe::Runs = Vec::new();
+    if node.indent > 0 {
+        left.push((" ".repeat(node.indent * 2), pair(neutral, ground)));
     }
 
-    /// Title + border styles for the panel chrome: warning colors when the
-    /// remote is disconnected, inverted (dark on light) title when focused.
-    /// Shared with [`Self::render_loading`] for the same no-drift reason as
-    /// [`Self::panel_title`].
-    fn panel_chrome_styles(
-        remote_connection: Option<&str>,
-        is_focused: bool,
-        theme: &Theme,
-    ) -> (Style, Style) {
-        let remote_disconnected = remote_connection
-            .map(|c| c.contains("(Disconnected)"))
-            .unwrap_or(false);
-        if remote_disconnected {
+    // The indicator column is sized from the configured glyphs so names stay
+    // aligned when a user picks a wider one.
+    let collapsed_w = str_width(d.collapsed);
+    let expanded_w = str_width(d.expanded);
+    let indicator_width = collapsed_w.max(expanded_w).max(1) + 1;
+    if node.is_dir() {
+        use crate::view::file_tree::NodeState;
+        // The arrows take the explorer's own indicator key; the loading and
+        // error marks stay warnings.
+        let (glyph, w, ink) = if node.state == NodeState::Expanded || d.opening {
             (
-                Style::default()
-                    .fg(theme.status_error_indicator_fg)
-                    .bg(theme.status_error_indicator_bg)
-                    .add_modifier(Modifier::BOLD),
-                Style::default().fg(theme.status_error_indicator_bg),
+                format!("{} ", d.expanded),
+                expanded_w + 1,
+                "ui.file_explorer_indicator_fg",
             )
-        } else if is_focused {
+        } else if node.state == NodeState::Collapsed {
             (
-                Style::default()
-                    .fg(theme.editor_bg)
-                    .bg(theme.editor_fg)
-                    .add_modifier(Modifier::BOLD),
-                Style::default().fg(theme.cursor),
+                format!("{} ", d.collapsed),
+                collapsed_w + 1,
+                "ui.file_explorer_indicator_fg",
             )
+        } else if node.state == NodeState::Loading {
+            ("⟳ ".to_string(), 2, "diagnostic.warning_fg")
         } else {
-            (
-                Style::default().fg(theme.line_number_fg),
-                Style::default().fg(theme.split_separator_fg),
-            )
-        }
-    }
-
-    /// Render the close button "×" at the right side of the title bar.
-    /// Shared by the materialised panel and the loading placeholder.
-    fn render_close_button(
-        frame: &mut Frame,
-        area: Rect,
-        theme: &Theme,
-        close_button_hovered: bool,
-    ) {
-        let close_button_x = area.x + area.width.saturating_sub(3);
-        let close_fg = if close_button_hovered {
-            theme.tab_close_hover_fg
-        } else {
-            theme.line_number_fg
+            ("! ".to_string(), 2, "diagnostic.warning_fg")
         };
-        let close_button =
-            ratatui::widgets::Paragraph::new("×").style(Style::default().fg(close_fg));
-        let close_area = Rect::new(close_button_x, area.y, 1, 1);
-        frame.render_widget(close_button, close_area);
+        left.push((glyph, pair(ink, ground)));
+        let pad = indicator_width.saturating_sub(w);
+        if pad > 0 {
+            left.push((" ".repeat(pad), pair(neutral, ground)));
+        }
+    } else {
+        left.push((" ".repeat(indicator_width), pair(neutral, ground)));
     }
 
-    /// Render the loading placeholder shown while the tree is still being
-    /// built (initial async build or expand-to-path sync): the panel's FINAL
-    /// chrome — same title, borders, styles, and close button as the
-    /// materialised panel — with a dimmed "Loading…" body in place of the
-    /// list. The tree landing therefore swaps only the body content; the
-    /// page layout and the panel chrome are pixel-identical before and after
-    /// the load, so a slow (e.g. remote) build never causes a two-stage
-    /// paint of the surrounding window.
-    #[allow(clippy::too_many_arguments)]
-    pub fn render_loading(
-        frame: &mut Frame,
-        area: Rect,
-        is_focused: bool,
-        keybinding_resolver: &crate::input::keybindings::KeybindingResolver,
-        current_context: crate::input::keybindings::KeyContext,
-        theme: &Theme,
-        close_button_hovered: bool,
-        remote_connection: Option<&str>,
-    ) {
-        use ratatui::layout::Alignment;
-        use ratatui::widgets::Paragraph;
-
-        let keybinding_suffix = keybinding_resolver
-            .get_keybinding_for_action(
-                &crate::input::keybindings::Action::FocusFileExplorer,
-                current_context,
-            )
-            .map(|kb| format!(" ({})", kb))
-            .unwrap_or_default();
-        let title = Self::panel_title(remote_connection, &keybinding_suffix);
-        let (title_style, border_style) =
-            Self::panel_chrome_styles(remote_connection, is_focused, theme);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .title_style(title_style)
-            .border_style(border_style)
-            .style(Style::default().bg(theme.editor_bg));
-        let placeholder = Paragraph::new(rust_i18n::t!("explorer.loading").to_string())
-            .style(Style::default().fg(theme.line_number_fg))
-            .alignment(Alignment::Center)
-            .block(block);
-        frame.render_widget(placeholder, area);
-
-        Self::render_close_button(frame, area, theme, close_button_hovered);
+    if let Some(slot) = &slots.leading {
+        let text_w = str_width(&slot.text);
+        let pad = slot.width().saturating_sub(text_w) + 1;
+        left.push((
+            slot.text.clone(),
+            pair(&slot_paint(slot.fg, &slot.fg_key), ground),
+        ));
+        left.push((" ".repeat(pad), pair(neutral, ground)));
     }
 
-    /// Check if a directory contains any modified files
-    fn folder_has_modified_files(
-        folder_path: &PathBuf,
-        files_with_unsaved_changes: &HashSet<PathBuf>,
-    ) -> bool {
-        for modified_file in files_with_unsaved_changes {
-            if modified_file.starts_with(folder_path) {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Render the file explorer in the given frame area.
-    ///
-    /// Returns the cell where the hardware caret should sit (the selected
-    /// row's left edge) when the panel owns the keyboard, or `None`. The
-    /// caret is deliberately *not* committed here: the sidebar paints early
-    /// in the frame, and ratatui draws the hardware caret on top of every
-    /// cell, so a caret set here would blink through any overlay painted
-    /// later (popups, menus, the settings modal). The caller commits it at
-    /// the end of the draw, once it knows what ended up covering that cell.
-    #[allow(clippy::too_many_arguments)]
-    pub fn render(
-        view: &mut FileTreeView,
-        frame: &mut Frame,
-        area: Rect,
-        deco: ExplorerDecorations<'_>,
-        is_focused: bool,
-        files_with_unsaved_changes: &HashSet<PathBuf>,
-        keybinding_resolver: &crate::input::keybindings::KeybindingResolver,
-        current_context: crate::input::keybindings::KeyContext,
-        theme: &Theme,
-        close_button_hovered: bool,
-        remote_connection: Option<&str>,
-        cut_paths: &[PathBuf],
-        config: &crate::config::FileExplorerConfig,
-        // The explorer is only ever painted by the TUI path, which always
-        // records theme-key provenance — so this isn't `Option` like the other
-        // chrome renderers (tabs/menu/status_bar), whose legacy/offscreen
-        // callers pass `None`.
-        rec: &mut CellThemeRecorder,
-        // When false, compute layout (viewport height for scrolling) but draw no
-        // cells — the frontend renders the sidebar natively from
-        // `Editor::file_explorer_view`. The TUI always passes `true`.
-        draw: bool,
-    ) -> Option<(u16, u16)> {
-        // Viewport height drives scrolling math AND the web projection's visible
-        // window, so it must be set on every render regardless of `draw`.
-        let viewport_height_pre = area.height.saturating_sub(2) as usize;
-        view.set_viewport_height(viewport_height_pre);
-        if !draw {
-            return None;
-        }
-        let search_active = view.is_search_active();
-        // The tree-indicator glyphs are the only config the inner renderers
-        // need; pull them out here and forward as `&str` so the helpers don't
-        // depend on the whole config struct.
-        let tree_indicator_collapsed = config.tree_indicator_collapsed.as_str();
-        let tree_indicator_expanded = config.tree_indicator_expanded.as_str();
-
-        // Seed the whole explorer rect with its surface keys so border/content
-        // rows resolve to the explorer; the selected row is refined below.
-        for row in area.y..area.y + area.height {
-            rec.run(
-                area.x,
-                row,
-                area.width,
-                Some("editor.fg"),
-                Some("editor.bg"),
-                "File Explorer",
-            );
-        }
-
-        let display_nodes = view.get_display_nodes();
-        let viewport_indices = view.viewport_display_indices();
-        let selected_index = view.get_selected_index();
-        let selected_viewport_index = selected_index
-            .and_then(|selected| viewport_indices.iter().position(|&i| i == selected));
-
-        // Available width for content (subtract borders and cursor indicator)
-        let content_width = area.width.saturating_sub(3) as usize;
-
-        let multi_selection = view.multi_selection();
-
-        // Create list items for the viewport only. `viewport_indices` starts
-        // with any sticky ancestor rows, followed by the ordinary scrolled
-        // rows, and is also used by mouse hit-testing.
-        let items: Vec<ListItem> = viewport_indices
-            .iter()
-            .filter_map(|&actual_idx| {
-                let &(node_id, indent) = display_nodes.get(actual_idx)?;
-                let is_selected = selected_index == Some(actual_idx);
-                let is_multi_selected = multi_selection.contains(&node_id);
-                let fuzzy_match = if search_active {
-                    view.get_match_for_node(node_id)
-                } else {
-                    None
-                };
-                Some(Self::render_node(
-                    view,
-                    deco,
-                    node_id,
-                    indent,
-                    is_selected,
-                    is_multi_selected,
-                    is_focused,
-                    files_with_unsaved_changes,
-                    theme,
-                    content_width,
-                    fuzzy_match.as_ref(),
-                    cut_paths,
-                    tree_indicator_collapsed,
-                    tree_indicator_expanded,
-                ))
-            })
-            .collect();
-
-        // Build the title with keybinding and optional remote host
-        let keybinding_suffix = keybinding_resolver
-            .get_keybinding_for_action(
-                &crate::input::keybindings::Action::FocusFileExplorer,
-                current_context,
-            )
-            .map(|kb| format!(" ({})", kb))
-            .unwrap_or_default();
-
-        // Show search query in title when search is active
-        let title = if search_active {
-            format!(" /{} ", view.search_query())
-        } else {
-            Self::panel_title(remote_connection, &keybinding_suffix)
-        };
-
-        let (title_style, border_style) =
-            Self::panel_chrome_styles(remote_connection, is_focused, theme);
-
-        // Create the list widget
-        let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .title_style(title_style)
-                    .border_style(border_style)
-                    .style(Style::default().bg(theme.editor_bg)),
-            )
-            .highlight_style(if is_focused {
-                Style::default().bg(theme.selection_bg).fg(theme.editor_fg)
-            } else {
-                Style::default().bg(theme.current_line_bg)
-            });
-
-        // Since we're only passing viewport items, selection is a screen-row
-        // index rather than an offset into the full flattened tree.
-        let mut list_state = ListState::default();
-        if let Some(selected) = selected_viewport_index {
-            list_state.select(Some(selected));
-        }
-
-        frame.render_stateful_widget(list, area, &mut list_state);
-
-        // Refine the selected row with its highlight keys (focused → selection
-        // background, blurred → current-line background).
-        if let Some(selected) = selected_viewport_index {
-            let row = area.y + 1 + selected as u16;
-            let inner_x = area.x + 1;
-            let inner_w = area.width.saturating_sub(2);
-            let bg_key = if is_focused {
-                "editor.selection_bg"
-            } else {
-                "editor.current_line_bg"
+    // Ancestors that compact mode folded into this row, outermost first. Each
+    // takes its own separator, so no cell between two names belongs to neither.
+    let chain: Vec<fe::ChainPart> = node
+        .chain
+        .iter()
+        .map(|seg| {
+            // A drag over one of the folded names would land in *that*
+            // directory, so that is the part that lights up. The row's own
+            // ground cannot say it: the anchor is a directory further down,
+            // and the row would otherwise show nothing at all.
+            let ground = match d.drop_target == Some(seg.path.as_path()) {
+                true => "editor.selection_bg",
+                false => ground,
             };
-            rec.run(
-                inner_x,
-                row,
-                inner_w,
-                Some("editor.fg"),
-                Some(bg_key),
-                "File Explorer",
-            );
-        }
+            fe::ChainPart {
+                runs: vec![
+                    // A folded segment is a directory name like any other:
+                    // the explorer's directory colour (#3697).
+                    (
+                        seg.name.clone(),
+                        pair("ui.file_explorer_directory_fg", ground),
+                    ),
+                    ("/".to_string(), pair("editor.line_number_fg", ground)),
+                ],
+                path: seg.path.clone(),
+            }
+        })
+        .collect();
 
-        // Render close button "×" at the right side of the title bar
-        Self::render_close_button(frame, area, theme, close_button_hovered);
-
-        // When focused, show a blinking cursor indicator at the selected row.
-        // We paint the indicator glyph here and hand the cell back to the
-        // caller, which parks the hardware cursor on it at the end of the
-        // draw — the hardware cursor provides efficient terminal-native
-        // blinking, but only the caller knows whether an overlay has since
-        // covered the cell.
-        if is_focused {
-            if let Some(selected) = selected_viewport_index {
-                // Position at the left edge of the selected row (after border)
-                let cursor_x = area.x + 1;
-                let cursor_y = area.y + 1 + selected as u16;
-
-                // Render a cursor indicator character that the hardware cursor will blink over
-                let cursor_indicator =
-                    ratatui::widgets::Paragraph::new("▌").style(Style::default().fg(theme.cursor));
-                let cursor_area = ratatui::layout::Rect::new(cursor_x, cursor_y, 1, 1);
-                frame.render_widget(cursor_indicator, cursor_area);
-
-                return Some((cursor_x, cursor_y));
+    // The anchor's own name, which is no segment's: a press on it is the row's.
+    let mut name: fe::Runs = Vec::new();
+    match (d.ghost, d.fuzzy) {
+        // The characters already typed into the preview row have left this
+        // one: they wear the removal's ground, the rest the row's own.
+        (Some(typed), _) => {
+            use crate::view::move_preview::{typed_split, GHOST_BG};
+            let (gone, kept) = typed_split(&node.entry.name, typed);
+            for (text, ground) in [(gone, GHOST_BG), (kept, ground)] {
+                if !text.is_empty() {
+                    name.push((text.to_string(), pair(&name_fg, ground)));
+                }
             }
         }
-        None
+        (None, Some(fm)) => {
+            let matched: std::collections::HashSet<usize> =
+                fm.match_positions.iter().copied().collect();
+            let hit = pair("search.match_fg", "search.match_bg");
+            let base = pair(&name_fg, ground);
+            let mut run = String::new();
+            let mut run_is_match = false;
+            for (i, c) in node.entry.name.chars().enumerate() {
+                let is_match = matched.contains(&i);
+                if i > 0 && is_match != run_is_match {
+                    let theme = if run_is_match {
+                        hit.clone()
+                    } else {
+                        base.clone()
+                    };
+                    name.push((std::mem::take(&mut run), theme));
+                }
+                run_is_match = is_match;
+                run.push(c);
+            }
+            if !run.is_empty() {
+                name.push((run, if run_is_match { hit } else { base }));
+            }
+        }
+        (None, None) => name.push((node.entry.name.clone(), pair(&name_fg, ground))),
     }
 
-    /// Render a single tree node as a ListItem
-    #[allow(clippy::too_many_arguments)]
-    fn render_node(
-        view: &FileTreeView,
-        deco: ExplorerDecorations<'_>,
-        node_id: NodeId,
-        indent: usize,
-        is_selected: bool,
-        is_multi_selected: bool,
-        is_focused: bool,
-        files_with_unsaved_changes: &HashSet<PathBuf>,
-        theme: &Theme,
-        content_width: usize,
-        fuzzy_match: Option<&FuzzyMatch>,
-        cut_paths: &[PathBuf],
-        tree_indicator_collapsed: &str,
-        tree_indicator_expanded: &str,
-    ) -> ListItem<'static> {
-        let line = Self::build_node_line(
-            view,
-            deco,
-            node_id,
-            indent,
-            is_selected,
-            is_multi_selected,
-            is_focused,
-            files_with_unsaved_changes,
-            theme,
-            content_width,
-            fuzzy_match,
-            cut_paths,
-            tree_indicator_collapsed,
-            tree_indicator_expanded,
-        );
-        let row_bg = if (is_selected || is_multi_selected) && is_focused {
-            theme.selection_bg
-        } else {
-            theme.editor_bg
-        };
-        ListItem::new(line).style(Style::default().bg(row_bg))
+    // The cell that holds the name off the status slot. Part of the label
+    // rather than a floor under the row's flex gap, because a label too long
+    // for the lane paints over that cell while the hit goes to the gap: here
+    // the space is the first thing such a label loses, which is what should
+    // give.
+    if slots.trailing.is_some() {
+        name.push((" ".to_string(), pair(neutral, ground)));
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn build_node_line(
-        view: &FileTreeView,
-        deco: ExplorerDecorations<'_>,
-        node_id: NodeId,
-        indent: usize,
-        is_selected: bool,
-        is_multi_selected: bool,
-        is_focused: bool,
-        files_with_unsaved_changes: &HashSet<PathBuf>,
-        theme: &Theme,
-        content_width: usize,
-        fuzzy_match: Option<&FuzzyMatch>,
-        cut_paths: &[PathBuf],
-        tree_indicator_collapsed: &str,
-        tree_indicator_expanded: &str,
-    ) -> Line<'static> {
-        let node = view.tree().get_node(node_id).expect("Node should exist");
+    fe::Row {
+        index: d.row,
+        theme: pair("ui.file_explorer_fg", ground),
+        left,
+        chain,
+        name,
+        trailing: slots.trailing.as_ref().map(|slot| fe::Slot {
+            text: slot.text.clone(),
+            theme: pair(&slot_paint(slot.fg, &slot.fg_key), ground),
+            path: (node.entry.path.clone()).into_path_buf(),
+        }),
+        error: matches!(node.state, crate::view::file_tree::NodeState::Error(_))
+            .then(|| (" [Error]".to_string(), pair("diagnostic.error_fg", ground))),
+        segment: None,
+    }
+}
 
-        let mut spans = Vec::new();
-        // Names of any ancestor directories that compact-mode folded into
-        // this row. Outermost-first; each gets prefixed before the anchor
-        // name and joined by `/`.
-        let chain_prefix_names: Vec<String> = view
-            .compact_chain_for_anchor(node_id)
+/// The row a drop's preview opens where a moved entry will land: the indent a
+/// child of the target directory has, and the part of `name` typed so far
+/// (`view::move_preview::typed_runs`). Nothing else — no glyph, no status —
+/// because nothing is there yet.
+///
+/// `index` is the target directory's row and `segment` the directory when it
+/// is a folded part of that row, so a press or a drop on the preview row
+/// means that directory.
+pub fn describe_preview_row(
+    index: usize,
+    segment: Option<std::path::PathBuf>,
+    indent: usize,
+    name: &str,
+    typed: usize,
+    collapsed: &str,
+    expanded: &str,
+) -> crate::view::shell::file_explorer::Row {
+    use crate::app::shell_host::shell_theme::pair;
+    let ground = "ui.file_explorer_bg";
+    // The same head a file row at this depth has, so the typed name starts
+    // in the column the real one will.
+    let indicator_width = str_width(collapsed).max(str_width(expanded)).max(1) + 1;
+    let head = " ".repeat(indent * 2 + indicator_width);
+    crate::view::shell::file_explorer::Row {
+        index,
+        theme: pair("ui.file_explorer_fg", ground),
+        left: vec![(head, pair("ui.file_explorer_fg", ground))],
+        chain: Vec::new(),
+        name: crate::view::move_preview::typed_runs(name, typed)
             .into_iter()
-            .filter_map(|id| view.tree().get_node(id).map(|n| n.entry.name.clone()))
-            .collect();
-
-        // Width reserved for the tree-indicator column. We size it from the
-        // configured collapsed/expanded glyphs (plus a trailing space) so file
-        // and directory names stay aligned even when the user picks wider
-        // custom indicators.
-        let collapsed_w = str_width(tree_indicator_collapsed);
-        let expanded_w = str_width(tree_indicator_expanded);
-        let indicator_width = collapsed_w.max(expanded_w).max(1) + 1;
-
-        let has_unsaved = if node.is_dir() {
-            Self::folder_has_modified_files(&node.entry.path, files_with_unsaved_changes)
-        } else {
-            files_with_unsaved_changes.contains(&node.entry.path)
-        };
-
-        let is_pending_cut = cut_paths.iter().any(|cp| cp == &node.entry.path);
-        let neutral_fg = if node
-            .entry
-            .metadata
-            .as_ref()
-            .map(|m| m.is_hidden)
-            .unwrap_or(false)
-        {
-            theme.line_number_fg
-        } else if node.entry.is_symlink() {
-            theme.syntax_type
-        } else if node.is_dir() {
-            theme.syntax_keyword
-        } else {
-            theme.editor_fg
-        };
-        let slot_context = ExplorerSlotContext {
-            path: &node.entry.path,
-            is_dir: node.is_dir(),
-            has_unsaved,
-            is_symlink: node.entry.is_symlink(),
-            is_hidden: node
-                .entry
-                .metadata
-                .as_ref()
-                .map(|m| m.is_hidden)
-                .unwrap_or(false),
-            decorations: deco.decorations,
-            slot_overrides: deco.slot_overrides,
-            theme,
-            neutral_fg,
-        };
-        let slot_resolution = deco.slot_resolver.resolve(&slot_context);
-        let leading_slot_width = slot_resolution
-            .leading
-            .as_ref()
-            .map(|slot| slot.width() + 1)
-            .unwrap_or(0);
-
-        let base_fg = if is_pending_cut {
-            theme.line_number_fg
-        } else if let Some(name_color_hint) = slot_resolution.name_color_hint {
-            name_color_hint
-        } else if (is_selected || is_multi_selected) && is_focused {
-            theme.editor_fg
-        } else {
-            neutral_fg
-        };
-
-        let chain_prefix_width: usize = chain_prefix_names.iter().map(|s| str_width(s) + 1).sum();
-        let name_width = str_width(&node.entry.name);
-
-        let indent_width = indent * 2;
-        let left_side_width =
-            indent_width + indicator_width + leading_slot_width + chain_prefix_width + name_width;
-        let trailing_slot_width = slot_resolution
-            .trailing
-            .as_ref()
-            .map(|slot| slot.width())
-            .unwrap_or(0);
-        let error_text = if node.is_error() { " [Error]" } else { "" };
-        let error_width = str_width(error_text);
-        let total_right_width = trailing_slot_width + error_width;
-
-        if indent > 0 {
-            spans.push(Span::raw("  ".repeat(indent)));
-        }
-
-        if node.is_dir() {
-            let (indicator, glyph_width) = if node.is_expanded() {
-                (format!("{} ", tree_indicator_expanded), expanded_w + 1)
-            } else if node.is_collapsed() {
-                (format!("{} ", tree_indicator_collapsed), collapsed_w + 1)
-            } else if node.is_loading() {
-                ("⟳ ".to_string(), 2)
-            } else {
-                ("! ".to_string(), 2)
-            };
-            spans.push(Span::styled(
-                indicator,
-                Style::default().fg(theme.diagnostic_warning_fg),
-            ));
-            let pad = indicator_width.saturating_sub(glyph_width);
-            if pad > 0 {
-                spans.push(Span::raw(" ".repeat(pad)));
-            }
-        } else {
-            spans.push(Span::raw(" ".repeat(indicator_width)));
-        }
-
-        if let Some(slot) = slot_resolution.leading {
-            let slot_width = slot.width();
-            let slot_text_width = str_width(&slot.text);
-            spans.push(Span::styled(slot.text, Style::default().fg(slot.fg)));
-            let slot_padding = slot_width.saturating_sub(slot_text_width) + 1;
-            spans.push(Span::raw(" ".repeat(slot_padding)));
-        }
-
-        let chain_segment_style = Style::default().fg(theme.syntax_keyword);
-        let chain_separator_style = Style::default().fg(theme.line_number_fg);
-        for name in &chain_prefix_names {
-            spans.push(Span::styled(name.clone(), chain_segment_style));
-            spans.push(Span::styled("/", chain_separator_style));
-        }
-
-        if let Some(fm) = fuzzy_match {
-            Self::render_name_with_highlights(
-                &node.entry.name,
-                &fm.match_positions,
-                base_fg,
-                theme,
-                &mut spans,
-            );
-        } else {
-            spans.push(Span::styled(
-                node.entry.name.clone(),
-                Style::default().fg(base_fg),
-            ));
-        }
-
-        let min_gap = 1;
-        let padding = if left_side_width + min_gap + total_right_width < content_width {
-            content_width - left_side_width - total_right_width
-        } else {
-            min_gap
-        };
-        spans.push(Span::raw(" ".repeat(padding)));
-
-        if let Some(slot) = slot_resolution.trailing {
-            spans.push(Span::styled(slot.text, Style::default().fg(slot.fg)));
-        }
-
-        if node.is_error() {
-            spans.push(Span::styled(
-                error_text,
-                Style::default().fg(theme.diagnostic_error_fg),
-            ));
-        }
-
-        Line::from(spans)
-    }
-
-    pub(crate) fn trailing_slot_screen_bounds(ctx: TrailingSlotBoundsCtx) -> Option<(u16, u16)> {
-        let TrailingSlotBoundsCtx {
-            view,
-            node_id,
-            indent,
-            content_width,
-            slot_resolution,
-            tree_indicator_collapsed,
-            tree_indicator_expanded,
-            explorer_area,
-        } = ctx;
-        let trailing_slot = slot_resolution.trailing.as_ref()?;
-        let node = view.tree().get_node(node_id).expect("Node should exist");
-
-        let chain_prefix_names: Vec<String> = view
-            .compact_chain_for_anchor(node_id)
-            .into_iter()
-            .filter_map(|id| view.tree().get_node(id).map(|n| n.entry.name.clone()))
-            .collect();
-        let collapsed_w = str_width(tree_indicator_collapsed);
-        let expanded_w = str_width(tree_indicator_expanded);
-        let indicator_width = collapsed_w.max(expanded_w).max(1) + 1;
-        let leading_slot_width = slot_resolution
-            .leading
-            .as_ref()
-            .map(|slot| slot.width() + 1)
-            .unwrap_or(0);
-        let chain_prefix_width: usize = chain_prefix_names.iter().map(|s| str_width(s) + 1).sum();
-        let name_width = str_width(&node.entry.name);
-        let left_side_width =
-            indent * 2 + indicator_width + leading_slot_width + chain_prefix_width + name_width;
-        let trailing_slot_width = trailing_slot.width();
-        let error_width = if node.is_error() {
-            str_width(" [Error]")
-        } else {
-            0
-        };
-        let total_right_width = trailing_slot_width + error_width;
-        let min_gap = 1;
-        let padding = if left_side_width + min_gap + total_right_width < content_width {
-            content_width - left_side_width - total_right_width
-        } else {
-            min_gap
-        };
-        let content_start_x = explorer_area.x + 2;
-        let slot_start = content_start_x + (left_side_width + padding) as u16;
-        let slot_end = slot_start + trailing_slot_width as u16;
-        Some((slot_start, slot_end))
-    }
-
-    /// Render a file/directory name with matched characters highlighted
-    fn render_name_with_highlights(
-        name: &str,
-        match_positions: &[usize],
-        base_fg: Color,
-        theme: &Theme,
-        spans: &mut Vec<Span<'static>>,
-    ) {
-        if match_positions.is_empty() {
-            spans.push(Span::styled(name.to_string(), Style::default().fg(base_fg)));
-            return;
-        }
-
-        let chars: Vec<char> = name.chars().collect();
-        let match_set: std::collections::HashSet<usize> = match_positions.iter().copied().collect();
-
-        let base_style = Style::default().fg(base_fg);
-        let highlight_style = Style::default()
-            .fg(theme.search_match_fg)
-            .bg(theme.search_match_bg);
-
-        let mut current_span = String::new();
-        let mut current_is_match = false;
-
-        for (i, &c) in chars.iter().enumerate() {
-            let is_match = match_set.contains(&i);
-
-            if i == 0 {
-                current_is_match = is_match;
-                current_span.push(c);
-            } else if is_match == current_is_match {
-                current_span.push(c);
-            } else {
-                // Style changed, push current span and start new one
-                let style = if current_is_match {
-                    highlight_style
-                } else {
-                    base_style
-                };
-                spans.push(Span::styled(current_span.clone(), style));
-                current_span.clear();
-                current_span.push(c);
-                current_is_match = is_match;
-            }
-        }
-
-        // Push final span
-        if !current_span.is_empty() {
-            let style = if current_is_match {
-                highlight_style
-            } else {
-                base_style
-            };
-            spans.push(Span::styled(current_span, style));
-        }
+            .map(|(text, bg)| (text.to_string(), pair("ui.file_explorer_fg", bg)))
+            .collect(),
+        trailing: None,
+        error: None,
+        segment,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests build rows straight from the caches; `describe_row`
+    // takes them through `ExplorerSlotContext`.
     use crate::model::filesystem::StdFileSystem;
+    use crate::view::file_tree::{
+        FileExplorerDecorationCache, FileExplorerSlotOverrideCache, FileTreeView, NodeId,
+    };
+    // The module itself no longer paints, so `Style` is a test-only type here:
+    // `build_line` resolves theme *names* back to styles so these tests can go
+    // on asserting about colours.
     use crate::services::fs::FsManager;
+    use ratatui::style::Style;
     use std::collections::{HashMap, HashSet};
     use std::fs as std_fs;
     use std::sync::Arc;
@@ -753,6 +390,9 @@ mod tests {
         (temp_dir, FileTreeView::new(tree))
     }
 
+    /// One row's pieces, with each theme *name* resolved back to the style it
+    /// stands for — so these tests can go on asserting about colours while the
+    /// description itself speaks in names.
     fn build_line(
         view: &FileTreeView,
         node_id: NodeId,
@@ -760,28 +400,44 @@ mod tests {
         decorations: &FileExplorerDecorationCache,
         slot_overrides: &FileExplorerSlotOverrideCache,
         theme: &Theme,
-    ) -> Line<'static> {
-        let deco = ExplorerDecorations {
-            slot_resolver: crate::view::file_tree::default_slot_providers().resolver(),
+    ) -> Vec<(String, Style)> {
+        let resolver = crate::view::file_tree::default_slot_providers().resolver();
+        let projection = view.projection();
+        let mut node =
+            projection.rows[projection.index_of(node_id).expect("a visible node")].clone();
+        node.indent = indent;
+        let row = describe_row(RowDesc {
+            node: &node,
+            row: 0,
+            is_cursor: false,
+            is_multi: false,
+            focused: false,
+            unsaved: &HashSet::new(),
+            cut: &[],
+            drop_target: None,
+            fuzzy: None,
             decorations,
             slot_overrides,
-        };
-        FileExplorerRenderer::build_node_line(
-            view,
-            deco,
-            node_id,
-            indent,
-            false,
-            false,
-            false,
-            &HashSet::new(),
+            slot_resolver: &resolver,
             theme,
-            80,
-            None,
-            &[],
-            ">",
-            "▼",
-        )
+            collapsed: ">",
+            expanded: "▼",
+            ghost: None,
+            opening: false,
+            pinned: false,
+        });
+        let resolve = |name: &str| crate::app::shell_host::shell_theme::resolve(name, theme);
+        // The label's parts in the order the row draws them.
+        let label = row
+            .left
+            .into_iter()
+            .chain(row.chain.into_iter().flat_map(|part| part.runs))
+            .chain(row.name);
+        label
+            .map(|(t, name)| (t, resolve(&name)))
+            .chain(row.trailing.map(|s| (s.text, resolve(&s.theme))))
+            .chain(row.error.map(|(t, name)| (t, resolve(&name))))
+            .collect()
     }
 
     #[tokio::test]
@@ -812,9 +468,9 @@ mod tests {
             &theme,
         );
 
-        assert!(line.spans.iter().any(|span| {
-            span.content.as_ref() == "M" && span.style.fg == Some(theme.file_status_modified_fg)
-        }));
+        assert!(line
+            .iter()
+            .any(|(text, style)| text == "M" && style.fg == Some(theme.file_status_modified_fg)));
     }
 
     #[tokio::test]
@@ -846,9 +502,9 @@ mod tests {
             &theme,
         );
 
-        assert!(line.spans.iter().any(|span| {
-            span.content.as_ref() == "●" && span.style.fg == Some(theme.file_status_renamed_fg)
-        }));
+        assert!(line
+            .iter()
+            .any(|(text, style)| text == "●" && style.fg == Some(theme.file_status_renamed_fg)));
     }
 
     #[tokio::test]
@@ -894,12 +550,11 @@ mod tests {
             &theme,
         );
 
-        assert!(line.spans.iter().any(|span| span.content.as_ref() == "PL"));
-        assert!(line.spans.iter().any(|span| span.content.as_ref() == "X"));
-        assert!(line.spans.iter().any(|span| {
-            span.content.as_ref() == "schema.ts"
-                && span.style.fg == Some(theme.file_status_added_fg)
-        }));
+        assert!(line.iter().any(|(text, _)| text == "PL"));
+        assert!(line.iter().any(|(text, _)| text == "X"));
+        assert!(line.iter().any(
+            |(text, style)| text == "schema.ts" && style.fg == Some(theme.file_status_added_fg)
+        ));
     }
 
     #[tokio::test]
@@ -939,62 +594,313 @@ mod tests {
 
         let line = build_line(&view, schema_id, 2, &decorations, &slot_overrides, &theme);
 
-        assert!(line.spans.iter().any(|span| {
-            span.content.as_ref() == "schema.ts" && span.style.fg == Some(theme.syntax_string)
-        }));
-        assert!(line.spans.iter().any(|span| {
-            span.content.as_ref() == "M" && span.style.fg == Some(theme.file_status_modified_fg)
-        }));
+        assert!(line
+            .iter()
+            .any(|(text, style)| text == "schema.ts" && style.fg == Some(theme.syntax_string)));
+        assert!(line
+            .iter()
+            .any(|(text, style)| text == "M" && style.fg == Some(theme.file_status_modified_fg)));
     }
 
+    /// A directory a held drag is over wears the selection ground, so a reader
+    /// can see where a drop would land — and it outranks the keyboard cursor,
+    /// which is on some other row entirely while the pointer is dragging.
     #[tokio::test]
-    async fn trailing_slot_bounds_track_rendered_right_edge_geometry() {
+    async fn the_drop_target_shows_where_a_drag_would_land() {
         let (_temp_dir, view) = create_renderer_view().await;
         let theme = Theme::load_builtin("dark").unwrap();
-        let schema_path = view.tree().root_path().join("src/schema.ts");
-        let schema_id = view.tree().get_node_by_path(&schema_path).unwrap().id;
-        let decorations = FileExplorerDecorationCache::rebuild(
-            vec![crate::view::file_tree::FileExplorerDecoration {
-                path: schema_path.clone(),
-                symbol: "M".to_string(),
-                color: fresh_core::api::OverlayColorSpec::ThemeKey(
-                    "ui.file_status_modified_fg".into(),
-                ),
-                priority: 50,
-            }],
-            view.tree().root_path(),
-            &HashMap::new(),
-        );
-        let slot_context = ExplorerSlotContext {
-            path: &schema_path,
-            is_dir: false,
-            has_unsaved: false,
-            is_symlink: false,
-            is_hidden: false,
-            decorations: &decorations,
-            slot_overrides: &FileExplorerSlotOverrideCache::default(),
-            theme: &theme,
-            neutral_fg: theme.editor_fg,
+        let src_path = view.tree().root_path().join("src");
+        let src_id = view.tree().get_node_by_path(&src_path).unwrap().id;
+
+        let resolver = crate::view::file_tree::default_slot_providers().resolver();
+        let projection = view.projection();
+        let node = &projection.rows[projection.index_of(src_id).expect("a row")];
+        let describe = |drop_target: Option<&std::path::Path>| {
+            describe_row(RowDesc {
+                node,
+                row: 0,
+                is_cursor: false,
+                is_multi: false,
+                focused: false,
+                unsaved: &HashSet::new(),
+                cut: &[],
+                drop_target,
+                fuzzy: None,
+                decorations: &FileExplorerDecorationCache::default(),
+                slot_overrides: &FileExplorerSlotOverrideCache::default(),
+                slot_resolver: &resolver,
+                theme: &theme,
+                collapsed: ">",
+                expanded: "▼",
+                ghost: None,
+                opening: false,
+                pinned: false,
+            })
         };
-        let slot_resolution = crate::view::file_tree::default_slot_providers()
-            .resolver()
-            .resolve(&slot_context);
-        let area = Rect::new(0, 0, 40, 10);
-        let content_width = area.width.saturating_sub(3) as usize;
 
-        let bounds = FileExplorerRenderer::trailing_slot_screen_bounds(TrailingSlotBoundsCtx {
-            view: &view,
-            node_id: schema_id,
-            indent: 2,
-            content_width,
-            slot_resolution: &slot_resolution,
-            tree_indicator_collapsed: ">",
-            tree_indicator_expanded: "▼",
-            explorer_area: area,
-        })
-        .expect("modified file should render a trailing slot");
+        let plain = describe(None);
+        let under_drag = describe(Some(&src_path));
+        assert_ne!(
+            plain.theme, under_drag.theme,
+            "the row a drop would land in should not look like an idle one"
+        );
+        assert_eq!(
+            describe(Some(&view.tree().root_path().join("README.md"))).theme,
+            plain.theme,
+            "and only that row should change"
+        );
+    }
 
-        assert_eq!(bounds.1, area.x + area.width.saturating_sub(1));
-        assert_eq!(bounds.1 - bounds.0, 1);
+    /// A compact row's label comes apart the way presses need it to: the indent
+    /// and indicator are the row's, each folded directory is its own part with
+    /// its own path, and the anchor's name is the row's again.
+    #[tokio::test]
+    async fn a_compact_rows_segments_are_its_own_parts() {
+        let (_temp_dir, view) = create_chain_renderer_view().await;
+        let theme = Theme::load_builtin("dark").unwrap();
+        let anchor_path = view.tree().root_path().join("chain/a/b/c");
+        let anchor_id = view.tree().get_node_by_path(&anchor_path).unwrap().id;
+
+        let resolver = crate::view::file_tree::default_slot_providers().resolver();
+        let projection = view.projection();
+        let mut node =
+            projection.rows[projection.index_of(anchor_id).expect("a visible node")].clone();
+        node.indent = 2;
+        let folded: Vec<&str> = node.chain.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(folded, vec!["chain", "a", "b"], "the folded ancestors");
+        let row = describe_row(RowDesc {
+            node: &node,
+            row: 0,
+            is_cursor: false,
+            is_multi: false,
+            focused: false,
+            unsaved: &HashSet::new(),
+            cut: &[],
+            drop_target: None,
+            fuzzy: None,
+            decorations: &FileExplorerDecorationCache::default(),
+            slot_overrides: &FileExplorerSlotOverrideCache::default(),
+            slot_resolver: &resolver,
+            theme: &theme,
+            collapsed: ">",
+            expanded: "▼",
+            ghost: None,
+            opening: false,
+            pinned: false,
+        });
+
+        let drawn =
+            |runs: &[(String, String)]| runs.iter().map(|(t, _)| t.as_str()).collect::<String>();
+        let root = view.tree().root_path();
+        let segments: Vec<(String, &std::path::Path)> = row
+            .chain
+            .iter()
+            .map(|part| (drawn(&part.runs), part.path.strip_prefix(root).unwrap()))
+            .collect();
+        assert_eq!(
+            segments,
+            vec![
+                ("chain/".to_string(), std::path::Path::new("chain")),
+                ("a/".to_string(), std::path::Path::new("chain/a")),
+                ("b/".to_string(), std::path::Path::new("chain/a/b")),
+            ]
+        );
+        assert_eq!(drawn(&row.left), "    ▼ ", "the indent and the indicator");
+        // The anchor's own name is no segment's, so a press on it is the row's.
+        assert_eq!(drawn(&row.name), "c");
+    }
+
+    /// **A row the list pins says so on screen: shaded where it would be
+    /// plain, saying the same thing.** The sticky band holds a scrolled
+    /// tree's expanded ancestors over the run; if the pinned rows drew like
+    /// the tree itself, there would be nothing on screen to say "your run
+    /// continues above this folder" (#2705).
+    #[tokio::test]
+    async fn a_pinned_ancestor_row_is_shaded_an_unpinned_one_is_not() {
+        let (_temp_dir, view) = create_renderer_view().await;
+        let theme = Theme::load_builtin("dark").unwrap();
+        let resolver = crate::view::file_tree::default_slot_providers().resolver();
+        let projection = view.projection();
+        // One expanded directory is enough: only a directory is ever pinned,
+        // and only when it is expanded (a pinned ancestor is an open door).
+        let src_id = view
+            .tree()
+            .get_node(view.tree().root_id())
+            .unwrap()
+            .children
+            .iter()
+            .copied()
+            .find(|id| view.tree().get_node(*id).unwrap().entry.name == "src")
+            .expect("the fixture has src");
+        let row_of = |pinned: bool, is_cursor: bool, focused: bool| {
+            let node =
+                projection.rows[projection.index_of(src_id).expect("src is visible")].clone();
+            describe_row(RowDesc {
+                node: &node,
+                row: 0,
+                is_cursor,
+                is_multi: false,
+                focused,
+                unsaved: &HashSet::new(),
+                cut: &[],
+                drop_target: None,
+                fuzzy: None,
+                decorations: &FileExplorerDecorationCache::default(),
+                slot_overrides: &FileExplorerSlotOverrideCache::default(),
+                slot_resolver: &resolver,
+                theme: &theme,
+                collapsed: ">",
+                expanded: "▼",
+                ghost: None,
+                opening: false,
+                pinned,
+            })
+        };
+        let plain = row_of(false, false, false);
+        let pinned = row_of(true, false, false);
+        let cursor_on_pinned = row_of(true, true, false);
+
+        // The band changes the colour, not the words: the same glyph, the
+        // same name, the same geometry, so a pinned row stays a clickable
+        // identical (only shaded) copy of its tree row.
+        let said = |row: &crate::view::shell::file_explorer::Row| {
+            row.left
+                .iter()
+                .map(|(t, _)| t.to_string())
+                .chain(row.name.iter().map(|(t, _)| t.to_string()))
+                .collect::<Vec<String>>()
+        };
+        assert_eq!(said(&plain), said(&pinned), "only the ink changed");
+
+        // Every run of the pinned row sits on the band's ground, and none of
+        // the plain row's does.
+        let ground_of = |row: &crate::view::shell::file_explorer::Row| {
+            row.left
+                .iter()
+                .chain(row.name.iter())
+                .map(|(_, th)| th.split('/').next_back().unwrap_or(th).to_string())
+                .collect::<Vec<String>>()
+        };
+        assert_eq!(
+            pinned.theme.split('/').next_back().unwrap_or(&pinned.theme),
+            "ui.file_explorer_pinned_bg",
+            "the pinned row's band"
+        );
+        for ground in ground_of(&pinned) {
+            assert_eq!(
+                ground, "ui.file_explorer_pinned_bg",
+                "the pinned row's runs"
+            );
+        }
+        // A cursor on a pinned folder is still a cursor: the band's ground
+        // yields to the current-line ground, so the two do not collide.
+        assert_eq!(
+            cursor_on_pinned
+                .theme
+                .split('/')
+                .next_back()
+                .unwrap_or(&cursor_on_pinned.theme),
+            "editor.current_line_bg",
+            "the cursor stays visible on a pinned row"
+        );
+        for ground in ground_of(&cursor_on_pinned) {
+            assert_eq!(ground, "editor.current_line_bg", "the cursor's runs");
+        }
+        assert_eq!(
+            plain.theme.split('/').next_back().unwrap_or(&plain.theme),
+            "ui.file_explorer_bg",
+            "an unpinned row sits on the panel"
+        );
+        for ground in ground_of(&plain) {
+            assert_eq!(ground, "ui.file_explorer_bg", "the plain row's ground");
+        }
+    }
+
+    /// A drag held over one of a compact row's folded names shows on *that*
+    /// name. The row's ground cannot say it — the row is anchored at `c`,
+    /// several directories below where the entry would land — so without this
+    /// a drop into a folded directory is drawn exactly like no drop at all.
+    #[tokio::test]
+    async fn a_drag_over_a_folded_name_shows_on_that_name() {
+        let (_temp_dir, view) = create_chain_renderer_view().await;
+        let theme = Theme::load_builtin("dark").unwrap();
+        let root = view.tree().root_path().to_path_buf();
+        let anchor_id = view
+            .tree()
+            .get_node_by_path(&root.join("chain/a/b/c"))
+            .unwrap()
+            .id;
+
+        let resolver = crate::view::file_tree::default_slot_providers().resolver();
+        let projection = view.projection();
+        let node = &projection.rows[projection.index_of(anchor_id).expect("a visible node")];
+        let describe = |drop_target: Option<&std::path::Path>| {
+            describe_row(RowDesc {
+                node,
+                row: 0,
+                is_cursor: false,
+                is_multi: false,
+                focused: false,
+                unsaved: &HashSet::new(),
+                cut: &[],
+                drop_target,
+                fuzzy: None,
+                decorations: &FileExplorerDecorationCache::default(),
+                slot_overrides: &FileExplorerSlotOverrideCache::default(),
+                slot_resolver: &resolver,
+                theme: &theme,
+                collapsed: ">",
+                expanded: "▼",
+                ghost: None,
+                opening: false,
+                pinned: false,
+            })
+        };
+        let themes = |row: &crate::view::shell::file_explorer::Row| {
+            row.chain
+                .iter()
+                .map(|part| part.runs.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        };
+
+        let idle = describe(None);
+        let over_a = describe(Some(&root.join("chain/a")));
+        assert_eq!(
+            themes(&idle)[0],
+            themes(&over_a)[0],
+            "`chain/` is not where the drop would land, so it is untouched"
+        );
+        assert_ne!(
+            themes(&idle)[1],
+            themes(&over_a)[1],
+            "`a/` is, so it has to look different"
+        );
+        assert_eq!(themes(&idle)[2], themes(&over_a)[2], "and `b/` is not");
+        assert_eq!(
+            idle.theme, over_a.theme,
+            "the row itself is not the drop target"
+        );
+    }
+
+    async fn create_chain_renderer_view() -> (TempDir, FileTreeView) {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        std_fs::create_dir_all(root.join("chain/a/b/c")).unwrap();
+        std_fs::write(root.join("chain/a/b/c/leaf.txt"), "leaf").unwrap();
+
+        let manager = Arc::new(FsManager::new(Arc::new(StdFileSystem)));
+        let tree = crate::view::file_tree::FileTree::new(root.to_path_buf(), manager)
+            .await
+            .unwrap();
+        let mut view = FileTreeView::new(tree);
+        let root_id = view.tree().root_id();
+        view.tree_mut().expand_node(root_id).await.unwrap();
+        let chain_id = view
+            .tree()
+            .get_node_by_path(&root.join("chain"))
+            .unwrap()
+            .id;
+        view.expand_with_chain(chain_id).await.unwrap();
+        (temp_dir, view)
     }
 }

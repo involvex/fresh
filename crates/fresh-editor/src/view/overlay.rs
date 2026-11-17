@@ -45,6 +45,19 @@ pub enum OverlayFace {
 }
 
 impl OverlayFace {
+    /// A face painted with a foreground and a background theme key, both
+    /// resolved — color and text attributes — when the cell is drawn, so it
+    /// follows theme changes. `fallback` stands where a key does not resolve.
+    pub fn themed(fg_key: &str, bg_key: &str, fallback: Style) -> Self {
+        OverlayFace::ThemedStyle {
+            fallback_style: fallback,
+            fg_theme: Some(fg_key.to_string()),
+            bg_theme: Some(bg_key.to_string()),
+            fg_on_collision_only: false,
+            fg_on_low_contrast: false,
+        }
+    }
+
     /// Create an OverlayFace from OverlayOptions
     ///
     /// If the options contain theme key references, creates a ThemedStyle
@@ -196,6 +209,21 @@ pub struct Overlay {
     /// Recorded at creation time so the theme inspector can show the exact key
     /// without reverse-mapping colors.
     pub theme_key: Option<&'static str>,
+
+    /// Paint this overlay over the selection instead of under it.
+    ///
+    /// Normally the selection background wins over every overlay. The
+    /// current search match is also the selection after Find Next, and must
+    /// keep its own color there so it still stands out from the other
+    /// matches.
+    pub above_selection: bool,
+
+    /// Draw only in a pane showing the buffer in compose view.
+    ///
+    /// Decorations live on the buffer, but compose view is a property of a
+    /// pane, so a plugin composing one pane would otherwise paint its
+    /// styling into a sibling pane showing the same buffer as source.
+    pub compose_only: bool,
 }
 
 impl Overlay {
@@ -224,6 +252,8 @@ impl Overlay {
             extend_to_line_end: false,
             url: None,
             theme_key: None,
+            above_selection: false,
+            compose_only: false,
         }
     }
 
@@ -237,6 +267,46 @@ impl Overlay {
         let mut overlay = Self::new(marker_list, range, face);
         overlay.namespace = Some(namespace);
         overlay
+    }
+
+    /// Build many namespaced overlays at once, creating every marker they
+    /// need in a single bulk tree build.
+    ///
+    /// Identical in result to [`with_namespace`] per spec, in order — the
+    /// markers get the same ids and the same right gravity. Replacing the
+    /// contents of a large decorated buffer installs one overlay per row and
+    /// three markers per overlay, and doing that a marker at a time is N
+    /// independent descents through a tree that is growing under them.
+    ///
+    /// [`with_namespace`]: Overlay::with_namespace
+    pub fn many_with_namespace(
+        marker_list: &mut MarkerList,
+        specs: Vec<(Range<usize>, OverlayFace)>,
+        namespace: OverlayNamespace,
+    ) -> Vec<Self> {
+        let ranges: Vec<Range<usize>> = specs.iter().map(|(r, _)| r.clone()).collect();
+        let markers = marker_list.create_overlay_markers_bulk(&ranges);
+        specs
+            .into_iter()
+            .zip(markers)
+            .map(
+                |((_, face), (start_marker, end_marker, span_marker))| Self {
+                    handle: OverlayHandle::new(),
+                    namespace: Some(namespace.clone()),
+                    start_marker,
+                    end_marker,
+                    span_marker,
+                    face,
+                    priority: 0,
+                    message: None,
+                    extend_to_line_end: false,
+                    url: None,
+                    theme_key: None,
+                    above_selection: false,
+                    compose_only: false,
+                },
+            )
+            .collect()
     }
 
     /// Like [`with_namespace`], but the end marker uses left gravity so the
@@ -268,7 +338,27 @@ impl Overlay {
             extend_to_line_end: false,
             url: None,
             theme_key: None,
+            above_selection: false,
+            compose_only: false,
         }
+    }
+
+    /// A search-match highlight over `range`: the theme's
+    /// `search.match_*` colours (`fg` on `bg` where the theme has none),
+    /// anchored as [`with_namespace_fixed_end`] so it stays on the matched
+    /// text, and drawn over syntax highlighting.
+    ///
+    /// [`with_namespace_fixed_end`]: Overlay::with_namespace_fixed_end
+    pub fn search_match(
+        marker_list: &mut MarkerList,
+        range: Range<usize>,
+        namespace: OverlayNamespace,
+        fg: ratatui::style::Color,
+        bg: ratatui::style::Color,
+    ) -> Self {
+        let style = ratatui::style::Style::default().fg(fg).bg(bg);
+        let face = OverlayFace::themed("search.match_fg", "search.match_bg", style);
+        Self::with_namespace_fixed_end(marker_list, range, face, namespace).with_priority_value(10)
     }
 
     /// Create an overlay with a specific priority
@@ -295,12 +385,6 @@ impl Overlay {
         self
     }
 
-    /// Set the namespace
-    pub fn with_namespace_value(mut self, namespace: OverlayNamespace) -> Self {
-        self.namespace = Some(namespace);
-        self
-    }
-
     /// Set whether to extend the overlay to the end of the visual line
     pub fn with_extend_to_line_end(mut self, extend: bool) -> Self {
         self.extend_to_line_end = extend;
@@ -310,6 +394,12 @@ impl Overlay {
     /// Set the theme key that produced this overlay's color
     pub fn with_theme_key(mut self, key: &'static str) -> Self {
         self.theme_key = Some(key);
+        self
+    }
+
+    /// Paint this overlay over the selection (see [`Overlay::above_selection`])
+    pub fn with_above_selection(mut self) -> Self {
+        self.above_selection = true;
         self
     }
 
@@ -514,46 +604,50 @@ impl OverlayManager {
         // Find overlays in this namespace that overlap the range. Use the
         // marker-tree to narrow candidates; verify each candidate's true
         // range and namespace before removing.
-        if range.start < range.end {
-            let hits = marker_list.query_range(range.start, range.end);
-            let mut candidates: Vec<usize> = hits
-                .iter()
-                .filter_map(|(mid, _, _)| self.marker_to_idx.get(mid).copied())
-                .collect();
-            candidates.sort_unstable();
-            candidates.dedup();
-            let mut to_remove: Vec<usize> = candidates
-                .into_iter()
-                .filter(|&idx| {
-                    let o = &self.overlays[idx];
-                    if o.namespace.as_ref() != Some(namespace) {
-                        return false;
-                    }
-                    let start = marker_list.get_position(o.start_marker).unwrap_or(0);
-                    let end = marker_list.get_position(o.end_marker).unwrap_or(0);
-                    if start < end {
-                        // Healthy overlay: remove on genuine half-open overlap.
-                        start < range.end && range.start < end
-                    } else {
-                        // Collapsed (start == end) or inverted (start > end)
-                        // overlay. These arise when an edit erases the overlay's
-                        // anchored text — the markers clamp to the edit point and
-                        // a later insert can even push them past each other
-                        // (issue #2414). A strict overlap test never matches a
-                        // zero-length span, so the dead overlay would linger and
-                        // surface as a phantom search match. Treat it as a point
-                        // and remove it whenever it lands inside the replaced
-                        // range, so it is dropped rather than recreated.
-                        let lo = start.min(end);
-                        let hi = start.max(end);
-                        lo <= range.end && range.start <= hi
-                    }
-                })
-                .collect();
-            to_remove.sort_unstable_by(|a, b| b.cmp(a));
-            for idx in to_remove {
-                self.swap_remove_at(idx, marker_list);
-            }
+        //
+        // An empty `range` still runs this pass: an edit that empties the
+        // span collapses every overlay in it onto that one point, and
+        // skipping left them stranded as phantom matches (issue #3444).
+        // Healthy overlays are spared there, since nothing is replacing them.
+        let replaces_span = range.start < range.end;
+        let hits = marker_list.query_range(range.start, range.end);
+        let mut candidates: Vec<usize> = hits
+            .iter()
+            .filter_map(|(mid, _, _)| self.marker_to_idx.get(mid).copied())
+            .collect();
+        candidates.sort_unstable();
+        candidates.dedup();
+        let mut to_remove: Vec<usize> = candidates
+            .into_iter()
+            .filter(|&idx| {
+                let o = &self.overlays[idx];
+                if o.namespace.as_ref() != Some(namespace) {
+                    return false;
+                }
+                let start = marker_list.get_position(o.start_marker).unwrap_or(0);
+                let end = marker_list.get_position(o.end_marker).unwrap_or(0);
+                if start < end {
+                    // Healthy overlay: remove on genuine half-open overlap.
+                    replaces_span && start < range.end && range.start < end
+                } else {
+                    // Collapsed (start == end) or inverted (start > end)
+                    // overlay. These arise when an edit erases the overlay's
+                    // anchored text — the markers clamp to the edit point and
+                    // a later insert can even push them past each other
+                    // (issue #2414). A strict overlap test never matches a
+                    // zero-length span, so the dead overlay would linger and
+                    // surface as a phantom search match. Treat it as a point
+                    // and remove it whenever it lands inside the replaced
+                    // range, so it is dropped rather than recreated.
+                    let lo = start.min(end);
+                    let hi = start.max(end);
+                    lo <= range.end && range.start <= hi
+                }
+            })
+            .collect();
+        to_remove.sort_unstable_by(|a, b| b.cmp(a));
+        for idx in to_remove {
+            self.swap_remove_at(idx, marker_list);
         }
 
         if !new_overlays.is_empty() {
@@ -729,6 +823,40 @@ impl OverlayManager {
             .filter_map(move |idx| self.overlays.get(idx))
     }
 
+    /// Grow `range` to cover every overlay in `namespace` that a
+    /// [`replace_range_in_namespace`] over it would remove.
+    ///
+    /// A caller that rebuilds those overlays by rescanning `range` can only
+    /// re-find what lies inside it, so without this an overlay reaching past
+    /// either end is removed and never put back.
+    ///
+    /// [`replace_range_in_namespace`]: Self::replace_range_in_namespace
+    pub fn namespace_replacement_span(
+        &self,
+        namespace: &OverlayNamespace,
+        range: Range<usize>,
+        marker_list: &MarkerList,
+    ) -> Range<usize> {
+        if range.start >= range.end {
+            return range;
+        }
+        let mut lo = range.start;
+        let mut hi = range.end;
+        for o in self.candidates_in(range.clone(), marker_list) {
+            if o.namespace.as_ref() != Some(namespace) {
+                continue;
+            }
+            // Must agree with the healthy-overlay arm of
+            // `replace_range_in_namespace`: widen for exactly what it removes.
+            let r = o.range(marker_list);
+            if r.start < r.end && o.overlaps(&range, marker_list) {
+                lo = lo.min(r.start);
+                hi = hi.max(r.end);
+            }
+        }
+        lo..hi
+    }
+
     /// The overlays in one namespace. O(k), for callers that would otherwise
     /// filter `all()` — a per-frame walk of everything to count a handful.
     pub fn in_namespace<'a>(
@@ -800,16 +928,6 @@ impl OverlayManager {
                 included.then_some((overlay, range))
             })
             .collect()
-    }
-
-    /// Get overlay by handle
-    pub fn get_by_handle(&self, handle: &OverlayHandle) -> Option<&Overlay> {
-        self.overlays.iter().find(|o| &o.handle == handle)
-    }
-
-    /// Get mutable overlay by handle
-    pub fn get_by_handle_mut(&mut self, handle: &OverlayHandle) -> Option<&mut Overlay> {
-        self.overlays.iter_mut().find(|o| &o.handle == handle)
     }
 
     /// Get total number of overlays
@@ -944,113 +1062,6 @@ impl Default for OverlayManager {
     }
 }
 
-/// Helper functions for creating common overlay types
-impl Overlay {
-    /// Create an error underline overlay (wavy red line)
-    pub fn error(
-        marker_list: &mut MarkerList,
-        range: Range<usize>,
-        message: Option<String>,
-    ) -> Self {
-        let mut overlay = Self::with_priority(
-            marker_list,
-            range,
-            OverlayFace::Underline {
-                color: Color::Red,
-                style: UnderlineStyle::Wavy,
-            },
-            10, // Higher priority for errors
-        );
-        overlay.message = message;
-        overlay
-    }
-
-    /// Create a warning underline overlay (wavy yellow line)
-    pub fn warning(
-        marker_list: &mut MarkerList,
-        range: Range<usize>,
-        message: Option<String>,
-    ) -> Self {
-        let mut overlay = Self::with_priority(
-            marker_list,
-            range,
-            OverlayFace::Underline {
-                color: Color::Yellow,
-                style: UnderlineStyle::Wavy,
-            },
-            5, // Medium priority for warnings
-        );
-        overlay.message = message;
-        overlay
-    }
-
-    /// Create an info underline overlay (wavy blue line)
-    pub fn info(
-        marker_list: &mut MarkerList,
-        range: Range<usize>,
-        message: Option<String>,
-    ) -> Self {
-        let mut overlay = Self::with_priority(
-            marker_list,
-            range,
-            OverlayFace::Underline {
-                color: Color::Blue,
-                style: UnderlineStyle::Wavy,
-            },
-            3, // Lower priority for info
-        );
-        overlay.message = message;
-        overlay
-    }
-
-    /// Create a hint underline overlay (dotted gray line)
-    pub fn hint(
-        marker_list: &mut MarkerList,
-        range: Range<usize>,
-        message: Option<String>,
-    ) -> Self {
-        let mut overlay = Self::with_priority(
-            marker_list,
-            range,
-            OverlayFace::Underline {
-                color: Color::Gray,
-                style: UnderlineStyle::Dotted,
-            },
-            1, // Lowest priority for hints
-        );
-        overlay.message = message;
-        overlay
-    }
-
-    /// Create a selection highlight overlay
-    pub fn selection(marker_list: &mut MarkerList, range: Range<usize>) -> Self {
-        let mut overlay = Self::with_priority(
-            marker_list,
-            range,
-            OverlayFace::Background {
-                color: Color::Rgb(38, 79, 120), // VSCode-like selection color
-            },
-            -10, // Very low priority so it's under other overlays
-        );
-        overlay.theme_key = Some("editor.selection_bg");
-        overlay
-    }
-
-    /// Create a search result highlight overlay
-    pub fn search_match(marker_list: &mut MarkerList, range: Range<usize>) -> Self {
-        let mut overlay = Self::with_priority(
-            marker_list,
-            range,
-            OverlayFace::Background {
-                color: Color::Rgb(72, 72, 0), // Yellow-ish highlight
-            },
-            -5, // Low priority
-        );
-        overlay.theme_key = Some("search.match_bg");
-        overlay
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1141,7 +1152,7 @@ mod tests {
         );
         mgr.check_invariants();
         assert!(
-            mgr.namespace_to_idx.get(&scratch).is_none(),
+            !mgr.namespace_to_idx.contains_key(&scratch),
             "the cleared namespace leaves no index entry behind"
         );
         // Every surviving overlay must be findable at its recorded index.
@@ -1449,6 +1460,68 @@ mod tests {
         assert!(overlay.overlaps(&(5..15), &marker_list));
         assert!(overlay.overlaps(&(15..25), &marker_list));
         assert!(!overlay.overlaps(&(20..30), &marker_list));
+    }
+
+    /// Deleting every byte the overlays covered collapses them onto one
+    /// point, and the span the caller re-evaluates is then empty too. The
+    /// leftovers still have to go: search reads surviving overlays as its
+    /// match set, so a stranded one is a phantom match (issue #3444).
+    #[test]
+    fn test_replace_empty_range_evicts_collapsed_overlays() {
+        let mut marker_list = MarkerList::new();
+        marker_list.set_buffer_size(30);
+        let mut manager = OverlayManager::new();
+
+        let ns = OverlayNamespace::from_string("search".to_string());
+        for start in [0usize, 10, 20] {
+            manager.add(Overlay::with_namespace(
+                &mut marker_list,
+                start..(start + 5),
+                OverlayFace::Background { color: Color::Red },
+                ns.clone(),
+            ));
+        }
+        assert_eq!(manager.len(), 3);
+
+        // Delete the whole buffer: every overlay collapses onto offset 0.
+        marker_list.adjust_for_delete(0, 30);
+        marker_list.set_buffer_size(0);
+
+        // No text left, so the span the caller re-evaluates is empty too.
+        manager.replace_range_in_namespace(&ns, &(0..0), Vec::new(), &mut marker_list);
+
+        assert_eq!(
+            manager.len(),
+            0,
+            "collapsed overlays must not survive an empty replacement range"
+        );
+        manager.check_invariants();
+    }
+
+    /// The flip side: an empty replacement range puts nothing back, so it
+    /// must not take a live overlay with it just because it spans the point.
+    #[test]
+    fn test_replace_empty_range_keeps_healthy_overlays() {
+        let mut marker_list = MarkerList::new();
+        marker_list.set_buffer_size(100);
+        let mut manager = OverlayManager::new();
+
+        let ns = OverlayNamespace::from_string("search".to_string());
+        manager.add(Overlay::with_namespace(
+            &mut marker_list,
+            10..20,
+            OverlayFace::Background { color: Color::Red },
+            ns.clone(),
+        ));
+
+        manager.replace_range_in_namespace(&ns, &(15..15), Vec::new(), &mut marker_list);
+
+        assert_eq!(
+            manager.len(),
+            1,
+            "a live overlay spanning the point must survive an empty replacement range"
+        );
+        manager.check_invariants();
     }
 
     #[test]
